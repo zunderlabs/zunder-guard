@@ -16,9 +16,10 @@
 //!   owner is the user): the circle that can read a 0600 file on Unix. The
 //!   ACL is read as SDDL, whose identifiers do not depend on the display
 //!   language, and parsed by an allowlist: any entry type, flag or
-//!   condition it does not know is refused. Windows' own tools do the work
-//!   (`whoami`, `icacls`, PowerShell's `Get-Acl`), by absolute path under
-//!   `%SystemRoot%\System32`: no `unsafe` code and no new dependency.
+//!   condition it does not know is refused. Permissions are queried on the
+//!   open file handle with Windows' GetSecurityInfo, through safe wrappers.
+//!   System tools used for creation and SID resolution are invoked by absolute
+//!   path under `%SystemRoot%\System32`.
 //!
 //! [`check_sddl`] and [`unix_openness`] are text and number processing,
 //! tested on every platform; the Windows paths are tested on Windows (the
@@ -76,9 +77,9 @@ pub fn check(path: &Path) -> Result<Option<Openness>, String> {
     }
     #[cfg(windows)]
     {
-        let (sddl, local_admin) = windows::sddl(path)?;
-        let user = windows::user_sid()?;
-        Ok(check_sddl(&sddl, &user, local_admin.as_deref()).err())
+        let file =
+            open_for_reading(path).map_err(|error| format!("{}: {error}", path.display()))?;
+        check_opened(&file)
     }
     #[cfg(not(any(unix, windows)))]
     {
@@ -89,15 +90,29 @@ pub fn check(path: &Path) -> Result<Option<Openness>, String> {
     }
 }
 
-/// Windows: open `path` for reading so that nobody can change, rename or
-/// delete it while it is open (sharing read only), without following a
-/// reparse point (a symbolic link or junction is refused, not followed),
-/// and check that it is a plain file. The caller then checks the ACL with
-/// [`check`] and reads from the returned handle: the file the ACL was
-/// checked on is the file that is read.
+/// Windows: open a plain file with read-only sharing and without following a
+/// final reparse point. Observed ancestor links are also refused; concurrent
+/// ancestor mutations are not excluded by that observation. Call [`check_opened`]
+/// before reading, so permission checks and key bytes refer to the same handle.
 #[cfg(windows)]
 pub fn open_for_reading(path: &Path) -> io::Result<fs::File> {
     windows::open_for_reading(path)
+}
+
+/// Windows: check permissions on this open file, without resolving its pathname.
+/// Use the same file for subsequent reads. The strict allowlist is shared with
+/// [`check`]; errors and unknown descriptors fail closed.
+#[cfg(windows)]
+pub fn check_opened(file: &fs::File) -> Result<Option<Openness>, String> {
+    windows::check_plain(file).map_err(|error| error.to_string())?;
+    let sddl = windows::sddl(file).map_err(|error| error.to_string())?;
+    let user = windows::user_sid()?;
+    let local_admin = if sddl.contains("LA") {
+        windows::local_admin_sid()?
+    } else {
+        None
+    };
+    Ok(check_sddl(&sddl, &user, local_admin.as_deref()).err())
 }
 
 /// Unix mode bits: group or other write first, then any other bit for
@@ -459,7 +474,7 @@ mod windows {
                 "icacls",
             )?;
             // Nothing is written into it before its ACL is known to be right.
-            match super::check(&inside) {
+            match super::check_opened(&file) {
                 Ok(None) => {}
                 Ok(Some(open)) => {
                     return Err(io::Error::other(format!(
@@ -501,10 +516,9 @@ mod windows {
     }
 
     pub fn open_for_reading(path: &Path) -> io::Result<fs::File> {
-        // No link or junction among the folders above the key: the path is
-        // taken to mean what it says. That alone is a look at one moment;
-        // the path's resolution is compared again after the open below, so
-        // a folder swapped for a junction in between is caught too.
+        // Refuse links observed in the supplied spelling. This is path hygiene,
+        // not an identity guarantee during concurrent namespace changes. ACLs
+        // and subsequent bytes are checked through the opened file handle.
         let absolute = std::path::absolute(path)?;
         for ancestor in absolute.ancestors().skip(1) {
             if ancestor.parent().is_none() {
@@ -518,18 +532,22 @@ mod windows {
                 ));
             }
         }
-        let before = fs::canonicalize(path)?;
+        open_final(&absolute)
+    }
+
+    // Separate from the ancestor observations so native tests can deterministically
+    // substitute the namespace between observation, opening and ACL validation.
+    fn open_final(path: &Path) -> io::Result<fs::File> {
         let file = fs::OpenOptions::new()
             .read(true)
             .share_mode(FILE_SHARE_READ)
             .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
-            .open(&before)?;
-        if fs::canonicalize(path)? != before {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "the path changed while the key file was opened",
-            ));
-        }
+            .open(path)?;
+        check_plain(&file)?;
+        Ok(file)
+    }
+
+    pub fn check_plain(file: &fs::File) -> io::Result<()> {
         let attributes = file.metadata()?.file_attributes();
         if attributes & (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DIRECTORY) != 0 {
             return Err(io::Error::new(
@@ -537,37 +555,205 @@ mod windows {
                 "not a plain file (a link, junction or folder)",
             ));
         }
-        Ok(file)
+        Ok(())
     }
 
-    /// The file's security descriptor as SDDL, read by PowerShell's
-    /// `Get-Acl`; the path is handed over in the environment, so it is
-    /// never parsed as PowerShell.
-    /// Also the SID the alias `LA` stands for on this machine (the
-    /// built-in Administrator account), when Windows can resolve it.
-    pub fn sddl(path: &Path) -> Result<(String, Option<String>), String> {
+    /// Query only owner and DACL on the existing handle. No pathname is
+    /// supplied to the security API, and no privileged SACL access is requested.
+    pub fn sddl(file: &fs::File) -> io::Result<String> {
+        use windows_permissions::{
+            constants::{SeObjectType::SE_FILE_OBJECT, SecurityInformation},
+            wrappers::{ConvertSecurityDescriptorToStringSecurityDescriptor, GetSecurityInfo},
+        };
+        let information = SecurityInformation::Owner | SecurityInformation::Dacl;
+        let descriptor = GetSecurityInfo(file, SE_FILE_OBJECT, information)?;
+        ConvertSecurityDescriptorToStringSecurityDescriptor(&descriptor, information)?
+            .into_string()
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "the ACL is not valid Unicode"))
+    }
+
+    /// Resolve LA independently of the key path. RID 500 alone is insufficient:
+    /// local-machine and domain Administrator accounts have different SID prefixes.
+    pub fn local_admin_sid() -> Result<Option<String>, String> {
         let text = run(
-            Command::new(system32(r"WindowsPowerShell\v1.0\powershell.exe"))
-                .args([
-                    "-NoProfile",
-                    "-NonInteractive",
-                    "-Command",
-                    "(Get-Acl -LiteralPath $env:ZUNDER_ACL_PATH).Sddl; try { ([Security.Principal.SecurityIdentifier]'LA').Value } catch { '' }",
-                ])
-                .env("ZUNDER_ACL_PATH", path),
-            "Get-Acl",
+            Command::new(system32(r"WindowsPowerShell\v1.0\powershell.exe")).args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "try { ([Security.Principal.SecurityIdentifier]'LA').Value } catch { '' }",
+            ]),
+            "resolving the local Administrator SID",
         )
-        .map_err(|error| format!("{}: {error}", path.display()))?;
-        let mut lines = text.lines().map(str::trim);
-        let sddl = lines.next().unwrap_or_default().to_owned();
-        if sddl.is_empty() {
-            return Err(format!("{}: Get-Acl printed nothing", path.display()));
+        .map_err(|error| error.to_string())?;
+        let sid = text.trim();
+        if sid.is_empty() {
+            return Ok(None);
         }
-        let local_admin = lines
-            .next()
-            .filter(|sid| sid.starts_with("S-1-"))
-            .map(str::to_owned);
-        Ok((sddl, local_admin))
+        if sid.starts_with("S-1-")
+            && sid
+                .bytes()
+                .all(|b| b.is_ascii_digit() || b == b'-' || b == b'S')
+        {
+            Ok(Some(sid.to_owned()))
+        } else {
+            Err("Windows returned an invalid local Administrator SID".into())
+        }
+    }
+
+    #[cfg(test)]
+    mod native_tests {
+        use super::*;
+        use crate::owner_only::{Openness, check, check_opened};
+
+        fn directory(name: &str) -> PathBuf {
+            let path = std::env::temp_dir()
+                .join(format!("owner-only-{name}-{}", unique_suffix().unwrap()));
+            fs::create_dir(&path).unwrap();
+            path
+        }
+
+        fn junction(link: &Path, target: &Path) {
+            let output = Command::new(system32("cmd.exe"))
+                .args(["/d", "/c", "mklink", "/J"])
+                .arg(link)
+                .arg(target)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "junction fixture failed: {output:?}"
+            );
+            assert_ne!(
+                fs::symlink_metadata(link).unwrap().file_attributes()
+                    & FILE_ATTRIBUTE_REPARSE_POINT,
+                0,
+                "fixture is not a junction"
+            );
+        }
+
+        #[test]
+        fn final_symlinks_and_observed_parent_junctions_are_refused() {
+            let dir = directory("links");
+            let target = dir.join("target");
+            fs::create_dir(&target).unwrap();
+            let key = target.join("key");
+            drop(create(&key).unwrap());
+            let link = dir.join("key-link");
+            std::os::windows::fs::symlink_file(&key, &link)
+                .expect("the native CI runner must support the symlink fixture");
+            assert_eq!(
+                open_for_reading(&link).unwrap_err().kind(),
+                io::ErrorKind::InvalidInput
+            );
+            assert!(check(&link).is_err());
+            let alias = dir.join("parent-link");
+            junction(&alias, &target);
+            assert_eq!(
+                open_for_reading(&alias.join("key")).unwrap_err().kind(),
+                io::ErrorKind::InvalidInput
+            );
+            fs::remove_file(link).unwrap();
+            fs::remove_dir(alias).unwrap();
+            fs::remove_dir_all(dir).unwrap();
+        }
+
+        #[test]
+        fn the_open_file_cannot_be_written_renamed_or_deleted() {
+            let dir = directory("sharing");
+            let key = dir.join("key");
+            drop(create(&key).unwrap());
+            let file = open_for_reading(&key).unwrap();
+            assert_eq!(check_opened(&file).unwrap(), None);
+            assert!(fs::write(&key, b"synthetic replacement").is_err());
+            assert!(fs::rename(&key, dir.join("renamed")).is_err());
+            assert!(fs::remove_file(&key).is_err());
+            drop(file);
+            // Reciprocal sharing: an already-open writer or DELETE handle
+            // prevents the restrictive reader from opening at all.
+            for access in [0x4000_0000, 0x0001_0000] {
+                let conflicting = fs::OpenOptions::new()
+                    .access_mode(access)
+                    .open(&key)
+                    .unwrap();
+                assert!(open_for_reading(&key).is_err(), "access mask {access:#x}");
+                drop(conflicting);
+                drop(open_for_reading(&key).unwrap());
+            }
+            fs::rename(&key, dir.join("renamed")).unwrap();
+            fs::remove_dir_all(dir).unwrap();
+        }
+
+        #[test]
+        fn a_restrictive_decoy_never_approves_the_open_permissive_target() {
+            let dir = directory("substitution");
+            let permissive = dir.join("permissive");
+            let restrictive = dir.join("restrictive");
+            fs::create_dir(&permissive).unwrap();
+            fs::create_dir(&restrictive).unwrap();
+            for path in [&permissive, &restrictive] {
+                let mut file = create(&path.join("key")).unwrap();
+                use std::io::Write;
+                file.write_all(b"synthetic fixture, never a private key")
+                    .unwrap();
+            }
+            run(
+                Command::new(system32("icacls.exe"))
+                    .arg(permissive.join("key"))
+                    .args(["/grant", "*S-1-1-0:R", "/q"]),
+                "fixture ACL",
+            )
+            .unwrap();
+            let alias = dir.join("observed-parent");
+            // Simulate a junction substituted after ancestor observation.
+            junction(&alias, &permissive);
+            let file = open_final(&alias.join("key")).unwrap();
+            // The same supplied spelling now names a restrictive decoy, while
+            // the held File still refers to the permissive synthetic target.
+            fs::remove_dir(&alias).unwrap();
+            junction(&alias, &restrictive);
+            assert_eq!(check(&restrictive.join("key")).unwrap(), None);
+            assert!(matches!(
+                check_opened(&file).unwrap(),
+                Some(Openness::Readable(_))
+            ));
+            // No key bytes are consumed when this held handle is too open.
+            drop(file);
+            fs::remove_dir(alias).unwrap();
+            fs::remove_dir_all(dir).unwrap();
+        }
+
+        #[test]
+        fn a_native_null_dacl_is_refused() {
+            use windows_permissions::{
+                constants::{SeObjectType::SE_FILE_OBJECT, SecurityInformation},
+                wrappers::SetSecurityInfo,
+            };
+            let dir = directory("null-dacl");
+            let key = dir.join("key");
+            drop(create(&key).unwrap());
+            // READ_CONTROL | WRITE_DAC: sufficient to install the synthetic
+            // null DACL and query it, without privileged SACL access.
+            let mut file = fs::OpenOptions::new()
+                .access_mode(0x0006_0000)
+                .open(&key)
+                .unwrap();
+            SetSecurityInfo(
+                &mut file,
+                SE_FILE_OBJECT,
+                SecurityInformation::Dacl | SecurityInformation::ProtectedDacl,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+            assert!(matches!(
+                check_opened(&file).unwrap(),
+                Some(Openness::Writable(_))
+            ));
+            drop(file);
+            fs::remove_dir_all(dir).unwrap();
+        }
     }
 }
 

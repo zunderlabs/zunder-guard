@@ -110,6 +110,44 @@ jobs:
           if ((Get-FileHash wingetcreate.exe -Algorithm SHA256).Hash -ne $env:WC_SHA256.ToUpper()) { throw "wingetcreate.exe does not match WINGETCREATE_SHA256" }
           .\wingetcreate.exe submit --token $env:WINGET_TOKEN manifests
 
+  aws-template:
+    needs: verify
+    if: >-
+      vars.AWS_TEMPLATE_PUBLISH == 'enabled' &&
+      github.repository == 'zunderlabs/zunder-guard' &&
+      !github.event.release.draft && !github.event.release.prerelease
+    environment: aws-template-publish
+    permissions:
+      contents: read
+      id-token: write
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.release.tag_name }}
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: verified
+          path: rel
+      - name: Check publishing configuration
+        env:
+          ROLE: ${{ vars.AWS_TEMPLATE_ROLE_ARN }}
+          BUCKET: ${{ vars.AWS_TEMPLATE_BUCKET }}
+        run: |
+          test -n "$ROLE" && test -n "$BUCKET" || { echo "::error::Set AWS_TEMPLATE_ROLE_ARN and AWS_TEMPLATE_BUCKET"; exit 1; }
+      - uses: aws-actions/configure-aws-credentials@61815dcd50bd041e203e49132bacad1fd04d2708 # v5.1.1
+        with:
+          role-to-assume: ${{ vars.AWS_TEMPLATE_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_TEMPLATE_REGION || 'ap-northeast-1' }}
+          role-session-name: guard-template-${{ github.run_id }}
+          role-duration-seconds: 900
+      - name: Publish immutable template and verify public bytes
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+          AWS_TEMPLATE_BUCKET: ${{ vars.AWS_TEMPLATE_BUCKET }}
+        run: python3 deploy/guard/github/publish-aws-template.py --release-dir rel
+
   latest:
     needs: verify
     permissions:

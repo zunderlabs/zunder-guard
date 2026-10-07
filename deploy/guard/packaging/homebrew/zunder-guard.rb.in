@@ -37,6 +37,7 @@ class ZunderGuard < Formula
 
   def install
     bin.install "zunder-guard"
+    pkgshare.install "LICENSE", "NOTICE", "THIRD_PARTY_LICENSES.md"
   end
 
   # Paper mode on 127.0.0.1 (unless `init` chose another address). `run` sends only where
@@ -68,5 +69,8 @@ class ZunderGuard < Formula
 
   test do
     assert_match "zunder-guard", shell_output("#{bin}/zunder-guard --version")
+    %w[LICENSE NOTICE THIRD_PARTY_LICENSES.md].each do |notice|
+      assert_path_exists pkgshare/notice
+    end
   end
 end

@@ -46,6 +46,7 @@ http-body-util = "0.1"
 hyper = { version = "1", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 keyring = { version = "3", default-features = false, features = ["windows-native"] }
+windows-permissions = "=0.2.4"
 getrandom = "0.3"
 base64 = { version = "0.22", default-features = false, features = ["std"] }
 

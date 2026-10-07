@@ -15,6 +15,14 @@ Documentation: <https://zunderlabs.com/docs>.
 
 ## Install
 
+Binary installation requires a published, signed release. Check the
+[releases page](https://github.com/zunderlabs/zunder-guard/releases) for availability.
+
+Configure rules and choose an installation path at
+[Connect](https://zunderlabs.com/connect#guard). The AWS template starts in paper mode,
+defaults to Tokyo (`ap-northeast-1`), and supports changing the region. Cloud deployment
+in v1.0 supports AWS; Docker Compose is also included.
+
 On a Linux server, guided (rules from <https://zunderlabs.com>, then account, mode and key with
 hidden input):
 

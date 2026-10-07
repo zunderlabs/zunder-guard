@@ -93,8 +93,16 @@ pub fn key_from_file(
     );
     #[cfg(not(windows))]
     let mut opened: Option<std::fs::File> = None;
+    #[cfg(windows)]
+    let openness = owner_only::check_opened(
+        opened
+            .as_ref()
+            .expect("the Windows key file is already open"),
+    );
+    #[cfg(not(windows))]
+    let openness = owner_only::check(path);
     let mut warning = None;
-    match owner_only::check(path).map_err(KeyReadError::File)? {
+    match openness.map_err(KeyReadError::File)? {
         None => {}
         Some(Openness::Writable(why)) => {
             return Err(KeyReadError::File(format!(
@@ -196,5 +204,34 @@ mod tests {
         set(0o600);
         let missing = key_from_file(&dir.path().join("nothing"), false).unwrap_err();
         assert!(!missing.to_string().contains("0123456789"));
+    }
+    #[cfg(windows)]
+    #[test]
+    fn a_windows_key_file_requires_its_own_private_acl_and_no_final_link() {
+        use std::io::Write;
+        let dir = crate::testdir::TestDir::new("key-file-windows");
+        let path = dir.path().join("api-wallet-key");
+        let mut file = zunder_venue::owner_only::create(&path).unwrap();
+        writeln!(file, "{KEY}").unwrap();
+        drop(file);
+        let (_, warning) = key_from_file(&path, false).unwrap();
+        assert!(warning.is_none());
+        let link = dir.path().join("link.key");
+        std::os::windows::fs::symlink_file(&path, &link)
+            .expect("the native CI runner must support the symlink fixture");
+        assert!(key_from_file(&link, false).is_err());
+        std::fs::remove_file(&link).unwrap();
+        let granted = std::process::Command::new("icacls")
+            .arg(&path)
+            .args(["/grant", "*S-1-1-0:R"])
+            .output()
+            .unwrap();
+        assert!(granted.status.success());
+        // Windows never accepts container leniency for an over-open key.
+        for container in [false, true] {
+            let error = key_from_file(&path, container).unwrap_err();
+            assert!(matches!(error, KeyReadError::File(_)));
+            assert!(!format!("{error:?} {error}").contains("0123456789"));
+        }
     }
 }

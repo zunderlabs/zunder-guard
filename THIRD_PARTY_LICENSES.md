@@ -18,6 +18,7 @@ are the files each crate ships, grouped where they are identical.
 | base16ct | 1.0.0 | Apache-2.0 OR MIT | https://github.com/RustCrypto/formats |
 | base64 | 0.22.1 | MIT OR Apache-2.0 | https://github.com/marshallpierce/rust-base64 |
 | base64 | 0.23.1 | MIT OR Apache-2.0 | https://github.com/marshallpierce/rust-base64 |
+| bitflags | 1.3.2 | MIT/Apache-2.0 | https://github.com/bitflags/bitflags |
 | bitflags | 2.13.2 | MIT OR Apache-2.0 | https://github.com/bitflags/bitflags |
 | block-buffer | 0.10.4 | MIT OR Apache-2.0 | https://github.com/RustCrypto/utils |
 | block-buffer | 0.12.1 | MIT OR Apache-2.0 | https://github.com/RustCrypto/utils |
@@ -219,7 +220,11 @@ are the files each crate ships, grouped where they are identical.
 | wasm-bindgen-shared | 0.2.129 | MIT OR Apache-2.0 | https://github.com/wasm-bindgen/wasm-bindgen/tree/master/crates/shared |
 | web-sys | 0.3.106 | MIT OR Apache-2.0 | https://github.com/wasm-bindgen/wasm-bindgen/tree/master/crates/web-sys |
 | web-time | 1.1.0 | MIT OR Apache-2.0 | https://github.com/daxpedda/web-time |
+| winapi | 0.3.9 | MIT/Apache-2.0 | https://github.com/retep998/winapi-rs |
+| winapi-i686-pc-windows-gnu | 0.4.0 | MIT/Apache-2.0 | https://github.com/retep998/winapi-rs |
+| winapi-x86_64-pc-windows-gnu | 0.4.0 | MIT/Apache-2.0 | https://github.com/retep998/winapi-rs |
 | windows-link | 0.2.1 | MIT OR Apache-2.0 | https://github.com/microsoft/windows-rs |
+| windows-permissions | 0.2.4 | MIT | https://github.com/danieldulaney/windows-permissions-rs |
 | windows-sys | 0.52.0 | MIT OR Apache-2.0 | https://github.com/microsoft/windows-rs |
 | windows-sys | 0.60.2 | MIT OR Apache-2.0 | https://github.com/microsoft/windows-rs |
 | windows-sys | 0.61.2 | MIT OR Apache-2.0 | https://github.com/microsoft/windows-rs |
@@ -258,7 +263,7 @@ are the files each crate ships, grouped where they are identical.
 | zmij | 1.0.23 | MIT | https://github.com/dtolnay/zmij |
 
 Crates that ship no licence file (their licence is stated in their manifest; the standard
-text of that licence applies): r-efi 5.3.0 (MIT OR Apache-2.0 OR LGPL-2.1-or-later), r-efi 6.0.0 (MIT OR Apache-2.0 OR LGPL-2.1-or-later).
+text of that licence applies): r-efi 5.3.0 (MIT OR Apache-2.0 OR LGPL-2.1-or-later), r-efi 6.0.0 (MIT OR Apache-2.0 OR LGPL-2.1-or-later), winapi-i686-pc-windows-gnu 0.4.0 (MIT/Apache-2.0), winapi-x86_64-pc-windows-gnu 0.4.0 (MIT/Apache-2.0), windows-permissions 0.2.4 (MIT).
 
 ## Licence texts
 
@@ -290,7 +295,7 @@ SOFTWARE.
 
 ### LICENSE-APACHE
 
-Used by: anstream 1.0.0, anstyle 1.0.14, anstyle-parse 1.0.0, anstyle-query 1.1.5, anstyle-wincon 3.0.11, colorchoice 1.0.5, is_terminal_polyfill 1.70.2, once_cell_polyfill 1.70.2, serde_spanned 1.1.1, toml 1.1.6+spec-1.1.0, toml_datetime 1.1.1+spec-1.1.0, toml_edit 0.25.15+spec-1.1.0, toml_parser 1.1.3+spec-1.1.0, toml_writer 1.1.2+spec-1.1.0.
+Used by: anstream 1.0.0, anstyle 1.0.14, anstyle-parse 1.0.0, anstyle-query 1.1.5, anstyle-wincon 3.0.11, colorchoice 1.0.5, is_terminal_polyfill 1.70.2, once_cell_polyfill 1.70.2, serde_spanned 1.1.1, toml 1.1.6+spec-1.1.0, toml_datetime 1.1.1+spec-1.1.0, toml_edit 0.25.15+spec-1.1.0, toml_parser 1.1.3+spec-1.1.0, toml_writer 1.1.2+spec-1.1.0, winapi 0.3.9.
 
 ````text
 Apache License
@@ -743,7 +748,7 @@ DEALINGS IN THE SOFTWARE.
 
 ### LICENSE-APACHE
 
-Used by: arrayvec 0.7.8, atomic-waker 1.1.2, autocfg 1.5.1, base64 0.22.1, base64 0.23.1, bitflags 2.13.2, bumpalo 3.20.3, cc 1.6.0, cfg-if 1.0.5, core-foundation 0.10.1, core-foundation-sys 0.8.7, curve25519-dalek-derive 0.1.1, displaydoc 0.2.7, equivalent 1.0.2, errno 0.3.14, ff 0.14.0, find-msvc-tools 0.1.14, form_urlencoded 1.2.2, group 0.14.0, hashbrown 0.17.1, heck 0.5.0, httparse 1.10.1, hyper-rustls 0.27.10, idna 1.1.0, idna_adapter 1.2.2, indexmap 2.14.2, js-sys 0.3.106, log 0.4.34, num-traits 0.2.19, once_cell 1.21.4, openssl-probe 0.2.1, percent-encoding 2.3.2, rustc_version 0.4.1, rustls 0.23.45, rustls-native-certs 0.8.4, security-framework 3.7.0, security-framework-sys 2.17.0, signal-hook-registry 1.4.8, smallvec 1.16.2, socket2 0.6.5, stable_deref_trait 1.2.1, tungstenite 0.30.0, url 2.5.8, version_check 0.9.5, wasi 0.11.1+wasi-snapshot-preview1, wasip2 1.0.4+wasi-0.2.12, wasm-bindgen 0.2.129, wasm-bindgen-futures 0.4.79, wasm-bindgen-macro 0.2.129, wasm-bindgen-macro-support 0.2.129, wasm-bindgen-shared 0.2.129, web-sys 0.3.106, wit-bindgen 0.57.1.
+Used by: arrayvec 0.7.8, atomic-waker 1.1.2, autocfg 1.5.1, base64 0.22.1, base64 0.23.1, bitflags 1.3.2, bitflags 2.13.2, bumpalo 3.20.3, cc 1.6.0, cfg-if 1.0.5, core-foundation 0.10.1, core-foundation-sys 0.8.7, curve25519-dalek-derive 0.1.1, displaydoc 0.2.7, equivalent 1.0.2, errno 0.3.14, ff 0.14.0, find-msvc-tools 0.1.14, form_urlencoded 1.2.2, group 0.14.0, hashbrown 0.17.1, heck 0.5.0, httparse 1.10.1, hyper-rustls 0.27.10, idna 1.1.0, idna_adapter 1.2.2, indexmap 2.14.2, js-sys 0.3.106, log 0.4.34, num-traits 0.2.19, once_cell 1.21.4, openssl-probe 0.2.1, percent-encoding 2.3.2, rustc_version 0.4.1, rustls 0.23.45, rustls-native-certs 0.8.4, security-framework 3.7.0, security-framework-sys 2.17.0, signal-hook-registry 1.4.8, smallvec 1.16.2, socket2 0.6.5, stable_deref_trait 1.2.1, tungstenite 0.30.0, url 2.5.8, version_check 0.9.5, wasi 0.11.1+wasi-snapshot-preview1, wasip2 1.0.4+wasi-0.2.12, wasm-bindgen 0.2.129, wasm-bindgen-futures 0.4.79, wasm-bindgen-macro 0.2.129, wasm-bindgen-macro-support 0.2.129, wasm-bindgen-shared 0.2.129, web-sys 0.3.106, wit-bindgen 0.57.1.
 
 ````text
 Apache License
@@ -1332,7 +1337,7 @@ THE SOFTWARE.
 
 ### LICENSE-MIT
 
-Used by: bitflags 2.13.2, log 0.4.34, num-traits 0.2.19.
+Used by: bitflags 1.3.2, bitflags 2.13.2, log 0.4.34, num-traits 0.2.19.
 
 ````text
 Copyright (c) 2014 The Rust Project Developers
@@ -9271,6 +9276,32 @@ Apache License
    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
    See the License for the specific language governing permissions and
    limitations under the License.
+````
+
+### LICENSE-MIT
+
+Used by: winapi 0.3.9.
+
+````text
+Copyright (c) 2015-2018 The winapi-rs Developers
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
 ````
 
 ### license-apache-2.0

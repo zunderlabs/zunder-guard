@@ -68,6 +68,59 @@ jobs:
       - name: i.ps1 under PowerShell 7
         shell: pwsh
         run: deploy/guard/test/installer-windows.ps1 -Release $env:RELEASE_DIR -Cosign fakebin/cosign.cmd
+      - name: Windows ACL diagnostics on failure (empty files only)
+        if: failure()
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $root = Join-Path ([IO.Path]::GetTempPath()) ('guard-acl-' + [Guid]::NewGuid().ToString('N'))
+          $file = $null
+          function Show-Acl([string]$Path) {
+            $env:ZUNDER_ACL_PATH = $Path
+            $child = [Diagnostics.Process]::new()
+            $child.StartInfo.FileName = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
+            $child.StartInfo.Arguments = '-NoProfile -NonInteractive -Command "(Get-Acl -LiteralPath $env:ZUNDER_ACL_PATH).Sddl; try { ([Security.Principal.SecurityIdentifier]''LA'').Value } catch { '''' }"'
+            $child.StartInfo.UseShellExecute = $false
+            $child.StartInfo.RedirectStandardOutput = $true
+            $child.StartInfo.RedirectStandardError = $true
+            try {
+              $child.Start() | Out-Null
+              $stdout = $child.StandardOutput.ReadToEndAsync()
+              $stderr = $child.StandardError.ReadToEndAsync()
+              $child.WaitForExit()
+              [ordered]@{
+                stdout = $stdout.Result; stderr = $stderr.Result
+                stdout_length = $stdout.Result.Length; exit_code = $child.ExitCode
+              } | ConvertTo-Json -Compress
+            } finally { $child.Dispose() }
+            $acl = Get-Acl -LiteralPath $Path -ErrorAction Stop
+            $raw = [Security.AccessControl.RawSecurityDescriptor]::new($acl.GetSecurityDescriptorBinaryForm(), 0)
+            [ordered]@{
+              path = $Path; sddl = $acl.Sddl
+              owner = $acl.GetOwner([Security.Principal.SecurityIdentifier]).Value
+              protected = $acl.AreAccessRulesProtected
+              control_flags = $raw.ControlFlags.ToString()
+              dacl_null = ($null -eq $raw.DiscretionaryAcl)
+            } | ConvertTo-Json -Compress
+          }
+          try {
+            New-Item -ItemType Directory -Path $root | Out-Null
+            $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+            & "$env:SystemRoot\System32\icacls.exe" $root /inheritance:r /grant:r "*${sid}:(OI)(CI)F" /q
+            if ($LASTEXITCODE -ne 0) { throw 'Folder ACL command failed' }
+            Show-Acl $root
+            $path = Join-Path $root 'empty'
+            $sharing = [IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete
+            $file = [IO.FileStream]::new($path, [IO.FileMode]::CreateNew, [IO.FileAccess]::ReadWrite, $sharing)
+            Show-Acl $path
+            & "$env:SystemRoot\System32\icacls.exe" $path /inheritance:d /q
+            if ($LASTEXITCODE -ne 0) { throw 'File ACL command failed' }
+            Show-Acl $path
+          } finally {
+            if ($null -ne $file) { $file.Dispose() }
+            Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue
+            Remove-Item Env:ZUNDER_ACL_PATH -ErrorAction SilentlyContinue
+          }
 
   deny:
     runs-on: ubuntu-24.04
@@ -100,6 +153,11 @@ jobs:
           sudo apt-get update -q && sudo apt-get install -yq shellcheck
           shellcheck -s sh deploy/guard/install.sh deploy/guard/loader/i.sh
           shellcheck deploy/guard/packaging/*.sh deploy/guard/github/*.sh deploy/guard/test/*.sh
+      - name: AWS publication and bootstrap regressions
+        run: |
+          python3 deploy/guard/github/test_publish_aws_template.py
+          python3 -m pip install PyYAML==6.0.3
+          python3 deploy/guard/test/aws_template_test.py
       - name: Publication gate regressions (no network or signing)
         run: python3 -B deploy/guard/test/release-policy.py
       - name: actionlint

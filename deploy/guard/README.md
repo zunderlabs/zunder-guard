@@ -10,7 +10,7 @@ is what we built, and what it talks to.
 | `install.sh` | The guided installer the loader runs |
 | `Dockerfile`, `Dockerfile.dockerignore`, `compose.yaml` | Image (static, distroless, non-root, two architectures) and Compose |
 | `systemd/zunder-guard.service` | The hardened unit for servers |
-| `templates/` | Fly.io (`fly.toml`), Railway (`railway.json`), Render (`render.yaml`), Hetzner and DigitalOcean (`cloud-init.yaml`), AWS (`cloudformation.yaml`) |
+| `templates/` | AWS (`cloudformation.yaml`); other provider templates are deferred |
 | `github/workflows/` | `release.yml`, `publish.yml`, `ci.yml` for `github.com/zunderlabs/zunder-guard` (kept outside `.github/`, so nothing runs here) |
 | `github/build-release.sh`, `packaging/` | Reproducible builds and archives; the Homebrew formula's template |
 | `rules/` | Rules schema v1: Rust crate `zunder-guard-rules`, `zr1.ts`, `schema-v1.json`, `vectors.json` |
@@ -180,25 +180,34 @@ What Windows offers in 1.0, and how it keeps the key:
 - **x86_64 only**: Windows 11 on ARM runs it through its x64 emulation.
 - **The agent kit**: `zunder-guard mcp --key-file <file from client add --out>`, as on Unix.
 
-### 4. One-click templates (the user's own account, the user's own key)
+### 4. AWS launch (the user's own account)
 
-| Template | Where | Region | Key | Public? |
-|---|---|---|---|---|
-| `templates/fly.toml` | Fly.io | `nrt` (Tokyo) | `fly ssh console -C "… init --interactive"`: hidden prompt, 0600 in the volume | No: no `services`; reachable as `<app>.internal` on Fly's private network. A commented `[[services]]` block with a warning |
-| `templates/railway.json` | Railway | Singapore (no Tokyo); set in the dashboard | Paper only for now: Railway has no secret files and the image no shell (below) | No public domain unless the user generates one |
-| `templates/render.yaml` | Render, private service | Singapore (no Tokyo) | Secret File in the dashboard, read through `ZUNDER_GUARD_KEY_FILE` | No: `pserv` has no public URL. Changing the type to `web` is the opt-in, with a warning |
-| `templates/cloud-init.yaml` | Hetzner Cloud, DigitalOcean | Singapore (`sin`, `sgp1`; neither has Tokyo) | Never in user data (the provider stores it). Paper at boot, then the SSH one-liner | No: ufw admits SSH only; Guard on 127.0.0.1 |
-| `templates/cloudformation.yaml` | AWS | `ap-northeast-1` (Tokyo) by launch link; a stack output warns elsewhere | Never in the template. Paper at boot; the guided setup over SSM Session Manager | No inbound rules. `ExposePort=yes` opens 8547 to one CIDR, refuses `0.0.0.0/0`, warns |
+AWS is the only cloud template published for this release. Docker, SSH, and downloadable
+binaries remain available. Other provider templates are deferred.
 
-Railway: deploy the image (or the repository with `railway.json`), add a volume at `/data`, set
-`ZUNDER_GUARD_RULES` and `ZUNDER_GUARD_LISTEN=[::]:8547` (private network) and keep it in
-paper mode. Railway has no secret files and its image has no shell for an interactive setup, so
-testnet and mainnet keys are not offered on Railway until the Guard core decides how a key may
-come from a platform variable (open question 4). All templates run exactly one instance: two
-would race on the journal and the nonces.
+The website launch link opens AWS CloudFormation's quick-create review with Tokyo
+(`ap-northeast-1`) selected and `param_Rules` / `param_Account` prefilled. Tokyo is a default,
+not a restriction: the customer may change regions. AWS still requires sign-in, review of
+costs and IAM resources, and its final Create stack confirmation.
 
-AWS launch link for the website (Tokyo preselected):
-`https://ap-northeast-1.console.aws.amazon.com/cloudformation/home?region=ap-northeast-1#/stacks/create/review?templateURL=<template URL>&stackName=zunder-guard`.
+`templates/cloudformation.yaml` creates one ARM instance in its own VPC and subnet, with
+no inbound access by default and Session Manager access through `ConsoleShell`. Installation
+starts in paper mode using only a public account address and rules; no trading key or licence
+belongs in the launch URL or template. The release renderer pins the loader URL and checksum.
+CloudFormation reports success only after installation, service and local health checks pass.
+Optional public access is restricted to one valid IPv4 /32 address. Installer output is
+captured in a root-only temporary file, removed on success, so client keys and pairing codes
+never enter cloud-init logs. On failure the console reports only the diagnostic file path.
+Use `PairPaper` to pair the running paper setup. `NextStep` deliberately stops Guard and
+replaces bootstrap configuration/client pairings through guided installation; journals remain.
+
+The encrypted, tagged state volume is retained when the instance terminates. Stack deletion
+therefore needs an explicit follow-up volume deletion after any required backup to stop all
+storage charges. Replacement does not automatically reattach that volume.
+
+See [AWS publication setup](github/AWS-PUBLISH.md) for the restricted OIDC publisher and
+signed, versioned S3 URL. The website launch control stays gated until the actual installer,
+AWS deployment, and customer licence journey have been verified.
 
 ### 5. systemd on a server
 
@@ -282,8 +291,8 @@ Every release (`github/workflows/release.yml`, on a tag `vX.Y.Z`):
 - **Checksums**: `SHA256SUMS` lists every asset: archives (each with `LICENSE`, `NOTICE` and
   `THIRD_PARTY_LICENSES.md`), `install.sh`, the loaders `i` and `i.ps1`, SBOMs, the signed
   immutable image reference `zunder-guard-<version>.image.txt`, the Homebrew formula, and the
-  deployment templates with the image pinned to the release (`compose.yaml`, `fly.toml`,
-  `render.yaml`, `railway.json`, `cloud-init.yaml`, `cloudformation.yaml`).
+  deployment payloads (`compose.yaml`, `cloudformation.yaml`) with the image pinned to its
+  immutable release digest and the AWS loader pinned to its release URL and checksum.
 - **Sigstore keyless signing**: `SHA256SUMS.sigstore.json` is the cosign bundle for
   `SHA256SUMS`, signed with the workflow's own GitHub identity; no key exists that could leak.
   The workflow verifies its own signature the way the installer will before releasing.
@@ -362,8 +371,8 @@ container without a shell can be configured.
 | Command | Does | Used by |
 |---|---|---|
 | `zunder-guard --version` | Prints `zunder-guard <version>` | everything (the release still refuses the old stub's marker) |
-| `init --interactive [--rules R] [--account A] [--no-key] [--force]` | Prompts on the terminal: rules (keep or edit, bounds-checked), account, mode (paper default), then the key with hidden input unless `--no-key` or paper. Testnet stores it through systemd-creds or a 0600 file on Unix, or Windows Credential Manager on Windows. Mainnet requires Linux systemd setup and standard input at every start. | install.sh, i.ps1, Docker, Homebrew, Fly |
-| `init --non-interactive --rules R --network N [--account A] [--account-network testnet\|mainnet] [--confirm-mainnet A] [--equity-cap USDC] [--key-stdin \| --no-key] [--listen L] [--ip-share S] [--key-store auto\|file\|systemd-creds] [--client-key-out F] [--force]` | The same without prompts; refuses anything missing. Paper reads the account of `--account-network` (default mainnet). Writes the config with `mode`, starts the risk journal for paper and testnet (mainnet: `journal-init --mode mainnet` by a person) | install.sh, cloud-init, AWS |
+| `init --interactive [--rules R] [--account A] [--no-key] [--force]` | Prompts on the terminal: rules (keep or edit, bounds-checked), account, mode (paper default), then the key with hidden input unless `--no-key` or paper. Testnet stores it through systemd-creds or a 0600 file on Unix, or Windows Credential Manager on Windows. Mainnet requires Linux systemd setup and standard input at every start. | install.sh, i.ps1, Docker, Homebrew |
+| `init --non-interactive --rules R --network N [--account A] [--account-network testnet\|mainnet] [--confirm-mainnet A] [--equity-cap USDC] [--key-stdin \| --no-key] [--listen L] [--ip-share S] [--key-store auto\|file\|systemd-creds] [--client-key-out F] [--force]` | The same without prompts; refuses anything missing. Paper reads the account of `--account-network` (default mainnet). Writes the config with `mode`, starts the risk journal for paper and testnet (mainnet: `journal-init --mode mainnet` by a person) | install.sh, AWS |
 | `config get network\|account\|listen\|rules` | Prints one configured value | install.sh |
 | `key check --key-stdin` | Reads the key from standard input, checks it is an API wallet approved by the configured account on the configured network; prints the wallet address, never the key | install.sh |
 | `pair` | Creates a client key for a bot, prints it once with a pairing code; safe while `run` runs (the running Guard accepts it after a restart) | install.sh, Compose, Homebrew |
@@ -373,7 +382,7 @@ container without a shell can be configured.
 | `kill --reason R` | Writes the kill file; a running Guard opens nothing and flattens until a person removes it and restarts; warns when the running Guard watches another file | docs |
 | `journal-init`, `journal-resume`, `journal-show --mode M` | The risk journal: start (a person's decision), resume after a drawdown review, print | docs |
 | `mcp …` | The agent kit's MCP server over stdio (`docs/guard-mcp.md`), the same code as `zunder-guard-mcp` | agents |
-| `run [--network N] [--listen L] [--ip-share S] [--key-stdin \| --key-file F] [--container]` | Runs Guard. `--network` must equal the configuration's mode (a testnet config never runs as paper by accident). On an empty home with `ZUNDER_GUARD_RULES` and `ZUNDER_GUARD_ACCOUNT` set it sets up paper mode non-interactively (sending modes need `init`). Mainnet needs `ZUNDER_MAINNET_CONFIRM` (the variable Zunder's runner uses; not `ZUNDER_GUARD_MAINNET_CONFIRM`) naming the account at every start, a risk journal started for mainnet, and the key on standard input only (no key file, no environment variable, so Railway and the like stay paper and testnet). A key file group or others can write is refused; on bare metal one they can read too; in a container (`--container`, `ZUNDER_GUARD_CONTAINER`, or Docker's `/.dockerenv`) a read-only mount readable by others is accepted with a warning. Warns when not listening on loopback. Handles SIGTERM and SIGINT (also as PID 1) | systemd unit, image, templates |
+| `run [--network N] [--listen L] [--ip-share S] [--key-stdin \| --key-file F] [--container]` | Runs Guard. `--network` must equal the configuration's mode (a testnet config never runs as paper by accident). On an empty home with `ZUNDER_GUARD_RULES` and `ZUNDER_GUARD_ACCOUNT` set it sets up paper mode non-interactively (sending modes need `init`). Mainnet needs `ZUNDER_MAINNET_CONFIRM` (the variable Zunder's runner uses; not `ZUNDER_GUARD_MAINNET_CONFIRM`) naming the account at every start, a risk journal started for mainnet, and the key on standard input only (no key file, no environment variable, so containers stay paper and testnet). A key file group or others can write is refused; on bare metal one they can read too; in a container (`--container`, `ZUNDER_GUARD_CONTAINER`, or Docker's `/.dockerenv`) a read-only mount readable by others is accepted with a warning. Warns when not listening on loopback. Handles SIGTERM and SIGINT (also as PID 1) | systemd unit, image, templates |
 | `health [--listen L \| --url U]` | Exit 0 if `GET /healthz` on the listen address answers 200 (`0.0.0.0` and `[::]` mean loopback) | image healthcheck, install.sh |
 | `status [--listen L \| --url U] [--json]` | `GET /guard/status` for a person, one fact a line (mode, kill switch, risk state, equity, the fee and its approval, alerts), or the JSON as Guard answers it; exit 2 when no Guard answers | docs, quickstart |
 
@@ -449,9 +458,10 @@ The tests run on a Linux machine with Docker: `test/box-setup.sh` installs what 
   and bad signatures must refuse. Real OIDC/signature/native gates run on the first tag.
 - `rules.sh`: the rules crate and Guard (fmt, clippy, tests); `zr1.ts` under `tsc --strict`
   and `node --test` in a pinned Node image.
-- `lint.sh`: shellcheck (scripts, the one-liner, the read-first form, the cloud-init commands),
-  actionlint, hadolint, `systemd-analyze verify`, cloud-init's schema, cfn-lint, the Railway,
-  Render and winget JSON schemas, `fly.toml`, Ruby's syntax check of the formula, Compose;
+- `lint.sh`: shellcheck (scripts, the one-liner and the read-first form), actionlint,
+  hadolint, `systemd-analyze verify`, three-region CloudFormation validation, winget schemas,
+  Ruby's syntax check of the formula and Compose. Deferred provider files are checked only
+  when their source files are present;
   `i.ps1` and its Windows test parsed by PowerShell, ASCII only, PSScriptAnalyzer clean, and
   refusing on Linux without closing the shell.
 - `windows-cross.sh`: Guard's crates cross-compiled for `x86_64-pc-windows-gnu` (MinGW-w64):
@@ -503,7 +513,7 @@ a mismatch).
    the schema's names were given.
 3. **Platform secret files**: read-only mounts readable by others are accepted in a container
    with a warning; a key file others can write is refused everywhere (decided 6 Oct 2026).
-4. **Keys from platform variables** (Railway has nothing else): not offered. Allowing it means a
+4. **Keys from environment variables**: not offered. Allowing it means a
    key in a process environment, against the decision of 6 Oct 2026 for Zunder's own keys.
 5. **macOS signing and notarisation**: binaries from `install.sh` are not quarantined (curl) and
    Homebrew's are fine, but a downloaded archive opened in Finder is blocked by Gatekeeper.

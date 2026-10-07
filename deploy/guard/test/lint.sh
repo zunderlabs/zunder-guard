@@ -37,6 +37,8 @@ cat >"$W/inspect-first.sh" <<'EOF'
 curl -fsSLO https://zunderlabs.com/i && less i && sh i --rules zr1_eyJ2IjoxfQ
 EOF
 shellcheck -s sh "$W/oneliner.sh" "$W/remote.sh" "$W/inspect-first.sh"
+# Optional cloud-init source is checked when present.
+if [ -f "$G/templates/cloud-init.yaml" ]; then
 # The cloud-init and CloudFormation commands, extracted.
 python3 - "$G/templates/cloud-init.yaml" >"$W/cloud-init-cmd.sh" <<'PY'
 import sys, yaml
@@ -47,6 +49,7 @@ for c in doc["runcmd"]:
 PY
 shellcheck -s sh "$W/cloud-init-cmd.sh"
 echo "  ok: scripts, the one-liner, the inspect-first form, the cloud-init commands"
+fi
 
 step "actionlint"
 $DOCKER run --rm -v "$PWD/$G/github/workflows:/w:ro" -w /w rhysd/actionlint:1.7.12 -no-color release.yml publish.yml ci.yml
@@ -63,7 +66,7 @@ sed -i 's|/usr/local/bin/zunder-guard|/bin/true|' "$W/unit/zunder-guard.service"
 systemd-analyze verify "$W/unit/zunder-guard.service" && echo "  ok: unit"
 
 step "cloud-init schema"
-cloud-init schema -c $G/templates/cloud-init.yaml
+if [ -f "$G/templates/cloud-init.yaml" ]; then cloud-init schema -c $G/templates/cloud-init.yaml; fi
 
 step "cfn-lint"
 "$VENV/bin/cfn-lint" --version
@@ -72,13 +75,17 @@ step "cfn-lint"
 
 step "JSON schemas: Railway, Render, winget"
 fetch() { curl -fsSL --retry 3 -o "$W/$1" "$2"; }
+if [ -f "$G/templates/railway.json" ]; then
 fetch railway.schema.json https://railway.com/railway.schema.json
 "$VENV/bin/check-jsonschema" --schemafile "$W/railway.schema.json" $G/templates/railway.json
+fi
+if [ -f "$G/templates/render.yaml" ]; then
 if fetch render.schema.json https://render.com/schema/render.yaml.json; then
   "$VENV/bin/check-jsonschema" --schemafile "$W/render.schema.json" $G/templates/render.yaml
 else
   echo "  note: Render's schema could not be fetched; render.yaml checked as YAML only"
   python3 -c 'import sys, yaml; yaml.safe_load(open(sys.argv[1]))' $G/templates/render.yaml
+fi
 fi
 sub() {
   sed -e 's/@VERSION@/v1.2.3/g; s/@VERSION_NUMBER@/1.2.3/g; s/@RELEASE_DATE@/2026-10-06/g' \
@@ -119,6 +126,7 @@ $DOCKER run --rm -v "$W:/w:ro" mcr.microsoft.com/dotnet/sdk:9.0-noble pwsh -NoPr
   Write-Host "  ok: both parse, ASCII, no analyzer findings, refuses on Linux"
 '
 
+if [ -f "$G/templates/fly.toml" ]; then
 step "fly.toml"
 python3 - $G/templates/fly.toml <<'PY'
 import sys, tomllib
@@ -129,6 +137,8 @@ assert c["mounts"]["destination"] == "/data"
 assert not any("KEY" in k and "FILE" not in k for k in c["env"]), "no key in env"
 print("  ok: parses; nrt; no public service; volume at /data; no key in [env]")
 PY
+
+fi
 
 step "Homebrew formula (Ruby syntax)"
 sub $G/packaging/homebrew/zunder-guard.rb.in >"$W/zunder-guard.rb"

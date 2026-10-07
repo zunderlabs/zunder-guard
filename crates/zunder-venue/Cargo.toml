@@ -23,6 +23,9 @@ thiserror.workspace = true
 zunder-core.workspace = true
 zunder-risk.workspace = true
 
+[target.'cfg(windows)'.dependencies]
+windows-permissions.workspace = true
+
 [dev-dependencies]
 proptest.workspace = true
 tokio.workspace = true

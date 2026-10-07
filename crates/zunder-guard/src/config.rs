@@ -933,13 +933,19 @@ mod tests {
             )
         );
         assert_ne!(log.parent(), journal.parent());
-        // A directory that resolves to the state directory (the check
-        // compares paths, which `x/..` gets past while `x` does not exist):
-        // still another file than the journal.
+        // Unix cannot canonicalize through a nonexistent component;
+        // Windows normalizes x/.. to the existing state directory.
         let mut around = config.clone();
         around.emergency_dir = Some(config.state_dir.join("x").join(".."));
+        #[cfg(unix)]
         assert!(around.validate().is_ok());
+        #[cfg(windows)]
+        assert!(matches!(around.validate(), Err(ConfigError::EmergencyDir)));
         assert_ne!(around.emergency_log(false).file_name(), journal.file_name());
+        // Once the component exists, both platforms resolve the alias
+        // to the journal directory and must refuse it.
+        std::fs::create_dir(config.state_dir.join("x")).unwrap();
+        assert!(matches!(around.validate(), Err(ConfigError::EmergencyDir)));
         // Named as the state directory itself: refused.
         let mut same = config.clone();
         same.emergency_dir = Some(config.state_dir.clone());
