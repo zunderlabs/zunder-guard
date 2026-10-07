@@ -1,0 +1,45 @@
+# Zunder Guard red-team suite: a black-box adversary that attacks a running
+# Guard (or a naive mock proxy) only through its public Hyperliquid-shaped
+# interface. It shares no code with zunder-guard / zunder-guard-core: the
+# Hyperliquid signing here is an independent second implementation, pinned
+# against the official Python SDK's signing vectors, so a bug in Guard's
+# signer cannot hide a bug here.
+[package]
+name = "zunder-redteam"
+description = "Black-box red-team suite for Zunder Guard: 60+ documented attacks, each of which Guard must refuse. Independent Hyperliquid signer; attacks over HTTP/WebSocket and against a naive in-process mock."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license = "Elastic-2.0"
+
+[[bin]]
+name = "zunder-redteam"
+path = "src/main.rs"
+
+# Scripted pilot client: one step per invocation, with every order previewed and capped.
+[[bin]]
+name = "zunder-guard-pilot"
+path = "src/pilot_main.rs"
+
+[dependencies]
+anyhow.workspace = true
+# Reading the markets out of the target's `zr1_` rules code.
+base64.workspace = true
+clap.workspace = true
+# Independent Hyperliquid signing: secp256k1 ECDSA and Keccak-256, the same
+# primitives Guard uses but a separate implementation (RustCrypto).
+k256.workspace = true
+sha3.workspace = true
+rust_decimal.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+# Blocking HTTP client for the running-Guard target (rustls, native roots).
+reqwest = { workspace = true, features = ["blocking"] }
+# Blocking WebSocket client for the `post`-over-WebSocket attacks.
+tungstenite.workspace = true
+# The pilot client's key buffer is wiped after use.
+zeroize.workspace = true
+
+[lints]
+workspace = true

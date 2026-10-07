@@ -1,0 +1,60 @@
+[package]
+name = "zunder-guard"
+description = "Zunder Guard: a local risk firewall between any trading bot and Hyperliquid, speaking Hyperliquid's own API"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+# Source-available: Elastic License 2.0 (docs/guard.md, "Licence").
+license = "Elastic-2.0"
+
+[[bin]]
+name = "zunder-guard"
+path = "src/main.rs"
+
+[features]
+# Test hooks for the integration tests (`tests/fee.rs`); never in a release
+# build. Enabled by the dev-dependency on this crate itself below.
+test-hooks = ["zunder-guard-core/test-hooks"]
+
+[dependencies]
+# anyhow and clap are for the binary only; the library uses thiserror.
+anyhow.workspace = true
+bytes.workspace = true
+clap.workspace = true
+futures-util.workspace = true
+getrandom.workspace = true
+http-body-util.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+reqwest.workspace = true
+rpassword.workspace = true
+rust_decimal.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha3.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-tungstenite.workspace = true
+toml.workspace = true
+zeroize.workspace = true
+zunder-core.workspace = true
+zunder-guard-core.workspace = true
+zunder-guard-rules.workspace = true
+# `zunder-guard mcp`: the agent kit's MCP server in the one binary users install.
+zunder-guard-mcp.workspace = true
+zunder-risk.workspace = true
+zunder-venue.workspace = true
+
+# The Credential Manager keeps a testnet key on Windows (init.rs).
+[target.'cfg(windows)'.dependencies]
+keyring.workspace = true
+
+[dev-dependencies]
+base64.workspace = true
+fastrand.workspace = true
+zunder-guard = { path = ".", features = ["test-hooks"] }
+zunder-redteam.workspace = true
+
+[lints]
+workspace = true

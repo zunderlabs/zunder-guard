@@ -1,0 +1,17 @@
+# yaml-language-server: $schema=https://aka.ms/winget-manifest.installer.1.10.0.schema.json
+# A portable command in a zip: winget puts zunder-guard on PATH. Set-up after installing:
+#   zunder-guard init --interactive --rules zr1_…
+PackageIdentifier: ZunderLabs.ZunderGuard
+PackageVersion: "@VERSION_NUMBER@"
+InstallerType: zip
+NestedInstallerType: portable
+NestedInstallerFiles:
+  - RelativeFilePath: zunder-guard.exe
+    PortableCommandAlias: zunder-guard
+ReleaseDate: "@RELEASE_DATE@"
+Installers:
+  - Architecture: x64
+    InstallerUrl: https://github.com/zunderlabs/zunder-guard/releases/download/@VERSION@/zunder-guard-@VERSION@-windows-amd64.zip
+    InstallerSha256: "@SHA256_WINDOWS_AMD64_UPPER@"
+ManifestType: installer
+ManifestVersion: 1.10.0

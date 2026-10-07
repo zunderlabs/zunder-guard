@@ -1,0 +1,20 @@
+Zunder Guard
+Copyright 2026 Orcastrate UG (haftungsbeschränkt), Germany. https://zunderlabs.com
+
+This software is source-available under the Elastic License 2.0 (SPDX: Elastic-2.0); the
+full text is in LICENSE. The licensor is Orcastrate UG (haftungsbeschränkt). It is not open
+source.
+
+License key functionality. Zunder Guard attaches Orcastrate's Hyperliquid builder code and
+builder fee to the orders it sends on mainnet, unless it runs with a valid licence key signed
+by Orcastrate and checked offline (crates/zunder-guard-core/src/licence.rs). That fee and the
+licence key check are license key functionality within the meaning of the Elastic License
+2.0: they may not be moved, changed, disabled or circumvented. Fee-free licence keys:
+hello@zunderlabs.com.
+
+"Zunder", "Zunder Labs", "Zunder Guard" and the Zunder logos are names used by Orcastrate UG
+(haftungsbeschränkt). The licence does not grant any right to use them.
+
+Third-party components are used under their own permissive licences (MIT, Apache-2.0,
+BSD, ISC, Unicode-3.0 and similar; deny.toml holds the allow list). Their notices and licence
+texts are in THIRD_PARTY_LICENSES.md, generated from Cargo.lock for each release.

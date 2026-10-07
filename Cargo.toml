@@ -1,0 +1,71 @@
+[workspace]
+resolver = "3"
+members = ["crates/zunder-core", "crates/zunder-guard", "crates/zunder-guard-core", "crates/zunder-guard-mcp", "crates/zunder-risk", "crates/zunder-venue", "deploy/guard/rules", "tests/redteam"]
+
+[workspace.package]
+version = "1.0.0"
+edition = "2024"
+rust-version = "1.97"
+publish = false
+
+[workspace.dependencies]
+# Our crates first, then third-party crates under permissive licences only (deny.toml).
+zunder-core = { path = "crates/zunder-core" }
+zunder-guard-core = { path = "crates/zunder-guard-core" }
+zunder-guard = { path = "crates/zunder-guard" }
+zunder-guard-mcp = { path = "crates/zunder-guard-mcp" }
+zunder-guard-rules = { path = "deploy/guard/rules" }
+zunder-redteam = { path = "tests/redteam" }
+zunder-risk = { path = "crates/zunder-risk" }
+zunder-venue = { path = "crates/zunder-venue" }
+
+anyhow = "1"
+clap = { version = "4", features = ["derive", "env"] }
+reqwest = { version = "0.12.28", default-features = false, features = ["blocking", "rustls-tls-native-roots"] }
+rpassword = "7"
+rust_decimal = { version = "1.43", features = ["macros", "serde"] }
+serde = { version = "1", features = ["derive", "rc"] }
+serde_json = "1"
+proptest = { version = "1", default-features = false, features = ["std"] }
+thiserror = "2"
+toml = "1"
+tungstenite = { version = "0.30", default-features = false, features = ["handshake", "rustls-tls-native-roots"] }
+
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "signal", "sync"] }
+
+k256 = { version = "0.14", default-features = false, features = ["ecdsa"] }
+sha3 = { version = "0.12", default-features = false }
+zeroize = "1"
+ed25519-dalek = { version = "2", default-features = false, features = ["zeroize"] }
+
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+tokio-tungstenite = { version = "0.30", features = ["rustls-tls-native-roots"] }
+fastrand = "2"
+bytes = "1"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+keyring = { version = "3", default-features = false, features = ["windows-native"] }
+getrandom = "0.3"
+base64 = { version = "0.22", default-features = false, features = ["std"] }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+# A panic in an order path is a position nobody is managing. These lints
+# remove the usual sources. They do not cover everything: `Decimal` operators
+# still panic on overflow, so limits and config are bounds-checked instead.
+dbg_macro = "deny"
+todo = "deny"
+unimplemented = "deny"
+unwrap_used = "deny"
+
+# Dependencies are optimised even in debug builds: Decimal arithmetic at
+# opt-level 0 makes backtest-heavy tests several times slower.
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.release]
+codegen-units = 1
+lto = "thin"

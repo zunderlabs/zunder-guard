@@ -1,0 +1,19 @@
+# Build context for deploy/guard/Dockerfile (BuildKit reads <Dockerfile>.dockerignore).
+# An allow list: only the workspace sources and prebuilt release binaries are sent, so .env,
+# data, reports and research folders can never end up in a build context or an image layer.
+*
+!Cargo.toml
+!Cargo.lock
+!rust-toolchain.toml
+!LICENSE
+!NOTICE
+!THIRD_PARTY_LICENSES.md
+!crates/
+!deploy/guard/rules/
+!tests/redteam/
+!dist/linux-*/zunder-guard
+**/target
+**/.env
+**/.env.*
+**/*.key
+**/*.pem

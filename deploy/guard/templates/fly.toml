@@ -1,0 +1,61 @@
+# Zunder Guard on Fly.io, on your own account, in Tokyo (deploy/guard/README.md, "Fly.io").
+#
+#   fly apps create <your-app>                       # then set app below
+#   fly volumes create guard_data --region nrt --size 1 --app <your-app>
+#   fly deploy --config fly.toml                     # paper mode from ZUNDER_GUARD_RULES below
+#
+# Not public: there is no [http_service] and no [[services]] section, so Fly gives the app no
+# public address. Your other Fly apps reach Guard at http://<your-app>.internal:8547 over Fly's
+# private network (6PN); from your own machine: fly proxy 8547 --app <your-app>.
+#
+# Testnet, the guided way (rules, account, mode, then the key with hidden input; the
+# key is stored in the volume with mode 0600, and Guard says so):
+#   fly ssh console --app <your-app> -C "/usr/local/bin/zunder-guard init --interactive --force"
+#   fly ssh console --app <your-app> -C "/usr/local/bin/zunder-guard pair"
+# then uncomment ZUNDER_GUARD_NETWORK = "testnet" below and `fly deploy --config fly.toml`: Guard
+# sends only where ZUNDER_GUARD_NETWORK says and only when that is the mode init recorded; a
+# testnet setup without it refuses to start rather than run as paper. Mainnet is not offered on
+# Fly (Guard takes a mainnet key on standard input only).
+# The key never goes into this file or into an environment variable.
+app = "zunder-guard-CHANGE-ME"
+primary_region = "nrt"
+
+[build]
+  image = "ghcr.io/zunderlabs/zunder-guard:latest"
+
+[env]
+  # Fly's private network is IPv6; [::] covers it. Still no public address (see above).
+  ZUNDER_GUARD_LISTEN = "[::]:8547"
+  # First start on an empty volume: initialise in paper mode with these rules, reading this
+  # account (its address only; no key).
+  ZUNDER_GUARD_RULES = "zr1_PASTE_YOUR_RULES_HERE"
+  ZUNDER_GUARD_ACCOUNT = "0xPASTE_YOUR_ACCOUNT_ADDRESS_HERE"
+  # After a testnet `init` (above): where to send. Leave it out for paper mode.
+  # ZUNDER_GUARD_NETWORK = "testnet"
+
+# The journal and configuration. One machine only: two would race on the journal and nonces.
+[mounts]
+  source = "guard_data"
+  destination = "/data"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "256mb"
+
+[checks]
+  [checks.guard]
+    type = "http"
+    port = 8547
+    path = "/healthz"
+    interval = "30s"
+    timeout = "5s"
+    grace_period = "20s"
+
+# PUBLIC ACCESS, opt-in only. WARNING: uncommenting this puts Guard on the internet. Anyone who
+# reaches it can send orders signed with a paired client key. Prefer the private network above.
+# [[services]]
+#   internal_port = 8547
+#   protocol = "tcp"
+#   [[services.ports]]
+#     port = 8547
+#     handlers = ["tls"]

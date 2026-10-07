@@ -1,0 +1,15 @@
+[package]
+name = "zunder-core"
+description = "Domain types and the strategy interface shared by every Zunder crate"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license = "Elastic-2.0"
+
+[dependencies]
+rust_decimal.workspace = true
+serde.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,8 @@
+# yaml-language-server: $schema=https://aka.ms/winget-manifest.version.1.10.0.schema.json
+# Rendered by deploy/guard/packaging/render.sh; submitted to microsoft/winget-pkgs under
+# manifests/z/ZunderLabs/ZunderGuard/@VERSION_NUMBER@/ (deploy/guard/README.md, "Publishing").
+PackageIdentifier: ZunderLabs.ZunderGuard
+PackageVersion: "@VERSION_NUMBER@"
+DefaultLocale: en-US
+ManifestType: version
+ManifestVersion: 1.10.0

@@ -1,0 +1,420 @@
+{
+  "_comment": "Shared test vectors for deploy/guard/rules (Rust) and zr1.ts (TypeScript), reconciled schema v1. A valid case: zr1_ + base64url(json) decodes, and re-encodes to canonical. An invalid case: input (or zr1_ + base64url(json)) is refused with code (and field, where given). Canonical strings were computed by an independent Python reference.",
+  "valid": [
+    {
+      "name": "defaults written out",
+      "json": "{\"v\":1,\"maxLeverage\":5,\"maxLossAtStopPct\":2,\"stopPolicy\":\"attach\",\"defaultStopDistancePct\":2,\"minLiqDistancePct\":10,\"maxPositionPct\":200,\"maxOpenRiskPct\":6,\"dailyLossStopPct\":6,\"drawdownHaltPct\":25,\"markets\":[\"*\"]}",
+      "canonical": "zr1_eyJ2IjoxLCJtYXhMZXZlcmFnZSI6NSwibWF4TG9zc0F0U3RvcFBjdCI6Miwic3RvcFBvbGljeSI6ImF0dGFjaCIsImRlZmF1bHRTdG9wRGlzdGFuY2VQY3QiOjIsIm1pbkxpcURpc3RhbmNlUGN0IjoxMCwibWF4UG9zaXRpb25QY3QiOjIwMCwibWF4T3BlblJpc2tQY3QiOjYsImRhaWx5TG9zc1N0b3BQY3QiOjYsImRyYXdkb3duSGFsdFBjdCI6MjUsIm1hcmtldHMiOlsiKiJdfQ"
+    },
+    {
+      "name": "only the version: every default",
+      "json": "{\"v\":1}",
+      "canonical": "zr1_eyJ2IjoxLCJtYXhMZXZlcmFnZSI6NSwibWF4TG9zc0F0U3RvcFBjdCI6Miwic3RvcFBvbGljeSI6ImF0dGFjaCIsImRlZmF1bHRTdG9wRGlzdGFuY2VQY3QiOjIsIm1pbkxpcURpc3RhbmNlUGN0IjoxMCwibWF4UG9zaXRpb25QY3QiOjIwMCwibWF4T3BlblJpc2tQY3QiOjYsImRhaWx5TG9zc1N0b3BQY3QiOjYsImRyYXdkb3duSGFsdFBjdCI6MjUsIm1hcmtldHMiOlsiKiJdfQ"
+    },
+    {
+      "name": "v written as 1.0",
+      "json": "{\"v\":1.0}",
+      "canonical": "zr1_eyJ2IjoxLCJtYXhMZXZlcmFnZSI6NSwibWF4TG9zc0F0U3RvcFBjdCI6Miwic3RvcFBvbGljeSI6ImF0dGFjaCIsImRlZmF1bHRTdG9wRGlzdGFuY2VQY3QiOjIsIm1pbkxpcURpc3RhbmNlUGN0IjoxMCwibWF4UG9zaXRpb25QY3QiOjIwMCwibWF4T3BlblJpc2tQY3QiOjYsImRhaWx5TG9zc1N0b3BQY3QiOjYsImRyYXdkb3duSGFsdFBjdCI6MjUsIm1hcmtldHMiOlsiKiJdfQ"
+    },
+    {
+      "name": "refuse policy without the optional stop distance",
+      "json": "{\"v\":1,\"stopPolicy\":\"refuse\"}",
+      "canonical": "zr1_eyJ2IjoxLCJtYXhMZXZlcmFnZSI6NSwibWF4TG9zc0F0U3RvcFBjdCI6Miwic3RvcFBvbGljeSI6InJlZnVzZSIsImRlZmF1bHRTdG9wRGlzdGFuY2VQY3QiOjIsIm1pbkxpcURpc3RhbmNlUGN0IjoxMCwibWF4UG9zaXRpb25QY3QiOjIwMCwibWF4T3BlblJpc2tQY3QiOjYsImRhaWx5TG9zc1N0b3BQY3QiOjYsImRyYXdkb3duSGFsdFBjdCI6MjUsIm1hcmtldHMiOlsiKiJdfQ"
+    },
+    {
+      "name": "paper-book style rules with a market list",
+      "json": "{\"v\":1,\"maxLeverage\":3,\"maxLossAtStopPct\":0.85,\"defaultStopDistancePct\":1.5,\"markets\":[\"BTC\",\"xyz:XYZ100\",\"PURR/USDC\",\"@107\",\"kPEPE\"]}",
+      "canonical": "zr1_eyJ2IjoxLCJtYXhMZXZlcmFnZSI6MywibWF4TG9zc0F0U3RvcFBjdCI6MC44NSwic3RvcFBvbGljeSI6ImF0dGFjaCIsImRlZmF1bHRTdG9wRGlzdGFuY2VQY3QiOjEuNSwibWluTGlxRGlzdGFuY2VQY3QiOjEwLCJtYXhQb3NpdGlvblBjdCI6MjAwLCJtYXhPcGVuUmlza1BjdCI6NiwiZGFpbHlMb3NzU3RvcFBjdCI6NiwiZHJhd2Rvd25IYWx0UGN0IjoyNSwibWFya2V0cyI6WyJCVEMiLCJ4eXo6WFlaMTAwIiwiUFVSUi9VU0RDIiwiQDEwNyIsImtQRVBFIl19"
+    },
+    {
+      "name": "every upper bound (the stop distance just below the liquidation distance)",
+      "json": "{\"v\":1,\"maxLeverage\":10,\"maxLossAtStopPct\":5,\"defaultStopDistancePct\":49.9999,\"minLiqDistancePct\":50,\"maxPositionPct\":1000,\"maxOpenRiskPct\":20,\"dailyLossStopPct\":15,\"drawdownHaltPct\":50}",
+      "canonical": "zr1_eyJ2IjoxLCJtYXhMZXZlcmFnZSI6MTAsIm1heExvc3NBdFN0b3BQY3QiOjUsInN0b3BQb2xpY3kiOiJhdHRhY2giLCJkZWZhdWx0U3RvcERpc3RhbmNlUGN0Ijo0OS45OTk5LCJtaW5MaXFEaXN0YW5jZVBjdCI6NTAsIm1heFBvc2l0aW9uUGN0IjoxMDAwLCJtYXhPcGVuUmlza1BjdCI6MjAsImRhaWx5TG9zc1N0b3BQY3QiOjE1LCJkcmF3ZG93bkhhbHRQY3QiOjUwLCJtYXJrZXRzIjpbIioiXX0"
+    },
+    {
+      "name": "every lower edge",
+      "json": "{\"v\":1,\"maxLeverage\":0.0001,\"maxLossAtStopPct\":0.0001,\"defaultStopDistancePct\":0.0001,\"minLiqDistancePct\":1,\"maxPositionPct\":0.0001,\"maxOpenRiskPct\":0.0001,\"dailyLossStopPct\":0.0001,\"drawdownHaltPct\":0.0001}",
+      "canonical": "zr1_eyJ2IjoxLCJtYXhMZXZlcmFnZSI6MC4wMDAxLCJtYXhMb3NzQXRTdG9wUGN0IjowLjAwMDEsInN0b3BQb2xpY3kiOiJhdHRhY2giLCJkZWZhdWx0U3RvcERpc3RhbmNlUGN0IjowLjAwMDEsIm1pbkxpcURpc3RhbmNlUGN0IjoxLCJtYXhQb3NpdGlvblBjdCI6MC4wMDAxLCJtYXhPcGVuUmlza1BjdCI6MC4wMDAxLCJkYWlseUxvc3NTdG9wUGN0IjowLjAwMDEsImRyYXdkb3duSGFsdFBjdCI6MC4wMDAxLCJtYXJrZXRzIjpbIioiXX0"
+    },
+    {
+      "name": "keys in another order, trailing zeros",
+      "json": "{\"markets\":[\"ETH\"],\"drawdownHaltPct\":20.50,\"v\":1,\"maxLeverage\":2.5000,\"maxPositionPct\":250}",
+      "canonical": "zr1_eyJ2IjoxLCJtYXhMZXZlcmFnZSI6Mi41LCJtYXhMb3NzQXRTdG9wUGN0IjoyLCJzdG9wUG9saWN5IjoiYXR0YWNoIiwiZGVmYXVsdFN0b3BEaXN0YW5jZVBjdCI6MiwibWluTGlxRGlzdGFuY2VQY3QiOjEwLCJtYXhQb3NpdGlvblBjdCI6MjUwLCJtYXhPcGVuUmlza1BjdCI6NiwiZGFpbHlMb3NzU3RvcFBjdCI6NiwiZHJhd2Rvd25IYWx0UGN0IjoyMC41LCJtYXJrZXRzIjpbIkVUSCJdfQ"
+    },
+    {
+      "name": "four decimal places",
+      "json": "{\"v\":1,\"maxLossAtStopPct\":1.2345,\"maxOpenRiskPct\":6.0001}",
+      "canonical": "zr1_eyJ2IjoxLCJtYXhMZXZlcmFnZSI6NSwibWF4TG9zc0F0U3RvcFBjdCI6MS4yMzQ1LCJzdG9wUG9saWN5IjoiYXR0YWNoIiwiZGVmYXVsdFN0b3BEaXN0YW5jZVBjdCI6MiwibWluTGlxRGlzdGFuY2VQY3QiOjEwLCJtYXhQb3NpdGlvblBjdCI6MjAwLCJtYXhPcGVuUmlza1BjdCI6Ni4wMDAxLCJkYWlseUxvc3NTdG9wUGN0Ijo2LCJkcmF3ZG93bkhhbHRQY3QiOjI1LCJtYXJrZXRzIjpbIioiXX0"
+    },
+    {
+      "name": "whitespace in the JSON",
+      "json": "{ \"v\" : 1 ,\n \"maxLeverage\" : 4 }",
+      "canonical": "zr1_eyJ2IjoxLCJtYXhMZXZlcmFnZSI6NCwibWF4TG9zc0F0U3RvcFBjdCI6Miwic3RvcFBvbGljeSI6ImF0dGFjaCIsImRlZmF1bHRTdG9wRGlzdGFuY2VQY3QiOjIsIm1pbkxpcURpc3RhbmNlUGN0IjoxMCwibWF4UG9zaXRpb25QY3QiOjIwMCwibWF4T3BlblJpc2tQY3QiOjYsImRhaWx5TG9zc1N0b3BQY3QiOjYsImRyYXdkb3duSGFsdFBjdCI6MjUsIm1hcmtldHMiOlsiKiJdfQ"
+    },
+    {
+      "name": "every market written out",
+      "json": "{\"v\":1,\"markets\":[\"*\"]}",
+      "canonical": "zr1_eyJ2IjoxLCJtYXhMZXZlcmFnZSI6NSwibWF4TG9zc0F0U3RvcFBjdCI6Miwic3RvcFBvbGljeSI6ImF0dGFjaCIsImRlZmF1bHRTdG9wRGlzdGFuY2VQY3QiOjIsIm1pbkxpcURpc3RhbmNlUGN0IjoxMCwibWF4UG9zaXRpb25QY3QiOjIwMCwibWF4T3BlblJpc2tQY3QiOjYsImRhaWx5TG9zc1N0b3BQY3QiOjYsImRyYXdkb3duSGFsdFBjdCI6MjUsIm1hcmtldHMiOlsiKiJdfQ"
+    },
+    {
+      "name": "HIP-3: every main-dex market and every market of dex xyz",
+      "json": "{\"v\":1,\"markets\":[\"*\",\"xyz:*\"]}",
+      "canonical": "zr1_eyJ2IjoxLCJtYXhMZXZlcmFnZSI6NSwibWF4TG9zc0F0U3RvcFBjdCI6Miwic3RvcFBvbGljeSI6ImF0dGFjaCIsImRlZmF1bHRTdG9wRGlzdGFuY2VQY3QiOjIsIm1pbkxpcURpc3RhbmNlUGN0IjoxMCwibWF4UG9zaXRpb25QY3QiOjIwMCwibWF4T3BlblJpc2tQY3QiOjYsImRhaWx5TG9zc1N0b3BQY3QiOjYsImRyYXdkb3duSGFsdFBjdCI6MjUsIm1hcmtldHMiOlsiKiIsInh5ejoqIl19"
+    },
+    {
+      "name": "HIP-3: a dex, a main-dex coin and one coin of another dex",
+      "json": "{\"v\":1,\"markets\":[\"xyz:*\",\"BTC\",\"flx:GOLD\"]}",
+      "canonical": "zr1_eyJ2IjoxLCJtYXhMZXZlcmFnZSI6NSwibWF4TG9zc0F0U3RvcFBjdCI6Miwic3RvcFBvbGljeSI6ImF0dGFjaCIsImRlZmF1bHRTdG9wRGlzdGFuY2VQY3QiOjIsIm1pbkxpcURpc3RhbmNlUGN0IjoxMCwibWF4UG9zaXRpb25QY3QiOjIwMCwibWF4T3BlblJpc2tQY3QiOjYsImRhaWx5TG9zc1N0b3BQY3QiOjYsImRyYXdkb3duSGFsdFBjdCI6MjUsIm1hcmtldHMiOlsieHl6OioiLCJCVEMiLCJmbHg6R09MRCJdfQ"
+    },
+    {
+      "name": "HIP-3: one market of one dex (valid before HIP-3 support, unchanged)",
+      "json": "{\"v\":1,\"markets\":[\"xyz:GOLD\"]}",
+      "canonical": "zr1_eyJ2IjoxLCJtYXhMZXZlcmFnZSI6NSwibWF4TG9zc0F0U3RvcFBjdCI6Miwic3RvcFBvbGljeSI6ImF0dGFjaCIsImRlZmF1bHRTdG9wRGlzdGFuY2VQY3QiOjIsIm1pbkxpcURpc3RhbmNlUGN0IjoxMCwibWF4UG9zaXRpb25QY3QiOjIwMCwibWF4T3BlblJpc2tQY3QiOjYsImRhaWx5TG9zc1N0b3BQY3QiOjYsImRyYXdkb3duSGFsdFBjdCI6MjUsIm1hcmtldHMiOlsieHl6OkdPTEQiXX0"
+    }
+  ],
+  "invalid": [
+    {
+      "name": "empty string",
+      "input": "",
+      "code": "prefix"
+    },
+    {
+      "name": "another schema version prefix",
+      "input": "zr2_eyJ2IjoxfQ",
+      "code": "prefix"
+    },
+    {
+      "name": "upper-case prefix",
+      "input": "ZR1_eyJ2IjoxfQ",
+      "code": "prefix"
+    },
+    {
+      "name": "padding",
+      "input": "zr1_eyJ2IjoxfQ==",
+      "code": "base64"
+    },
+    {
+      "name": "standard base64 alphabet",
+      "input": "zr1_eyJ2Ijox+Q",
+      "code": "base64"
+    },
+    {
+      "name": "stray bits in the last character",
+      "input": "zr1_eyJ2IjoxfR",
+      "code": "base64"
+    },
+    {
+      "name": "impossible length",
+      "input": "zr1_eyJ2I",
+      "code": "base64"
+    },
+    {
+      "name": "nothing after the prefix",
+      "input": "zr1_",
+      "code": "json"
+    },
+    {
+      "name": "not UTF-8",
+      "input": "zr1___57fQ",
+      "code": "json"
+    },
+    {
+      "name": "not JSON",
+      "json": "{\"v\":1,}",
+      "code": "json"
+    },
+    {
+      "name": "an array",
+      "json": "[1]",
+      "code": "not_object"
+    },
+    {
+      "name": "a number",
+      "json": "1",
+      "code": "not_object"
+    },
+    {
+      "name": "no version",
+      "json": "{}",
+      "code": "version"
+    },
+    {
+      "name": "version 2",
+      "json": "{\"v\":2}",
+      "code": "version"
+    },
+    {
+      "name": "version as a string",
+      "json": "{\"v\":\"1\"}",
+      "code": "version"
+    },
+    {
+      "name": "unknown field",
+      "json": "{\"v\":1,\"maxLeverageX\":5}",
+      "code": "unknown_field"
+    },
+    {
+      "name": "requireStop was removed from v1",
+      "json": "{\"v\":1,\"requireStop\":true}",
+      "code": "unknown_field"
+    },
+    {
+      "name": "unknown field before a bad version",
+      "json": "{\"v\":2,\"apiKey\":\"0xabc\"}",
+      "code": "unknown_field"
+    },
+    {
+      "name": "number as a string",
+      "json": "{\"v\":1,\"maxLeverage\":\"5\"}",
+      "code": "type",
+      "field": "maxLeverage"
+    },
+    {
+      "name": "null number",
+      "json": "{\"v\":1,\"maxOpenRiskPct\":null}",
+      "code": "type",
+      "field": "maxOpenRiskPct"
+    },
+    {
+      "name": "stop distance as a string",
+      "json": "{\"v\":1,\"defaultStopDistancePct\":\"2\"}",
+      "code": "type",
+      "field": "defaultStopDistancePct"
+    },
+    {
+      "name": "leverage above the aggressive frame",
+      "json": "{\"v\":1,\"maxLeverage\":11}",
+      "code": "out_of_range",
+      "field": "maxLeverage"
+    },
+    {
+      "name": "leverage zero",
+      "json": "{\"v\":1,\"maxLeverage\":0}",
+      "code": "out_of_range",
+      "field": "maxLeverage"
+    },
+    {
+      "name": "negative risk",
+      "json": "{\"v\":1,\"maxLossAtStopPct\":-1}",
+      "code": "out_of_range",
+      "field": "maxLossAtStopPct"
+    },
+    {
+      "name": "risk per trade above 5%",
+      "json": "{\"v\":1,\"maxLossAtStopPct\":5.0001}",
+      "code": "out_of_range",
+      "field": "maxLossAtStopPct"
+    },
+    {
+      "name": "stop distance zero",
+      "json": "{\"v\":1,\"defaultStopDistancePct\":0}",
+      "code": "out_of_range",
+      "field": "defaultStopDistancePct"
+    },
+    {
+      "name": "stop distance above 50%",
+      "json": "{\"v\":1,\"defaultStopDistancePct\":50.0001}",
+      "code": "out_of_range",
+      "field": "defaultStopDistancePct"
+    },
+    {
+      "name": "drawdown in exponent notation, huge",
+      "json": "{\"v\":1,\"drawdownHaltPct\":1e21}",
+      "code": "out_of_range",
+      "field": "drawdownHaltPct"
+    },
+    {
+      "name": "daily loss above the bound",
+      "json": "{\"v\":1,\"dailyLossStopPct\":16}",
+      "code": "out_of_range",
+      "field": "dailyLossStopPct"
+    },
+    {
+      "name": "liquidation distance below the floor",
+      "json": "{\"v\":1,\"minLiqDistancePct\":0.5}",
+      "code": "out_of_range",
+      "field": "minLiqDistancePct"
+    },
+    {
+      "name": "position above 10x",
+      "json": "{\"v\":1,\"maxPositionPct\":1000.5}",
+      "code": "out_of_range",
+      "field": "maxPositionPct"
+    },
+    {
+      "name": "five decimal places",
+      "json": "{\"v\":1,\"maxLossAtStopPct\":2.00001}",
+      "code": "precision",
+      "field": "maxLossAtStopPct"
+    },
+    {
+      "name": "tiny value in exponent notation",
+      "json": "{\"v\":1,\"maxLossAtStopPct\":1e-7}",
+      "code": "precision",
+      "field": "maxLossAtStopPct"
+    },
+    {
+      "name": "float noise from a browser",
+      "json": "{\"v\":1,\"maxOpenRiskPct\":0.30000000000000004}",
+      "code": "precision",
+      "field": "maxOpenRiskPct"
+    },
+    {
+      "name": "first bad field wins",
+      "json": "{\"v\":1,\"drawdownHaltPct\":99,\"maxLeverage\":11}",
+      "code": "out_of_range",
+      "field": "maxLeverage"
+    },
+    {
+      "name": "type error before a later range error",
+      "json": "{\"v\":1,\"maxLossAtStopPct\":true,\"drawdownHaltPct\":99}",
+      "code": "type",
+      "field": "maxLossAtStopPct"
+    },
+    {
+      "name": "range error before markets",
+      "json": "{\"v\":1,\"markets\":[],\"drawdownHaltPct\":99}",
+      "code": "out_of_range",
+      "field": "drawdownHaltPct"
+    },
+    {
+      "name": "unknown stop policy",
+      "json": "{\"v\":1,\"stopPolicy\":\"ignore\"}",
+      "code": "stop_policy",
+      "field": "stopPolicy"
+    },
+    {
+      "name": "stop policy not a string",
+      "json": "{\"v\":1,\"stopPolicy\":1}",
+      "code": "type",
+      "field": "stopPolicy"
+    },
+    {
+      "name": "no markets",
+      "json": "{\"v\":1,\"markets\":[]}",
+      "code": "markets",
+      "field": "markets"
+    },
+    {
+      "name": "every market and one more",
+      "json": "{\"v\":1,\"markets\":[\"*\",\"BTC\"]}",
+      "code": "markets",
+      "field": "markets"
+    },
+    {
+      "name": "HIP-3: every main-dex market, a dex and a main-dex coin",
+      "json": "{\"v\":1,\"markets\":[\"*\",\"xyz:*\",\"BTC\"]}",
+      "code": "markets",
+      "field": "markets"
+    },
+    {
+      "name": "HIP-3: a dex and one of its markets again",
+      "json": "{\"v\":1,\"markets\":[\"xyz:*\",\"xyz:GOLD\"]}",
+      "code": "markets",
+      "field": "markets"
+    },
+    {
+      "name": "HIP-3: a wildcard dex",
+      "json": "{\"v\":1,\"markets\":[\"*:*\"]}",
+      "code": "markets",
+      "field": "markets"
+    },
+    {
+      "name": "HIP-3: a dex without a name",
+      "json": "{\"v\":1,\"markets\":[\":*\"]}",
+      "code": "markets",
+      "field": "markets"
+    },
+    {
+      "name": "HIP-3: a dex name with a dot",
+      "json": "{\"v\":1,\"markets\":[\"x.y:*\"]}",
+      "code": "markets",
+      "field": "markets"
+    },
+    {
+      "name": "every main-dex market twice",
+      "json": "{\"v\":1,\"markets\":[\"*\",\"*\"]}",
+      "code": "markets",
+      "field": "markets"
+    },
+    {
+      "name": "a market twice",
+      "json": "{\"v\":1,\"markets\":[\"BTC\",\"ETH\",\"BTC\"]}",
+      "code": "markets",
+      "field": "markets"
+    },
+    {
+      "name": "a space in a market",
+      "json": "{\"v\":1,\"markets\":[\"BTC \"]}",
+      "code": "markets",
+      "field": "markets"
+    },
+    {
+      "name": "a wildcard inside a name",
+      "json": "{\"v\":1,\"markets\":[\"BTC*\"]}",
+      "code": "markets",
+      "field": "markets"
+    },
+    {
+      "name": "an empty market name",
+      "json": "{\"v\":1,\"markets\":[\"\"]}",
+      "code": "markets",
+      "field": "markets"
+    },
+    {
+      "name": "a market name too long",
+      "json": "{\"v\":1,\"markets\":[\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\"]}",
+      "code": "markets",
+      "field": "markets"
+    },
+    {
+      "name": "33 markets",
+      "json": "{\"v\":1,\"markets\":[\"M0\",\"M1\",\"M2\",\"M3\",\"M4\",\"M5\",\"M6\",\"M7\",\"M8\",\"M9\",\"M10\",\"M11\",\"M12\",\"M13\",\"M14\",\"M15\",\"M16\",\"M17\",\"M18\",\"M19\",\"M20\",\"M21\",\"M22\",\"M23\",\"M24\",\"M25\",\"M26\",\"M27\",\"M28\",\"M29\",\"M30\",\"M31\",\"M32\"]}",
+      "code": "markets",
+      "field": "markets"
+    },
+    {
+      "name": "markets as a string",
+      "json": "{\"v\":1,\"markets\":\"*\"}",
+      "code": "type",
+      "field": "markets"
+    },
+    {
+      "name": "a market as a number",
+      "json": "{\"v\":1,\"markets\":[1]}",
+      "code": "type",
+      "field": "markets"
+    },
+    {
+      "name": "open risk below risk per trade",
+      "json": "{\"v\":1,\"maxLossAtStopPct\":5,\"maxOpenRiskPct\":4}",
+      "code": "open_risk_below_trade_risk"
+    },
+    {
+      "name": "position above the leverage cap",
+      "json": "{\"v\":1,\"maxLeverage\":2,\"maxPositionPct\":250}",
+      "code": "position_above_leverage"
+    },
+    {
+      "name": "default position above a lowered leverage cap",
+      "json": "{\"v\":1,\"maxLeverage\":1.5}",
+      "code": "position_above_leverage"
+    },
+    {
+      "name": "markets checked before cross-field rules",
+      "json": "{\"v\":1,\"markets\":[],\"maxLossAtStopPct\":5,\"maxOpenRiskPct\":4}",
+      "code": "markets",
+      "field": "markets"
+    },
+    {
+      "name": "stop distance at the liquidation distance",
+      "json": "{\"v\":1,\"defaultStopDistancePct\":10,\"minLiqDistancePct\":10}",
+      "code": "liq_not_beyond_stop"
+    },
+    {
+      "name": "stop distance beyond a lowered liquidation distance",
+      "json": "{\"v\":1,\"minLiqDistancePct\":1.5}",
+      "code": "liq_not_beyond_stop"
+    }
+  ]
+}

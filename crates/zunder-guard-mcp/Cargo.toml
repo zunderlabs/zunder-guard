@@ -1,0 +1,36 @@
+[package]
+name = "zunder-guard-mcp"
+description = "MCP server that gives AI agents guarded trading tools on Hyperliquid through a local Zunder Guard"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+# Code published with Guard under the Elastic License 2.0 (decided 6 Oct 2026).
+# cargo deny ignores our own unpublished crates.
+license = "Elastic-2.0"
+
+[[bin]]
+name = "zunder-guard-mcp"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+base64.workspace = true
+clap.workspace = true
+k256.workspace = true
+# Plain HTTP to Guard on a loopback address only (`guard::GuardUrl`).
+reqwest.workspace = true
+rust_decimal.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha3.workspace = true
+thiserror.workspace = true
+zeroize.workspace = true
+zunder-core.workspace = true
+# The preview's estimate (`preview.rs`): the real engine, never a copy of it.
+zunder-risk.workspace = true
+# Address parsing and Hyperliquid's price and size grid (`InstrumentRules`).
+zunder-venue.workspace = true
+
+[lints]
+workspace = true

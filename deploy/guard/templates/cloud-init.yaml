@@ -1,0 +1,37 @@
+#cloud-config
+# Zunder Guard on a fresh Hetzner Cloud or DigitalOcean server (deploy/guard/README.md, "Cloud
+# servers"). Paste as "Cloud config" (Hetzner) or "User data" (DigitalOcean) when creating an
+# Ubuntu 24.04 server; zunderlabs.com/deploy fills in your rules.
+#
+# It installs Guard through the signed loader and starts it in PAPER mode, listening on
+# 127.0.0.1 only, behind a firewall that admits SSH and nothing else. It never takes a key:
+# user data is stored by the provider and readable from the server's metadata service.
+# For testnet or mainnet, run the guided setup over SSH afterwards (input hidden, key encrypted
+# with systemd-creds):
+#
+#   ssh -t root@<server> "curl -fsSL https://zunderlabs.com/i | sh -s -- --rules <your zr1_…>"
+#
+# Neither provider has a Tokyo region (Hyperliquid's validators are there); Singapore (sgp1 at
+# DigitalOcean, sin at Hetzner) is the nearest. For Tokyo use the AWS template.
+package_update: true
+packages:
+  - curl
+  - ufw
+write_files:
+  - path: /etc/zunder-guard/rules
+    permissions: "0644"
+    content: |
+      zr1_PASTE_YOUR_RULES_HERE
+runcmd:
+  - [ufw, default, deny, incoming]
+  - [ufw, allow, OpenSSH]
+  - [ufw, --force, enable]
+  - - sh
+    - -c
+    - >-
+      curl -fsSL --proto =https https://zunderlabs.com/i
+      | sh -s -- --non-interactive --network paper --rules "$(cat /etc/zunder-guard/rules)"
+final_message: >-
+  Zunder Guard is installed in paper mode on 127.0.0.1:8547 (journalctl -u zunder-guard).
+  Next: ssh -t root@<this server> and rerun the loader for testnet or mainnet, or pair a bot with
+  'sudo -u zunder-guard env ZUNDER_GUARD_HOME=/var/lib/zunder-guard zunder-guard pair'.

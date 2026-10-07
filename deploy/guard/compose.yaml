@@ -1,0 +1,57 @@
+# Zunder Guard with Docker Compose (deploy/guard/README.md, "Docker").
+#
+#   docker compose -f compose.yaml run --rm guard init --interactive --rules zr1_…   # guided setup
+#   docker compose -f compose.yaml run --rm guard pair                               # client key for the bot
+#   docker compose -f compose.yaml up -d
+#
+# After a testnet `init`, uncomment ZUNDER_GUARD_NETWORK below, then `up -d`: `run` sends only
+# where ZUNDER_GUARD_NETWORK says, and only when that is the mode `init` recorded. A testnet
+# setup started without it refuses to start ("the config is for testnet: pass --network
+# testnet"); it never quietly runs as paper. (Uncomment it only after init: init reads it too,
+# as its mode.) Mainnet is not offered in a container (Guard takes a mainnet key on standard
+# input only): use the SSH installer.
+#
+# The port is published on the host's 127.0.0.1 only. Bots in this compose project reach Guard
+# at http://guard:8547. Do NOT change the published address to 0.0.0.0 or drop the 127.0.0.1:
+# Docker writes its own firewall rules and bypasses ufw, so the port would be open to the
+# internet, protected only by the client key.
+#
+# The key: `init --interactive` asks for it with hidden input and stores it in the volume
+# (mode 0600, readable only by the container's user), and says so. To keep it out of the
+# volume, keep it in a file owned by the container's user (uid 65532) with mode 0600
+# (`sudo chown 65532 hl-api-wallet-key && chmod 600 hl-api-wallet-key`) and uncomment the
+# secret below; Guard then reads it from /run/secrets/hl-api-wallet-key. Compose mounts the
+# file as it is, so the owner and mode on the host are the ones that count.
+name: zunder-guard
+
+services:
+  guard:
+    # Pin a release (and ideally its digest, as printed in the release notes) instead of latest.
+    image: ${ZUNDER_GUARD_IMAGE:-ghcr.io/zunderlabs/zunder-guard:latest}
+    # One instance per account: two would race on the journal and the nonces.
+    restart: unless-stopped
+    # Signals reach the binary through a minimal init (the image has none of its own).
+    init: true
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    environment:
+      # Inside the container Guard listens on its own interface; the host side is below.
+      ZUNDER_GUARD_LISTEN: "0.0.0.0:8547"
+      # After a testnet init: where to send. It must equal the mode init recorded.
+      # ZUNDER_GUARD_NETWORK: testnet
+      # ZUNDER_GUARD_KEY_FILE: /run/secrets/hl-api-wallet-key
+    ports:
+      - "127.0.0.1:8547:8547"
+    volumes:
+      - guard-data:/data
+    tmpfs:
+      - /tmp
+    # secrets: [hl-api-wallet-key]
+
+volumes:
+  guard-data:
+
+# secrets:
+#   hl-api-wallet-key:
+#     file: ./hl-api-wallet-key    # chmod 600; never commit it

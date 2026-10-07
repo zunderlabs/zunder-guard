@@ -1,0 +1,41 @@
+# cargo-deny configuration: `cargo deny check`. Every dependency must come under a
+# permissive licence on the allow list below; copyleft licences are refused by not being
+# on it. Our own crates are under the Elastic License 2.0 (LICENSE) and unpublished on
+# crates.io, so cargo-deny skips them.
+
+[graph]
+all-features = true
+
+[advisories]
+yanked = "deny"
+
+[licenses]
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "CC0-1.0",
+    "ISC",
+    "MIT",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+]
+confidence-threshold = 0.9
+# The list pre-approves the usual permissive licences; not all are in use yet.
+unused-allowed-license = "allow"
+
+[licenses.private]
+# The workspace crates are our own (Elastic License 2.0) and not on crates.io.
+ignore = true
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

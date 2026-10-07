@@ -1,0 +1,130 @@
+---
+title: Veto and reason codes
+description: Every code Guard, the risk engine and the browser tools use to say why an entry was refused or resized.
+sidebar:
+  order: 4
+---
+import VetoDemo from '@components/docs/VetoDemo.astro';
+
+A refusal always carries a code (stable, for programs) and a reason (a sentence, for people). Codes are `snake_case` and never change meaning; new ones may be added.
+
+<VetoDemo />
+
+## Risk engine
+
+`Veto` in `crates/zunder-risk/src/engine.rs`. The codes are the variant names in `snake_case`, as the WebAssembly build serialises them (`VetoCode` in `crates/zunder-risk-wasm/src/api.rs`).
+
+| Code | Rule | Reason (the engine's own) | Example |
+|---|---|---|---|
+| `halted_for_day` | (h) | trading is halted for the day | down 6% since 00:00 UTC |
+| `stopped` | (i) | trading is stopped until a manual review | 25% below the peak |
+| `stop_on_wrong_side` | (g) | the stop is not on the losing side of the entry price | buy at 100, stop at 101 |
+| `open_risk_exhausted` | (e) | the open-risk budget is used up | stops already risk 6% |
+| `leverage_exhausted` | (c) | the leverage cap is reached | positions already worth 5× equity |
+| `below_minimum` | (g) | the sized quantity is below the venue minimum | the allowed size is worth less than the minimum order |
+| `unprotected_position` | (e) | an open position has no protective stop, or its price is at or through it | an ETH position without a stop blocks a BTC entry |
+| `invalid_request` | (g) | the sizing request contains a negative or non-positive amount | a price of 0 |
+| `overflow` | (g) | the numbers are too large or too small to size safely | absurd inputs |
+
+## Policy: the website's judge
+
+`crates/zunder-risk-wasm/src/judge.rs`, which judges trades on this website (backtest, Watch). Guard's own policy answers with its own codes, below.
+
+| Code | Rule | Example reason |
+|---|---|---|
+| `coin_not_allowed` | (a) | HYPE is not on the market allowlist |
+| `no_protective_stop` | (b) | no stop order protects the ETH position |
+| `liquidation_too_close` | (d) | liquidation is 7% from the price; the minimum is 10% |
+| `position_cap_reached` | (f) | a position may be worth at most 200% of account value |
+| `equity_not_positive` | (g) | the account has no positive equity |
+
+**Resizes** carry the rule that bound the size instead of a code: `max_leverage`, `max_open_risk`, `max_position_size` or `max_loss_per_trade`, with a reason such as "a stop-out may lose at most 2% of equity".
+
+## Watch: account warnings
+
+`crates/zunder-risk-wasm/src/account.rs`. Not refusals: warnings about the account as a whole.
+
+| Code | Meaning |
+|---|---|
+| `halted_for_day` | the daily loss stop is reached |
+| `stopped` | the drawdown halt is reached |
+| `position_without_stop` | a position has no protective stop |
+| `open_risk_over_cap` | open risk is over your cap |
+| `leverage_over_cap` | leverage is over your cap |
+
+## Guard
+
+What a running Guard answers with: in every reply that refuses or changes a request (the `code` field, and in the text `Zunder Guard veto [code]: …`), in its decision events and on `/guard/decision`. Generated from `zunder_guard_core::codes` in Guard's source; a test fails if code and this table drift apart. Engine refusals reach a bot under Guard's names (`daily_loss_stop`, `drawdown_halt`, `stop_wrong_side`, `open_risk`, `leverage`, `below_minimum`, `unprotected_position`, `invalid`).
+
+{/* GENERATED:guard-codes:start (crates/zunder-guard/tests/codes.rs); do not edit by hand */}
+
+| Code | Outcome | When |
+|---|---|---|
+| `allowed` | forwarded | within every rule; forwarded as sent |
+| `resized` | forwarded | forwarded with changes, listed in `changes`: a size cut to the rules, a stop attached, a limit price pulled in, a stop's limit widened, an order made reduce-only or cut to the position |
+| `reduce_only_unjudged` | forwarded | the account could not be read; reduce-only orders are forwarded as sent, unjudged, so closing never waits |
+| `malformed` | refused before judging | the request is not a well-formed Hyperliquid request (unknown fields, wrong types, bad prices, too many orders) |
+| `funds_or_permissions` | refused before judging | an action that moves funds or grants permissions (withdrawals, transfers, agent or builder approvals, referrers, vaults, staking): never forwarded |
+| `unsupported_action` | refused before judging | an action Guard does not forward (TWAP and others) |
+| `vault` | refused before judging | a request for a vault or sub-account (`vaultAddress`): Guard trades the configured account only |
+| `auth_bad_signature` | refused before judging | the signature recovers no key |
+| `auth_unknown_signer` | refused before judging | the signature recovers a key that is not one of Guard's clients |
+| `auth_replay` | refused before judging | the nonce is not above every nonce this client used before |
+| `auth_nonce_too_old` | refused before judging | the nonce lies more than 30 s behind Guard's clock |
+| `auth_nonce_too_new` | refused before judging | the nonce lies more than 5 s ahead of Guard's clock |
+| `auth_nonce_before_start` | refused before judging | the nonce is from before Guard's start (plus 5 s): no request survives a restart |
+| `auth_expired` | refused before judging | the request's `expiresAfter` has passed |
+| `auth_too_large` | refused before judging | the request is too large to hash and check |
+| `kill_switch` | vetoed | the kill switch is pulled: nothing opens until a person removes the kill file and restarts Guard |
+| `daily_loss_stop` | vetoed | the daily loss stop is reached: nothing opens until the next UTC day |
+| `drawdown_halt` | vetoed | the drawdown halt is reached: nothing opens until a person's review |
+| `journal` | vetoed | a journal does not allow it: when the risk journal is not ready, entries are refused; when a decision cannot be written to the decision journal (or its sync takes longer than 2 s), every request is refused, closes and cancels included, until a restart on an intact journal (Guard's own flattening and protection go on, recorded in the emergency log) |
+| `market_not_allowed` | vetoed | the market is not on the rules' market list |
+| `unknown_market` | vetoed | the asset is not a perp the venue lists |
+| `unsupported_market` | vetoed | a spot pair or a HIP-4 outcome (Guard trades perps), or a HIP-3 dex that margins in another token than USDC |
+| `dex_not_allowed` | vetoed | a HIP-3 dex's perp on a dex the rules' markets do not name (`dex:*` or `dex:COIN`): Guard neither reads nor forwards anything there but cancels |
+| `market_halted` | vetoed | a HIP-3 market its deployer halted and settled (or delisted): nothing opens there |
+| `open_interest_cap` | vetoed | a HIP-3 market at its open-interest cap: the venue takes no order that adds to it |
+| `dex_margin` | vetoed | the HIP-3 dex's own margin account cannot fund the venue's minimum order at the leverage Guard sets: move USDC to that dex first |
+| `thin_book` | vetoed | a HIP-3 book too thin for the stop: the position, with what rests on its side, may take at most half the depth between the price and the stop's worst fill (or the book could not be read) |
+| `unsupported_order` | vetoed | an entry that is not a limit order (a trigger entry) |
+| `account_unknown` | vetoed | the account is not in standard mode, or its equity is not positive: entries cannot be sized |
+| `account_unreadable` | vetoed | the account could not be read from the venue (reduce-only orders still go, as `reduce_only_unjudged`); or its ledger not yet, after a loss that would halt Guard (a withdrawal is no loss: up to 10 s); or every view for 10 s may or may not show a deposit or withdrawal: no new positions meanwhile |
+| `no_price` | vetoed | no mid price for the market |
+| `rate_limited` | vetoed | Guard's budget of the venue's request weight for bots' requests is spent (reading the account, a HIP-3 entry's book, and what a forwarded request sends; the rest of the venue's limit is kept for Guard's own protection); try again in a few seconds (reduce-only orders still go, unjudged) |
+| `stop_required` | vetoed | an entry without a stop under the stop policy `refuse` (a stop-limit is no stop) |
+| `stop_wrong_side` | vetoed | the stop is not on the losing side of the entry and the mid |
+| `stop_removed` | vetoed | a cancel or modify would leave a position, or a resting entry, without a stop covering all of it |
+| `stop_loosened` | vetoed | a modify would move a stop further away, shrink it, or turn it into something that is not a market stop; or the change would raise the risk to the stops beyond the open-risk budget |
+| `guard_stop` | vetoed | a cancel of Guard's own stop while its position is open |
+| `open_risk` | vetoed | the open-risk budget is used up (risk engine) |
+| `leverage` | vetoed | the leverage cap is reached (risk engine); an open position runs above the cap; or a leverage update above the cap, or one that raises an open position's leverage |
+| `position_cap` | vetoed | the position is at the rules' largest position already |
+| `liquidation_too_close` | vetoed | no isolated leverage of 1x or more puts the liquidation beyond the stop's worst fill and the minimum distance; adding to an open position would leave its liquidation too close; or a leverage update an entry resting on the coin could not take |
+| `cross_margin` | vetoed | the position is on cross margin, or a leverage update asks for cross: Guard trades isolated |
+| `below_minimum` | vetoed | the size the rules allow (or its stop, at its worst fill) is worth less than the venue's minimum order |
+| `unprotected_position` | vetoed | a position has no stop covering all of it: no new entry until it has one |
+| `unprotected_order` | vetoed | an order rests that could open a position without a stop: no new entry until it is cancelled or has one |
+| `flip` | vetoed | the order would turn a position around: close it first (reduce-only), then enter |
+| `one_entry_per_action` | vetoed | more than one entry in one action |
+| `modify_entry` | vetoed | a modify of a resting entry: cancel it and send a new one |
+| `unknown_order` | vetoed | a modify of an order Guard cannot see resting |
+| `margin_removal` | vetoed | `updateIsolatedMargin` that removes margin |
+| `schedule_cancel` | vetoed | `scheduleCancel` that sets a time (it would cancel the stops too); clearing it is allowed |
+| `client_builder` | vetoed | an entry carrying a builder field of its own (in ccxt: `options.builderFee = false`); from an exit the field is removed instead |
+| `fee_not_approved` | vetoed | a new entry, or a modify, while Guard charges its builder fee and the account's approval of it (`maxBuilderFee`) is not confirmed: approve it with the main wallet at https://zunderlabs.com/approve; exits, closes, new stops and flattens are never refused for it |
+| `invalid` | vetoed | the request cannot be judged as sent: TP/SL that do not belong to the entry, two stops, the entry not first in `normalTpsl`, Guard's stop-id prefix, a change of market or side in a modify, numbers out of range |
+| `venue_refused_leverage` | not sent | the venue did not confirm the isolated leverage the entry needs, so the entry was not sent |
+| `venue_unreachable` | not sent | the venue could not be reached or answered with an error, or the request could not be signed; when no answer came at all it may have reached the venue, so check open orders before sending again |
+
+{/* GENERATED:guard-codes:end */}
+
+## How a refusal reaches your bot
+
+In Hyperliquid's own error format, so a tool that handles Hyperliquid errors handles Guard's, with the code as a field of its own beside the text:
+
+```json
+{"status": "err", "code": "stop_required", "response": "Zunder Guard veto [stop_required]: the policy requires every entry to carry a stop loss (a normalTpsl child with tpsl \"sl\")"}
+```
+
+In paper mode nothing is sent and every reply says what would have happened: `{"status": "err", "code": "resized", "verdict": "resize", "requested_size": "10", "size": "2.5537", "response": "Zunder Guard paper mode: would resize [resized]: … (nothing was sent)"}`. A forwarded request gets the venue's reply with `code`, `verdict` and the sizes added. Details: the contract in Guard's `docs/guard.md`.

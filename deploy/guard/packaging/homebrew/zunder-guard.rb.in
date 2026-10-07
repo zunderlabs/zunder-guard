@@ -1,0 +1,72 @@
+# Homebrew formula for Zunder Guard. Rendered by deploy/guard/packaging/render.sh for each
+# release (version and checksums filled in) and committed to github.com/zunderlabs/homebrew-tap
+# as Formula/zunder-guard.rb:
+#
+#   brew install zunderlabs/tap/zunder-guard
+#
+# Homebrew checks the SHA-256 below, which the release workflow took from the signed release.
+# To check the Sigstore signature as well, follow "Verify this release" in the README.
+class ZunderGuard < Formula
+  desc "Self-hosted risk firewall between trading bots or AI agents and Hyperliquid"
+  homepage "https://zunderlabs.com"
+  version "@VERSION_NUMBER@"
+  # Source-available, not open source: Elastic License 2.0.
+  license "Elastic-2.0"
+
+  on_macos do
+    on_arm do
+      url "https://github.com/zunderlabs/zunder-guard/releases/download/@VERSION@/zunder-guard-@VERSION@-darwin-arm64.tar.gz"
+      sha256 "@SHA256_DARWIN_ARM64@"
+    end
+    on_intel do
+      url "https://github.com/zunderlabs/zunder-guard/releases/download/@VERSION@/zunder-guard-@VERSION@-darwin-amd64.tar.gz"
+      sha256 "@SHA256_DARWIN_AMD64@"
+    end
+  end
+
+  on_linux do
+    on_arm do
+      url "https://github.com/zunderlabs/zunder-guard/releases/download/@VERSION@/zunder-guard-@VERSION@-linux-arm64.tar.gz"
+      sha256 "@SHA256_LINUX_ARM64@"
+    end
+    on_intel do
+      url "https://github.com/zunderlabs/zunder-guard/releases/download/@VERSION@/zunder-guard-@VERSION@-linux-amd64.tar.gz"
+      sha256 "@SHA256_LINUX_AMD64@"
+    end
+  end
+
+  def install
+    bin.install "zunder-guard"
+  end
+
+  # Paper mode on 127.0.0.1 (unless `init` chose another address). `run` sends only where
+  # --network says and only when that is the mode init recorded, so a testnet setup refuses to
+  # start under this service: run it with --network testnet instead (caveats).
+  service do
+    run [opt_bin/"zunder-guard", "run", "--network", "paper"]
+    environment_variables ZUNDER_GUARD_HOME: var/"zunder-guard"
+    keep_alive successful_exit: false
+    log_path var/"log/zunder-guard.log"
+    error_log_path var/"log/zunder-guard.log"
+  end
+
+  def caveats
+    <<~EOS
+      Set Guard up first. It shows your rules, then asks for the account, the mode (paper or
+      testnet; mainnet only under the SSH installer's systemd setup) and, for testnet, the API
+      wallet key with hidden input:
+        ZUNDER_GUARD_HOME=#{var}/zunder-guard zunder-guard init --interactive --rules zr1_...
+        ZUNDER_GUARD_HOME=#{var}/zunder-guard zunder-guard pair
+      Then start it, in paper mode:
+        brew services start zunder-guard
+      For testnet, `run` must be told where to send (the service runs paper only):
+        ZUNDER_GUARD_HOME=#{var}/zunder-guard zunder-guard run --network testnet
+      Guard listens on 127.0.0.1:8547 only. AI agents: zunder-guard mcp (the agent kit's MCP
+      server), with its own client key from zunder-guard client add --out FILE.
+    EOS
+  end
+
+  test do
+    assert_match "zunder-guard", shell_output("#{bin}/zunder-guard --version")
+  end
+end
