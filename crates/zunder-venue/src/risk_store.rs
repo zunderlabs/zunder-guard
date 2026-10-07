@@ -94,11 +94,14 @@
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     fmt,
-    fs::{self, File, OpenOptions, TryLockError},
+    fs::{self, File, OpenOptions},
     future::Future,
-    io::{self, Read, Write},
+    io::{self, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
 };
+
+#[cfg(not(windows))]
+use std::fs::TryLockError;
 
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
@@ -671,6 +674,41 @@ struct RiskJournal {
 }
 
 impl RiskJournal {
+    /// Read through the writer's existing handle, keeping its cursor and lock.
+    /// A pathname lookup could refer to a different file after a namespace change.
+    fn records(&mut self) -> Result<Vec<JournalRecord>, JournalError> {
+        let io = |error: io::Error| JournalError::Io {
+            path: self.path.clone(),
+            message: error.to_string(),
+        };
+        let position = self.file.stream_position().map_err(io)?;
+        let read = (|| {
+            self.file.seek(SeekFrom::Start(0)).map_err(io)?;
+            let (bytes, complete) = read_all(&self.path, &mut self.file)?;
+            if complete < bytes.len() {
+                return Err(JournalError::TornTail {
+                    path: self.path.clone(),
+                    bytes: (bytes.len() - complete) as u64,
+                });
+            }
+            let records = parse(&self.path, &bytes)?.1;
+            if records.last() != Some(&self.last) {
+                return Err(JournalError::Inconsistent {
+                    path: self.path.clone(),
+                    line: records.len(),
+                    message: "the journal changed while its writer was open".into(),
+                });
+            }
+            Ok(records)
+        })();
+        // Attempt restoration even if reading or parsing failed. Either failure
+        // is returned to the caller, which latches the existing broken state.
+        let restored = self.file.seek(SeekFrom::Start(position)).map_err(io);
+        let records = read?;
+        restored?;
+        Ok(records)
+    }
+
     /// Append one record, after checking that the reader would accept it.
     /// A `flowed` record is checked against `base`, the state, horizon and
     /// reach ([`reach`]) of the record it names, as the reader finds them.
@@ -804,24 +842,54 @@ fn mark_broken(path: &Path, reason: &str) {
 
 /// Open `path` for reading and appending, and lock it.
 fn open_locked(path: &Path) -> Result<File, JournalError> {
-    let file = OpenOptions::new()
-        .read(true)
-        .append(true)
-        .open(path)
-        .map_err(|error| match error.kind() {
+    open_locked_mode(path, false)
+}
+
+/// Only manual repair needs truncation rights; its handle never leaves repair.
+fn open_locked_mode(path: &Path, repair: bool) -> Result<File, JournalError> {
+    let mut options = OpenOptions::new();
+    options.read(true).write(repair).append(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        // Atomically exclude other writers and delete/rename handles while
+        // allowing read-only inspection. Windows byte locks also block the
+        // locking process's separate inspection handles.
+        options.share_mode(0x0000_0001); // FILE_SHARE_READ
+        if repair {
+            // Windows append mode omits FILE_WRITE_DATA, which set_len needs.
+            // Repair explicitly seeks to EOF before appending its audit record.
+            options.access_mode(0xc000_0000); // GENERIC_READ | GENERIC_WRITE
+        }
+    }
+    let file = options.open(path).map_err(|error| {
+        #[cfg(windows)]
+        if error.raw_os_error() == Some(32) {
+            // ERROR_SHARING_VIOLATION: another incompatible handle is open.
+            return JournalError::Locked(path.to_owned());
+        }
+        match error.kind() {
             io::ErrorKind::NotFound => JournalError::Missing(path.to_owned()),
             _ => JournalError::Io {
                 path: path.to_owned(),
                 message: error.to_string(),
             },
-        })?;
-    match file.try_lock() {
-        Ok(()) => Ok(file),
-        Err(TryLockError::WouldBlock) => Err(JournalError::Locked(path.to_owned())),
-        Err(TryLockError::Error(error)) => Err(JournalError::Io {
-            path: path.to_owned(),
-            message: format!("locking: {error}"),
-        }),
+        }
+    })?;
+    #[cfg(windows)]
+    {
+        Ok(file)
+    }
+    #[cfg(not(windows))]
+    {
+        match file.try_lock() {
+            Ok(()) => Ok(file),
+            Err(TryLockError::WouldBlock) => Err(JournalError::Locked(path.to_owned())),
+            Err(TryLockError::Error(error)) => Err(JournalError::Io {
+                path: path.to_owned(),
+                message: format!("locking: {error}"),
+            }),
+        }
     }
 }
 
@@ -1668,7 +1736,7 @@ impl PersistentRisk {
         at: Timestamp,
         note: &str,
     ) -> Result<u64, JournalError> {
-        let mut file = open_locked(path)?;
+        let mut file = open_locked_mode(path, true)?;
         let (bytes, complete) = read_all(path, &mut file)?;
         if complete == bytes.len() {
             // Nothing to cut; still refuse a journal of other limits or
@@ -1690,6 +1758,7 @@ impl PersistentRisk {
         };
         file.set_len(complete as u64).map_err(io)?;
         file.sync_all().map_err(io)?;
+        file.seek(SeekFrom::End(0)).map_err(io)?;
         let cut = (bytes.len() - complete) as u64;
         // Still under the same lock.
         let mut risk = Self::from_records(path, file, limits, records, checks)?;
@@ -2431,7 +2500,9 @@ impl PersistentRisk {
     #[must_use]
     pub fn with_flows(mut self) -> Self {
         let mut book = FlowBook::default();
-        let rebuilt = Self::read(&self.journal.path)
+        let rebuilt = self
+            .journal
+            .records()
             .map_err(|error| error.to_string())
             .and_then(|records| book.rebuild(&self.journal.limits, &records));
         if let Err(error) = rebuilt {
@@ -3113,7 +3184,7 @@ mod tests {
             );
             assert_eq!(without_flows.engine.snapshot(), snapshot);
             assert_eq!(fs::read(dir.journal()).unwrap(), bytes);
-            if stopped {
+            let forged = if stopped {
                 let mut cleared = without_flows.engine.clone();
                 cleared.resume_after_review(at(4 * HOUR), dec!(10000));
                 let event = JournalEvent::ResumedAfterReview {
@@ -3144,11 +3215,18 @@ mod tests {
                 .unwrap();
                 let mut forged = bytes.clone();
                 forged.extend_from_slice(line.as_bytes());
+                Some(forged)
+            } else {
+                None
+            };
+            drop(without_flows);
+            // Offline corruption: close the writer after every live refusal
+            // assertion, then prove the reader rejects a forged resume.
+            if let Some(forged) = forged {
                 fs::write(dir.journal(), forged).unwrap();
                 assert!(PersistentRisk::read(&dir.journal()).is_err());
                 fs::write(dir.journal(), &bytes).unwrap();
             }
-            drop(without_flows);
             let mut restored = PersistentRisk::open(&dir.journal(), &limits())
                 .unwrap()
                 .with_flows();
@@ -3714,6 +3792,196 @@ mod tests {
     }
 
     #[test]
+    fn the_locked_writer_allows_read_inspection_and_preserves_its_cursor() {
+        let dir = TestDir::new("read-locked");
+        let mut risk = journal_with(&dir, &[dec!(2200)]);
+        let position = risk.journal.file.stream_position().unwrap();
+        let inspected = PersistentRisk::read(&dir.journal()).unwrap();
+        assert_eq!(risk.journal.records().unwrap(), inspected);
+        assert_eq!(risk.journal.file.stream_position().unwrap(), position);
+        assert_eq!(inspected.last(), Some(&risk.journal.last));
+        // Even after a read/seek, an ordinary writer must append at EOF.
+        risk.journal.file.seek(SeekFrom::Start(0)).unwrap();
+        assert_eq!(
+            PersistentRisk::open(&dir.journal(), &limits()).unwrap_err(),
+            JournalError::Locked(dir.journal())
+        );
+        risk.engine.observe(at(2 * HOUR), dec!(2400));
+        risk.commit(at(2 * HOUR), JournalEvent::Updated).unwrap();
+        drop(risk);
+        assert_eq!(
+            PersistentRisk::open(&dir.journal(), &limits())
+                .unwrap()
+                .engine()
+                .peak(),
+            dec!(2400)
+        );
+    }
+
+    #[test]
+    fn rebuilding_flows_keeps_the_writer_and_appends_after_the_existing_records() {
+        let dir = TestDir::new("rebuild-handle");
+        let mut risk = journal_with(&dir, &[]).with_flows();
+        let empty = VenueView::default();
+        let first =
+            risk.observe_view_at(at(0), [(String::new(), 0)].into(), dec!(2000), &empty, true);
+        assert!(first.journal_error.is_none());
+        let flow = Flow {
+            time_ms: HOUR,
+            amount: dec!(100),
+            id: "deposit-on-held-handle".into(),
+            dex: String::new(),
+            between: false,
+            value: Some(flows::ValueRange::cash_exact(dec!(2000))),
+        };
+        risk.apply_flow(at(HOUR), &flow).unwrap();
+        // Hand calculation: 2,000 cash + 100 deposit = 2,100; no trade PnL.
+        let out = risk.observe_view_at(
+            at(2 * HOUR),
+            [(String::new(), 2 * HOUR)].into(),
+            dec!(2100),
+            &empty,
+            true,
+        );
+        assert!(out.journal_error.is_none());
+        let before = risk.engine.snapshot();
+        let position = risk.journal.file.stream_position().unwrap();
+        let mut rebuilt = risk.with_flows();
+        assert!(rebuilt.broken.is_none());
+        assert!(rebuilt.knows_flow(&flow.id));
+        assert_eq!(rebuilt.engine.snapshot(), before);
+        assert_eq!(rebuilt.journal.file.stream_position().unwrap(), position);
+        assert!(matches!(
+            PersistentRisk::open(&dir.journal(), &limits()),
+            Err(JournalError::Locked(_))
+        ));
+        let out = rebuilt.observe_view_at(
+            at(3 * HOUR),
+            [(String::new(), 3 * HOUR)].into(),
+            dec!(2100),
+            &empty,
+            true,
+        );
+        assert!(out.journal_error.is_none());
+        drop(rebuilt);
+        let restarted = PersistentRisk::open(&dir.journal(), &limits())
+            .unwrap()
+            .with_flows();
+        assert!(restarted.broken.is_none());
+        assert!(restarted.knows_flow(&flow.id));
+        assert_eq!(restarted.engine.peak(), dec!(2100));
+    }
+
+    #[test]
+    fn rebuilding_a_damaged_journal_restores_the_cursor_and_blocks_entries() {
+        for damage in [b"{".as_slice(), b"not-json\n".as_slice()] {
+            let dir = TestDir::new("rebuild-damaged");
+            let mut risk = journal_with(&dir, &[]);
+            risk.journal.file.write_all(damage).unwrap();
+            risk.journal.file.sync_data().unwrap();
+            let position = risk.journal.file.stream_position().unwrap();
+            assert!(risk.journal.records().is_err());
+            assert_eq!(risk.journal.file.stream_position().unwrap(), position);
+            let mut rebuilt = risk.with_flows();
+            assert!(matches!(
+                rebuilt.check_ready(),
+                Err(JournalError::Broken(_))
+            ));
+            assert_eq!(rebuilt.journal.file.stream_position().unwrap(), position);
+        }
+    }
+
+    #[test]
+    fn reconstruction_refuses_a_valid_record_not_written_by_its_writer() {
+        let dir = TestDir::new("rebuild-other-writer");
+        let mut risk = journal_with(&dir, &[]);
+        let (_, line) = JournalRecord::new(
+            risk.journal.last.seq + 1,
+            at(HOUR),
+            JournalEvent::Updated,
+            risk.engine.snapshot(),
+            risk.journal.last.check.clone(),
+            FlowFields::default(),
+        )
+        .unwrap();
+        risk.journal.file.write_all(line.as_bytes()).unwrap();
+        risk.journal.file.sync_data().unwrap();
+        let position = risk.journal.file.stream_position().unwrap();
+        assert!(matches!(
+            risk.journal.records(),
+            Err(JournalError::Inconsistent { .. })
+        ));
+        assert_eq!(risk.journal.file.stream_position().unwrap(), position);
+        assert!(matches!(
+            risk.with_flows().check_ready(),
+            Err(JournalError::Broken(_))
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn flow_reconstruction_uses_the_open_journal_after_path_substitution() {
+        let dir = TestDir::new("rebuild-namespace");
+        let risk = journal_with(&dir, &[]);
+        let state = risk.engine.snapshot();
+        let original = dir.0.join("original.jsonl");
+        fs::rename(dir.journal(), &original).unwrap();
+        fs::write(dir.journal(), "not the opened journal\n").unwrap();
+        let rebuilt = risk.with_flows();
+        assert!(rebuilt.broken.is_none());
+        assert_eq!(rebuilt.engine.snapshot(), state);
+        assert!(PersistentRisk::read(&dir.journal()).is_err());
+        assert!(PersistentRisk::read(&original).is_ok());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_writer_excludes_legacy_write_and_delete_handles_in_both_orders() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let dir = TestDir::new("windows-writer-sharing");
+        drop(journal_with(&dir, &[]));
+        // The previous implementation opened read+append with default sharing
+        // and then took std's exclusive byte lock. Both versions exclude one another.
+        let legacy = OpenOptions::new()
+            .read(true)
+            .append(true)
+            .open(dir.journal())
+            .unwrap();
+        legacy.try_lock().unwrap();
+        assert_eq!(
+            open_locked(&dir.journal()).unwrap_err(),
+            JournalError::Locked(dir.journal())
+        );
+        drop(legacy);
+        let writer = open_locked(&dir.journal()).unwrap();
+        assert!(
+            OpenOptions::new()
+                .read(true)
+                .append(true)
+                .open(dir.journal())
+                .is_err()
+        );
+        assert!(fs::rename(dir.journal(), dir.0.join("renamed")).is_err());
+        assert!(fs::remove_file(dir.journal()).is_err());
+        assert!(PersistentRisk::read(&dir.journal()).is_ok());
+        drop(writer);
+        for access in [0x4000_0000, 0x0001_0000] {
+            // GENERIC_WRITE, DELETE
+            let incompatible = OpenOptions::new()
+                .access_mode(access)
+                .share_mode(7)
+                .open(dir.journal())
+                .unwrap();
+            assert_eq!(
+                open_locked(&dir.journal()).unwrap_err(),
+                JournalError::Locked(dir.journal())
+            );
+            drop(incompatible);
+            assert!(open_locked(&dir.journal()).is_ok());
+        }
+    }
+
+    #[test]
     fn other_limits_are_refused() {
         let dir = TestDir::new("limits");
         drop(journal_with(&dir, &[]));
@@ -3731,7 +3999,8 @@ mod tests {
     fn a_torn_record_is_refused_until_a_person_repairs_it() {
         let dir = TestDir::new("torn");
         drop(journal_with(&dir, &[dec!(1880)]));
-        let mut torn = fs::read(dir.journal()).unwrap();
+        let complete = fs::read(dir.journal()).unwrap();
+        let mut torn = complete.clone();
         // 51 bytes of a third record whose write was cut short.
         torn.extend_from_slice(br#"{"format":"zunder-risk-journal","version":1,"seq":3"#);
         fs::write(dir.journal(), &torn).unwrap();
@@ -3747,6 +4016,11 @@ mod tests {
         let cut = PersistentRisk::repair_torn_tail(&dir.journal(), &limits(), at(HOUR), "repaired")
             .unwrap();
         assert_eq!(cut, 51);
+        let repaired = fs::read(dir.journal()).unwrap();
+        assert!(repaired.starts_with(&complete));
+        let added = &repaired[complete.len()..];
+        assert!(!added.contains(&0));
+        assert_eq!(added.iter().filter(|byte| **byte == b'\n').count(), 1);
         let reopened = PersistentRisk::open(&dir.journal(), &limits()).unwrap();
         // The halt in the last complete record is still there.
         assert_eq!(reopened.state(), RiskState::HaltedForDay { day: 0 });
@@ -3762,6 +4036,21 @@ mod tests {
             PersistentRisk::repair_torn_tail(&dir.journal(), &limits(), at(HOUR), "again").unwrap(),
             0
         );
+    }
+
+    #[test]
+    fn repair_refuses_a_live_writer_without_mutation() {
+        let dir = TestDir::new("repair-live-writer");
+        let risk = journal_with(&dir, &[dec!(1880)]);
+        let before = fs::read(dir.journal()).unwrap();
+        assert_eq!(
+            PersistentRisk::repair_torn_tail(&dir.journal(), &limits(), at(HOUR), "repair")
+                .unwrap_err(),
+            JournalError::Locked(dir.journal())
+        );
+        assert_eq!(fs::read(dir.journal()).unwrap(), before);
+        // 2,000 - 120 = 1,880; the daily-loss halt must survive refused repair.
+        assert_eq!(risk.state(), RiskState::HaltedForDay { day: 0 });
     }
 
     #[test]

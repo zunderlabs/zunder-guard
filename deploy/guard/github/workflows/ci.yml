@@ -41,7 +41,7 @@ jobs:
           persist-credentials: false
       - run: rustup toolchain install
       - run: cargo clippy --locked --all-targets -p zunder-venue -p zunder-guard-core -p zunder-guard-mcp -p zunder-guard-rules -p zunder-guard -p zunder-redteam -- -D warnings
-      - run: cargo test --locked -p zunder-venue -p zunder-guard-core -p zunder-guard-mcp -p zunder-guard-rules -p zunder-guard
+      - run: cargo test --no-fail-fast --locked -p zunder-venue -p zunder-guard-core -p zunder-guard-mcp -p zunder-guard-rules -p zunder-guard
       - name: A local release from this build (the test double signs it)
         shell: bash
         run: |
