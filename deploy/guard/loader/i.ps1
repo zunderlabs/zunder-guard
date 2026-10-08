@@ -186,7 +186,7 @@ function Assert-ZgHelperPolicy {
 }
 
 function Get-ZgLoaderRecordNetwork($Record) {
-  $mode = if ($Record.PSObject.Properties.Name -contains 'mode') { $Record.mode } else { 'mainnet' }
+  $mode = if ($null -ne $Record.PSObject.Properties['mode']) { $Record.mode } else { 'mainnet' }
   if ($mode -cnotin @('mainnet','testnet')) { throw 'Unsupported owned sending network.' }
   return $mode
 }

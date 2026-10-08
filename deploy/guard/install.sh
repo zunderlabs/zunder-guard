@@ -131,8 +131,9 @@ elif [ -n "$VOLUME" ]; then
 fi
 
 if [ "$KEY_STDIN" -eq 1 ]; then
-  [ "$NETWORK" = testnet ] && [ "$NONINTERACTIVE" -eq 1 ] && [ "$NO_SERVICE" -eq 0 ] \
-    || die "--key-stdin requires explicit testnet, non-interactive managed setup"
+  if ! { [ "$NETWORK" = testnet ] && [ "$NONINTERACTIVE" -eq 1 ] && [ "$NO_SERVICE" -eq 0 ]; }; then
+    die "--key-stdin requires explicit testnet, non-interactive managed setup"
+  fi
   [ -z "$KEY_FILE$CONFIRM" ] || die "testnet private stdin cannot be combined with a key file or mainnet consent"
 fi
 if [ "$NETWORK" = testnet ] && [ -n "$CONFIRM" ]; then

@@ -163,7 +163,7 @@ function Assert-ZgHelperPolicy {
 
 function Get-ZgRecordNetwork($Record) {
   # A missing field is the immutable legacy Mainnet transaction schema.
-  $mode = if ($Record.PSObject.Properties.Name -contains 'mode') { $Record.mode } else { 'mainnet' }
+  $mode = if ($null -ne $Record.PSObject.Properties['mode']) { $Record.mode } else { 'mainnet' }
   if ($mode -cnotin @('mainnet','testnet')) { throw 'Unsupported owned sending network.' }
   return $mode
 }
