@@ -189,7 +189,8 @@ try {
   Refuses { & $mutant } 'repeated init mutation caught by fixture pairing invariant'
 } finally { Set-Item Function:Get-ZgHash $realHash; Remove-Case }
 # Archive member refusal executes the actual extraction predicate before any binary.
-# Windows PowerShell 5.1 does not preload ZipFile for this synthetic archive fixture.
+# Windows PowerShell 5.1 needs both ZipFile and ZipArchiveMode assemblies loaded explicitly.
+[Reflection.Assembly]::Load('System.IO.Compression, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089') | Microsoft.PowerShell.Core\Out-Null
 [Reflection.Assembly]::Load('System.IO.Compression.FileSystem, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089') | Microsoft.PowerShell.Core\Out-Null
 New-Case
 try {

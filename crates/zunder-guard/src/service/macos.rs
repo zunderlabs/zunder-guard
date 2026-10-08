@@ -443,12 +443,12 @@ pub fn run(binding: &ServiceBinding, binding_path: &Path) -> Result<()> {
             drop(pipe.take());
             stopping = Some(Instant::now());
         }
-        if let Some(started) = stopping {
-            if started.elapsed() >= Duration::from_secs(30) {
-                let _ = killpg(group, Signal::SIGKILL);
-                let _ = child.wait();
-                return Err(refused("supervised Guard exceeded its shutdown deadline"));
-            }
+        if let Some(started) = stopping
+            && started.elapsed() >= Duration::from_secs(30)
+        {
+            let _ = killpg(group, Signal::SIGKILL);
+            let _ = child.wait();
+            return Err(refused("supervised Guard exceeded its shutdown deadline"));
         }
         std::thread::sleep(Duration::from_millis(100));
     }

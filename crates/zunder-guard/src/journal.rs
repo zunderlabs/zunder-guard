@@ -1942,13 +1942,22 @@ mod crash_tests {
 
     /// A disk whose writes wait until the test opens the gate.
     #[derive(Clone)]
-    struct GatedStorage(MemStorage, Arc<(Mutex<bool>, std::sync::Condvar)>);
+    struct GatedStorage(
+        MemStorage,
+        Arc<(Mutex<bool>, std::sync::Condvar)>,
+        Option<std::sync::mpsc::SyncSender<()>>,
+    );
 
     impl Storage for GatedStorage {
         fn write_at(&mut self, offset: u64, bytes: &[u8]) -> io::Result<()> {
             let (open, opened) = &*self.1;
             let mut is_open = open.lock().unwrap();
             while !*is_open {
+                if let Some(blocked) = self.2.take() {
+                    blocked
+                        .send(())
+                        .expect("test awaits writer-blocked handshake");
+                }
                 is_open = opened.wait(is_open).unwrap();
             }
             drop(is_open);
@@ -1991,7 +2000,7 @@ mod crash_tests {
     fn a_writer_behind_drops_and_refuses_but_never_breaks() {
         let gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
         let disk = Arc::new(Mutex::new(Disk::default()));
-        let storage = GatedStorage(MemStorage(disk), gate.clone());
+        let storage = GatedStorage(MemStorage(disk), gate.clone(), None);
         let empty = read_records(io::empty(), Path::new("image")).unwrap();
         // The step large enough that the writer's first write is the
         // record (allocation is not gated).
@@ -2093,6 +2102,7 @@ mod crash_tests {
         let storage = GatedStorage(
             MemStorage(Arc::new(Mutex::new(Disk::default()))),
             gate.clone(),
+            None,
         );
         let empty = read_records(io::empty(), Path::new("image")).unwrap();
         let mut journal = DecisionJournal::start(Path::new("image"), empty, 0, storage, 1 << 20);
@@ -2148,7 +2158,7 @@ mod crash_tests {
     fn a_stop_with_the_queue_full_waits_for_the_writer() {
         let gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
         let disk = Arc::new(Mutex::new(Disk::default()));
-        let storage = GatedStorage(MemStorage(disk.clone()), gate.clone());
+        let storage = GatedStorage(MemStorage(disk.clone()), gate.clone(), None);
         let empty = read_records(io::empty(), Path::new("image")).unwrap();
         let mut journal = DecisionJournal::start(Path::new("image"), empty, 0, storage, 1 << 20);
         let _open = OpenOnDrop(gate.clone());
@@ -2183,33 +2193,82 @@ mod crash_tests {
             text: "intent".into(),
         };
         let behind = |gate: &Arc<(Mutex<bool>, std::sync::Condvar)>| {
+            let (blocked, writer_blocked) = std::sync::mpsc::sync_channel(1);
             let storage = GatedStorage(
                 MemStorage(Arc::new(Mutex::new(Disk::default()))),
                 gate.clone(),
+                Some(blocked),
             );
             let empty = read_records(io::empty(), Path::new("image")).unwrap();
             let mut journal =
                 DecisionJournal::start(Path::new("image"), empty, 0, storage, 1 << 20);
-            while journal
-                .append(1, EventBody::Error { text: "x".into() })
-                .is_ok()
-            {}
+            let open_on_failure = OpenOnDrop(gate.clone());
+            // Seed one write and wait until storage actually holds the writer.
+            // A full queue alone is insufficient: its first batch may still drain.
             journal
+                .append(
+                    1,
+                    EventBody::Error {
+                        text: "seed".into(),
+                    },
+                )
+                .unwrap();
+            if let Err(error) = writer_blocked.recv_timeout(std::time::Duration::from_secs(5)) {
+                open_gate(gate); // Never deadlock journal drop on a failed handshake.
+                panic!("writer did not reach the closed storage gate: {error}");
+            }
+            for _ in 0..QUEUE {
+                journal
+                    .append(1, EventBody::Error { text: "x".into() })
+                    .unwrap();
+            }
+            assert!(matches!(
+                journal.append(
+                    1,
+                    EventBody::Error {
+                        text: "full".into()
+                    }
+                ),
+                Err(JournalError::Busy)
+            ));
+            (journal, open_on_failure)
         };
         // Caught up after 300 ms: written.
         let gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
-        let mut journal = behind(&gate);
-        let _open = OpenOnDrop(gate.clone());
+        let (mut journal, _open) = behind(&gate);
+        let waiting_runtime = runtime();
+        let (pending, first_pending) = std::sync::mpsc::sync_channel(1);
         let opener = {
             let gate = gate.clone();
             std::thread::spawn(move || {
+                if let Err(error) = first_pending.recv_timeout(std::time::Duration::from_secs(5)) {
+                    open_gate(&gate);
+                    panic!("intent was not polled to Pending: {error}");
+                }
                 std::thread::sleep(std::time::Duration::from_millis(300));
                 open_gate(&gate);
             })
         };
         let started = std::time::Instant::now();
-        let seq = runtime()
-            .block_on(journal.append_durable_waiting(2, intent()))
+        let seq = waiting_runtime
+            .block_on(async {
+                use std::future::Future;
+                let mut waiting = std::pin::pin!(journal.append_durable_waiting(2, intent()));
+                let mut first = true;
+                std::future::poll_fn(|context| {
+                    let result = waiting.as_mut().poll(context);
+                    if first {
+                        assert!(
+                            result.is_pending(),
+                            "protective intent must first wait for room"
+                        );
+                        pending.send(()).expect("opener awaits first Pending");
+                        first = false;
+                    }
+                    result
+                })
+                .await
+            })
             .unwrap();
         assert!(started.elapsed() >= std::time::Duration::from_millis(250));
         assert_eq!(seq, journal.last_seq());
@@ -2219,10 +2278,10 @@ mod crash_tests {
         opener.join().unwrap();
         // Never caught up: broken after the deadline.
         let gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
-        let mut journal = behind(&gate);
-        let _open = OpenOnDrop(gate.clone());
+        let (mut journal, _open) = behind(&gate);
+        let deadline_runtime = runtime();
         let started = std::time::Instant::now();
-        let result = runtime().block_on(journal.append_durable_waiting(2, intent()));
+        let result = deadline_runtime.block_on(journal.append_durable_waiting(2, intent()));
         assert!(matches!(result, Err(JournalError::Broken(_))), "{result:?}");
         assert!(journal.is_broken());
         let waited = started.elapsed();
