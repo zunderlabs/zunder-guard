@@ -32,7 +32,7 @@ def render(commit, wallet, kms_key_arn, destination):
     statements = [
         dict(Sid='ExactTestnetKey', Effect='Allow', Action=['ssm:GetParameter'], Resource=['arn:aws:ssm:'+REGION+':'+ACCOUNT+':parameter/zunder/testnet/api-wallet-key']),
         dict(Sid='FixedDocument', Effect='Allow', Action=['ssm:SendCommand'], Resource=['arn:aws:ssm:'+REGION+':'+ACCOUNT+':document/ZunderReleaseTestnetControl', 'arn:aws:ec2:'+REGION+':'+ACCOUNT+':instance/i-0ca66c349ad743928']),
-        dict(Sid='CommandReadback', Effect='Allow', Action=['ssm:GetCommandInvocation'], Resource='*'),
+        dict(Sid='CommandReadback', Effect='Allow', Action=['ssm:GetCommandInvocation'], Resource='*', Condition={'StringEquals': {'aws:RequestedRegion': REGION}}),
         dict(Sid='DenySecretMutationAndOtherSecrets', Effect='Deny', Action=['ssm:PutParameter', 'ssm:DeleteParameter', 'ssm:GetParameters', 'ssm:GetParametersByPath', 'ssm:GetParameterHistory', 'secretsmanager:*'], Resource='*'),
         dict(Sid='DenyMainnetParameter', Effect='Deny', Action=['ssm:GetParameter'], NotResource=['arn:aws:ssm:'+REGION+':'+ACCOUNT+':parameter/zunder/testnet/api-wallet-key'])
     ]

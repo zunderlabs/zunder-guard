@@ -64,7 +64,7 @@ Account `436632189317`, region `eu-central-1`:
 - Allow `ssm:GetParameter` only for `/zunder/testnet/api-wallet-key`.
 - The parameter uses customer-managed KMS key `arn:aws:kms:eu-central-1:436632189317:key/20d7fdda-950b-4101-a391-b3749f892939`, alias `zunder-exec-testnet`. Allow `kms:Decrypt` only for that key, through eu-central-1 SSM, with the exact parameter ARN encryption context.
 - Allow `ssm:SendCommand` only for `ZunderReleaseTestnetControl` and existing instance `i-0ca66c349ad743928`. No general shell document, session, instance creation or document mutation permission.
-- `ssm:GetCommandInvocation` requires `Resource:*`, because AWS does not support resource-level scoping for that readback operation. Consequently the role could read other same-region command outputs. The implementation requests only its own returned command ID. Removing that residual capability would require a separate readback broker.
+- `ssm:GetCommandInvocation` requires `Resource:*`, because AWS does not support resource-level scoping for that readback operation. An explicit `StringEquals aws:RequestedRegion=eu-central-1` condition restricts this readback grant to that region. The role could still read other command outputs in eu-central-1. The implementation requests only its own returned command ID. Removing that residual capability would require a separate readback broker.
 - Create document version 1 from exact `ssm-document.json`. Read back AWS's actual document content/hash and match `policy.json` before enabling. Each call supplies both exact version and SHA256.
 - Require SSM Agent >=3.3.2746.0 for ENV_VAR interpolation. No legacy string-substitution fallback is provided.
 

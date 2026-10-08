@@ -74,6 +74,16 @@ class Tests(unittest.TestCase):
             p=json.loads((out/'policy.json').read_text());self.assertEqual(p['approved_public_api_wallet'],WALLET)
             self.assertEqual(p['aws_credential_trust_scope'],'canonical-repository-and-environment')
             self.assertNotIn('automation_commit',p)
+    def test_command_readback_is_region_limited_and_static_policy_matches_renderer(self):
+        static=json.loads((ROOT/'aws-permissions-policy.json').read_text())
+        readback=[s for s in static['Statement'] if s['Sid']=='CommandReadback']
+        self.assertEqual(readback,[dict(Sid='CommandReadback',Effect='Allow',Action=['ssm:GetCommandInvocation'],
+            Resource='*',Condition={'StringEquals':{'aws:RequestedRegion':'eu-central-1'}})])
+        kms=next(s['Resource'][0] for s in static['Statement'] if s['Sid']=='DecryptExactTestnetKeyOnly')
+        with tempfile.TemporaryDirectory(dir=ROOT) as temp:
+            out=Path(temp)/'out';r.render(SHA,WALLET,kms,out)
+            self.assertEqual(json.loads((out/'aws-permissions-policy.json').read_text()),static)
+
     def test_render_rejects_bad_inputs(self):
         for commit,wallet,kms in (('main',WALLET,'alias/aws/ssm'),(SHA,WALLET+';id','alias/aws/ssm'),(SHA,'0x'+'0'*40,'alias/aws/ssm'),(SHA,WALLET,'arn:evil')):
             with tempfile.TemporaryDirectory(dir=ROOT) as temp, self.assertRaises(AssertionError):r.render(commit,wallet,kms,Path(temp)/'out')
