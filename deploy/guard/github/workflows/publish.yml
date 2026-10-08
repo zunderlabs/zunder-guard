@@ -5,8 +5,8 @@
 # release.yml at this tag, and every file it hands on against SHA256SUMS. Then, each only when
 # its repository variable is "enabled":
 #   HOMEBREW_TAP  opens a pull request on zunderlabs/homebrew-tap with the rendered formula
-#                 (needs the secret HOMEBREW_TAP_TOKEN: a fine-grained token, contents and pull
-#                 requests write on that one repository);
+#                 (needs HOMEBREW_APP_CLIENT_ID and HOMEBREW_APP_PRIVATE_KEY for an App installed
+#                 only on the tap, contents and pull requests write; short-lived token);
 #   WINGET        submits the manifests to microsoft/winget-pkgs with wingetcreate (needs the
 #                 secret WINGET_TOKEN: a classic token with public_repo, of the account whose
 #                 fork of winget-pkgs is used) and the variables WINGETCREATE_VERSION and
@@ -55,6 +55,9 @@ jobs:
 
   homebrew:
     needs: verify
+    concurrency:
+      group: guard-homebrew-publication
+      cancel-in-progress: false
     if: vars.HOMEBREW_TAP == 'enabled'
     permissions: {}
     runs-on: ubuntu-24.04
@@ -63,26 +66,75 @@ jobs:
         with:
           name: verified
           path: rel
+      - name: Recheck the verified formula before issuing a write token
+        id: formula-check
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fsS https://api.github.com/repos/zunderlabs/zunder-guard/releases/latest | python3 -c 'import json,os,sys; r=json.load(sys.stdin); sys.exit(0 if r.get("tag_name")==os.environ["TAG"] and not r.get("draft") and not r.get("prerelease") else "Refusing a stale or non-stable release")'
+          cd rel
+          awk '$2 == "zunder-guard.rb" { n++; line=$0 } END { if (n != 1) exit 1; print line }' SHA256SUMS | sha256sum -c -
+      - name: Mint a short-lived token for the tap only
+        id: tap-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3
+        with:
+          client-id: ${{ vars.HOMEBREW_APP_CLIENT_ID }}
+          private-key: ${{ secrets.HOMEBREW_APP_PRIVATE_KEY }}
+          owner: zunderlabs
+          repositories: homebrew-tap
+          permission-contents: write
+          permission-pull-requests: write
+          skip-token-revoke: false
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: zunderlabs/homebrew-tap
-          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          token: ${{ steps.tap-token.outputs.token }}
           path: tap
           persist-credentials: true
       - name: Pull request with the new formula
         env:
-          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          GH_TOKEN: ${{ steps.tap-token.outputs.token }}
           TAG: ${{ github.event.release.tag_name }}
         run: |
+          set -euo pipefail
+          [[ $TAG =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "invalid release tag" >&2; exit 1; }
+          curl -fsS https://api.github.com/repos/zunderlabs/zunder-guard/releases/latest | python3 -c 'import json,os,sys; r=json.load(sys.stdin); sys.exit(0 if r.get("tag_name")==os.environ["TAG"] and not r.get("draft") and not r.get("prerelease") else "Refusing a stale or non-stable release")'
           cd tap
-          git switch -c "zunder-guard-$TAG"
+          python3 - "$TAG" Formula/zunder-guard.rb <<'PYVERSION'
+          import pathlib,re,sys
+          target=tuple(map(int,sys.argv[1][1:].split('.')))
+          current=pathlib.Path(sys.argv[2])
+          if current.exists():
+              versions=re.findall(r'^  version "([0-9]+\.[0-9]+\.[0-9]+)"$',current.read_text(),re.MULTILINE)
+              if len(versions)!=1 or tuple(map(int,versions[0].split('.')))>target:
+                  raise SystemExit('Refusing an ambiguous formula or a tap downgrade')
+          PYVERSION
+          if cmp -s ../rel/zunder-guard.rb Formula/zunder-guard.rb; then
+            echo "The tap default branch already contains this verified formula."
+            exit 0
+          fi
+          branch="zunder-guard-$TAG"
+          remote=$(git ls-remote --heads origin "refs/heads/$branch")
+          if [ -n "$remote" ]; then
+            git fetch origin "refs/heads/$branch"
+            git switch -c "$branch" FETCH_HEAD
+          else
+            git switch -c "$branch"
+          fi
           install -D -m 0644 ../rel/zunder-guard.rb Formula/zunder-guard.rb
           git add Formula/zunder-guard.rb
-          git -c user.name="zunder-release" -c user.email="release@zunderlabs.com" \
-            commit -m "zunder-guard $TAG"
-          git push origin "zunder-guard-$TAG"
-          gh pr create --repo zunderlabs/homebrew-tap --head "zunder-guard-$TAG" \
-            --title "zunder-guard $TAG" --body "Formula rendered and checksummed by the signed release $TAG."
+          if ! git diff --cached --quiet; then
+            git -c user.name="zunder-release" -c user.email="release@zunderlabs.com" \
+              commit -m "zunder-guard $TAG"
+          fi
+          git push origin "$branch"
+          count=$(gh pr list --repo zunderlabs/homebrew-tap --head "$branch" --state open --json number --jq length)
+          if [ "$count" = 0 ]; then
+            gh pr create --repo zunderlabs/homebrew-tap --head "$branch" \
+              --title "zunder-guard $TAG" --body "Formula rendered and checksummed by the signed release $TAG."
+          fi
 
   winget:
     needs: verify
@@ -148,8 +200,41 @@ jobs:
           AWS_TEMPLATE_BUCKET: ${{ vars.AWS_TEMPLATE_BUCKET }}
         run: python3 deploy/guard/github/publish-aws-template.py --release-dir rel
 
+  installers:
+    needs: verify
+    if: >-
+      vars.INSTALLER_PUBLISH == 'enabled' &&
+      github.repository == 'zunderlabs/zunder-guard' &&
+      !github.event.release.draft && !github.event.release.prerelease
+    environment: installer-publish
+    concurrency:
+      group: guard-canonical-installers
+      cancel-in-progress: false
+    permissions:
+      contents: read
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.release.tag_name }}
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: verified
+          path: rel
+      - name: Publish and verify canonical signed installers
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_ZONE_ID: ${{ vars.CLOUDFLARE_ZONE_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_INSTALLER_TOKEN }}
+        run: python3 deploy/guard/github/publish-loaders.py --release-dir rel --tag "$TAG"
+
   latest:
     needs: verify
+    concurrency:
+      group: guard-image-latest-publication
+      cancel-in-progress: false
     permissions:
       packages: write
     runs-on: ubuntu-24.04
@@ -167,5 +252,7 @@ jobs:
       - env:
           TAG: ${{ github.event.release.tag_name }}
         run: |
+          set -euo pipefail
+          curl -fsS https://api.github.com/repos/zunderlabs/zunder-guard/releases/latest | python3 -c 'import json,os,sys; r=json.load(sys.stdin); sys.exit(0 if r.get("tag_name")==os.environ["TAG"] and not r.get("draft") and not r.get("prerelease") else "Refusing a stale or non-stable release")'
           REF=$(cat "rel/zunder-guard-$TAG.image.txt")
           docker buildx imagetools create -t "$IMAGE:latest" "$REF"

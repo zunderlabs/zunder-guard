@@ -207,7 +207,9 @@ jobs:
           python3 -m pip install PyYAML==6.0.3
           python3 deploy/guard/test/aws_template_test.py
       - name: Publication gate regressions (no network or signing)
-        run: python3 -B deploy/guard/test/release-policy.py
+        run: |
+          python3 -B deploy/guard/test/release-policy.py
+          python3 -B deploy/guard/github/test_publish_loaders.py
       - name: actionlint
         run: |
           docker run --rm -v "$PWD:/repo:ro" -w /repo rhysd/actionlint:1.7.12 \

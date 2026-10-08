@@ -1,0 +1,126 @@
+# Bootstrap this in zunderlabs/homebrew-tap before enabling automated formula PRs.
+# No secrets or write token: the signed upstream formula must match before Homebrew runs it.
+name: verify-formula
+on:
+  pull_request:
+    paths:
+      - Formula/zunder-guard.rb
+      - .github/workflows/verify.yml
+  push:
+    branches: [main]
+    paths:
+      - Formula/zunder-guard.rb
+      - .github/workflows/verify.yml
+permissions:
+  contents: read
+jobs:
+  verified-native-install:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, macos-15-intel, ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: v3.1.3
+      - name: Match the exact signed release formula
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG=$(python3 - <<'PY'
+          import pathlib, re
+          text = pathlib.Path('Formula/zunder-guard.rb').read_text()
+          versions = re.findall(r'^  version "([0-9]+\.[0-9]+\.[0-9]+)"$', text, re.MULTILINE)
+          if len(versions) != 1:
+              raise SystemExit('expected exactly one stable formula version')
+          print('v' + versions[0])
+          PY
+          )
+          export TAG
+          curl -fsS https://api.github.com/repos/zunderlabs/zunder-guard/releases/latest | python3 -c 'import json,os,sys; r=json.load(sys.stdin); sys.exit(0 if r.get("tag_name")==os.environ["TAG"] and not r.get("draft") and not r.get("prerelease") else "Refusing a stale or non-stable release")'
+          gh release download "$TAG" --repo zunderlabs/zunder-guard --dir verified \
+            --pattern zunder-guard.rb --pattern SHA256SUMS --pattern SHA256SUMS.sigstore.json
+          cosign verify-blob --bundle verified/SHA256SUMS.sigstore.json \
+            --certificate-identity "https://github.com/zunderlabs/zunder-guard/.github/workflows/release.yml@refs/tags/$TAG" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com verified/SHA256SUMS
+          (cd verified && awk '$2 == "zunder-guard.rb" { n++; line=$0 } END { if (n != 1) exit 1; print line }' SHA256SUMS | shasum -a 256 -c -)
+          cmp verified/zunder-guard.rb Formula/zunder-guard.rb
+      - uses: Homebrew/actions/setup-homebrew@9ffcbcc2c89631400988e8d4b1e3ac17dbbe3fe9
+        with:
+          stable: true
+      # Existing installer-test account: public reads only, never keys or orders.
+      - name: Check the controlled paper fixture is still usable
+        shell: bash
+        env:
+          PAPER_ACCOUNT: '0x67f7aa8fb95c47e6ea9c517b623e0701cbf9d9ba'
+        run: |
+          python3 - <<'PYCODE'
+          import json, os, urllib.request
+          from decimal import Decimal
+          account = os.environ['PAPER_ACCOUNT']
+          def info(kind):
+              request = urllib.request.Request('https://api.hyperliquid.xyz/info',
+                  data=json.dumps({'type': kind, 'user': account}).encode(),
+                  headers={'Content-Type': 'application/json'}, method='POST')
+              with urllib.request.urlopen(request, timeout=20) as response:
+                  return json.load(response)
+          if info('userAbstraction') != 'disabled':
+              raise SystemExit('Paper fixture is no longer in standard mode; no installation test run')
+          equity = Decimal(info('clearinghouseState')['marginSummary']['accountValue'])
+          if not equity.is_finite() or equity <= 0:
+              raise SystemExit('Paper fixture needs positive equity; no installation test run')
+          print('Read-only paper fixture precheck passed; no key or order path')
+          PYCODE
+      - name: Install, pair, restart and preserve state through reinstall
+        env:
+          PAPER_ACCOUNT: '0x67f7aa8fb95c47e6ea9c517b623e0701cbf9d9ba'
+        shell: bash
+        run: |
+          set -euo pipefail
+          brew tap --custom-remote zunderlabs/tap "$PWD"
+          brew audit --strict --online zunderlabs/tap/zunder-guard
+          brew install zunderlabs/tap/zunder-guard
+          brew test zunderlabs/tap/zunder-guard
+          zunder-guard --version
+          ZUNDER_GUARD_HOME="$(brew --prefix)/var/zunder-guard"
+          export ZUNDER_GUARD_HOME
+          if [ "$RUNNER_OS" = Linux ]; then
+            sudo loginctl enable-linger "$USER"
+            sudo systemctl start "user@$(id -u).service"
+            XDG_RUNTIME_DIR="/run/user/$(id -u)"
+            export XDG_RUNTIME_DIR
+            export DBUS_SESSION_BUS_ADDRESS="unix:path=$XDG_RUNTIME_DIR/bus"
+          fi
+          trap 'brew services stop zunder-guard >/dev/null 2>&1 || true' EXIT
+          zunder-guard init --non-interactive --network paper --account "$PAPER_ACCOUNT" --rules zr1_eyJ2IjoxfQ > "$RUNNER_TEMP/guard-init.txt"
+          # Generated client credentials are disposable; never emit them into CI logs.
+          zunder-guard pair > "$RUNNER_TEMP/guard-pairing.txt"
+          shasum -a 256 "$ZUNDER_GUARD_HOME/guard.toml" > "$RUNNER_TEMP/guard-config.sha256"
+          brew services start zunder-guard
+          ready() {
+            for _attempt in $(seq 1 30); do
+              if zunder-guard health >/dev/null 2>&1; then return 0; fi
+              sleep 1
+            done
+            return 1
+          }
+          ready
+          zunder-guard status --json > "$RUNNER_TEMP/guard-status.json"
+          brew services restart zunder-guard
+          ready
+          brew services stop zunder-guard
+          # First release has no prior version: prove same-version reinstall honestly.
+          brew reinstall zunderlabs/tap/zunder-guard
+          shasum -a 256 -c "$RUNNER_TEMP/guard-config.sha256"
+          brew services start zunder-guard
+          ready
+          brew services stop zunder-guard
+          brew uninstall zunder-guard
+          shasum -a 256 -c "$RUNNER_TEMP/guard-config.sha256"
+          rm -f "$RUNNER_TEMP/guard-pairing.txt" "$RUNNER_TEMP/guard-init.txt"
