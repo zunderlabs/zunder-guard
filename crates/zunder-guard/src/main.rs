@@ -118,6 +118,11 @@ enum Command {
     /// the venue and stored), a client key for the bot and a pairing code
     /// shown once, the risk journal. Interactive on a terminal.
     Init(InitArgs),
+    /// Manage an explicitly admitted OS mainnet supervisor.
+    Service {
+        #[command(subcommand)]
+        command: ServiceCommand,
+    },
     /// Print one configured value: network (the mode: paper, testnet or
     /// mainnet), account, listen or rules.
     Config {
@@ -169,6 +174,86 @@ enum Command {
     Licence {
         #[command(subcommand)]
         command: LicenceCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum ServiceCommand {
+    /// Emit public admission JSON; the OS installer stores it with trusted ownership.
+    Prepare {
+        #[arg(long)]
+        credential_id: String,
+        #[arg(long)]
+        confirm_mainnet: String,
+        #[arg(long)]
+        uid: Option<u32>,
+        #[arg(long)]
+        gid: Option<u32>,
+        #[arg(long)]
+        service_name: Option<String>,
+        #[arg(long)]
+        service_sid: Option<String>,
+    },
+    /// Store a mainnet API key only in the admitted OS secure store.
+    Provision {
+        #[arg(long)]
+        binding: PathBuf,
+        #[arg(long)]
+        confirm_mainnet: String,
+        #[arg(long)]
+        key_stdin: bool,
+        #[arg(long)]
+        replace: bool,
+    },
+    /// Check metadata and OS store presence without printing a key.
+    Check {
+        #[arg(long)]
+        binding: PathBuf,
+    },
+    /// Entry point for the native OS supervisor.
+    Run {
+        #[arg(long)]
+        binding: PathBuf,
+    },
+    /// Re-provision the verified next macOS release through a private pipe.
+    MigrateCredential {
+        #[arg(long)]
+        binding: PathBuf,
+        #[arg(long)]
+        next_binding: PathBuf,
+        #[arg(long)]
+        confirm_mainnet: String,
+    },
+    /// Explicitly admit reviewed client/risk/listen changes while stopped.
+    Readmit {
+        #[arg(long)]
+        binding: PathBuf,
+        #[arg(long)]
+        confirm_mainnet: String,
+    },
+    /// Set a verified licence while preserving service ownership and renewal updates.
+    LicenceSet {
+        #[arg(long)]
+        binding: PathBuf,
+        #[arg(long)]
+        key: String,
+    },
+    /// Report the service licence and live fee state.
+    LicenceShow {
+        #[arg(long)]
+        binding: PathBuf,
+    },
+    /// Add a bot client while stopped; a separate explicit readmission follows.
+    Pair {
+        #[arg(long)]
+        binding: PathBuf,
+        #[arg(long)]
+        confirm_mainnet: String,
+    },
+    /// Delete exactly this installation's credential, after stopping it.
+    RemoveCredential {
+        #[arg(long)]
+        binding: PathBuf,
     },
 }
 
@@ -250,6 +335,9 @@ struct InitArgs {
     /// Read the key from standard input (with --non-interactive).
     #[arg(long)]
     key_stdin: bool,
+    /// Windows machine-service staging identity; prompts for its key inside Rust.
+    #[arg(long, requires = "non_interactive", conflicts_with_all = ["key_stdin", "no_key"])]
+    service_setup: Option<String>,
     /// Rules from the website: a `zr1_…` code.
     #[arg(long, env = "ZUNDER_GUARD_RULES")]
     rules: Option<String>,
@@ -310,6 +398,12 @@ struct RunArgs {
     /// Read the API wallet key from standard input.
     #[arg(long, conflicts_with = "key_file")]
     key_stdin: bool,
+    /// Private supervisor pipe framing; remaining stdin controls process lifetime.
+    #[arg(long, requires_all = ["key_stdin", "service_binding"])]
+    supervised_stdin: bool,
+    /// Immutable OS service admission; accepted only under the admitted OS identity.
+    #[arg(long, requires = "supervised_stdin")]
+    service_binding: Option<PathBuf>,
     /// Read it from this file (testnet only), which only its owner may
     /// read (in a container: which nobody else may write).
     #[arg(long, env = "ZUNDER_GUARD_KEY_FILE")]
@@ -395,6 +489,7 @@ struct KillArgs {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
+    let supervised_child = matches!(&cli.command, Command::Run(args) if args.supervised_stdin);
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -408,6 +503,7 @@ fn main() -> ExitCode {
     let paths = Paths::new(cli.home, cli.config);
     let result = match cli.command {
         Command::Init(args) => runtime.block_on(run_init(&paths, args)),
+        Command::Service { command } => service_command(&paths, command),
         Command::Config {
             command: ConfigCommand::Get { key },
         } => config_get(&paths, &key),
@@ -445,9 +541,33 @@ fn main() -> ExitCode {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("zunder-guard: {error:#}");
-            ExitCode::from(2)
+            if supervised_child && transient_service_start_failure(&error) {
+                ExitCode::from(75)
+            } else {
+                ExitCode::from(2)
+            }
         }
     }
+}
+
+/// Only typed read-only startup transport failures request native recovery.
+/// Unknown refusals and HTTP authentication/client failures remain stopped.
+fn transient_service_start_failure(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        matches!(
+            cause.downcast_ref::<zunder_guard::upstream::UpstreamError>(),
+            Some(
+                zunder_guard::upstream::UpstreamError::NotSent(_)
+                    | zunder_guard::upstream::UpstreamError::NoAnswer(_)
+            )
+        ) || matches!(
+            cause.downcast_ref::<zunder_guard::upstream::UpstreamError>(),
+            Some(zunder_guard::upstream::UpstreamError::Status {
+                status: 429 | 500..=599,
+                ..
+            })
+        )
+    })
 }
 
 /// Guard's home and config file.
@@ -655,6 +775,22 @@ fn credential_target(config: &Path) -> String {
 }
 
 async fn run_init(paths: &Paths, args: InitArgs) -> Result<()> {
+    let service_setup = args.service_setup.is_some();
+    if let Some(identity) = &args.service_setup {
+        if args.network != Some(ModeArg::Mainnet)
+            || args.confirm_mainnet.is_none()
+            || args.equity_cap.is_none()
+        {
+            bail!("service setup requires explicit mainnet, account confirmation and equity cap");
+        }
+        #[cfg(windows)]
+        zunder_guard::service::windows::validate_setup(&paths.home, &paths.config, identity)?;
+        #[cfg(not(windows))]
+        {
+            let _ = identity;
+            bail!("--service-setup is for Windows SCM staging only");
+        }
+    }
     let options = InitOptions {
         config: paths.config.clone(),
         state_dir: PathBuf::from("."),
@@ -673,9 +809,12 @@ async fn run_init(paths: &Paths, args: InitArgs) -> Result<()> {
         ip_share: args.ip_share,
         force: args.force,
         client_key_out: args.client_key_out,
-        refuse_mainnet: args
-            .refuse_mainnet
-            .or(platform::NO_MAINNET.map(str::to_owned)),
+        refuse_mainnet: args.refuse_mainnet.or_else(|| {
+            (!service_setup)
+                .then_some(platform::NO_MAINNET)
+                .flatten()
+                .map(str::to_owned)
+        }),
         licence: args.licence,
         licence_public_key: None,
     };
@@ -706,7 +845,26 @@ async fn run_init(paths: &Paths, args: InitArgs) -> Result<()> {
         StoreArg::Auto => &file,
     };
     let mut random = init::os_random;
-    let outcome = if options.non_interactive {
+    let outcome = if service_setup {
+        // No plaintext ever enters PowerShell or a process argument. init
+        // receives the bounded in-memory reader and still never stores mainnet.
+        zunder_guard::service::enforce_no_core_dumps()?;
+        let mut secret = zeroize::Zeroizing::new(
+            rpassword::prompt_password("API wallet key (hidden, checked for service setup): ")?
+                .into_bytes(),
+        );
+        secret.push(b'\n');
+        let mut reader = secret.as_slice();
+        init::init(
+            &options,
+            &mut Batch,
+            Some(&mut reader),
+            &VenueInfo,
+            store,
+            &mut random,
+        )
+        .await
+    } else if options.non_interactive {
         let mut stdin = if args.key_stdin {
             Some(stdin_fd()?)
         } else {
@@ -974,7 +1132,26 @@ async fn run(paths: &Paths, args: RunArgs) -> Result<()> {
         Some(mode) => mode,
     };
     let paper = mode == GuardMode::Paper;
-    if mode == GuardMode::Mainnet
+    if let Some(binding_path) = &args.service_binding {
+        let binding = zunder_guard::service::load_binding(binding_path)?;
+        if binding.home != paths.home
+            || binding.config != paths.config
+            || mode != GuardMode::Mainnet
+        {
+            bail!("runtime paths or mode differ from service admission");
+        }
+        zunder_guard::service::verify_child(&binding)?;
+        // Admit the same snapshot used below for journals, budgets and Setup,
+        // after ip-share overrides; a second matching disk read is insufficient.
+        binding.validate_runtime_config(&config)?;
+        if args
+            .listen
+            .as_ref()
+            .is_some_and(|listen| listen != &config.listen)
+        {
+            bail!("service listen override differs from the admitted runtime config");
+        }
+    } else if mode == GuardMode::Mainnet
         && let Some(reason) = platform::NO_MAINNET
     {
         bail!("{reason}");
@@ -1079,6 +1256,7 @@ async fn run(paths: &Paths, args: RunArgs) -> Result<()> {
     if let Some(warning) = &fee_warning {
         eprintln!("WARNING: {warning}");
     }
+    let mut supervised_shutdown = None;
     match venue {
         None => {
             let upstream = Hyperliquid::paper(network.venue())?;
@@ -1091,10 +1269,32 @@ async fn run(paths: &Paths, args: RunArgs) -> Result<()> {
                 fee_warning,
                 limits: Default::default(),
             };
-            serve(setup, upstream, clock, listen, &paths.config).await
+            serve(
+                setup,
+                upstream,
+                clock,
+                listen,
+                &paths.config,
+                supervised_shutdown,
+            )
+            .await
         }
         Some(venue) => {
-            let key = if args.key_stdin {
+            let key = if args.supervised_stdin {
+                let mut input = stdin_fd()?;
+                let bytes = zunder_guard::service::read_key_frame(&mut input)?;
+                let key = zunder_guard::keyread::key_from_text(
+                    std::str::from_utf8(&bytes)?,
+                    "supervisor stdin",
+                )?;
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                std::thread::spawn(move || {
+                    let reason = zunder_guard::service::await_parent_close(&mut input);
+                    let _ = tx.send(reason);
+                });
+                supervised_shutdown = Some(rx);
+                key
+            } else if args.key_stdin {
                 read_key(&mut stdin_fd()?, "standard input")?
             } else if let Some(path) = &args.key_file {
                 key_from_file(path, container)?
@@ -1116,7 +1316,15 @@ async fn run(paths: &Paths, args: RunArgs) -> Result<()> {
             // A key of another wallet stops here, before it signs anything.
             config.check_api_wallet(key.address())?;
             let upstream = Hyperliquid::sending(venue)?;
-            venue_checks(&upstream, &key, account).await?;
+            if let Some(parent) = supervised_shutdown.as_mut() {
+                tokio::select! {
+                    biased;
+                    _ = parent => return Ok(()),
+                    checked = venue_checks(&upstream, &key, account) => checked?,
+                }
+            } else {
+                venue_checks(&upstream, &key, account).await?;
+            }
             let signing = if venue.is_mainnet() {
                 SigningNetwork::Mainnet
             } else {
@@ -1134,7 +1342,15 @@ async fn run(paths: &Paths, args: RunArgs) -> Result<()> {
                 fee_warning,
                 limits: Default::default(),
             };
-            serve(setup, upstream, clock, listen, &paths.config).await
+            serve(
+                setup,
+                upstream,
+                clock,
+                listen,
+                &paths.config,
+                supervised_shutdown,
+            )
+            .await
         }
     }
 }
@@ -1207,16 +1423,32 @@ async fn serve<U: Upstream>(
     clock: SystemClock,
     addr: SocketAddr,
     config_path: &Path,
+    supervised_shutdown: Option<tokio::sync::oneshot::Receiver<&'static str>>,
 ) -> Result<()> {
     let mode = setup.mode.name();
     let auto_update = setup.config.licence_auto_update;
     // A stop asked for from here on (while the first sync or the stream's
     // start still waits) ends Guard cleanly: its journal synced.
     let shutdown = platform::shutdown().context("signal handlers")?;
+    let shutdown = async move {
+        match supervised_shutdown {
+            Some(mut parent) => tokio::select! {
+                biased;
+                reason = &mut parent => reason.unwrap_or("supervisor monitor stopped"),
+                reason = shutdown => reason,
+            },
+            None => shutdown.await,
+        }
+    };
+    tokio::pin!(shutdown);
     let guard = Guard::new(setup, upstream, clock).map_err(anyhow::Error::msg)?;
     // A new licence key in the config (`licence set`, or a renewal) applies
     // at the next sync.
-    guard.watch_config(config_path.to_owned()).await;
+    tokio::select! {
+        biased;
+        reason = &mut shutdown => { guard.stopped(reason).await; return Ok(()); }
+        () = guard.watch_config(config_path.to_owned()) => {}
+    }
     // Renewal from Orcastrate's licence service: only when the user
     // switched it on (`licence_auto_update`).
     let renewal = auto_update.then(|| tokio::spawn(renew_forever(config_path.to_owned())));
@@ -1233,7 +1465,16 @@ async fn serve<U: Upstream>(
     // The account over the venue's WebSocket: a request is judged from it
     // when it is clean, else after a read (docs/guard.md, "The account
     // stream").
-    let stream = guard.start_stream().await;
+    let stream = tokio::select! {
+        biased;
+        reason = &mut shutdown => {
+            server.abort(); sync.abort();
+            if let Some(renewal) = renewal { renewal.abort(); }
+            guard.stopped(reason).await;
+            return Ok(());
+        }
+        stream = guard.start_stream() => stream,
+    };
     let recovery = {
         let guard = guard.clone();
         let count = pending.len();
@@ -1676,6 +1917,197 @@ fn check_config(paths: &Paths) -> Result<()> {
     println!("rules: {}", rules::encode(&config.policy));
     for line in init::describe(&config.policy) {
         println!("{line}");
+    }
+    Ok(())
+}
+
+fn service_command(paths: &Paths, command: ServiceCommand) -> Result<()> {
+    use zunder_guard::service::{self, ServiceBinding, ServiceIdentity};
+    match command {
+        ServiceCommand::Prepare {
+            credential_id,
+            confirm_mainnet,
+            uid,
+            gid,
+            service_name,
+            service_sid,
+        } => {
+            let config = paths.load()?;
+            config.check_mainnet()?;
+            if config.mode != GuardMode::Mainnet
+                || config.account()?
+                    != Address::from_hex(&confirm_mainnet)
+                        .context("invalid mainnet confirmation address")?
+            {
+                bail!("service preparation needs the configured mainnet account confirmation");
+            }
+            let identity = match (uid, gid, service_name, service_sid) {
+                (Some(uid), Some(gid), None, None) => ServiceIdentity::Macos { uid, gid },
+                (None, None, Some(service_name), Some(service_sid)) => ServiceIdentity::Windows {
+                    service_name,
+                    service_sid,
+                },
+                _ => bail!("provide exactly one complete OS service identity"),
+            };
+            let executable = fs::canonicalize(std::env::current_exe()?)?;
+            let binding = ServiceBinding {
+                version: 1,
+                credential_id,
+                mode: "mainnet".into(),
+                account: config.account()?.to_hex(),
+                api_wallet: config
+                    .api_wallet
+                    .clone()
+                    .context("mainnet API wallet missing")?,
+                home: fs::canonicalize(&paths.home)?,
+                config: fs::canonicalize(&paths.config)?,
+                executable_sha256: service::hash_file(&executable)?,
+                executable,
+                admission_config_sha256: service::config_fingerprint(&config)?,
+                identity,
+            };
+            binding.validate()?;
+            println!("{}", serde_json::to_string_pretty(&binding)?);
+        }
+        ServiceCommand::Provision {
+            binding,
+            confirm_mainnet,
+            key_stdin,
+            replace,
+        } => {
+            let binding = service::load_binding(&binding)?;
+            binding.validate()?;
+            if Address::from_hex(&confirm_mainnet)
+                .context("invalid mainnet confirmation address")?
+                != Address::from_hex(&binding.account).context("invalid bound account")?
+            {
+                bail!("credential provisioning needs the exact admitted account confirmation");
+            }
+            service::validate_provision(&binding)?;
+            let key = if key_stdin {
+                service::read_key_frame(&mut stdin_fd()?)?
+            } else {
+                zeroize::Zeroizing::new(
+                    rpassword::prompt_password("API wallet key (hidden): ")?.into_bytes(),
+                )
+            };
+            service::provision(&binding, &key, replace)?;
+            eprintln!(
+                "Stored the API wallet credential in the OS secure store; no service was started."
+            );
+        }
+        ServiceCommand::Check { binding } => {
+            let binding = service::load_binding(&binding)?;
+            service::check(&binding)?;
+            eprintln!(
+                "Service metadata and credential presence checked; runtime journal checks still apply at start."
+            );
+        }
+        ServiceCommand::Run { binding } => {
+            let path = fs::canonicalize(binding)?;
+            let binding = service::load_binding(&path)?;
+            service::run(&binding, &path)?;
+        }
+        ServiceCommand::MigrateCredential {
+            binding,
+            next_binding,
+            confirm_mainnet,
+        } => {
+            let binding = service::load_binding(&binding)?;
+            #[cfg(target_os = "macos")]
+            service::macos::migrate(&binding, &next_binding, &confirm_mainnet)?;
+            #[cfg(not(target_os = "macos"))]
+            {
+                let _ = (binding, next_binding, confirm_mainnet);
+                bail!("credential migration is a macOS release operation");
+            }
+        }
+        ServiceCommand::Readmit {
+            binding,
+            confirm_mainnet,
+        } => {
+            let path = fs::canonicalize(binding)?;
+            let mut binding = service::load_binding(&path)?;
+            if Some(Address::from_hex(&confirm_mainnet).context("invalid confirmation")?)
+                != Address::from_hex(&binding.account)
+            {
+                bail!("readmission requires the exact admitted mainnet account");
+            }
+            service::validate_management_stopped(&binding)?;
+            let config = service::load_config(&binding)?;
+            binding.admission_config_sha256 = service::config_fingerprint(&config)?;
+            binding.validate()?;
+            service::write_binding(&path, &binding)?;
+            eprintln!(
+                "Reviewed configuration re-admitted. Service remains stopped; no journal was initialized or resumed."
+            );
+        }
+        ServiceCommand::LicenceSet { binding, key } => {
+            let binding = service::load_binding(&binding)?;
+            let config = binding.validate()?;
+            let checked = licence_life::check_key(
+                key.trim(),
+                LICENCE_PUBLIC_KEY.as_ref(),
+                config.account()?,
+                SystemClock.now_ms() as i64,
+            )
+            .map_err(|_| anyhow::anyhow!("licence key refused; service config unchanged"))?;
+            let mut next = config.clone();
+            next.licence = Some(key.trim().to_owned());
+            service::write_config(&binding, &config, &next)?;
+            println!(
+                "Licence for {} until {} saved with service ownership preserved. A running Guard applies it on its next sync; use service licence-show to verify.",
+                checked.licensee,
+                zunder_guard::guard::utc_text(checked.expires_at_ms)
+            );
+        }
+        ServiceCommand::LicenceShow { binding } => {
+            let binding = service::load_binding(&binding)?;
+            let config = binding.validate()?;
+            for line in licence_life::describe(
+                config.licence.as_deref(),
+                LICENCE_PUBLIC_KEY.as_ref(),
+                config.account()?,
+                SystemClock.now_ms() as i64,
+            ) {
+                println!("{line}");
+            }
+            if let Some(status) = guard_status(&config.listen) {
+                println!(
+                    "running licence {}, fee {}",
+                    status["licence"]["state"].as_str().unwrap_or("?"),
+                    status["fee"]["mode"].as_str().unwrap_or("?")
+                );
+            } else {
+                println!("service runtime is not answering on {}", config.listen);
+            }
+        }
+        ServiceCommand::Pair {
+            binding,
+            confirm_mainnet,
+        } => {
+            let binding = service::load_binding(&binding)?;
+            if Address::from_hex(&confirm_mainnet) != Address::from_hex(&binding.account) {
+                bail!("pairing requires the exact admitted mainnet account");
+            }
+            service::validate_management_stopped(&binding)?;
+            let config = binding.validate()?;
+            let mut next = config.clone();
+            let (secret, address) = init::new_client(&mut init::os_random)?;
+            let (code, hash) = init::pairing(&mut init::os_random)?;
+            next.auth.clients.push(address.to_hex());
+            next.pairing_sha3 = Some(hash);
+            service::write_config(&binding, &config, &next)?;
+            println!("Client key (shown once): {}", secret.as_str());
+            println!("Pairing code (shown once): {code}");
+            println!(
+                "Service remains stopped. Explicitly readmit the client change before restarting."
+            );
+        }
+        ServiceCommand::RemoveCredential { binding } => {
+            let binding = service::load_binding(&binding)?;
+            service::remove(&binding)?;
+        }
     }
     Ok(())
 }

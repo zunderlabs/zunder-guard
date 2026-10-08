@@ -170,6 +170,122 @@ jobs:
             Remove-Item Env:ZUNDER_ACL_PATH -ErrorAction SilentlyContinue
           }
 
+  # Native proof runs on PR/main before any release tag. No secrets or publication.
+  macos-service:
+    name: macOS service (${{ matrix.arch }})
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            arch: arm64
+          - runner: macos-15-intel
+            arch: x86_64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 50
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Identify the native runner and exact source
+        env:
+          EXPECTED_ARCH: ${{ matrix.arch }}
+          SOURCE_SHA: ${{ github.sha }}
+        run: |
+          mkdir -p native-macos-evidence
+          test "$RUNNER_ENVIRONMENT" = github-hosted
+          test "$(uname -s)" = Darwin
+          test "$(uname -m)" = "$EXPECTED_ARCH"
+          sw_vers > native-macos-evidence/os.txt
+          uname -m > native-macos-evidence/architecture.txt
+          git rev-parse HEAD > native-macos-evidence/source-commit.txt
+          test "$(cat native-macos-evidence/source-commit.txt)" = "$SOURCE_SHA"
+          shasum -a 256 Cargo.lock rust-toolchain.toml \
+            crates/zunder-guard/src/service.rs crates/zunder-guard/src/service/macos.rs \
+            crates/zunder-guard/examples/macos_service_fixture.rs deploy/guard/macos/native-ci.sh \
+            deploy/guard/macos/crash-report-scan.py deploy/guard/macos/test-crash-report-scan.py \
+            > native-macos-evidence/source-sha256.txt
+          printf '%s\n' 'Synthetic native service gates only. Pre-login reboot, full signed installer lifecycle and crash-report coverage beyond the bounded synthetic fixture scan remain separate release gates.' > native-macos-evidence/scope.txt
+      - name: macOS bootstrap tool resolution and shell regressions (no privilege)
+        run: |
+          /usr/bin/python3 -B deploy/guard/test/macos-bootstrap.py
+          /usr/bin/python3 -B deploy/guard/test/macos-shell.py
+      - name: Crash-report scanner deterministic hit, miss and scope tests
+        run: /usr/bin/python3 -B deploy/guard/macos/test-crash-report-scan.py
+      - name: Install the repository-pinned toolchain
+        run: |
+          rustup toolchain install
+          rustc -Vv > native-macos-evidence/toolchain.txt
+      - name: Typecheck and lint native broker, CLI and synthetic fixture
+        run: |
+          set +e
+          cargo clippy --locked -p zunder-guard --lib --bin zunder-guard --example macos_service_fixture -- -D warnings > native-macos-evidence/clippy.log 2>&1
+          result=$?
+          set -e
+          printf '%s\n' "$result" > native-macos-evidence/clippy-exit-code.txt
+          exit "$result"
+      - name: Private Keychain isolation and core-limit tests
+        run: |
+          set +e
+          cargo test --locked -p zunder-guard --lib service::macos::tests -- --test-threads=1 > native-macos-evidence/private-keychain-tests.log 2>&1
+          result=$?
+          set -e
+          printf '%s\n' "$result" > native-macos-evidence/private-keychain-exit-code.txt
+          exit "$result"
+      - name: Build the exact broker and non-shipped fixture
+        run: |
+          set +e
+          cargo build --locked -p zunder-guard --bin zunder-guard --example macos_service_fixture > native-macos-evidence/build.log 2>&1
+          result=$?
+          set -e
+          printf '%s\n' "$result" > native-macos-evidence/build-exit-code.txt
+          test "$result" = 0
+          shasum -a 256 target/debug/zunder-guard target/debug/examples/macos_service_fixture > native-macos-evidence/binary-sha256.txt
+      - name: System Keychain and launchd synthetic lifecycle
+        run: |
+          set +e
+          # Driver output intentionally belongs to the unprivileged evidence directory.
+          # shellcheck disable=SC2024
+          /usr/bin/sudo /usr/bin/env GITHUB_ACTIONS="$GITHUB_ACTIONS" RUNNER_OS="$RUNNER_OS" RUNNER_ENVIRONMENT="$RUNNER_ENVIRONMENT" /bin/bash \
+            deploy/guard/macos/native-ci.sh "$PWD/target/debug/examples/macos_service_fixture" "$PWD/native-macos-evidence" \
+            > native-macos-evidence/system-service-driver.log 2>&1
+          result=$?
+          set -e
+          printf '%s\n' "$result" > native-macos-evidence/system-service-driver-exit-code.txt
+          test "$result" = 0
+          test "$(cat native-macos-evidence/system-service-exit-code.txt)" = 0
+          test "$(cat native-macos-evidence/cleanup-errors.txt)" = 0
+          test -s native-macos-evidence/system-service-result.txt
+          test "$(cat native-macos-evidence/crash-report-scan-exit-code.txt)" = 0
+          test -s native-macos-evidence/crash-report-scan.txt
+      - name: Redact logs before retaining evidence
+        id: redact
+        if: always()
+        run: |
+          mkdir -p native-macos-evidence
+          # Logs can contain synthetic test scalars or snippets from compiler diagnostics.
+          # Keep explicit source/binary hash files intact; never upload raw crash dumps.
+          for log in native-macos-evidence/*.log; do
+            test -f "$log" || continue
+            /usr/bin/sed -E 's/(0x)?[[:xdigit:]]{64}/[redacted-64-hex]/g' "$log" > "$log.redacted"
+            /bin/mv "$log.redacted" "$log"
+          done
+      - name: Retain redacted native evidence
+        if: always() && steps.redact.outcome == 'success'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: native-macos-pr-${{ matrix.arch }}-${{ github.sha }}
+          path: |
+            native-macos-evidence/*.txt
+            native-macos-evidence/*.log
+          if-no-files-found: error
+          retention-days: 7
+
   deny:
     runs-on: ubuntu-24.04
     steps:
@@ -200,15 +316,21 @@ jobs:
         run: |
           sudo apt-get update -q && sudo apt-get install -yq shellcheck
           shellcheck -s sh deploy/guard/install.sh deploy/guard/loader/i.sh
-          shellcheck deploy/guard/packaging/*.sh deploy/guard/github/*.sh deploy/guard/test/*.sh
+          shellcheck deploy/guard/packaging/*.sh deploy/guard/github/*.sh deploy/guard/test/*.sh deploy/guard/macos/*.sh
       - name: AWS publication and bootstrap regressions
         run: |
           python3 deploy/guard/github/test_publish_aws_template.py
           python3 -m pip install PyYAML==6.0.3
           python3 deploy/guard/test/aws_template_test.py
+      - name: Container supervisor contract (synthetic only; no native restart claim)
+        run: python3 -B deploy/guard/test/container-supervisor.py
+      - name: Container installer transaction and ownership checks
+        run: python3 -B deploy/guard/test/container-installer.py
       - name: Publication gate regressions (no network or signing)
         run: |
           python3 -B deploy/guard/test/release-policy.py
+          python3 -B deploy/guard/test/native-readiness.py
+          python3 -B deploy/guard/test/macos-shell.py
           python3 -B deploy/guard/github/test_publish_loaders.py
       - name: actionlint
         run: |

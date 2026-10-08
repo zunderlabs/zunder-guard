@@ -1,0 +1,94 @@
+# Candidate-only gates. Does not publish, contact a venue, or use real credentials.
+# Copy to the public repository's .github/workflows/ through the normal exporter.
+name: native-service-candidate
+on:
+  pull_request:
+  workflow_call:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: native-service-candidate-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  windows:
+    name: windows-service-native
+    runs-on: windows-2025
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Mainnet loader transactions and trust regressions (PowerShell 7)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & ./deploy/guard/test/windows-mainnet-loader.ps1
+      - name: Mainnet loader transactions and trust regressions (PowerShell 5.1)
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & ./deploy/guard/test/windows-mainnet-loader.ps1
+      - name: Default Restricted policy bootstrap and process-only helper policy
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & ./deploy/guard/test/windows-mainnet-policy.ps1
+      - run: rustup toolchain install
+      - run: cargo clippy --locked -p zunder-guard --all-targets -- -D warnings
+      - name: Compile native and exercise synthetic credential, ACL and process containment
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Path native-service-receipt | Out-Null
+          cargo test --locked -p zunder-guard --lib service:: -- --test-threads=1
+          if ($LASTEXITCODE -ne 0) { throw 'Native service tests failed.' }
+          cargo test --locked -p zunder-guard --lib service::windows::tests::native_protected_file_acl -- --ignored --test-threads=1
+          if ($LASTEXITCODE -ne 0) { throw 'Elevated native ACL test failed.' }
+          cargo build --locked -p zunder-guard --example windows_service_fixture
+          if ($LASTEXITCODE -ne 0) { throw 'SCM fixture build failed.' }
+          & ./deploy/guard/test/windows-service-native.ps1 -Fixture ./target/debug/examples/windows_service_fixture.exe
+          & "$env:SystemRoot/System32/WindowsPowerShell/v1.0/powershell.exe" -NoProfile -NonInteractive -File ./deploy/guard/test/windows-service-native.ps1 -Fixture ./target/debug/examples/windows_service_fixture.exe
+          if ($LASTEXITCODE -ne 0) { throw 'PowerShell 5.1 SCM fixture failed.' }
+          $Errors = $null
+          $Tokens = $null
+          [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $PWD 'deploy/guard/windows/service.ps1'),[ref]$Tokens,[ref]$Errors) | Out-Null
+          if ($Errors.Count) { throw ($Errors | Out-String) }
+          @{
+            source = '${{ github.sha }}'
+            os = [Environment]::OSVersion.VersionString
+            architecture = [Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()
+            credentials = 'synthetic only; no venue traffic'
+            verified = @('machine protection round trip','immutable ACL refusal','reparse refusal','Job child and descendant termination','stdin EOF stop','framing and exact runtime config snapshot admission','independent randomized admission and lifecycle models','acknowledged SCM Stop wins over transient child exit','SCM Session-0 virtual account','machine decryption under service identity','broker death containment','four transient retries','service-owned renewal/admin access','bounded runtime crash dump scan')
+            pending = @('broker crash artifact scan','signed production installer upgrade rollback','unattended reboot before user login')
+            releaseReady = $false
+          } | ConvertTo-Json -Depth 8 | Set-Content native-service-receipt/windows.json
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: native-service-windows-${{ github.sha }}
+          path: native-service-receipt/
+          if-no-files-found: warn
+
+  container-native:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Disposable VM prerequisites
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -yq qemu-system-x86 qemu-utils cloud-image-utils ubuntu-cloudimage-keyring gpgv openssh-client curl
+      - name: Real systemd and Docker lifecycle, including guest reboot
+        run: python3 -B deploy/guard/test/container-native/vm.py --output "${{ runner.temp }}/container-native-evidence"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: always()
+        with:
+          name: container-native-lifecycle
+          path: ${{ runner.temp }}/container-native-evidence
+          if-no-files-found: warn
+          retention-days: 14

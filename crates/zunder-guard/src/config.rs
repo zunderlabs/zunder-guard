@@ -340,7 +340,11 @@ impl GuardConfig {
         // The new file is the lock: created before the config is read, so
         // a second update at the same time fails rather than losing the
         // first one's change.
-        let mut file = zunder_venue::owner_only::create(&temporary)
+        #[cfg(windows)]
+        let created = crate::service::windows::create_config_update(path, &temporary);
+        #[cfg(not(windows))]
+        let created = zunder_venue::owner_only::create(&temporary);
+        let mut file = created
             .map_err(|error| {
                 write_error(format!(
                     "{} exists or cannot be created ({error}): another update may be running; remove it if not",

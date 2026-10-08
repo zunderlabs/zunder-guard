@@ -61,8 +61,11 @@ render() { # template output
 }
 
 render "$HERE/../install.sh" "$DIST/install.sh"
+# Internal macOS helper is independently covered by the signed release manifest.
+render "$HERE/../macos/install-service.sh" "$DIST/install-macos-service.sh"
 render "$HERE/../loader/i.sh" "$DIST/i"
 render "$HERE/../loader/i.ps1" "$DIST/i.ps1"
+render "$HERE/../windows/service.ps1" "$DIST/install-windows-service.ps1"
 render "$HERE/homebrew/zunder-guard.rb.in" "$DIST/zunder-guard.rb"
 for m in ZunderLabs.ZunderGuard ZunderLabs.ZunderGuard.installer ZunderLabs.ZunderGuard.locale.en-US; do
   render "$HERE/winget/$m.yaml.in" "$DIST/$m.yaml"
@@ -103,6 +106,10 @@ text = replace_once(text,
     "      for guided setup. This replaces bootstrap configuration and client pairings; journals are preserved.", path.name)
 path.write_text(text)
 PY
+# The installer/guardian are release bytes, authenticated before privilege/key handling.
+for pair in 'install-container.py:install-container.py' 'supervisor.py:container-supervisor.py' 'operations.py:container-operations.py' 'zunder-guard-container.service:zunder-guard-container.service' 'zunder-guard-setup-guardian.service:zunder-guard-setup-guardian.service'; do
+  cp "$HERE/../container/${pair%%:*}" "$DIST/${pair#*:}"
+done
 chmod 0644 "$DIST"/*
 
 (cd "$DIST" && find . -maxdepth 1 -type f ! -name 'SHA256SUMS*' -printf '%f\n' | LC_ALL=C sort \

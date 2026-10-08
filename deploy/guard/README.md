@@ -18,16 +18,18 @@ is what we built, and what it talks to.
 
 ## Install paths
 
-All paths start in **paper mode** (real Hyperliquid prices, no orders), listen on
-**127.0.0.1:8547** only, and never take the key from a template, a URL, an environment
-variable set by us, or a command line.
+The website preselects **mainnet setup**, with paper and testnet available. Mainnet setup
+requires local account confirmation, an equity cap, a protected credential and an explicit
+journal/start decision; installing does not start trading. AWS bootstraps in paper mode.
+All paths bind to **127.0.0.1:8547** and keep API wallet keys out of URLs, templates,
+command arguments and environment variables.
 
 ### 1. One SSH command (the default)
 
 The website generates, with the user's rules filled in:
 
 ```sh
-ssh -t you@server "curl -fsSL https://zunderlabs.com/i | sh -s -- --rules zr1_…"
+ssh -t you@server "curl -fsSL https://zunderlabs.com/i | sh -s -- --network mainnet --rules zr1_…"
 ```
 
 `-t` gives the setup a terminal. On the server the loader checks the installer's signature,
@@ -36,13 +38,15 @@ then the installer checks the release and walks through the setup:
 1. shows the rules decoded from `--rules` and asks "Keep these? [Y/edit]"; "edit" asks for each
    value with its bounds and refuses anything outside them;
 2. asks for the Hyperliquid account address;
-3. asks for the mode: paper (default), testnet or mainnet. Mainnet must be typed in full, and
-   then the account address again (the same confirmation Zunder's own mainnet runner needs);
+3. asks for the mode when no `--network` is supplied (paper is the CLI default). Mainnet
+   always requires the account address again as a separate confirmation;
 4. for testnet or mainnet, asks for the API wallet key with hidden input (`stty -echo`). It is
    never echoed, never in shell history (it is read, not typed into a command), never on a
    command line (`printf` is a shell builtin, so not in `ps`), never in the environment;
 5. pipes the key on standard input to `zunder-guard key check` and then to `systemd-creds`;
-6. installs the hardened systemd unit and starts it;
+6. installs the hardened systemd unit; a fresh mainnet setup without a journal stays stopped
+   and prints journal/start commands. Reconfiguration with an existing mainnet journal can
+   restart the service; keep bots stopped. Paper/testnet starts after setup;
 7. prints the client key for the bot (once), the pairing code and the next step.
 
 Steps 1 to 3 are the binary's own prompts (`zunder-guard init --interactive`): the binary owns
@@ -52,15 +56,35 @@ key itself, because it stores the key with `systemd-creds`, and pipes it.
 Without a terminal (`ssh` without `-t`, cloud-init, CI) the installer refuses, unless
 `--non-interactive` is given with every value: `--rules`, `--network`, and for testnet or mainnet
 `--account` and `--key-file` (a file the installer reads; mainnet also `--confirm-mainnet` with
-the same account). Other options: `--listen` (warns unless loopback), `--ip-share S` (this
+the same account and `--equity-cap`). Other options: `--listen` (warns unless loopback), `--ip-share S` (this
 Guard's part of the IP address's request weight: `1/N` for N Guards on one machine), `--prefix`,
 `--no-service`,
 `--force` (replace a configuration; the journal is kept). Running the one-liner again
 reconfigures: Guard asks before replacing its configuration.
 
+### Upgrade without reconfiguring
+
+Stop your bot and Guard first. Run the new release's verified loader with
+`--install-only`, retaining the existing binary directory (`--prefix DIR` if customized):
+
+```sh
+curl -fsSL https://zunderlabs.com/i | sh -s -- --install-only
+```
+
+This verifies the signed archive and replaces only the binary and distribution notices. It
+needs no setup terminal, key or setup values (sudo may still require authentication); setup flags including `--force` are refused. It does
+not run `init`, change the systemd unit or credentials, reset journals, or restart Guard.
+Keep the existing config, licence, renewal settings and client pairings. Restart Guard
+explicitly using the same service or foreground command, check its version, health, network,
+account and fee mode before restarting your bot. Review release notes for any required unit
+or configuration migration: this option deliberately does not apply those changes. Use
+Homebrew's upgrade command for a Homebrew installation, not this installer.
+
 Without root the installer uses `sudo` for the service; without either it installs to
 `~/.local/bin`, lets the binary ask for the key and store it its own way, and prints how to
-start Guard. On macOS it does the same (no systemd).
+start Guard for paper/testnet. Mainnet requires its protected service path. macOS mainnet
+uses the separately signed service installer, System Keychain and a system LaunchDaemon;
+see [macOS setup](https://zunderlabs.com/docs/deploy/macos/).
 
 **Read it first.** Anyone who prefers not to pipe a script into a shell:
 
@@ -106,16 +130,25 @@ sha256sum --ignore-missing -c SHA256SUMS && sh install.sh --rules zr1_…
 ### 2. Docker and Compose
 
 ```sh
-docker run -it --rm -v zunder-guard:/data ghcr.io/zunderlabs/zunder-guard:v1.0.0 init --interactive --rules zr1_…
-docker run -it --rm -v zunder-guard:/data ghcr.io/zunderlabs/zunder-guard:v1.0.0 pair
+docker run -it --rm --log-driver=none -v zunder-guard:/data ghcr.io/zunderlabs/zunder-guard:v1.0.0 init --interactive --rules zr1_…
+docker run -it --rm --log-driver=none -v zunder-guard:/data ghcr.io/zunderlabs/zunder-guard:v1.0.0 pair
 docker run -d --name zunder-guard --init --restart unless-stopped -v zunder-guard:/data \
   -e ZUNDER_GUARD_LISTEN=0.0.0.0:8547 -p 127.0.0.1:8547:8547 ghcr.io/zunderlabs/zunder-guard:v1.0.0
 ```
 
 After a testnet `init`, add `-e ZUNDER_GUARD_NETWORK=testnet` to the last command: `run` sends
 only where it is told to, and only when that is the mode `init` recorded, so a testnet setup
-started without it refuses to start instead of running as paper. Mainnet is not offered in a
-container (its key comes on standard input only).
+started without it refuses to start instead of running as paper. These Docker/Compose
+commands are for paper/testnet. For mainnet on a native Linux host with systemd 250+, Python 3.11+ and a
+local rootful Docker Engine, use the verified supervised installer:
+
+```sh
+curl -fsSL https://zunderlabs.com/i | sh -s -- --container --network mainnet
+```
+
+It supplies an encrypted systemd credential over stdin to an owned container, binds only
+loopback, and leaves boot activation inhibited until explicit local activation and readiness
+checks pass. Follow [Docker setup](https://zunderlabs.com/docs/deploy/docker/).
 
 Or `compose.yaml` (`docker compose run --rm guard init --interactive --rules zr1_…`, then
 `docker compose up -d`; after a testnet init, uncomment `ZUNDER_GUARD_NETWORK: testnet` first).
@@ -129,7 +162,7 @@ The image:
   `-p 8547:8547` reaches nothing. To reach it from the host, set
   `ZUNDER_GUARD_LISTEN=0.0.0.0:8547` and publish on `127.0.0.1:` as above and in Compose.
   Never publish without `127.0.0.1:`: Docker writes its own firewall rules and bypasses ufw;
-- the key: `init --interactive` asks for it with hidden input and stores it in the volume (0600,
+- for testnet, `init --interactive` asks for the key with hidden input and stores it in the volume (0600,
   with a warning), or the Compose secret holds it in a 0600 file owned by uid 65532.
 
 ### 3. Homebrew, a plain archive
@@ -143,42 +176,27 @@ release. The archives (`zunder-guard-<version>-<os>-<arch>.tar.gz`, Linux and ma
 arm64) verify by hand as in path 1. `brew services` runs paper mode; a testnet setup runs with
 `zunder-guard run --network testnet` (the caveats say so).
 
-### 3a. Windows (paper and testnet)
+### 3a. Windows
+
+On native x64 Windows, open an elevated interactive Windows PowerShell 5.1 or PowerShell 7:
 
 ```powershell
-& ([scriptblock]::Create((irm https://zunderlabs.com/i.ps1))) -Rules zr1_… -Account 0x…   # guided, values pre-filled
-irm https://zunderlabs.com/i.ps1 | iex                                                   # guided, asks for everything
-# winget is deferred beyond 1.0; the PowerShell installer above is the native Windows path.
+& ([scriptblock]::Create((irm https://zunderlabs.com/i.ps1))) -Network mainnet
 ```
 
-`i.ps1` does what the loader and `install.sh` do on Unix, in one file: it pins the version, the
-signer and cosign v3.1.3 (`cosign-windows-amd64.exe` by SHA-256), verifies the Sigstore bundle
-of `SHA256SUMS`, checks `zunder-guard-<version>-windows-amd64.zip` against it, installs
-`zunder-guard.exe` to `%LOCALAPPDATA%\Programs\zunder-guard` (on the user's PATH, no
-administrator rights), checks `--version`, then runs `zunder-guard init --interactive`. It
-never calls `exit` (which would close the window it runs in under `iex`); every refusal is a
-`throw` that names the reason. `-InstallOnly` installs without setting up; `-NonInteractive`
-sets up paper mode from `-Rules` and `-Account`.
+The loader verifies the signed archive and machine-service helper before installation.
+The managed service uses a virtual service account, machine-protected credential with
+restricted ACLs, and a broker that passes the key to Guard over stdin. Setup leaves the
+service stopped; use its printed commands for licence or builder approval, explicit journal
+initialization when needed, and activation. Interrupted setup and upgrades remain disabled
+until explicitly recovered. Existing journals and halts are preserved.
 
-What Windows offers in 1.0, and how it keeps the key:
-
-- **Paper and testnet.** `init` asks for the testnet key with hidden input and keeps it in the
-  **Windows Credential Manager** (encrypted with DPAPI for that user; entry `zunder-guard`,
-  named by the configuration's folder); `run --network testnet` reads it from there itself.
-  It is never written to a file and never on a command line. `--key-stdin` works as on Unix.
-- **Mainnet is refused** (`init` and `run`): Guard takes a mainnet key on standard input only,
-  and Windows has no equivalent of the systemd service that hands it over from an encrypted
-  credential at every start. Mainnet runs on Linux (path 1).
-- **Files**: home `%LOCALAPPDATA%\zunder-guard` (journals, config); key files (`client add
-  --out`, `--key-file`) are owner-only by ACL: on creation the inherited entries are removed
-  and only the user is granted access (`icacls`), and a key file is read only when its ACL
-  allows no one but the user, the owner, SYSTEM and Administrators (read as SDDL, so the
-  check does not depend on the display language). The kill file lives in the home as on Unix.
-- **Running**: in the foreground (`zunder-guard run --network testnet`; Ctrl-C, Ctrl-Break and
-  closing the window stop it cleanly). No Windows service in 1.0; a scheduled task at logon
-  is documented on the website (it runs as the user, so it reads the user's credential).
-- **x86_64 only**: Windows 11 on ARM runs it through its x64 emulation.
-- **The agent kit**: `zunder-guard mcp --key-file <file from client add --out>`, as on Unix.
+For a separate per-user paper/testnet installation, run without administrator rights and
+select `-Network paper` or `-Network testnet`. The binary goes to
+`%LOCALAPPDATA%\Programs\zunder-guard`; testnet credentials use Windows Credential Manager.
+`-InstallOnly` remains the per-user binary-only path, not a mainnet service upgrade.
+See [Windows setup](https://zunderlabs.com/docs/deploy/windows/) for activation and management.
+Winget publication remains deferred beyond 1.0.
 
 ### 4. AWS launch (the user's own account)
 
@@ -244,14 +262,17 @@ standard input were weighed:
 | A one-shot unit a person starts with the key piped in (`systemd-run --pipe`, or `systemd-ask-password`) | nowhere | no: after a crash, a reboot or a venue outage at start-up, positions stay without Guard until a person types the key again | refused: an unattended Guard is the larger risk |
 | A 0600 plain file read by `LoadCredential=` | in plain text on disk | yes | testnet only (with a warning); refused for mainnet |
 
-So for mainnet the installer **requires `systemd-creds`** (systemd 250 or newer) and refuses
+For native Linux mainnet the installer **requires `systemd-creds`** (systemd 250 or newer) and refuses
 before it asks for the key when it is missing (run Guard by hand with the key piped in, or
 upgrade). The binary itself still sees only standard input: `sh -c 'exec … run --key-stdin <
 "$CREDENTIALS_DIRECTORY/…"'` opens the decrypted credential as file descriptor 0 and replaces
 itself with Guard, so the key is never in an argument, the environment or a log.
 
 The mainnet risk journal is a person's start, as everywhere in Zunder: the installer sets
-everything up, enables the unit and does **not** start it. It prints the two commands for when
+everything up and, when no mainnet journal exists, enables the unit without starting it.
+Reconfiguring an existing mainnet installation with its journal can restart the service;
+use `--install-only` for an upgrade that must not run setup or restart. A fresh setup prints
+the two commands for when
 the user is ready: `journal-init --mode mainnet` (with `ZUNDER_MAINNET_CONFIRM` naming the account,
 as the `zunder-guard` user), then `systemctl start zunder-guard`. Non-interactive mainnet installs
 need `--confirm-mainnet` and `--equity-cap` as well.
@@ -371,7 +392,7 @@ container without a shell can be configured.
 | Command | Does | Used by |
 |---|---|---|
 | `zunder-guard --version` | Prints `zunder-guard <version>` | everything (the release still refuses the old stub's marker) |
-| `init --interactive [--rules R] [--account A] [--no-key] [--force]` | Prompts on the terminal: rules (keep or edit, bounds-checked), account, mode (paper default), then the key with hidden input unless `--no-key` or paper. Testnet stores it through systemd-creds or a 0600 file on Unix, or Windows Credential Manager on Windows. Mainnet requires Linux systemd setup and standard input at every start. | install.sh, i.ps1, Docker, Homebrew |
+| `init --interactive [--rules R] [--account A] [--no-key] [--force]` | Prompts on the terminal: rules (keep or edit, bounds-checked), account, mode (paper default), then the key with hidden input unless `--no-key` or paper. Testnet stores it through systemd-creds or a 0600 file on Unix, or Windows Credential Manager on Windows. Mainnet validates the API wallet without storing a plaintext key. Managed services use protected Linux systemd credentials, macOS System Keychain or the Windows machine broker; each start retains account consent and credential handoff. Direct Unix foreground starts require the key on stdin. | install.sh, i.ps1, Docker, Homebrew |
 | `init --non-interactive --rules R --network N [--account A] [--account-network testnet\|mainnet] [--confirm-mainnet A] [--equity-cap USDC] [--key-stdin \| --no-key] [--listen L] [--ip-share S] [--key-store auto\|file\|systemd-creds] [--client-key-out F] [--force]` | The same without prompts; refuses anything missing. Paper reads the account of `--account-network` (default mainnet). Writes the config with `mode`, starts the risk journal for paper and testnet (mainnet: `journal-init --mode mainnet` by a person) | install.sh, AWS |
 | `config get network\|account\|listen\|rules` | Prints one configured value | install.sh |
 | `key check --key-stdin` | Reads the key from standard input, checks it is an API wallet approved by the configured account on the configured network; prints the wallet address, never the key | install.sh |
@@ -382,7 +403,7 @@ container without a shell can be configured.
 | `kill --reason R` | Writes the kill file; a running Guard opens nothing and flattens until a person removes it and restarts; warns when the running Guard watches another file | docs |
 | `journal-init`, `journal-resume`, `journal-show --mode M` | The risk journal: start (a person's decision), resume after a drawdown review, print | docs |
 | `mcp …` | The agent kit's MCP server over stdio (`docs/guard-mcp.md`), the same code as `zunder-guard-mcp` | agents |
-| `run [--network N] [--listen L] [--ip-share S] [--key-stdin \| --key-file F] [--container]` | Runs Guard. `--network` must equal the configuration's mode (a testnet config never runs as paper by accident). On an empty home with `ZUNDER_GUARD_RULES` and `ZUNDER_GUARD_ACCOUNT` set it sets up paper mode non-interactively (sending modes need `init`). Mainnet needs `ZUNDER_MAINNET_CONFIRM` (the variable Zunder's runner uses; not `ZUNDER_GUARD_MAINNET_CONFIRM`) naming the account at every start, a risk journal started for mainnet, and the key on standard input only (no key file, no environment variable, so containers stay paper and testnet). A key file group or others can write is refused; on bare metal one they can read too; in a container (`--container`, `ZUNDER_GUARD_CONTAINER`, or Docker's `/.dockerenv`) a read-only mount readable by others is accepted with a warning. Warns when not listening on loopback. Handles SIGTERM and SIGINT (also as PID 1) | systemd unit, image, templates |
+| `run [--network N] [--listen L] [--ip-share S] [--key-stdin \| --key-file F] [--container]` | Runs Guard. `--network` must equal the configuration's mode (a testnet config never runs as paper by accident). On an empty home with `ZUNDER_GUARD_RULES` and `ZUNDER_GUARD_ACCOUNT` set it sets up paper mode non-interactively (sending modes need `init`). Mainnet needs `ZUNDER_MAINNET_CONFIRM` (the variable Zunder's runner uses; not `ZUNDER_GUARD_MAINNET_CONFIRM`) naming the account at every start, a risk journal started for mainnet, and the key on standard input only (no key file or key environment variable; the managed container supervisor supplies stdin). A key file group or others can write is refused; on bare metal one they can read too; in a container (`--container`, `ZUNDER_GUARD_CONTAINER`, or Docker's `/.dockerenv`) a read-only mount readable by others is accepted with a warning. Warns when not listening on loopback. Handles SIGTERM and SIGINT (also as PID 1) | systemd unit, image, templates |
 | `health [--listen L \| --url U]` | Exit 0 if `GET /healthz` on the listen address answers 200 (`0.0.0.0` and `[::]` mean loopback) | image healthcheck, install.sh |
 | `status [--listen L \| --url U] [--json]` | `GET /guard/status` for a person, one fact a line (mode, kill switch, risk state, equity, the fee and its approval, alerts), or the JSON as Guard answers it; exit 2 when no Guard answers | docs, quickstart |
 
@@ -442,11 +463,18 @@ then `markets` (`markets`) and the two cross-field rules (`open_risk_below_trade
 ## Release pipeline and publishing
 
 `github/workflows/release.yml` (tag → draft release, image, provenance), `publish.yml` (a person
-publishes the draft → Homebrew pull request, image `latest`), `ci.yml` (checks on every push). Actions are pinned by commit; `slsa-github-generator` by tag, as it
+promotes the verified draft → Homebrew pull request, image `latest`), `ci.yml` (checks on every push). Actions are pinned by commit; `slsa-github-generator` by tag, as it
 requires. Permissions are per job; nothing runs on `pull_request_target`. Linux and both macOS
 architectures build and install natively; Windows uses MSVC. Publishing requires successful
 completed CI and release runs for the tag commit, every signed asset, and a verified immutable
-image digest covered by `SHA256SUMS`; prereleases do not promote packages or `latest`.
+image digest covered by `SHA256SUMS`, and complete identified maintainer-attested native
+observations bound to those exact assets. Use `github/promote-release.sh` before a draft
+becomes public; downstream publishing repeats the same full gate. Draft rehearsal uses
+`github/verify-release-assets.sh`, which does not authorize publication. See
+[Native readiness and promotion](github/NATIVE-READINESS.md). Prereleases do not promote
+packages or `latest`. Homebrew and AWS additionally require their own exact public-entrypoint
+attestations before their publisher jobs acquire write credentials; native service evidence
+alone does not establish those channels.
 
 ## Testing
 
@@ -467,7 +495,7 @@ The tests run on a Linux machine with Docker: `test/box-setup.sh` installs what 
 - `windows-cross.sh`: Guard's crates cross-compiled for `x86_64-pc-windows-gnu` (MinGW-w64):
   clippy `-D warnings` on the Windows code paths and a release build of `zunder-guard.exe`.
   Windows binaries cannot run on the box; the public repository's CI runs the tests and
-  `test/installer-windows.ps1` (good installs, tampering, mainnet refused) on `windows-2025`
+  `test/installer-windows.ps1` (per-user installs, tampering, invalid mainnet invocations refused) on `windows-2025`
   under Windows PowerShell 5.1 and PowerShell 7, and `release.yml`'s `install-smoke` runs
   `i.ps1` against every signed draft.
 - `image.sh`: native and two-architecture builds, the smoke test (non-root, no shell,
@@ -518,7 +546,7 @@ a mismatch).
 5. **macOS signing and notarisation**: binaries from `install.sh` are not quarantined (curl) and
    Homebrew's are fine, but a downloaded archive opened in Finder is blocked by Gatekeeper.
    Notarisation needs an Apple Developer account (99 USD a year).
-6. **Windows**: x86_64 only (ARM through emulation), paper and testnet, no service; **Linux on
-   32-bit ARM** is not built.
+6. **Architecture**: the Windows managed mainnet service requires native x64. Linux and macOS
+   provide amd64 and arm64 builds; Linux on 32-bit ARM is not built.
 7. **Licence**: Elastic License 2.0 (SPDX `Elastic-2.0`, decided 6 Oct 2026). The formula and the
    image label carry it; the public repository has the text verbatim in `LICENSE`.

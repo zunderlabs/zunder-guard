@@ -2,6 +2,7 @@
 """Drives the loader and install.sh through a terminal, as a person over `ssh -t` would
 (deploy/guard/test/installer.sh runs it). Uses pexpect (ISC licence), a test tool only.
 
+    installer_test.py install-only # offline release fixtures, no Rust binary or services
     installer_test.py container   # in a throwaway container: no systemd, non-root user
     installer_test.py bootstrap   # in a container without cosign: the pinned cosign download
     installer_test.py systemd     # on the Linux build host itself: unit, credentials, clean-up
@@ -10,6 +11,10 @@
 Release under test: $REL (a directory holding the fake release), version v0.0.0.
 """
 import base64
+import hashlib
+from pathlib import Path
+import shlex
+import tarfile
 import json
 import re
 import os
@@ -18,7 +23,7 @@ import subprocess
 import sys
 import tempfile
 
-import pexpect
+
 
 REL = os.environ.get("REL", "/rel")
 VERSION = "v0.0.0"
@@ -341,6 +346,9 @@ def case_systemd_paper():
     status, text = finish(c)
     good = status == 0 and "Guard is running (paper)" in text and "Client key for your bot" in text
     (ok if good else fail)("systemd, paper, guided", text)
+    # Pair mutates guard.toml; its last printed key must precede the start that loads it.
+    (ok if text.rfind("Client key for your bot") < text.index("Guard is running (paper)")
+     else fail)("all displayed client keys paired before the service starts", text)
     active = sh("systemctl is-active zunder-guard").stdout.strip()
     (ok if active == "active" else fail)(f"unit active ({active})", sh("sudo journalctl -u zunder-guard -n 30 --no-pager").stdout)
     local_addrs = sh("sudo ss -Hltn sport = :8547 | awk '{print $4}'").stdout.split()
@@ -491,9 +499,168 @@ def case_docker_interactive():
     sh(f"docker volume rm -f {vol}")
 
 
+def case_install_only_offline():
+    """Synthetic verified release: exercise installation without a key, venue or service.
+
+    fake-cosign verifies fixture identity/hash, not a real Sigstore signature. The fake
+    Guard only supports --version and logs every invocation; anything else fails.
+    """
+    source = Path(__file__).resolve().parents[1] / "install.sh"
+    if not source.is_file():
+        source = Path(REL) / VERSION / "install.sh"  # existing /t-only container mount
+    with tempfile.TemporaryDirectory(prefix="guard-upgrade-") as temporary:
+        root = Path(temporary)
+        release = root / "release"
+        release.mkdir()
+        fakebin = root / "fakebin"
+        fakebin.mkdir()
+        prefix = root / "bin"
+        prefix.mkdir()
+        home = root / "home"
+        home.mkdir()
+        state = home / ".zunder-guard"
+        state.mkdir()
+        for name in ("guard.toml", "risk-mainnet.jsonl", "api-wallet-key", "client-key", "renewal-token"):
+            (state / name).write_text("synthetic preserved " + name)
+            (state / name).chmod(0o600)
+        before = {p.name: (p.read_bytes(), p.stat().st_mode) for p in state.iterdir()}
+        calls = root / "calls"
+        guard = release / "zunder-guard"
+        guard.write_text('#!/bin/sh\nprintf "%s\\n" "$*" >> "$INSTALL_TEST_CALLS"\n'
+                         '[ "$#" -eq 1 ] && [ "$1" = --version ] || exit 91\n'
+                         'echo "zunder-guard 0.0.0"\n')
+        guard.chmod(0o755)
+        for name in ("LICENSE", "NOTICE", "THIRD_PARTY_LICENSES.md"):
+            (release / name).write_text("fixture " + name)
+        system = subprocess.check_output(["uname", "-s"], text=True).strip()
+        arch = subprocess.check_output(["uname", "-m"], text=True).strip()
+        os_name = "darwin" if system == "Darwin" else "linux"
+        arch = "arm64" if arch in ("arm64", "aarch64") else "amd64"
+        archive = release / f"zunder-guard-{VERSION}-{os_name}-{arch}.tar.gz"
+        with tarfile.open(archive, "w:gz") as tar:
+            for name in ("zunder-guard", "LICENSE", "NOTICE", "THIRD_PARTY_LICENSES.md"):
+                tar.add(release / name, arcname=name)
+        sums = release / "SHA256SUMS"
+        sums.write_text(hashlib.sha256(archive.read_bytes()).hexdigest() + "  " + archive.name + "\n")
+        bundle = release / "SHA256SUMS.sigstore.json"
+        identity = f"https://github.com/zunderlabs/zunder-guard/.github/workflows/release.yml@refs/tags/{VERSION}"
+        bundle.write_text(json.dumps({"identity": identity, "sha256": hashlib.sha256(sums.read_bytes()).hexdigest()}))
+        shutil.copy(Path(__file__).with_name("fake-cosign"), fakebin / "cosign")
+        (fakebin / "cosign").chmod(0o755)
+        # Refuse network URLs even if installer control flow regresses.
+        curl = shutil.which("curl")
+        (fakebin / "curl").write_text('#!/bin/sh\nfor arg do case "$arg" in http:* | https:*) exit 92;; esac; done\nexec ' + shlex.quote(curl) + ' "$@"\n')
+        (fakebin / "curl").chmod(0o755)
+        for command in ("sudo", "systemctl", "systemd-creds", "useradd", "chown"):
+            shim = fakebin / command
+            shim.write_text('#!/bin/sh\necho "UNEXPECTED ' + command + '" >> "$INSTALL_TEST_CALLS"\nexit 93\n')
+            shim.chmod(0o755)
+        script = root / "install.sh"
+        script.write_text(source.read_text().replace("@VERSION@", VERSION))
+        env = {"PATH": str(fakebin) + os.pathsep + os.environ["PATH"], "HOME": str(home),
+               "ZUNDER_GUARD_BASE_URL": release.as_uri(), "INSTALL_TEST_CALLS": str(calls)}
+        def execute(extra=()):
+            return subprocess.run(["sh", str(script), "--install-only", "--prefix", str(prefix), *extra],
+                                  env=env, stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                                  start_new_session=True)
+        old = prefix / "zunder-guard"
+        old.write_text("previous version")
+        with old.open() as previous_inode:
+            result = execute()
+            preserved_inode = previous_inode.read() == "previous version"
+        good = (result.returncode == 0 and preserved_inode and old.read_bytes() == guard.read_bytes()
+                and calls.read_text().splitlines() == ["--version"]
+                and before == {p.name: (p.read_bytes(), p.stat().st_mode) for p in state.iterdir()})
+        (ok if good else fail)("install-only atomically replaces verified binary, preserves all state, no setup/service", result.stdout + result.stderr)
+        result = execute(["--non-interactive"])
+        (ok if result.returncode == 0 else fail)("install-only needs no setup values without a terminal", result.stderr)
+        for args in (["--force"], ["--network", "mainnet"], ["--licence", "zgl1_fixture"], ["--key-file", "/not-read"]):
+            count = calls.read_text()
+            result = execute(args)
+            (ok if result.returncode != 0 and "cannot be combined" in result.stderr and calls.read_text() == count else fail)("install-only rejects setup flags: " + args[0], result.stderr)
+        pristine = old.read_bytes()
+        archive_bytes = archive.read_bytes()
+        bundle_bytes = bundle.read_bytes()
+        archive.write_bytes(archive.read_bytes() + b"tamper")
+        result = execute()
+        (ok if result.returncode != 0 and "checksum mismatch" in result.stderr and old.read_bytes() == pristine else fail)("install-only refuses tampered archive before replacement", result.stderr)
+        bundle.write_text(json.dumps({"identity": identity + "-wrong", "sha256": hashlib.sha256(sums.read_bytes()).hexdigest()}))
+        result = execute()
+        (ok if result.returncode != 0 and "signature check FAILED" in result.stderr and old.read_bytes() == pristine else fail)("install-only refuses wrong signing identity before replacement", result.stderr)
+        archive.write_bytes(archive_bytes)
+        bundle.write_bytes(bundle_bytes)
+        old.unlink()
+        target = root / "outside-binary"
+        target.write_bytes(pristine)
+        old.symlink_to(target)
+        result = execute()
+        (ok if result.returncode != 0 and old.is_symlink() and target.read_bytes() == pristine
+         else fail)("install-only refuses a symlink destination", result.stderr)
+        old.unlink()
+        old.mkdir()
+        result = execute()
+        (ok if result.returncode != 0 and old.is_dir() and not list(old.iterdir())
+         else fail)("install-only refuses a directory destination", result.stderr)
+        old.rmdir()
+        old.write_bytes(pristine)
+        mv = shutil.which("mv")
+        (fakebin / "mv").write_text('#!/bin/sh\ncase "$2" in */.zunder-guard.*) exit 94;; esac\nexec ' + shlex.quote(mv) + ' "$@"\n')
+        (fakebin / "mv").chmod(0o755)
+        result = execute()
+        (ok if result.returncode != 0 and old.read_bytes() == pristine and not list(prefix.glob(".zunder-guard.*"))
+         else fail)("failed replacement keeps previous binary and cleans staging", result.stderr)
+
+
+def case_init_options_offline():
+    """Execute the installer's actual init-argument block with an inert Guard.
+
+    This checks the explicit network selected in the website command reaches the
+    interactive CLI without carrying noninteractive account consent or a key file.
+    No installer setup, system service, credential or venue call is executed.
+    """
+    source = Path(__file__).resolve().parents[1] / "install.sh"
+    script = source.read_text()
+    block = script.split("\nset -- init\n", 1)[1].split("\nNET=$(guard config get network)", 1)[0]
+    # Only replace the controlling-terminal input boundary, not argument logic.
+    block = "set -- init\n" + block.replace("</dev/tty", "</dev/null")
+    capture = 'guard() { printf "%s\\n" "$@"; }\n'
+    base = {"PATH": os.environ["PATH"], "RULES": "zr1_fixture", "SERVICE": "1",
+            "NO_MAINNET": "", "FORCE": "0", "LISTEN": "", "SHARE": "", "LICENCE": "",
+            "CAP": "100", "ACCOUNT": PAPER_ACCOUNT, "CONFIRM": PAPER_ACCOUNT, "KEY_FILE": "/dev/null"}
+    for network in ("", "paper", "testnet", "mainnet"):
+        env = {**base, "NONINTERACTIVE": "0", "NETWORK": network}
+        result = subprocess.run(["sh", "-eu", "-c", capture + block], env=env,
+                                stdin=subprocess.DEVNULL, capture_output=True, text=True)
+        args = result.stdout.splitlines()
+        expected = ["init", "--rules", "zr1_fixture", "--no-key", "--equity-cap", "100",
+                    "--account", PAPER_ACCOUNT]
+        if network:
+            expected += ["--network", network]
+        expected += ["--interactive"]
+        (ok if result.returncode == 0 and args == expected else fail)(
+            "interactive selected mode forwarded with explicit consent still in CLI: " + (network or "ask"),
+            result.stdout + result.stderr)
+    env = {**base, "NONINTERACTIVE": "1", "NETWORK": "mainnet"}
+    result = subprocess.run(["sh", "-eu", "-c", capture + block], env=env,
+                            stdin=subprocess.DEVNULL, capture_output=True, text=True)
+    expected = ["init", "--rules", "zr1_fixture", "--no-key", "--equity-cap", "100",
+                "--non-interactive", "--network", "mainnet", "--account", PAPER_ACCOUNT,
+                "--confirm-mainnet", PAPER_ACCOUNT, "--key-stdin"]
+    (ok if result.returncode == 0 and result.stdout.splitlines() == expected else fail)(
+        "noninteractive explicit account-consent and stdin contract preserved", result.stdout + result.stderr)
+
+
 def main():
     mode = sys.argv[1]
-    if mode == "container":
+    if mode not in ("install-only", "init-options"):
+        global pexpect
+        import pexpect
+    if mode == "init-options":
+        case_init_options_offline()
+    elif mode == "install-only":
+        case_init_options_offline()
+        case_install_only_offline()
+    elif mode == "container":
         case_paper_interactive_through_the_pipe()
         case_edit_with_bounds()
         case_testnet_key_hidden_and_checked()
@@ -502,6 +669,7 @@ def main():
         case_non_interactive()
         case_invalid_rules()
         case_tampering()
+        case_install_only_offline()
     elif mode == "bootstrap":
         case_bootstrap_real_cosign()
     elif mode == "systemd":

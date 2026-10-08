@@ -55,6 +55,21 @@ class ReleaseRendering(unittest.TestCase):
         for name in ('i', self.descriptor.name, 'compose.yaml', 'cloudformation.yaml'):
             self.assertIn(hashlib.sha256((self.dist / name).read_bytes()).hexdigest() + '  ' + name, sums)
 
+    def test_windows_service_helper_is_rendered_and_signed(self):
+        result = self.render()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        helper = self.dist / 'install-windows-service.ps1'
+        self.assertIn('Invoke-ZgLifecycle', helper.read_text())
+        line = hashlib.sha256(helper.read_bytes()).hexdigest() + '  ' + helper.name
+        self.assertEqual((self.dist / 'SHA256SUMS').read_text().splitlines().count(line), 1)
+
+    def test_windows_embedded_trust_and_lifecycle_sources_match(self):
+        shared = (GUARD / 'windows/bootstrap.ps1.inc').read_text()
+        journey = (GUARD / 'windows/loader-mainnet.ps1.inc').read_text()
+        lifecycle = (GUARD / 'windows/lifecycle.ps1.inc').read_text()
+        self.assertIn(shared + '\n' + journey, (GUARD / 'loader/i.ps1').read_text())
+        self.assertIn(shared + '\n' + lifecycle, (GUARD / 'windows/service.ps1').read_text())
+
     def test_homebrew_preserves_every_notice_and_tests_the_installed_files(self):
         self.assertEqual(self.render().returncode, 0)
         formula = (self.dist / 'zunder-guard.rb').read_text()

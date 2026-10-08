@@ -69,17 +69,22 @@ Usage: sh install.sh [options]
   --prefix DIR          binary directory (default /usr/local/bin as root, else ~/.local/bin);
                         notices go in ../share/licenses/zunder-guard for a bin directory,
                         otherwise DIR/share/licenses/zunder-guard
+  --container           guided Linux mainnet Docker service with encrypted credential
+  --volume NAME         explicit named volume for container setup (default zunder-guard-data)
+  --install-only        verify and replace binary/notices only; no setup or service changes
+                        stop Guard first; restart it yourself after checking the release
   --no-service          install and set up, but do not install the systemd unit
   --force               replace an existing configuration without asking (the journal is kept)
   --version             print the release this installer belongs to
 EOF
 }
 
-RULES="" NETWORK="" ACCOUNT="" KEY_FILE="" CONFIRM="" CAP="" PREFIX="" LISTEN="" SHARE="" LICENCE="" NONINTERACTIVE=0 NO_SERVICE=0 FORCE=0
+RULES="" NETWORK="" ACCOUNT="" KEY_FILE="" CONFIRM="" CAP="" PREFIX="" LISTEN="" SHARE="" LICENCE="" NONINTERACTIVE=0 NO_SERVICE=0 FORCE=0 INSTALL_ONLY=0 SETUP_OPTIONS=0 CONTAINER=0 VOLUME=""
 while [ $# -gt 0 ]; do
   case "$1" in
-    --rules | --network | --account | --key-file | --confirm-mainnet | --equity-cap | --prefix | --listen | --ip-share | --licence)
+    --rules | --network | --account | --key-file | --confirm-mainnet | --equity-cap | --prefix | --listen | --ip-share | --licence | --volume)
       [ $# -ge 2 ] || die "$1 needs a value"
+      [ "$1" = --prefix ] || SETUP_OPTIONS=1
       case "$1" in
         --rules) RULES=$2 ;;
         --network) NETWORK=$2 ;;
@@ -91,17 +96,34 @@ while [ $# -gt 0 ]; do
         --listen) LISTEN=$2 ;;
         --ip-share) SHARE=$2 ;;
         --licence) LICENCE=$2 ;;
+        --volume) VOLUME=$2 ;;
       esac
       shift 2
       ;;
+    --container) CONTAINER=1 && SETUP_OPTIONS=1 && shift ;;
+    --install-only) INSTALL_ONLY=1 && shift ;;
     --non-interactive) NONINTERACTIVE=1 && shift ;;
     --no-service) NO_SERVICE=1 && shift ;;
-    --force) FORCE=1 && shift ;;
+    --force) FORCE=1 && SETUP_OPTIONS=1 && shift ;;
     --version) say "$VERSION" && exit 0 ;;
     -h | --help) usage && exit 0 ;;
     *) die "unknown option $1 (see --help)" ;;
   esac
 done
+
+if [ "$CONTAINER" -eq 1 ]; then
+  PATH=/usr/sbin:/usr/bin:/sbin:/bin
+  export PATH
+  [ "$NETWORK" = mainnet ] || die "--container requires --network mainnet"
+  [ "$INSTALL_ONLY$NONINTERACTIVE$NO_SERVICE$FORCE" = 0000 ] || die "container mode requires interactive managed setup"
+  [ -z "$KEY_FILE$CONFIRM$PREFIX$LISTEN" ] || die "container mode does not accept key-file, confirm-mainnet, prefix or listen"
+elif [ -n "$VOLUME" ]; then
+  die "--volume requires --container"
+fi
+
+if [ "$INSTALL_ONLY" -eq 1 ] && [ "$SETUP_OPTIONS" -eq 1 ]; then
+  die "--install-only cannot be combined with setup options (rules, network, account, key, licence, limits, listen or --force)"
+fi
 
 # Values that reach a command line are checked for shape here; the binary checks them again.
 case "$RULES" in "" | zr1_*) ;; *) die "a rules string starts with zr1_" ;; esac
@@ -121,7 +143,9 @@ for a in "$ACCOUNT" "$CONFIRM"; do
   case "$a" in "" | 0x[0-9a-fA-F]*) ;; *) die "an account address is 0x and 40 hex digits" ;; esac
 done
 
-if [ "$NONINTERACTIVE" -eq 1 ]; then
+if [ "$INSTALL_ONLY" -eq 1 ]; then
+  : # No terminal, setup values or credentials are needed to replace verified release files.
+elif [ "$NONINTERACTIVE" -eq 1 ]; then
   [ -n "$RULES" ] || die "--non-interactive needs --rules"
   [ -n "$NETWORK" ] || die "--non-interactive needs --network"
   if [ "$NETWORK" != paper ]; then
@@ -161,9 +185,11 @@ command -v curl >/dev/null 2>&1 || die "curl is required"
 
 TMP=$(mktemp -d)
 NOTICE_STAGE=""
+BINARY_STAGE=""
 SUDO_BIN=""
 cleanup() {
   stty echo 2>/dev/null </dev/tty || true
+  if [ -n "${BINARY_STAGE:-}" ]; then $SUDO_BIN rm -f "$BINARY_STAGE"; fi
   if [ -n "${NOTICE_STAGE:-}" ]; then $SUDO_BIN rm -rf "$NOTICE_STAGE"; fi
   rm -rf "$TMP"
 }
@@ -181,6 +207,104 @@ sha256() {
 fetch() {
   curl -fsSL --proto '=https,file' --retry 3 -o "$TMP/$1" "$2" || die "download failed: $2"
 }
+
+# Container mode never installs/replaces a native Guard binary.
+if [ "$CONTAINER" -eq 1 ]; then
+  [ "$OS" = linux ] || die "--container mainnet requires Linux systemd and local Docker"
+  [ -x /usr/bin/python3 ] || die "Python 3.11 or newer is required for container installation"
+  /usr/bin/python3 -I -c 'import sys; sys.exit(sys.version_info < (3, 11))' || die "Python 3.11 or newer is required"
+  for asset in SHA256SUMS SHA256SUMS.sigstore.json install-container.py container-supervisor.py container-operations.py zunder-guard-container.service zunder-guard-setup-guardian.service "zunder-guard-$VERSION.image.txt"; do
+    fetch "$asset" "$BASE_URL/$asset"
+  done
+  fetch container-cosign "$COSIGN_URL/cosign-linux-$ARCH"
+  if [ "$(/usr/bin/id -u)" -eq 0 ]; then
+    CONTAINER_SUDO=""
+  else
+    [ -x /usr/bin/sudo ] || die "container installation needs root or sudo"
+    /usr/bin/sudo -v || die "administrator installation was not authorized"
+    CONTAINER_SUDO=/usr/bin/sudo
+  fi
+  $CONTAINER_SUDO /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME=/root LANG=C.UTF-8 \
+    /usr/bin/python3 -I - "$TMP" "$COSIGN_SHA256" "$VERSION" "$VOLUME" "$ACCOUNT" "$RULES" "$CAP" "$SHARE" "$LICENCE" <<'CONTAINER_BOOTSTRAP'
+import hashlib, os, pathlib, re, resource, shutil, stat, subprocess, sys, tempfile
+resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+os.umask(0o077)
+source, pinned, version, volume, account, rules, cap, share, licence = sys.argv[1:]
+if not re.fullmatch(r'v[0-9]+\.[0-9]+\.[0-9]+', version):
+    raise SystemExit('Invalid release version')
+env = {'PATH': '/usr/sbin:/usr/bin:/sbin:/bin', 'HOME': '/root', 'LANG': 'C.UTF-8'}
+def trusted(path, directory=False):
+    info = path.lstat()
+    if info.st_uid != 0 or info.st_mode & 0o022 or stat.S_ISLNK(info.st_mode):
+        raise SystemExit('Untrusted installer staging path')
+    if not (stat.S_ISDIR(info.st_mode) if directory else stat.S_ISREG(info.st_mode)):
+        raise SystemExit('Unexpected installer path type')
+base = pathlib.Path('/var/lib/zunder-guard-install')
+for parent in base.parents:
+    trusted(parent, True)
+base.mkdir(mode=0o700, exist_ok=True)
+trusted(base, True)
+if stat.S_IMODE(base.stat().st_mode) != 0o700:
+    raise SystemExit('Installer staging directory must be root-only')
+stage = pathlib.Path(tempfile.mkdtemp(prefix='release-', dir=base))
+assets = ['install-container.py', 'container-supervisor.py', 'container-operations.py',
+          'zunder-guard-container.service', 'zunder-guard-setup-guardian.service',
+          'zunder-guard-' + version + '.image.txt']
+try:
+    for name in ['SHA256SUMS', 'SHA256SUMS.sigstore.json', 'container-cosign', *assets]:
+        target = stage / name
+        with open(pathlib.Path(source) / name, 'rb') as src, open(target, 'xb') as dst:
+            shutil.copyfileobj(src, dst)
+        target.chmod(0o700 if name == 'container-cosign' else 0o600)
+    verifier = stage / 'container-cosign'
+    if hashlib.sha256(verifier.read_bytes()).hexdigest() != pinned:
+        raise SystemExit('Pinned verifier checksum mismatch')
+    check = subprocess.run([str(verifier), 'verify-blob', '--bundle', str(stage / 'SHA256SUMS.sigstore.json'),
+        '--certificate-identity', 'https://github.com/zunderlabs/zunder-guard/.github/workflows/release.yml@refs/tags/' + version,
+        '--certificate-oidc-issuer', 'https://token.actions.githubusercontent.com', str(stage / 'SHA256SUMS')],
+        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env, timeout=120)
+    if check.returncode:
+        raise SystemExit('Release signature verification failed')
+    checksums = {}
+    for line in (stage / 'SHA256SUMS').read_text().splitlines():
+        match = re.fullmatch(r'([a-f0-9]{64}) [ *]([A-Za-z0-9._-]+)', line)
+        if not match or match[2] in checksums:
+            raise SystemExit('Malformed or duplicate signed checksum')
+        checksums[match[2]] = match[1]
+    for name in assets:
+        if checksums.get(name) != hashlib.sha256((stage / name).read_bytes()).hexdigest():
+            raise SystemExit('Signed installer asset checksum mismatch')
+    # Preserve a different administrator-installed verifier; never overwrite silently.
+    destination = pathlib.Path('/usr/local/bin/cosign')
+    for parent in destination.parents:
+        trusted(parent, True)
+    if destination.exists() or destination.is_symlink():
+        trusted(destination)
+        if hashlib.sha256(destination.read_bytes()).hexdigest() != pinned:
+            raise SystemExit('Install the pinned cosign version at /usr/local/bin/cosign before retrying')
+    else:
+        fd, pending = tempfile.mkstemp(prefix='.cosign-', dir=destination.parent)
+        try:
+            with os.fdopen(fd, 'wb') as stream:
+                stream.write(verifier.read_bytes()); stream.flush(); os.fsync(stream.fileno())
+            os.chmod(pending, 0o755)
+            os.link(pending, destination)  # refuse a concurrent replacement
+        finally:
+            os.unlink(pending)
+    options = ['--version', version]
+    for name, value in [('volume', volume), ('account', account), ('rules', rules),
+                        ('equity-cap', cap), ('ip-share', share), ('licence', licence)]:
+        if value:
+            options += ['--' + name, value]
+    with open('/dev/tty', 'rb') as terminal:
+        result = subprocess.run(['/usr/bin/python3', '-I', str(stage / 'install-container.py'), *options],
+                                stdin=terminal, env=env, check=False)
+    raise SystemExit(result.returncode)
+finally:
+    shutil.rmtree(stage)
+CONTAINER_BOOTSTRAP
+  exit $?
+fi
 
 # ---------------------------------------------------------------- 1-3: download and verify
 say "Zunder Guard $VERSION for $OS-$ARCH: downloading and verifying the release"
@@ -221,7 +345,7 @@ done
 
 # ---------------------------------------------------------------- 4: install the binary
 SERVICE=0
-if [ "$OS" = linux ] && [ "$NO_SERVICE" -eq 0 ] && [ -d /run/systemd/system ]; then SERVICE=1; fi
+if [ "$INSTALL_ONLY" -eq 0 ] && [ "$OS" = linux ] && [ "$NO_SERVICE" -eq 0 ] && [ -d /run/systemd/system ]; then SERVICE=1; fi
 SUDO=""
 if [ "$(id -u)" -ne 0 ] && { [ "$SERVICE" -eq 1 ] || [ -z "$PREFIX" ]; }; then
   if command -v sudo >/dev/null 2>&1 && { [ "$NONINTERACTIVE" -eq 0 ] || sudo -n true 2>/dev/null; }; then
@@ -268,11 +392,99 @@ done
 $SUDO_BIN rmdir "$NOTICE_STAGE"
 NOTICE_STAGE=""
 $SUDO_BIN mkdir -p "$PREFIX"
-$SUDO_BIN install -m 0755 "$TMP/x/zunder-guard" "$PREFIX/zunder-guard"
+if [ "$INSTALL_ONLY" -eq 1 ]; then
+  # Stage beside the destination: rename replaces the executable without truncating the old
+  # inode, even if someone has left a process running. No process is stopped or restarted.
+  if ! { [ ! -L "$PREFIX/zunder-guard" ] && [ ! -d "$PREFIX/zunder-guard" ]; }; then
+    die "binary destination is a symlink or directory; refusing --install-only"
+  fi
+  BINARY_STAGE=$($SUDO_BIN mktemp "$PREFIX/.zunder-guard.XXXXXXXX")
+  $SUDO_BIN install -m 0755 "$TMP/x/zunder-guard" "$BINARY_STAGE"
+  $SUDO_BIN mv -f "$BINARY_STAGE" "$PREFIX/zunder-guard"
+  BINARY_STAGE=""
+else
+  $SUDO_BIN install -m 0755 "$TMP/x/zunder-guard" "$PREFIX/zunder-guard"
+fi
 BIN=$PREFIX/zunder-guard
 say "Installed $("$BIN" --version) to $BIN"
 say "Licence notices: $NOTICE_DIR"
 case ":$PATH:" in *":$PREFIX:"*) ;; *) say "  note: $PREFIX is not on your PATH" ;; esac
+
+if [ "$INSTALL_ONLY" -eq 1 ]; then
+  say "Installed release files only. Configuration, licences, keys, pairings, journals and services were not changed."
+  say "A running Guard still uses its old binary. Restart it yourself with its existing configuration when ready."
+  exit 0
+fi
+
+# macOS mainnet uses a protected launchd broker, never a user-writable binary.
+# This branch is deliberately AFTER the reviewed --install-only early return.
+if [ "$OS" = darwin ] && [ "$NETWORK" = mainnet ] && [ "$NO_SERVICE" -eq 0 ]; then
+  PATH=/usr/bin:/bin:/usr/sbin:/sbin
+  export PATH
+  if ! { [ -z "$KEY_FILE$CONFIRM" ] && [ "$FORCE" -eq 0 ]; }; then
+    die "macOS managed mainnet requires hidden key input and interactive account confirmation; key-file, confirm-mainnet and force are refused"
+  fi
+  [ "$NONINTERACTIVE" -eq 0 ] || die "macOS mainnet provisioning needs an interactive terminal; nothing was started"
+  if [ "$(/usr/bin/id -u)" -ne 0 ]; then
+    [ -x /usr/bin/sudo ] || die "macOS mainnet needs administrator installation"
+    /usr/bin/sudo -v || die "administrator installation was not authorized"
+    MAC_SUDO=/usr/bin/sudo
+  else
+    MAC_SUDO=""
+  fi
+  fetch install-macos-service.sh "$BASE_URL/install-macos-service.sh"
+  # Always use the exact pinned verifier, even if a different cosign verified
+  # the unprivileged download. It is checked again after root-private copying.
+  fetch macos-service-cosign "$COSIGN_URL/cosign-darwin-$ARCH"
+  [ "$(sha256 "$TMP/macos-service-cosign")" = "$COSIGN_SHA256" ] || die "macOS service verifier checksum mismatch"
+  MAC_STAGE=$($MAC_SUDO /bin/sh -s <<'ROOT_STAGE'
+set -eu
+PATH=/usr/bin:/bin:/usr/sbin:/sbin
+export PATH
+umask 077
+root_path() {
+  component=$1
+  while :; do
+    [ ! -L "$component" ] && [ "$(stat -f %u "$component")" = 0 ] || exit 2
+    permissions=$(stat -f %Lp "$component")
+    [ "$((0$permissions & 022))" = 0 ] || exit 2
+    [ "$component" != / ] || break
+    component=$(dirname "$component")
+  done
+}
+for directory in '/Library/Application Support' '/Library/Application Support/Zunder Guard' '/Library/Application Support/Zunder Guard/staging'; do
+  if [ ! -e "$directory" ]; then mkdir -m 0755 "$directory"; fi
+  root_path "$directory"
+done
+mktemp -d '/Library/Application Support/Zunder Guard/staging/install.XXXXXXXX'
+ROOT_STAGE
+  ) || die "could not establish root-private macOS staging"
+  for asset in SHA256SUMS SHA256SUMS.sigstore.json "$ARCHIVE" install-macos-service.sh; do
+    $MAC_SUDO /usr/bin/install -o root -g wheel -m 0600 "$TMP/$asset" "$MAC_STAGE/$asset"
+  done
+  $MAC_SUDO /usr/bin/install -o root -g wheel -m 0700 "$TMP/macos-service-cosign" "$MAC_STAGE/cosign"
+  # Only OS tools run privileged before the pinned verifier authenticates the
+  # helper. Caller arguments contain public paths/hashes, never credentials.
+  $MAC_SUDO /bin/sh -s -- "$MAC_STAGE" "$COSIGN_SHA256" "$VERSION" <<'ROOT_VERIFY'
+set -eu
+PATH=/usr/bin:/bin:/usr/sbin:/sbin
+export PATH
+stage=$1; verifier_hash=$2; version=$3
+actual=$(shasum -a 256 "$stage/cosign" | awk '{print $1}')
+[ "$actual" = "$verifier_hash" ] || exit 2
+"$stage/cosign" verify-blob --bundle "$stage/SHA256SUMS.sigstore.json" \
+  --certificate-identity "https://github.com/zunderlabs/zunder-guard/.github/workflows/release.yml@refs/tags/$version" \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com "$stage/SHA256SUMS" \
+  >"$stage/bootstrap-verification.log" 2>&1
+expected=$(awk '$2 == "install-macos-service.sh" || $2 == "*install-macos-service.sh" { print $1 }' "$stage/SHA256SUMS")
+[ "${#expected}" = 64 ] || exit 2
+[ "$(shasum -a 256 "$stage/install-macos-service.sh" | awk '{print $1}')" = "$expected" ] || exit 2
+ROOT_VERIFY
+  # Helper is now a verified, root-owned signed asset in root-private staging.
+  $MAC_SUDO /bin/sh "$MAC_STAGE/install-macos-service.sh" "$MAC_STAGE" "$VERSION" "$RULES" "$ACCOUNT" "$CAP" "$LISTEN" "$SHARE" "$LICENCE"
+  $MAC_SUDO /bin/rm -rf "$MAC_STAGE"
+  exit 0
+fi
 
 # ---------------------------------------------------------------- 5: set up
 if [ "$SERVICE" -eq 1 ]; then
@@ -329,10 +541,15 @@ if [ "$NONINTERACTIVE" -eq 1 ]; then
   fi
 else
   [ -n "$ACCOUNT" ] && set -- "$@" --account "$ACCOUNT"
+  [ -n "$NETWORK" ] && set -- "$@" --network "$NETWORK"
   guard "$@" --interactive </dev/tty
 fi
 NET=$(guard config get network)
 ACCOUNT=$(guard config get account)
+
+# Pair before a service loads the config, so the displayed client key works immediately.
+guard pair
+[ "$SERVICE" -eq 1 ] && $SUDO chown -R zunder-guard:zunder-guard "$SERVICE_HOME"
 
 if [ "$SERVICE" -eq 1 ]; then
   CREDENTIAL=""
@@ -437,9 +654,6 @@ if [ -n "$KEY_FILE" ]; then
   say "WARNING: $KEY_FILE still holds the API wallet key in plain text. Guard does not need it any"
   say "more: delete it (shred -u \"$KEY_FILE\" where available)."
 fi
-# ---------------------------------------------------------------- 7: pair the bot
-guard pair
-[ "$SERVICE" -eq 1 ] && $SUDO chown -R zunder-guard:zunder-guard "$SERVICE_HOME"
 if [ "$SERVICE" -eq 1 ]; then
   say "Logs: journalctl -u zunder-guard -f    Stop: sudo systemctl stop zunder-guard"
 else

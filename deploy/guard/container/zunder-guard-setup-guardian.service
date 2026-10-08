@@ -1,0 +1,29 @@
+[Unit]
+Description=Clean up owned temporary Zunder Guard installation containers
+After=docker.service
+Wants=docker.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=root
+Group=root
+ExecStart=/usr/bin/python3 -I /usr/local/libexec/zunder-guard-container/operations.py
+Restart=always
+RestartSec=2
+LimitCORE=0
+UMask=0077
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/etc/zunder-guard-container/operations
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+RestrictSUIDSGID=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+[Install]
+WantedBy=multi-user.target

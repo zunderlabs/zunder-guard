@@ -88,7 +88,7 @@ zunder-guard init --interactive
 zunder-guard check-config
 ```
 
-Mainnet is supported by the Unix binary in a foreground process, with the existing consent, journal and stdin-key requirements. Do not downgrade the customer's intended network to paper just to make the service check pass. Use a separate paper configuration for `brew services` proof. There is no mainnet service credential handoff in the Homebrew formula; unattended mainnet goes through the Linux systemd-creds installer.
+Mainnet is supported by the Unix binary in a foreground process, with the existing consent, journal and stdin-key requirements. Do not downgrade the customer's intended network to paper just to make the service check pass. Use a separate paper configuration for `brew services` proof. There is no mainnet service credential handoff in the Homebrew formula; unattended mainnet goes through the separately signed protected installer (systemd-creds on Linux, System Keychain/launchd on macOS). Never elevate a user-writable Homebrew Cellar executable to provision that service.
 
 Follow the customer instructions in `/docs/deploy/packages/` for network-specific startup, activation, pairing, restart, upgrade and uninstall. Before resuming a bot, inspect:
 

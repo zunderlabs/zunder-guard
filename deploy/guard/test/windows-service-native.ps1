@@ -1,0 +1,142 @@
+# Disposable hosted Windows runner only. Exercises production broker/DPAPI/ACL/Job
+# code with a non-shipped fixture binary that cannot start Guard or contact a venue.
+[CmdletBinding()]
+param([Parameter(Mandatory)][string]$Fixture)
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
+if ($env:GITHUB_ACTIONS -ne 'true' -or $env:RUNNER_OS -ne 'Windows') { throw 'Hosted native CI only.' }
+$Principal = [Security.Principal.WindowsPrincipal]::new([Security.Principal.WindowsIdentity]::GetCurrent())
+if (-not $Principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { throw 'Elevated runner required.' }
+$Id = 'ci-' + [Guid]::NewGuid().ToString('N')
+$Name = "ZunderGuard-$Id"
+$DataBase = Join-Path ([Environment]::GetFolderPath('CommonApplicationData')) 'ZunderGuard'
+$BinBase = Join-Path ([Environment]::GetFolderPath('ProgramFiles')) 'ZunderGuard'
+$Root = Join-Path $DataBase $Id
+$Runtime = Join-Path $Root 'runtime'
+$Bin = Join-Path $BinBase $Id
+$Exe = Join-Path $Bin 'zunder-guard.exe'
+$Binding = Join-Path $Root 'binding.json'
+$Log = Join-Path $Runtime 'lifecycle.log'
+$Sc = Join-Path ([Environment]::GetFolderPath('Windows')) 'System32\sc.exe'
+$Wer = 'HKLM:\SOFTWARE\Microsoft\Windows\Windows Error Reporting\ExcludedApplications'
+$Sid = $null
+$CreatedBases = @()
+$PreviousWer = $null
+$HadWer = $false
+function Invoke-Sc([string[]]$Words) { & $Sc @Words | Out-Host; if ($LASTEXITCODE) { throw 'SCM fixture operation failed.' } }
+function Set-FixtureAcl([string]$Path, [bool]$Writable = $false, [bool]$Public = $false) {
+  $Item = Get-Item -LiteralPath $Path -Force
+  if ($Item.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'Reparse fixture refused.' }
+  $Acl = if ($Item.PSIsContainer) { [Security.AccessControl.DirectorySecurity]::new() } else { [Security.AccessControl.FileSecurity]::new() }
+  $Acl.SetAccessRuleProtection($true,$false)
+  $Acl.SetOwner([Security.Principal.SecurityIdentifier]::new('S-1-5-32-544'))
+  $Inheritance = if ($Item.PSIsContainer) { [Security.AccessControl.InheritanceFlags]'ContainerInherit,ObjectInherit' } else { [Security.AccessControl.InheritanceFlags]::None }
+  foreach ($Owner in @('S-1-5-18','S-1-5-32-544')) { $Acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new([Security.Principal.SecurityIdentifier]::new($Owner),'FullControl',$Inheritance,'None','Allow')) }
+  $Reader = if ($Public) { 'S-1-5-11' } else { $script:Sid }
+  if ($Reader) {
+    $Rights = if ($Writable) { 'Modify' } else { 'ReadAndExecute' }
+    $Acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new([Security.Principal.SecurityIdentifier]::new($Reader),$Rights,$Inheritance,'None','Allow'))
+  }
+  Set-Acl -LiteralPath $Path -AclObject $Acl
+}
+function Wait-Started([int]$Count) {
+  $Deadline = [DateTime]::UtcNow.AddSeconds(45)
+  do {
+    $Lines = if (Test-Path -LiteralPath $Log) { @(Get-Content -LiteralPath $Log | Where-Object { $_ -match '^started \d+$' }) } else { @() }
+    if ($Lines.Count -ge $Count) { return [int]($Lines[-1] -split ' ')[1] }
+    Start-Sleep -Milliseconds 100
+  } while ([DateTime]::UtcNow -lt $Deadline)
+  throw 'Synthetic runtime did not start; SCM or credential admission failed.'
+}
+function Stop-Fixture {
+  $Service = Get-Service -Name $Name -ErrorAction SilentlyContinue
+  if ($Service -and $Service.Status -ne 'Stopped') { Stop-Service -Name $Name; $Service.WaitForStatus('Stopped',[TimeSpan]::FromSeconds(35)) }
+}
+function Assert-NoProcess([int]$ProcessId) {
+  $Process = Get-Process -Id $ProcessId -ErrorAction SilentlyContinue
+  if ($Process) { $Process | Wait-Process -Timeout 10 }
+  if (Get-Process -Id $ProcessId -ErrorAction SilentlyContinue) { throw 'Synthetic child survived broker shutdown.' }
+}
+try {
+  foreach ($Base in @($DataBase,$BinBase)) {
+    if (Test-Path -LiteralPath $Base) { throw 'Native fixture needs a clean disposable runner application namespace.' }
+    New-Item -ItemType Directory -Path $Base | Out-Null; $CreatedBases += $Base; Set-FixtureAcl $Base $false $true
+  }
+  foreach ($Path in @($Root,$Runtime,$Bin)) { New-Item -ItemType Directory -Path $Path | Out-Null; Set-FixtureAcl $Path }
+  Copy-Item -LiteralPath $Fixture -Destination $Exe
+  $ImagePath = '"' + $Exe + '" service run --binding "' + $Binding + '"'
+  Invoke-Sc @('create',$Name,'binPath=',$ImagePath,'start=','demand','obj=',"NT SERVICE\$Name")
+  $Sid = ([Security.Principal.NTAccount]::new("NT SERVICE\$Name")).Translate([Security.Principal.SecurityIdentifier]).Value
+  foreach ($Path in @($Root,$Bin,$Exe)) { Set-FixtureAcl $Path }
+  Set-FixtureAcl $Runtime $true
+  New-Item -Path $Wer -Force | Out-Null
+  $Existing = Get-ItemProperty -LiteralPath $Wer -Name 'zunder-guard.exe' -ErrorAction SilentlyContinue
+  if ($Existing) { $PreviousWer = $Existing.'zunder-guard.exe'; $HadWer = $true }
+  New-ItemProperty -LiteralPath $Wer -Name 'zunder-guard.exe' -Value 1 -PropertyType DWord -Force | Out-Null
+  $Json = & $Exe prepare-fixture --id $Id --home $Runtime --service-name $Name --service-sid $Sid
+  if ($LASTEXITCODE) { throw 'Synthetic fixture preparation failed.' }
+  [IO.File]::WriteAllText($Binding,($Json -join "`n"),[Text.UTF8Encoding]::new($false)); Set-FixtureAcl $Binding
+  Set-FixtureAcl (Join-Path $Runtime 'guard.toml') $true
+  Set-FixtureAcl (Join-Path $Runtime 'risk-mainnet.jsonl') $true
+  $Credential = Join-Path $Root 'credential.dpapi'; [IO.File]::WriteAllBytes($Credential,[byte[]]@()); Set-FixtureAcl $Credential
+  & $Exe service provision --binding $Binding; if ($LASTEXITCODE) { throw 'Synthetic machine credential provision failed.' }
+  Invoke-Sc @('failure',$Name,'reset=','86400','actions=','restart/1000/restart/1000/restart/1000')
+  Invoke-Sc @('failureflag',$Name,'0')
+  Invoke-Sc @('start',$Name); $First = Wait-Started 1
+  Stop-Fixture; Assert-NoProcess $First
+  if (-not ((Get-Content -LiteralPath $Log) -contains "stopped $First")) { throw 'Normal SCM stop did not reach stdin EOF cleanup.' }
+  Start-Sleep -Seconds 2
+  if ((Get-Service -Name $Name).Status -ne 'Stopped') { throw 'Intentional stop unexpectedly restarted.' }
+  Invoke-Sc @('start',$Name); $Second = Wait-Started 2
+  $Broker = Get-CimInstance Win32_Service -Filter "Name='$Name'"
+  if ($Broker.StartName -ne "NT SERVICE\$Name" -or $Broker.ProcessId -eq 0) { throw 'SCM virtual-account broker identity mismatch.' }
+  Stop-Process -Id $Broker.ProcessId -Force
+  Assert-NoProcess $Second
+  $Third = Wait-Started 3
+  Stop-Fixture; Assert-NoProcess $Third
+  [IO.File]::WriteAllText((Join-Path $Runtime 'fixture-transient-count'),'4'); Set-FixtureAcl (Join-Path $Runtime 'fixture-transient-count') $true
+  [IO.File]::WriteAllText((Join-Path $Runtime 'fixture-renew'),'synthetic only'); Set-FixtureAcl (Join-Path $Runtime 'fixture-renew') $true
+  Invoke-Sc @('start',$Name); $Fourth = Wait-Started 4
+  if ((Get-Content -LiteralPath (Join-Path $Runtime 'fixture-transient-count') -Raw).Trim() -ne '0') { throw 'SCM did not continue transient recovery past the third attempt.' }
+  & $Exe service check --binding $Binding; if ($LASTEXITCODE) { throw 'Administrator lost config access after service-owned renewal.' }
+  if ((Get-Content -LiteralPath (Join-Path $Runtime 'guard.toml') -Raw) -notmatch 'synthetic-renewed-fixture') { throw 'Service-owned renewal fixture did not update config.' }
+  Stop-Fixture; Assert-NoProcess $Fourth
+  # An accepted Stop must win even when the child independently exits 75.
+  $StopRace = Join-Path $Runtime 'fixture-stop-transient'
+  $ReleaseExit = Join-Path $Runtime 'fixture-exit-now'
+  [IO.File]::WriteAllText($StopRace,'synthetic only'); Set-FixtureAcl $StopRace $true
+  Invoke-Sc @('start',$Name); $Fifth = Wait-Started 5
+  Invoke-Sc @('stop',$Name) # returns after the handler acknowledges stop intent
+  [IO.File]::WriteAllText($ReleaseExit,'exit 75 now'); Set-FixtureAcl $ReleaseExit $true
+  (Get-Service -Name $Name).WaitForStatus('Stopped',[TimeSpan]::FromSeconds(35))
+  Assert-NoProcess $Fifth
+  if (-not ((Get-Content -LiteralPath $Log) -contains "transient-after-stop $Fifth")) { throw 'Synthetic child did not take the requested concurrent transient-exit path.' }
+  Start-Sleep -Seconds 3 # exceeds the fixture's one-second recovery action
+  if ((Get-Service -Name $Name).Status -ne 'Stopped') { throw 'Accepted Stop was overridden by transient recovery.' }
+  $Starts = @(Get-Content -LiteralPath $Log | Where-Object { $_ -match '^started \d+$' })
+  if ($Starts.Count -ne 5) { throw 'An extra broker restarted after accepted Stop.' }
+  Remove-Item -LiteralPath $StopRace,$ReleaseExit
+  # Crash the synthetic runtime while its public dummy key is resident.
+  # Admission already refuses HKLM/HKCU LocalDumps and managed WER policies.
+  $DumpRoots = @((Join-Path $env:ProgramData 'Microsoft\Windows\WER'),(Join-Path $env:LOCALAPPDATA 'CrashDumps'),(Join-Path $env:SystemRoot 'ServiceProfiles'),(Join-Path $env:SystemRoot 'System32\config\systemprofile\AppData\Local\CrashDumps'))
+  function Dump-Paths {
+    @($DumpRoots | Where-Object { Test-Path -LiteralPath $_ } | ForEach-Object { Get-ChildItem -LiteralPath $_ -File -Recurse -Force -ErrorAction Stop } | Where-Object { $_.Extension -in @('.dmp','.mdmp','.hdmp') } | ForEach-Object FullName)
+  }
+  $BeforeDumps = @(Dump-Paths)
+  [IO.File]::WriteAllText((Join-Path $Runtime 'fixture-crash'),'synthetic only'); Set-FixtureAcl (Join-Path $Runtime 'fixture-crash') $true
+  Invoke-Sc @('start',$Name)
+  (Get-Service -Name $Name).WaitForStatus('Stopped',[TimeSpan]::FromSeconds(35))
+  Start-Sleep -Seconds 5
+  $NewDumps = @(Dump-Paths | Where-Object { $_ -notin $BeforeDumps })
+  if ($NewDumps.Count) { throw 'Synthetic credential runtime crash created a dump artifact.' }
+  & $Exe service remove-credential --binding $Binding; if ($LASTEXITCODE) { throw 'Stopped credential removal failed.' }
+  if (Test-Path -LiteralPath $Credential) { throw 'Encrypted fixture credential remains.' }
+  Write-Host 'Native SCM virtual identity, machine decryption, stdin stop, broker death containment, four transient retries, accepted Stop versus transient exit, renewal/admin ACL, bounded WER dump scan after synthetic runtime crash and credential cleanup passed.'
+} finally {
+  Stop-Fixture
+  if (Get-Service -Name $Name -ErrorAction SilentlyContinue) { Invoke-Sc @('delete',$Name) }
+  foreach ($Path in @($Root,$Bin)) { if (Test-Path -LiteralPath $Path) { Remove-Item -LiteralPath $Path -Recurse -Force } }
+  foreach ($Path in $CreatedBases) { if (Test-Path -LiteralPath $Path) { Remove-Item -LiteralPath $Path -Force } }
+  if ($HadWer) { New-ItemProperty -LiteralPath $Wer -Name 'zunder-guard.exe' -Value $PreviousWer -PropertyType DWord -Force | Out-Null }
+  elseif (Test-Path -LiteralPath $Wer) { Remove-ItemProperty -LiteralPath $Wer -Name 'zunder-guard.exe' -ErrorAction SilentlyContinue }
+}

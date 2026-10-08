@@ -22,7 +22,7 @@ step() { echo "== $*"; }
 step "shellcheck"
 shellcheck --version | sed -n 2p
 shellcheck -s sh $G/install.sh $G/loader/i.sh $G/test/fake-cosign
-shellcheck $G/packaging/*.sh $G/github/*.sh $G/test/*.sh
+shellcheck $G/packaging/*.sh $G/github/*.sh $G/test/*.sh $G/macos/*.sh
 # The one-liner exactly as the website generates it, and the command it runs on the server.
 cat >"$W/oneliner.sh" <<'EOF'
 #!/bin/sh

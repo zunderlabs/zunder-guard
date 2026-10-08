@@ -59,6 +59,7 @@ COPY --chmod=0644 LICENSE NOTICE THIRD_PARTY_LICENSES.md /usr/share/licenses/zun
 USER 65532:65532
 # The journal, the configuration and (only if the user chose the file fallback) the key live
 # here. Mount a volume: losing it loses the daily-loss and drawdown state.
+COPY --chown=65532:65532 --chmod=0700 deploy/guard/container/volume-root/ /data/
 WORKDIR /data
 ENV ZUNDER_GUARD_HOME=/data \
     ZUNDER_GUARD_LISTEN=127.0.0.1:8547

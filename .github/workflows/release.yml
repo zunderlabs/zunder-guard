@@ -31,6 +31,11 @@ env:
   IMAGE: ghcr.io/zunderlabs/zunder-guard
 
 jobs:
+  native-services:
+    permissions:
+      contents: read
+    uses: ./.github/workflows/native-service.yml
+
   # Linux: the Dockerfile's build stage (a rust:alpine image pinned by digest), natively on each
   # architecture, so anyone can rebuild the same bytes with one command (README, "Reproducing a
   # release"). macOS and Windows: the toolchain pinned by rust-toolchain.toml on GitHub's runners
@@ -73,6 +78,43 @@ jobs:
           rustup target add "$TRIPLE"
           deploy/guard/github/build-release.sh "$TRIPLE"
           mkdir -p out && cp "target/$TRIPLE/release/zunder-guard$EXE" out/
+      - name: macOS credential isolation and crash-limit native gates
+        if: startsWith(matrix.target, 'darwin-')
+        shell: bash
+        env:
+          TRIPLE: ${{ matrix.triple }}
+        run: |
+          # Synthetic private fixture Keychain only; no venue requests or real keys.
+          # Serial execution keeps process-global Keychain interaction controls deterministic.
+          mkdir -p native-macos-evidence
+          python3 -B deploy/guard/test/macos-bootstrap.py deploy/guard/install.sh
+          sw_vers > native-macos-evidence/os.txt
+          uname -m > native-macos-evidence/architecture.txt
+          git rev-parse HEAD > native-macos-evidence/source-commit.txt
+          set +e
+          cargo test --locked -p zunder-guard --target "$TRIPLE" service::macos::tests -- --test-threads=1 > native-macos-evidence/synthetic-tests.log 2>&1
+          result=$?
+          set -e
+          printf '%s\n' "$result" > native-macos-evidence/exit-code.txt
+          cat native-macos-evidence/synthetic-tests.log
+          exit "$result"
+      - name: System Keychain and launchd native synthetic lifecycle
+        if: startsWith(matrix.target, 'darwin-')
+        shell: bash
+        env:
+          TRIPLE: ${{ matrix.triple }}
+        run: |
+          cargo build --locked -p zunder-guard --example macos_service_fixture --target "$TRIPLE"
+          shasum -a 256 "target/$TRIPLE/debug/examples/macos_service_fixture" > native-macos-evidence/fixture-sha256.txt
+          sudo /usr/bin/env GITHUB_ACTIONS=true RUNNER_OS=macOS RUNNER_ENVIRONMENT="$RUNNER_ENVIRONMENT" /bin/bash deploy/guard/macos/native-ci.sh "$PWD/target/$TRIPLE/debug/examples/macos_service_fixture" "$PWD/native-macos-evidence"
+      - name: Retain native macOS synthetic gate evidence
+        if: always() && startsWith(matrix.target, 'darwin-')
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: native-macos-${{ matrix.target }}
+          path: native-macos-evidence/
+          if-no-files-found: error
+          retention-days: 7
       - name: Refuse the stub, and a binary whose version is not the tag's
         shell: bash
         env:
@@ -127,7 +169,7 @@ jobs:
             || { echo "::error::the rebuild differs: the build is not reproducible"; exit 1; }
 
   package:
-    needs: [build, reproduce, image]
+    needs: [build, reproduce, image, native-services]
     permissions:
       contents: write # the draft release
       id-token: write # Sigstore keyless signing
@@ -275,7 +317,7 @@ jobs:
         run: gh release upload --repo "$GITHUB_REPOSITORY" "$VERSION" "zunder-guard-$VERSION.intoto.jsonl"
 
   image:
-    needs: [build, reproduce]
+    needs: [build, reproduce, native-services]
     permissions:
       contents: read
       packages: write

@@ -1,5 +1,6 @@
-# Runs when a person publishes the draft release that release.yml made (deploy/guard/README.md,
-# "Publishing"). Copy to .github/workflows/ in github.com/zunderlabs/zunder-guard.
+# Runs after the identified operator uses github/promote-release.sh on the verified draft.
+# The full native-readiness gate runs before that promotion and again here.
+# Copy to .github/workflows/ in github.com/zunderlabs/zunder-guard.
 #
 # Before anything leaves the repository it verifies the release's SHA256SUMS signature against
 # release.yml at this tag, and every file it hands on against SHA256SUMS. Then, each only when
@@ -42,7 +43,7 @@ jobs:
         with:
           ref: ${{ github.event.release.tag_name }}
           persist-credentials: false
-      - name: Verify completed release, every asset, and signed image digest
+      - name: Verify source, signed assets, image and identified native attestation
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.event.release.tag_name }}
@@ -52,6 +53,8 @@ jobs:
           name: verified
           path: rel
           retention-days: 7
+          # Contains only verified release bytes and public evidence/source bindings.
+          include-hidden-files: true
 
   homebrew:
     needs: verify
@@ -59,13 +62,24 @@ jobs:
       group: guard-homebrew-publication
       cancel-in-progress: false
     if: vars.HOMEBREW_TAP == 'enabled'
-    permissions: {}
+    permissions:
+      contents: read
     runs-on: ubuntu-24.04
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.release.tag_name }}
+          path: gate
+          persist-credentials: false
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: verified
           path: rel
+      - name: Require actual four-platform Homebrew entrypoint evidence
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.release.tag_name }}
+        run: python3 -B gate/deploy/guard/github/native-readiness.py verify "$TAG" rel --channel homebrew
       - name: Recheck the verified formula before issuing a write token
         id: formula-check
         env:
@@ -182,6 +196,11 @@ jobs:
         with:
           name: verified
           path: rel
+      - name: Require actual Tokyo arm64 AWS bootstrap evidence
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.release.tag_name }}
+        run: python3 -B deploy/guard/github/native-readiness.py verify "$TAG" rel --channel aws
       - name: Check publishing configuration
         env:
           ROLE: ${{ vars.AWS_TEMPLATE_ROLE_ARN }}

@@ -6,7 +6,8 @@ Hyperliquid's own API, sizes or refuses every order against the limits you set (
 trade, open risk, daily loss stop, drawdown halt, leverage, distance to liquidation, markets, a
 stop on every entry), re-signs what it allows with your API wallet key and sends it on.
 
-- Starts in **paper mode** (real prices, no orders) and listens on **127.0.0.1:8547** only.
+- Guided installation offers mainnet setup with explicit local consent, or paper rehearsal
+  (real prices, no orders). Guard listens on **127.0.0.1:8547** only.
 - Market and order traffic goes directly to Hyperliquid. Optional licence renewal contacts
   zunderlabs.com; no telemetry.
 - Your key stays on your machine; use an API wallet that can trade but cannot withdraw.
@@ -27,16 +28,16 @@ On a Linux server, guided (rules from <https://zunderlabs.com>, then account, mo
 hidden input):
 
 ```sh
-ssh -t you@server "curl -fsSL https://zunderlabs.com/i | sh -s -- --rules zr1_…"
+ssh -t you@server "curl -fsSL https://zunderlabs.com/i | sh -s -- --network mainnet --rules zr1_…"
 ```
 
 The loader checks the release's Sigstore signature and checksums before it runs anything.
 Read it first if you prefer: `curl -fsSLO https://zunderlabs.com/i && less i && sh i --rules zr1_…`.
 
-Docker (`linux/amd64`, `linux/arm64`):
+Docker paper rehearsal (`linux/amd64`, `linux/arm64`):
 
 ```sh
-docker run -it --rm -v zunder-guard:/data ghcr.io/zunderlabs/zunder-guard:v1.0.0 init --interactive --rules zr1_…
+docker run -it --rm --log-driver=none -v zunder-guard:/data ghcr.io/zunderlabs/zunder-guard:v1.0.0 init --interactive --network paper --rules zr1_…
 docker run -d --name zunder-guard --init --restart unless-stopped -v zunder-guard:/data \
   -e ZUNDER_GUARD_LISTEN=0.0.0.0:8547 -p 127.0.0.1:8547:8547 ghcr.io/zunderlabs/zunder-guard:v1.0.0
 ```
@@ -44,19 +45,31 @@ docker run -d --name zunder-guard --init --restart unless-stopped -v zunder-guar
 After a testnet setup add `-e ZUNDER_GUARD_NETWORK=testnet`: Guard sends only where it is told
 to, and only when that is the mode `init` recorded.
 
+For mainnet containers on native Linux with systemd 250+, Python 3.11+ and a local rootful Docker Engine:
+
+```sh
+curl -fsSL https://zunderlabs.com/i | sh -s -- --container --network mainnet
+```
+
 Homebrew (macOS, Linux): `brew install zunderlabs/tap/zunder-guard`. Archives for Linux and
 macOS (x86_64 and arm64), plus Windows x86_64, are on the
 [releases page](https://github.com/zunderlabs/zunder-guard/releases).
-Windows supports paper and testnet in 1.0. Use the documented Linux SSH/systemd setup for
-mainnet. Guided PowerShell setup:
+Mainnet on Linux and macOS uses the separately verified protected service installer:
+`curl -fsSL https://zunderlabs.com/i | sh -s -- --network mainnet`, including after Homebrew
+installation. Homebrew's own service is for paper rehearsal.
+
+On native x64 Windows, open an elevated interactive PowerShell terminal:
 
 ```powershell
-& ([scriptblock]::Create((irm https://zunderlabs.com/i.ps1))) -Rules zr1_…
+& ([scriptblock]::Create((irm https://zunderlabs.com/i.ps1))) -Network mainnet
 ```
 
-The Windows loader verifies the signature and checksums, initializes Guard and prints the run
-command; it does not start a background service. See the
-[Windows guide](https://zunderlabs.com/docs/deploy/windows/).
+Mainnet installers verify the signed service helper, ask for separate account confirmation,
+cap and hidden API wallet key, and leave the service stopped for explicit activation.
+See the [Windows](https://zunderlabs.com/docs/deploy/windows/),
+[macOS](https://zunderlabs.com/docs/deploy/macos/) and
+[mainnet activation](https://zunderlabs.com/docs/start/go-live/) guides.
+For a separate per-user paper/testnet installation, select that network without elevation.
 
 AI agents: `zunder-guard mcp` is an MCP server with guarded trading tools (`docs/guard-mcp.md`).
 

@@ -24,6 +24,7 @@ pub mod licence_life;
 pub mod recover;
 pub mod rules;
 pub mod server;
+pub mod service;
 pub mod statusview;
 pub mod stream;
 #[doc(hidden)]

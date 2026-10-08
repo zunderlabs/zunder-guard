@@ -18,10 +18,13 @@ import yaml
 
 from distribution import InstallerNotices, ReleaseRendering
 
-SCRIPT = Path(__file__).resolve().parents[1] / 'github/verify-release.sh'
+SCRIPT = Path(__file__).resolve().parents[1] / 'github/verify-release-assets.sh'
 TAG = 'v1.0.0'
 SHA = 'a' * 40
 REF = 'ghcr.io/zunderlabs/zunder-guard@sha256:' + 'b' * 64
+SERVICE_ASSETS = ['install-windows-service.ps1', 'install-macos-service.sh', 'install-container.py', 'container-supervisor.py',
+                  'container-operations.py', 'zunder-guard-container.service',
+                  'zunder-guard-setup-guardian.service']
 
 
 class PublicationGate(unittest.TestCase):
@@ -32,7 +35,7 @@ class PublicationGate(unittest.TestCase):
         self.assets = self.root / 'assets'
         self.assets.mkdir()
         for name in ['zunder-guard.rb', 'ZunderLabs.ZunderGuard.yaml',
-                     'ZunderLabs.ZunderGuard.installer.yaml', 'ZunderLabs.ZunderGuard.locale.en-US.yaml']:
+                     'ZunderLabs.ZunderGuard.installer.yaml', 'ZunderLabs.ZunderGuard.locale.en-US.yaml'] + SERVICE_ASSETS:
             (self.assets / name).write_text('release fixture\n')
         (self.assets / f'zunder-guard-{TAG}.image.txt').write_text(REF + '\n')
         (self.assets / f'zunder-guard-{TAG}.intoto.jsonl').write_text('provenance fixture\n')
@@ -139,6 +142,26 @@ if os.environ.get('TEST_FAIL_AFTER_SLSA') == command:
                 self.assertNotEqual(self.run_gate(tag).returncode, 0)
                 self.assertFalse((self.root / 'download').exists())
 
+    def test_windows_helper_must_be_unique_signed_subject(self):
+        helper = self.assets / 'install-windows-service.ps1'
+        helper.unlink()
+        self.checksums()
+        result = self.run_gate()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('install-windows-service.ps1 is missing or repeated', result.stderr)
+
+    def test_windows_helper_duplicate_subject_refuses(self):
+        sums = self.assets / 'SHA256SUMS'
+        line = next(line for line in sums.read_text().splitlines() if line.endswith('  install-windows-service.ps1'))
+        sums.write_text(sums.read_text() + line + '\n')
+        result = self.run_gate()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('install-windows-service.ps1 is missing or repeated', result.stderr)
+
+    def test_windows_helper_tampering_refuses(self):
+        (self.assets / 'install-windows-service.ps1').write_text('tampered helper\n')
+        self.assertNotEqual(self.run_gate().returncode, 0)
+
     def test_tampered_formula_refuses(self):
         (self.assets / 'zunder-guard.rb').write_text('tampered\n')
         self.assertNotEqual(self.run_gate().returncode, 0)
@@ -146,6 +169,20 @@ if os.environ.get('TEST_FAIL_AFTER_SLSA') == command:
     def test_missing_checksummed_asset_refuses(self):
         (self.assets / 'zunder-guard.rb').unlink()
         self.assertNotEqual(self.run_gate().returncode, 0)
+
+    def test_signed_manifest_cannot_omit_required_service_asset(self):
+        for asset in SERVICE_ASSETS:
+            with self.subTest(asset=asset):
+                path = self.assets / asset
+                original = path.read_bytes()
+                path.unlink()
+                self.checksums()
+                result = self.run_gate()
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(asset + ' is missing or repeated', result.stderr)
+                shutil.rmtree(self.root / 'download')
+                path.write_bytes(original)
+                self.checksums()
 
     def test_unsigned_image_reference_refuses(self):
         image = f'zunder-guard-{TAG}.image.txt'
@@ -243,8 +280,9 @@ class HomebrewPublication(unittest.TestCase):
         self.assertIs(settings['skip-token-revoke'], False)
         self.assertEqual(settings['client-id'], '${{ vars.HOMEBREW_APP_CLIENT_ID }}')
         self.assertEqual(settings['private-key'], '${{ secrets.HOMEBREW_APP_PRIVATE_KEY }}')
-        self.assertEqual(self.job['permissions'], {})
-        checkout = next(step for step in self.steps if 'actions/checkout@' in step.get('uses', ''))
+        self.assertEqual(self.job['permissions'], {'contents': 'read'})
+        checkout = next(step for step in self.steps if 'actions/checkout@' in step.get('uses', '')
+                        and step.get('with', {}).get('repository') == 'zunderlabs/homebrew-tap')
         self.assertEqual(checkout['with']['repository'], 'zunderlabs/homebrew-tap')
         self.assertEqual(checkout['with']['token'], '${{ steps.tap-token.outputs.token }}')
         pr = next(step for step in self.steps if 'gh pr create' in step.get('run', ''))
