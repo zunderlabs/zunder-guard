@@ -630,6 +630,7 @@ fn write_trusted(
     let temporary = PathBuf::from(name);
     let mut file = OpenOptions::new()
         .create_new(true)
+        .write(true)
         .access_mode(0xc00e0000)
         .share_mode(0)
         .custom_flags(0x00200000)
@@ -729,6 +730,7 @@ pub fn create_config_update(path: &Path, temporary: &Path) -> std::io::Result<Fi
         }
         let mut file = OpenOptions::new()
             .create_new(true)
+            .write(true)
             .access_mode(0xc0060000)
             .share_mode(7)
             .custom_flags(0x00200000)
@@ -884,8 +886,36 @@ mod tests {
         let temp = crate::testdir::TestDir::new("service-acl");
         let file = temp.path().join("binding.json");
         let sid = "S-1-5-80-1-2-3-4-5";
+        let temporary = temp.path().join("binding.json.new");
+        fs::write(&temporary, b"another operation's public metadata").expect("existing temporary");
+        assert!(
+            write_trusted(&file, sid, b"must not replace", false, || {
+                panic!("exclusive creation must refuse before admission callback");
+            })
+            .is_err()
+        );
+        assert_eq!(
+            fs::read(&temporary).expect("pre-existing temporary preserved"),
+            b"another operation's public metadata"
+        );
+        assert!(!file.exists());
+        fs::remove_file(&temporary).expect("remove fixture temporary");
         write_trusted(&file, sid, b"public synthetic metadata", false, || Ok(()))
             .expect("protected file");
+        assert!(
+            write_trusted(&file, sid, b"must not replace", false, || {
+                Err(refused("synthetic admission refusal"))
+            })
+            .is_err()
+        );
+        assert!(
+            !temporary.exists(),
+            "failed owned temporary must be removed"
+        );
+        assert_eq!(
+            fs::read(&file).expect("original protected file preserved"),
+            b"public synthetic metadata"
+        );
         assert!(open_checked(&file, sid, false, false).is_ok());
         assert!(open_checked(&file, "S-1-5-80-6-7-8-9-10", false, false).is_err());
         let link = temp.path().join("link.json");
