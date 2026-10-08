@@ -1,0 +1,17 @@
+{
+  "schemaVersion": "2.2",
+  "description": "Fixed testnet runner lease control; no arbitrary shell or secret output",
+  "parameters": {
+    "operation": {"type": "String", "allowedValues": ["stop", "status", "restore"], "interpolationType": "ENV_VAR"},
+    "lease": {"type": "String", "allowedPattern": "^[0-9]{1,20}-[0-9]{1,4}$", "interpolationType": "ENV_VAR"},
+    "cleanup": {"type": "String", "allowedPattern": "^[0-9a-f]{64}$", "interpolationType": "ENV_VAR"}
+  },
+  "mainSteps": [{
+    "action": "aws:runShellScript",
+    "name": "fixedTestnetControl",
+    "inputs": {
+      "timeoutSeconds": "1000",
+      "runCommand": ["exec /usr/bin/python3 -B /usr/local/libexec/zunder-release-e2e/host-control.py \"$SSM_operation\" \"$SSM_lease\" \"$SSM_cleanup\""]
+    }
+  }]
+}

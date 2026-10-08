@@ -1,0 +1,8 @@
+{
+  "unit": "zunder-exec-testnet.service",
+  "lease_path": "/var/lib/zunder-release-e2e/lease.json",
+  "dropin_path": "/etc/systemd/system/zunder-exec-testnet.service.d/release-lease.conf",
+  "dropin_sha256": "59f14b575f47440a6aa4058be7b07fdfe90ae9cf34746fc71e232f6ad0c69717",
+  "host_control_sha256": "c1f0f8991d3e856380a7ae803a6248c03e39f0f25a6b57a148efdcfe048e37e8",
+  "journey_sha256": "f71a0cf99e5ada4a0e74fad23397fcd7e8fa26aba879b115280d87c4d96ba43f"
+}

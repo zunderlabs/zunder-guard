@@ -1,0 +1,73 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ExactTestnetKey",
+      "Effect": "Allow",
+      "Action": [
+        "ssm:GetParameter"
+      ],
+      "Resource": [
+        "arn:aws:ssm:eu-central-1:436632189317:parameter/zunder/testnet/api-wallet-key"
+      ]
+    },
+    {
+      "Sid": "FixedDocument",
+      "Effect": "Allow",
+      "Action": [
+        "ssm:SendCommand"
+      ],
+      "Resource": [
+        "arn:aws:ssm:eu-central-1:436632189317:document/ZunderReleaseTestnetControl",
+        "arn:aws:ec2:eu-central-1:436632189317:instance/i-0ca66c349ad743928"
+      ]
+    },
+    {
+      "Sid": "CommandReadback",
+      "Effect": "Allow",
+      "Action": [
+        "ssm:GetCommandInvocation"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "DenySecretMutationAndOtherSecrets",
+      "Effect": "Deny",
+      "Action": [
+        "ssm:PutParameter",
+        "ssm:DeleteParameter",
+        "ssm:GetParameters",
+        "ssm:GetParametersByPath",
+        "ssm:GetParameterHistory",
+        "secretsmanager:*"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "DenyMainnetParameter",
+      "Effect": "Deny",
+      "Action": [
+        "ssm:GetParameter"
+      ],
+      "NotResource": [
+        "arn:aws:ssm:eu-central-1:436632189317:parameter/zunder/testnet/api-wallet-key"
+      ]
+    },
+    {
+      "Sid": "DecryptExactTestnetKeyOnly",
+      "Effect": "Allow",
+      "Action": [
+        "kms:Decrypt"
+      ],
+      "Resource": [
+        "arn:aws:kms:eu-central-1:436632189317:key/20d7fdda-950b-4101-a391-b3749f892939"
+      ],
+      "Condition": {
+        "StringEquals": {
+          "kms:ViaService": "ssm.eu-central-1.amazonaws.com",
+          "kms:EncryptionContext:PARAMETER_ARN": "arn:aws:ssm:eu-central-1:436632189317:parameter/zunder/testnet/api-wallet-key"
+        }
+      }
+    }
+  ]
+}

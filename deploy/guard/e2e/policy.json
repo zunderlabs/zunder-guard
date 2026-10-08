@@ -1,0 +1,15 @@
+{
+  "schema": 1,
+  "automation_commit_source": "authenticated-reusable-workflow-claim",
+  "approved_public_api_wallet": "0xa9860ba817e405d17ef0acbc790cc68de030c5d3",
+  "ssm_document_sha256": "6765486183b3cd1c8862ac959efb64d3b3a35904b0d2f249180c3687ae2cad6b",
+  "files": {
+    "orchestrator.py": "e591681ae480212460b5239d9871c652c09f0146e8aee392b146f44e1b0bea01",
+    "journey.py": "f71a0cf99e5ada4a0e74fad23397fcd7e8fa26aba879b115280d87c4d96ba43f",
+    "scan.py": "dd7a0aefd110c064829e321dac2a007d46e414fca55882cd077d6056661bd6a5",
+    "verify-release-assets.sh": "87b3cd3bf11e8f7be65b5ec7479a9436e827a9b25b01c53bc585e099e46f53b9",
+    "actions-artifacts.py": "69dc72eabaef3d7e39ac5762daa264693dc02d4d0f93b6c3215ee57cffbd774d",
+    "staged-subjects.py": "08cd01c76e9c67c7d753d93bed7b6c2b506dcce97e5b84291739363ae497b367"
+  },
+  "aws_credential_trust_scope": "canonical-repository-and-environment"
+}
