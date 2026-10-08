@@ -163,7 +163,9 @@ fi
 if [ ! -e "$home/guard.toml" ]; then
   set -- "$exe" --home "$home" init --network "$network"
   if [ "$network" = testnet ]; then
-    [ -n "$rules" ] && [ -n "$account" ] && [ -n "$cap" ] && [ -n "$licence" ] || fail 'testnet service requires explicit rules, account, cap and licence'
+    if ! { [ -n "$rules" ] && [ -n "$account" ] && [ -n "$cap" ] && [ -n "$licence" ]; }; then
+      fail 'testnet service requires explicit rules, account, cap and licence'
+    fi
     set -- "$@" --service-key-check --non-interactive --no-key --key-stdin
   else
     set -- "$@" --interactive
