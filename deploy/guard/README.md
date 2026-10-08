@@ -97,7 +97,7 @@ sh i --rules zr1_…                       # run it
 Or skip the loader and verify by hand (needs cosign), which is what the loader does:
 
 ```sh
-V=v1.0.1; R=https://github.com/zunderlabs/zunder-guard/releases/download/$V
+V=v1.0.2; R=https://github.com/zunderlabs/zunder-guard/releases/download/$V
 curl -fsSLO "$R/install.sh" -O "$R/SHA256SUMS" -O "$R/SHA256SUMS.sigstore.json"
 cosign verify-blob --bundle SHA256SUMS.sigstore.json \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com \
@@ -130,10 +130,10 @@ sha256sum --ignore-missing -c SHA256SUMS && sh install.sh --rules zr1_…
 ### 2. Docker and Compose
 
 ```sh
-docker run -it --rm --log-driver=none -v zunder-guard:/data ghcr.io/zunderlabs/zunder-guard:v1.0.1 init --interactive --rules zr1_…
-docker run -it --rm --log-driver=none -v zunder-guard:/data ghcr.io/zunderlabs/zunder-guard:v1.0.1 pair
+docker run -it --rm --log-driver=none -v zunder-guard:/data ghcr.io/zunderlabs/zunder-guard:v1.0.2 init --interactive --rules zr1_…
+docker run -it --rm --log-driver=none -v zunder-guard:/data ghcr.io/zunderlabs/zunder-guard:v1.0.2 pair
 docker run -d --name zunder-guard --init --restart unless-stopped -v zunder-guard:/data \
-  -e ZUNDER_GUARD_LISTEN=0.0.0.0:8547 -p 127.0.0.1:8547:8547 ghcr.io/zunderlabs/zunder-guard:v1.0.1
+  -e ZUNDER_GUARD_LISTEN=0.0.0.0:8547 -p 127.0.0.1:8547:8547 ghcr.io/zunderlabs/zunder-guard:v1.0.2
 ```
 
 After a testnet `init`, add `-e ZUNDER_GUARD_NETWORK=testnet` to the last command: `run` sends
@@ -330,23 +330,23 @@ What a user can check:
 ```sh
 # The release (as above)
 cosign verify-blob --bundle SHA256SUMS.sigstore.json --certificate-oidc-issuer https://token.actions.githubusercontent.com \
-  --certificate-identity https://github.com/zunderlabs/zunder-guard/.github/workflows/release.yml@refs/tags/v1.0.1 SHA256SUMS
+  --certificate-identity https://github.com/zunderlabs/zunder-guard/.github/workflows/release.yml@refs/tags/v1.0.2 SHA256SUMS
 # Provenance: built from this repository at this tag
-slsa-verifier verify-artifact zunder-guard-v1.0.1-linux-amd64.tar.gz \
-  --provenance-path zunder-guard-v1.0.1.intoto.jsonl --source-uri github.com/zunderlabs/zunder-guard --source-tag v1.0.1
+slsa-verifier verify-artifact zunder-guard-v1.0.2-linux-amd64.tar.gz \
+  --provenance-path zunder-guard-v1.0.2.intoto.jsonl --source-uri github.com/zunderlabs/zunder-guard --source-tag v1.0.2
 # The image
 cosign verify ghcr.io/zunderlabs/zunder-guard@sha256:<digest> --certificate-oidc-issuer https://token.actions.githubusercontent.com \
-  --certificate-identity https://github.com/zunderlabs/zunder-guard/.github/workflows/release.yml@refs/tags/v1.0.1
+  --certificate-identity https://github.com/zunderlabs/zunder-guard/.github/workflows/release.yml@refs/tags/v1.0.2
 slsa-verifier verify-image ghcr.io/zunderlabs/zunder-guard@sha256:<digest> \
-  --source-uri github.com/zunderlabs/zunder-guard --source-tag v1.0.1
+  --source-uri github.com/zunderlabs/zunder-guard --source-tag v1.0.2
 ```
 
 ### Reproducing a release
 
 ```sh
-git clone https://github.com/zunderlabs/zunder-guard && cd zunder-guard && git checkout v1.0.1
+git clone https://github.com/zunderlabs/zunder-guard && cd zunder-guard && git checkout v1.0.2
 docker buildx build -f deploy/guard/Dockerfile --target bin-build --platform linux/amd64 -o out .
-sha256sum out/zunder-guard     # equals zunder-guard inside zunder-guard-v1.0.1-linux-amd64.tar.gz
+sha256sum out/zunder-guard     # equals zunder-guard inside zunder-guard-v1.0.2-linux-amd64.tar.gz
 ```
 
 ## Network footprint

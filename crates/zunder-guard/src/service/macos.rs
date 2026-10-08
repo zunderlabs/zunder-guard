@@ -1,6 +1,6 @@
 // Copyright 2026 Orcastrate UG (haftungsbeschränkt)
 // SPDX-License-Identifier: Elastic-2.0
-//! Mainnet service credentials in the macOS System Keychain.
+//! Explicitly bound sending-service credentials in the macOS System Keychain.
 //!
 //! No API returns a printable credential. The shared service broker owns the
 //! sole caller of `read`: an anonymous stdin pipe to the admitted Guard child.
@@ -25,7 +25,32 @@ use zunder_guard_core::sign::{Address, GuardKey};
 use super::{Result, ServiceBinding, ServiceIdentity, refused};
 
 const KEYCHAIN: &str = "/Library/Keychains/System.keychain";
-const SERVICE: &str = "com.zunderlabs.guard.mainnet.v2";
+const MAINNET_SERVICE: &str = "com.zunderlabs.guard.mainnet.v2";
+const TESTNET_SERVICE: &str = "com.zunderlabs.guard.testnet.v2";
+
+fn network(binding: &ServiceBinding) -> Result<&'static str> {
+    match binding.sending_mode()? {
+        crate::config::GuardMode::Mainnet => Ok("mainnet"),
+        crate::config::GuardMode::Testnet => Ok("testnet"),
+        crate::config::GuardMode::Paper => Err(refused("paper mode has no service credential")),
+    }
+}
+
+fn credential_service(binding: &ServiceBinding) -> Result<&'static str> {
+    match network(binding)? {
+        "mainnet" => Ok(MAINNET_SERVICE),
+        "testnet" => Ok(TESTNET_SERVICE),
+        _ => Err(refused("unsupported service credential network")),
+    }
+}
+
+fn confirmation_flag(binding: &ServiceBinding) -> Result<&'static str> {
+    match network(binding)? {
+        "mainnet" => Ok("--confirm-mainnet"),
+        "testnet" => Ok("--confirm-account"),
+        _ => Err(refused("unsupported service confirmation network")),
+    }
+}
 // Documented OSStatus errSecItemNotFound, not a generic lookup failure.
 const ITEM_NOT_FOUND: i32 = -25300;
 
@@ -149,7 +174,7 @@ fn credential_account(binding: &ServiceBinding) -> Result<String> {
             ]
         })
         .collect();
-    Ok(format!("mainnet-{suffix}"))
+    Ok(format!("{}-{suffix}", network(binding)?))
 }
 
 /// The label is public metadata and contains no wallet credential.
@@ -216,7 +241,7 @@ pub fn provision(binding: &ServiceBinding, key: &Zeroizing<Vec<u8>>, replace: bo
         .map_err(|_| refused("could not disable Keychain interaction"))?;
     let keychain =
         SecKeychain::open(KEYCHAIN).map_err(|_| refused("could not open the System Keychain"))?;
-    match keychain.find_generic_password(SERVICE, &account) {
+    match keychain.find_generic_password(credential_service(binding)?, &account) {
         Ok((old, mut item)) => {
             drop(old);
             if !replace {
@@ -233,7 +258,7 @@ pub fn provision(binding: &ServiceBinding, key: &Zeroizing<Vec<u8>>, replace: bo
             // SecKeychainAddGenericPassword creates the default creator ACL.
             // No all-app access, security CLI, or password-bearing argv.
             keychain
-                .add_generic_password(SERVICE, &account, key)
+                .add_generic_password(credential_service(binding)?, &account, key)
                 .map_err(|_| refused("System Keychain credential creation refused"))?;
         }
         Err(_) => {
@@ -255,7 +280,7 @@ pub fn read(binding: &ServiceBinding) -> Result<Zeroizing<Vec<u8>>> {
     let keychain =
         SecKeychain::open(KEYCHAIN).map_err(|_| refused("could not open the System Keychain"))?;
     let (password, _) = keychain
-        .find_generic_password(SERVICE, &account)
+        .find_generic_password(credential_service(binding)?, &account)
         .map_err(|_| {
             refused("System Keychain service credential unavailable; service not started")
         })?;
@@ -279,13 +304,13 @@ pub fn remove(binding: &ServiceBinding) -> Result<()> {
         .map_err(|_| refused("could not disable Keychain interaction"))?;
     let keychain =
         SecKeychain::open(KEYCHAIN).map_err(|_| refused("could not open the System Keychain"))?;
-    match keychain.find_generic_password(SERVICE, &account) {
+    match keychain.find_generic_password(credential_service(binding)?, &account) {
         Ok((password, item)) => {
             drop(password);
             // The safe wrapper's delete API omits OSStatus. Verify exact-item
             // absence afterwards and report any ambiguous failure.
             item.delete();
-            match keychain.find_generic_password(SERVICE, &account) {
+            match keychain.find_generic_password(credential_service(binding)?, &account) {
                 Err(error) if error.code() == ITEM_NOT_FOUND => Ok(()),
                 _ => Err(refused(
                     "System Keychain did not confirm credential removal",
@@ -340,6 +365,46 @@ fn verify_inherited_groups(groups: rustix::io::Result<Vec<rustix::process::Gid>>
     Ok(())
 }
 
+// Build only public arguments. The network is admitted binding metadata;
+// testnet never inherits or manufactures mainnet consent.
+fn child_command(
+    binding: &ServiceBinding,
+    binding_path: &Path,
+    uid: u32,
+    gid: u32,
+) -> Result<Command> {
+    let mut command = Command::new("/usr/bin/sudo");
+    command.env_clear().args([
+        "-n",
+        "-u",
+        &format!("#{uid}"),
+        "-g",
+        &format!("#{gid}"),
+        "--",
+        "/usr/bin/env",
+        "-i",
+    ]);
+    if binding.sending_mode()? == crate::config::GuardMode::Mainnet {
+        command.arg(format!("ZUNDER_MAINNET_CONFIRM={}", binding.account));
+    }
+    command
+        .arg(&binding.executable)
+        .arg("--home")
+        .arg(&binding.home)
+        .arg("--config")
+        .arg(&binding.config)
+        .args([
+            "run",
+            "--network",
+            network(binding)?,
+            "--key-stdin",
+            "--supervised-stdin",
+            "--service-binding",
+        ])
+        .arg(binding_path);
+    Ok(command)
+}
+
 /// A same-process broker owns the pipe for the whole child's lifetime.
 /// launchd restarts this process; it never launches a detached Guard.
 pub fn run(binding: &ServiceBinding, binding_path: &Path) -> Result<()> {
@@ -361,34 +426,8 @@ pub fn run(binding: &ServiceBinding, binding_path: &Path) -> Result<()> {
         return Err(refused("service binding belongs to another platform"));
     };
     let mut signals = Signals::new([SIGTERM, SIGINT])?;
-    let mut command = Command::new("/usr/bin/sudo");
+    let mut command = child_command(binding, binding_path, *uid, *gid)?;
     command
-        .env_clear()
-        .args([
-            "-n",
-            "-u",
-            &format!("#{uid}"),
-            "-g",
-            &format!("#{gid}"),
-            "--",
-            "/usr/bin/env",
-            "-i",
-        ])
-        .arg(format!("ZUNDER_MAINNET_CONFIRM={}", binding.account))
-        .arg(&binding.executable)
-        .arg("--home")
-        .arg(&binding.home)
-        .arg("--config")
-        .arg(&binding.config)
-        .args([
-            "run",
-            "--network",
-            "mainnet",
-            "--key-stdin",
-            "--supervised-stdin",
-            "--service-binding",
-        ])
-        .arg(binding_path)
         .process_group(0)
         .stdin(Stdio::piped())
         .stdout(Stdio::inherit())
@@ -486,7 +525,7 @@ pub fn migrate(binding: &ServiceBinding, next_path: &Path, confirm: &str) -> Res
         .env_clear()
         .args(["service", "provision", "--binding"])
         .arg(next_path)
-        .args(["--confirm-mainnet", &binding.account, "--key-stdin"])
+        .args([confirmation_flag(binding)?, &binding.account, "--key-stdin"])
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::inherit())
@@ -642,8 +681,16 @@ pub fn write_config(
     binding.validate_shape()?;
     load_config(binding)?;
     config
-        .check_mainnet()
-        .map_err(|_| refused("updated configuration fails mainnet guards"))?;
+        .validate()
+        .map_err(|_| refused("updated configuration is invalid"))?;
+    if config.mode != binding.sending_mode()? {
+        return Err(refused("updated configuration changes service network"));
+    }
+    if config.mode == crate::config::GuardMode::Mainnet {
+        config
+            .check_mainnet()
+            .map_err(|_| refused("updated configuration fails mainnet guards"))?;
+    }
     if config.account().ok() != Address::from_hex(&binding.account) {
         return Err(refused(
             "configuration change names another service account",
@@ -763,6 +810,88 @@ mod tests {
             credential_account(&binding).expect("leading-zero slot"),
             "mainnet-00ed4f53a5389b6154a2cd51e4e2c3d85a3fc3d0d906c9dbce575cc5c3cfa115"
         );
+    }
+
+    #[test]
+    fn testnet_credentials_use_separate_namespace_and_confirmation() {
+        let mut binding = ServiceBinding {
+            version: 1,
+            credential_id: "testnet-native".into(),
+            mode: "testnet".into(),
+            account: "0x1111111111111111111111111111111111111111".into(),
+            api_wallet: "0x2222222222222222222222222222222222222222".into(),
+            home: "/fixture/state-testnet".into(),
+            config: "/fixture/state-testnet/guard.toml".into(),
+            executable: "/fixture/zunder-guard".into(),
+            executable_sha256: "ab".repeat(32),
+            admission_config_sha256: "cd".repeat(32),
+            identity: ServiceIdentity::Macos { uid: 450, gid: 450 },
+        };
+        let testnet_command = child_command(&binding, Path::new("/fixture/binding.json"), 450, 450)
+            .expect("testnet command");
+        let testnet_args: Vec<_> = testnet_command
+            .get_args()
+            .map(|value| value.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            testnet_args
+                .windows(2)
+                .any(|pair| pair == ["--network", "testnet"])
+        );
+        assert!(
+            !testnet_args
+                .iter()
+                .any(|value| value.starts_with("ZUNDER_MAINNET_CONFIRM="))
+        );
+        assert_eq!(network(&binding).expect("testnet network"), "testnet");
+        assert_eq!(
+            credential_service(&binding).expect("testnet service"),
+            TESTNET_SERVICE
+        );
+        assert_eq!(
+            confirmation_flag(&binding).expect("testnet consent"),
+            "--confirm-account"
+        );
+        assert_eq!(
+            launchd_label(&binding).expect("testnet label"),
+            "com.zunderlabs.guard.testnet-native"
+        );
+        let testnet_slot = credential_account(&binding).expect("testnet slot");
+        assert!(testnet_slot.starts_with("testnet-"));
+        // A legacy mainnet ID may already have a testnet-looking spelling;
+        // the service namespace and slot prefix still prevent credential aliasing.
+        binding.mode = "mainnet".into();
+        let mainnet_command = child_command(&binding, Path::new("/fixture/binding.json"), 450, 450)
+            .expect("mainnet command");
+        let mainnet_args: Vec<_> = mainnet_command
+            .get_args()
+            .map(|value| value.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            mainnet_args
+                .windows(2)
+                .any(|pair| pair == ["--network", "mainnet"])
+        );
+        assert!(mainnet_args.contains(&format!("ZUNDER_MAINNET_CONFIRM={}", binding.account)));
+        assert_eq!(
+            credential_service(&binding).expect("legacy service"),
+            MAINNET_SERVICE
+        );
+        assert_eq!(
+            confirmation_flag(&binding).expect("mainnet consent"),
+            "--confirm-mainnet"
+        );
+        assert_ne!(
+            credential_account(&binding).expect("mainnet slot"),
+            testnet_slot
+        );
+        binding.mode = "testnet".into();
+        binding.credential_id = "mainnet".into();
+        assert!(credential_service(&binding).is_err());
+        assert!(credential_account(&binding).is_err());
+        assert!(confirmation_flag(&binding).is_err());
+        binding.mode = "paper".into();
+        assert!(credential_service(&binding).is_err());
     }
 
     const FIXTURE_SERVICE: &str = "com.zunderlabs.guard.native-ci.synthetic";

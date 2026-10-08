@@ -32,7 +32,15 @@ main() {
     || no "the Sigstore signature of $V's checksums does not verify"
   [ "$(awk '$2 == "install.sh" { print $1 }' "$T/SHA256SUMS")" = "$(sum "$T/install.sh")" ] \
     || no "install.sh does not match the signed checksums"
-  if (: </dev/tty) 2>/dev/null; then I=/dev/tty; else I=/dev/null; fi
-  ZUNDER_GUARD_COSIGN=$S sh "$T/install.sh" "$@" <"$I"
+  private_stdin=0
+  for option in "$@"; do [ "$option" != --key-stdin ] || private_stdin=1; done
+  if [ "$private_stdin" -eq 1 ]; then
+    # The signed installer validates explicit testnet-only managed admission.
+    # Never read or echo the frame; preserve the caller's private pipe.
+    ZUNDER_GUARD_COSIGN=$S sh "$T/install.sh" "$@"
+  else
+    if (: </dev/tty) 2>/dev/null; then I=/dev/tty; else I=/dev/null; fi
+    ZUNDER_GUARD_COSIGN=$S sh "$T/install.sh" "$@" <"$I"
+  fi
 }
 main "$@"

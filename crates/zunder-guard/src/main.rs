@@ -183,8 +183,11 @@ enum ServiceCommand {
     Prepare {
         #[arg(long)]
         credential_id: String,
-        #[arg(long)]
-        confirm_mainnet: String,
+        #[arg(long, conflicts_with = "confirm_account")]
+        confirm_mainnet: Option<String>,
+        /// Testnet only: explicitly select the admitted account.
+        #[arg(long, conflicts_with = "confirm_mainnet")]
+        confirm_account: Option<String>,
         #[arg(long)]
         uid: Option<u32>,
         #[arg(long)]
@@ -194,12 +197,15 @@ enum ServiceCommand {
         #[arg(long)]
         service_sid: Option<String>,
     },
-    /// Store a mainnet API key only in the admitted OS secure store.
+    /// Store an API key only in the admitted network-bound OS secure store.
     Provision {
         #[arg(long)]
         binding: PathBuf,
-        #[arg(long)]
-        confirm_mainnet: String,
+        #[arg(long, conflicts_with = "confirm_account")]
+        confirm_mainnet: Option<String>,
+        /// Testnet only: explicitly select the admitted account.
+        #[arg(long, conflicts_with = "confirm_mainnet")]
+        confirm_account: Option<String>,
         #[arg(long)]
         key_stdin: bool,
         #[arg(long)]
@@ -221,15 +227,21 @@ enum ServiceCommand {
         binding: PathBuf,
         #[arg(long)]
         next_binding: PathBuf,
-        #[arg(long)]
-        confirm_mainnet: String,
+        #[arg(long, conflicts_with = "confirm_account")]
+        confirm_mainnet: Option<String>,
+        /// Testnet only: explicitly select the admitted account.
+        #[arg(long, conflicts_with = "confirm_mainnet")]
+        confirm_account: Option<String>,
     },
     /// Explicitly admit reviewed client/risk/listen changes while stopped.
     Readmit {
         #[arg(long)]
         binding: PathBuf,
-        #[arg(long)]
-        confirm_mainnet: String,
+        #[arg(long, conflicts_with = "confirm_account")]
+        confirm_mainnet: Option<String>,
+        /// Testnet only: explicitly select the admitted account.
+        #[arg(long, conflicts_with = "confirm_mainnet")]
+        confirm_account: Option<String>,
     },
     /// Set a verified licence while preserving service ownership and renewal updates.
     LicenceSet {
@@ -247,8 +259,11 @@ enum ServiceCommand {
     Pair {
         #[arg(long)]
         binding: PathBuf,
-        #[arg(long)]
-        confirm_mainnet: String,
+        #[arg(long, conflicts_with = "confirm_account")]
+        confirm_mainnet: Option<String>,
+        /// Testnet only: explicitly select the admitted account.
+        #[arg(long, conflicts_with = "confirm_mainnet")]
+        confirm_account: Option<String>,
     },
     /// Delete exactly this installation's credential, after stopping it.
     RemoveCredential {
@@ -335,9 +350,13 @@ struct InitArgs {
     /// Read the key from standard input (with --non-interactive).
     #[arg(long)]
     key_stdin: bool,
-    /// Windows machine-service staging identity; prompts for its key inside Rust.
-    #[arg(long, requires = "non_interactive", conflicts_with_all = ["key_stdin", "no_key"])]
+    /// Windows machine-service staging identity; key handling stays inside Rust.
+    #[arg(long, requires = "non_interactive", conflicts_with_all = ["no_key", "service_key_check"])]
     service_setup: Option<String>,
+    /// Protected testnet setup: check a framed stdin key and record its public
+    /// address without storing it; the admitted OS service provisions it later.
+    #[arg(long, requires_all = ["non_interactive", "no_key", "key_stdin"])]
+    service_key_check: bool,
     /// Rules from the website: a `zr1_…` code.
     #[arg(long, env = "ZUNDER_GUARD_RULES")]
     rules: Option<String>,
@@ -774,15 +793,38 @@ fn credential_target(config: &Path) -> String {
         .to_string()
 }
 
+fn validate_service_init_args(args: &InitArgs) -> Result<()> {
+    if args.service_key_check
+        && (args.network != Some(ModeArg::Testnet)
+            || args.confirm_mainnet.is_some()
+            || !args.non_interactive
+            || !args.no_key
+            || !args.key_stdin)
+    {
+        bail!(
+            "protected key check requires explicit testnet, no key storage and framed stdin; mainnet consent is refused"
+        );
+    }
+    if let Some(identity) = &args.service_setup {
+        match args.network {
+            Some(ModeArg::Mainnet)
+                if args.confirm_mainnet.is_some()
+                    && args.equity_cap.is_some()
+                    && !args.key_stdin => {}
+            Some(ModeArg::Testnet)
+                if args.confirm_mainnet.is_none() && identity.starts_with("testnet-") => {}
+            _ => bail!(
+                "service setup requires explicit network admission; mainnet retains account confirmation, equity cap and hidden input"
+            ),
+        }
+    }
+    Ok(())
+}
+
 async fn run_init(paths: &Paths, args: InitArgs) -> Result<()> {
+    validate_service_init_args(&args)?;
     let service_setup = args.service_setup.is_some();
     if let Some(identity) = &args.service_setup {
-        if args.network != Some(ModeArg::Mainnet)
-            || args.confirm_mainnet.is_none()
-            || args.equity_cap.is_none()
-        {
-            bail!("service setup requires explicit mainnet, account confirmation and equity cap");
-        }
         #[cfg(windows)]
         zunder_guard::service::windows::validate_setup(&paths.home, &paths.config, identity)?;
         #[cfg(not(windows))]
@@ -804,7 +846,9 @@ async fn run_init(paths: &Paths, args: InitArgs) -> Result<()> {
         mode: args.network.map(ModeArg::mode),
         confirm_mainnet: args.confirm_mainnet,
         equity_cap: args.equity_cap,
-        no_key: args.no_key,
+        no_key: args.no_key || (service_setup && args.network == Some(ModeArg::Testnet)),
+        check_key_only: args.service_key_check
+            || (service_setup && args.network == Some(ModeArg::Testnet)),
         listen: args.listen,
         ip_share: args.ip_share,
         force: args.force,
@@ -846,15 +890,41 @@ async fn run_init(paths: &Paths, args: InitArgs) -> Result<()> {
     };
     let mut random = init::os_random;
     let outcome = if service_setup {
-        // No plaintext ever enters PowerShell or a process argument. init
-        // receives the bounded in-memory reader and still never stores mainnet.
+        // Rust owns hidden input or the bounded private testnet frame. No key
+        // enters PowerShell arguments or its interactive-user credential store.
         zunder_guard::service::enforce_no_core_dumps()?;
-        let mut secret = zeroize::Zeroizing::new(
-            rpassword::prompt_password("API wallet key (hidden, checked for service setup): ")?
-                .into_bytes(),
-        );
-        secret.push(b'\n');
-        let mut reader = secret.as_slice();
+        if args.key_stdin {
+            // Init admits network/account/policy before reading this frame.
+            let mut reader = stdin_fd()?;
+            init::init(
+                &options,
+                &mut Batch,
+                Some(&mut reader),
+                &VenueInfo,
+                store,
+                &mut random,
+            )
+            .await
+        } else {
+            let mut secret = zeroize::Zeroizing::new(
+                rpassword::prompt_password("API wallet key (hidden, checked for service setup): ")?
+                    .into_bytes(),
+            );
+            secret.push(b'\n');
+            let mut reader = secret.as_slice();
+            init::init(
+                &options,
+                &mut Batch,
+                Some(&mut reader),
+                &VenueInfo,
+                store,
+                &mut random,
+            )
+            .await
+        }
+    } else if args.service_key_check {
+        zunder_guard::service::enforce_no_core_dumps()?;
+        let mut reader = stdin_fd()?;
         init::init(
             &options,
             &mut Batch,
@@ -1136,7 +1206,7 @@ async fn run(paths: &Paths, args: RunArgs) -> Result<()> {
         let binding = zunder_guard::service::load_binding(binding_path)?;
         if binding.home != paths.home
             || binding.config != paths.config
-            || mode != GuardMode::Mainnet
+            || mode != binding.sending_mode()?
         {
             bail!("runtime paths or mode differ from service admission");
         }
@@ -1927,19 +1997,22 @@ fn service_command(paths: &Paths, command: ServiceCommand) -> Result<()> {
         ServiceCommand::Prepare {
             credential_id,
             confirm_mainnet,
+            confirm_account,
             uid,
             gid,
             service_name,
             service_sid,
         } => {
             let config = paths.load()?;
-            config.check_mainnet()?;
-            if config.mode != GuardMode::Mainnet
-                || config.account()?
-                    != Address::from_hex(&confirm_mainnet)
-                        .context("invalid mainnet confirmation address")?
-            {
-                bail!("service preparation needs the configured mainnet account confirmation");
+            config.validate()?;
+            service::validate_confirmation(
+                config.mode,
+                &config.account()?.to_hex(),
+                confirm_mainnet.as_deref(),
+                confirm_account.as_deref(),
+            )?;
+            if config.mode == GuardMode::Mainnet {
+                config.check_mainnet()?;
             }
             let identity = match (uid, gid, service_name, service_sid) {
                 (Some(uid), Some(gid), None, None) => ServiceIdentity::Macos { uid, gid },
@@ -1953,12 +2026,12 @@ fn service_command(paths: &Paths, command: ServiceCommand) -> Result<()> {
             let binding = ServiceBinding {
                 version: 1,
                 credential_id,
-                mode: "mainnet".into(),
+                mode: config.mode.name().into(),
                 account: config.account()?.to_hex(),
                 api_wallet: config
                     .api_wallet
                     .clone()
-                    .context("mainnet API wallet missing")?,
+                    .context("sending API wallet missing")?,
                 home: fs::canonicalize(&paths.home)?,
                 config: fs::canonicalize(&paths.config)?,
                 executable_sha256: service::hash_file(&executable)?,
@@ -1972,17 +2045,14 @@ fn service_command(paths: &Paths, command: ServiceCommand) -> Result<()> {
         ServiceCommand::Provision {
             binding,
             confirm_mainnet,
+            confirm_account,
             key_stdin,
             replace,
         } => {
             let binding = service::load_binding(&binding)?;
             binding.validate()?;
-            if Address::from_hex(&confirm_mainnet)
-                .context("invalid mainnet confirmation address")?
-                != Address::from_hex(&binding.account).context("invalid bound account")?
-            {
-                bail!("credential provisioning needs the exact admitted account confirmation");
-            }
+            binding
+                .validate_confirmation(confirm_mainnet.as_deref(), confirm_account.as_deref())?;
             service::validate_provision(&binding)?;
             let key = if key_stdin {
                 service::read_key_frame(&mut stdin_fd()?)?
@@ -2012,27 +2082,28 @@ fn service_command(paths: &Paths, command: ServiceCommand) -> Result<()> {
             binding,
             next_binding,
             confirm_mainnet,
+            confirm_account,
         } => {
             let binding = service::load_binding(&binding)?;
+            binding
+                .validate_confirmation(confirm_mainnet.as_deref(), confirm_account.as_deref())?;
             #[cfg(target_os = "macos")]
-            service::macos::migrate(&binding, &next_binding, &confirm_mainnet)?;
+            service::macos::migrate(&binding, &next_binding, &binding.account)?;
             #[cfg(not(target_os = "macos"))]
             {
-                let _ = (binding, next_binding, confirm_mainnet);
+                let _ = (binding, next_binding, confirm_mainnet, confirm_account);
                 bail!("credential migration is a macOS release operation");
             }
         }
         ServiceCommand::Readmit {
             binding,
             confirm_mainnet,
+            confirm_account,
         } => {
             let path = fs::canonicalize(binding)?;
             let mut binding = service::load_binding(&path)?;
-            if Some(Address::from_hex(&confirm_mainnet).context("invalid confirmation")?)
-                != Address::from_hex(&binding.account)
-            {
-                bail!("readmission requires the exact admitted mainnet account");
-            }
+            binding
+                .validate_confirmation(confirm_mainnet.as_deref(), confirm_account.as_deref())?;
             service::validate_management_stopped(&binding)?;
             let config = service::load_config(&binding)?;
             binding.admission_config_sha256 = service::config_fingerprint(&config)?;
@@ -2085,11 +2156,11 @@ fn service_command(paths: &Paths, command: ServiceCommand) -> Result<()> {
         ServiceCommand::Pair {
             binding,
             confirm_mainnet,
+            confirm_account,
         } => {
             let binding = service::load_binding(&binding)?;
-            if Address::from_hex(&confirm_mainnet) != Address::from_hex(&binding.account) {
-                bail!("pairing requires the exact admitted mainnet account");
-            }
+            binding
+                .validate_confirmation(confirm_mainnet.as_deref(), confirm_account.as_deref())?;
             service::validate_management_stopped(&binding)?;
             let config = binding.validate()?;
             let mut next = config.clone();
@@ -2110,4 +2181,102 @@ fn service_command(paths: &Paths, command: ServiceCommand) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod service_cli_tests {
+    use super::*;
+
+    fn init_args(words: &[&str]) -> InitArgs {
+        let cli = Cli::try_parse_from(words).expect("synthetic CLI parses");
+        match cli.command {
+            Command::Init(args) => args,
+            _ => panic!("expected init command"),
+        }
+    }
+
+    #[test]
+    fn protected_testnet_stdin_setup_is_explicit_and_mainnet_keeps_hidden_input() {
+        let testnet = init_args(&[
+            "guard",
+            "init",
+            "--service-setup",
+            "testnet-ci",
+            "--network",
+            "testnet",
+            "--non-interactive",
+            "--key-stdin",
+        ]);
+        assert!(validate_service_init_args(&testnet).is_ok());
+        let mainnet = init_args(&[
+            "guard",
+            "init",
+            "--service-setup",
+            "ci",
+            "--network",
+            "mainnet",
+            "--non-interactive",
+            "--confirm-mainnet",
+            "0x1111111111111111111111111111111111111111",
+            "--equity-cap",
+            "100",
+            "--key-stdin",
+        ]);
+        assert!(validate_service_init_args(&mainnet).is_err());
+        let wrong = init_args(&[
+            "guard",
+            "init",
+            "--service-setup",
+            "ci",
+            "--network",
+            "testnet",
+            "--non-interactive",
+            "--key-stdin",
+        ]);
+        assert!(validate_service_init_args(&wrong).is_err());
+    }
+
+    #[test]
+    fn protected_key_check_refuses_mainnet_before_consuming_stdin() {
+        let testnet = init_args(&[
+            "guard",
+            "init",
+            "--network",
+            "testnet",
+            "--non-interactive",
+            "--no-key",
+            "--key-stdin",
+            "--service-key-check",
+        ]);
+        assert!(validate_service_init_args(&testnet).is_ok());
+        let mainnet = init_args(&[
+            "guard",
+            "init",
+            "--network",
+            "mainnet",
+            "--non-interactive",
+            "--no-key",
+            "--key-stdin",
+            "--service-key-check",
+        ]);
+        assert!(validate_service_init_args(&mainnet).is_err());
+    }
+
+    #[test]
+    fn command_line_cannot_mix_mainnet_consent_and_testnet_selection() {
+        assert!(
+            Cli::try_parse_from([
+                "guard",
+                "service",
+                "prepare",
+                "--credential-id",
+                "testnet-ci",
+                "--confirm-mainnet",
+                "0x1111111111111111111111111111111111111111",
+                "--confirm-account",
+                "0x1111111111111111111111111111111111111111"
+            ])
+            .is_err()
+        );
+    }
 }

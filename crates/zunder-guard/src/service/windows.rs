@@ -489,8 +489,8 @@ fn scm_session(binding: &ServiceBinding, path: &Path) -> Result<()> {
     result
 }
 
-/// The only Windows mainnet init exception is a pre-created protected machine
-/// service layout; this creates config, never a journal or running service.
+/// Sending-mode init requires a pre-created protected machine service layout.
+/// Mainnet creates no journal; Testnet's fresh journal remains in this protected home.
 pub fn validate_setup(home: &Path, config: &Path, identity: &str) -> Result<()> {
     if identity.is_empty()
         || identity.len() > 80
@@ -515,7 +515,7 @@ pub fn validate_setup(home: &Path, config: &Path, identity: &str) -> Result<()> 
                 .ok_or_else(|| refused("config parent missing"))?,
         )? != fs::canonicalize(home)?
     {
-        return Err(refused("mainnet setup requires the protected service home"));
+        return Err(refused("sending setup requires the protected service home"));
     }
     let _directory = open_checked(&root, &sid, false, true)?;
     let _runtime = open_checked(home, &sid, true, true)?;

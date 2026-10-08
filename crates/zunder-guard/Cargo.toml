@@ -62,6 +62,10 @@ rustix.workspace = true
 signal-hook = { workspace = true, features = ["iterator"] }
 nix.workspace = true
 
+# Protected Testnet container initialization disables and verifies process core limits.
+[target.'cfg(target_os = "linux")'.dependencies]
+nix.workspace = true
+
 [dev-dependencies]
 base64.workspace = true
 fastrand.workspace = true

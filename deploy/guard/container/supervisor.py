@@ -101,8 +101,17 @@ def docker_json(*args):
         raise Refused('Docker returned invalid metadata.') from error
 
 
+def sending_mode(config):
+    # Missing mode is the immutable legacy mainnet schema, never inferred Testnet.
+    mode = config.get('mode', 'mainnet')
+    require(mode in ('mainnet', 'testnet'), 'Sending network must be explicit and supported.')
+    return mode
+
+
 def validate(config):
-    require(set(config) == {'image', 'tag', 'volume', 'account', 'instance'}, 'Unexpected supervisor configuration.')
+    fields = {'image', 'tag', 'volume', 'account', 'instance'}
+    require(set(config) in (fields, fields | {'mode'}), 'Unexpected supervisor configuration.')
+    sending_mode(config)
     patterns = {'image': IMAGE_RE, 'tag': r'v[0-9]+\.[0-9]+\.[0-9]+',
                 'volume': VOLUME_RE, 'account': ACCOUNT_RE, 'instance': r'[a-f0-9]{32}'}
     for field, pattern in patterns.items():
@@ -217,8 +226,8 @@ def check_config(config, *, transient=False):
                           current['image'], *command)
     mode = run_operation(config, ['config', 'get', 'mode']).decode().strip()
     account = run_operation(config, ['config', 'get', 'account']).decode().strip()
-    require(mode == 'mainnet' and account.lower() == config['account'].lower(),
-            'Existing mainnet config and exact account must match.')
+    require(mode == sending_mode(config) and account.lower() == config['account'].lower(),
+            'Existing sending network and exact account must match.')
     run_operation(config, ['check-config'])
 
 
@@ -247,6 +256,8 @@ def inactive():
 def install(args):
     config = dict(image=args.image, tag=args.tag, volume=args.volume,
                   account=args.account, instance=uuid.uuid4().hex)
+    if getattr(args, 'network', 'mainnet') != 'mainnet':
+        config['mode'] = args.network
     validate(config)
     require(args.confirm_account == args.account, 'Repeat the exact account confirmation.')
     inactive()
@@ -254,8 +265,9 @@ def install(args):
             'Existing containers must be stopped and removed without removing the volume first.')
     if (BASE / 'config.json').exists():
         previous = load()
-        require(previous['volume'] == config['volume'] and previous['account'] == config['account'],
-                'Changing the supervisor account or volume requires a separate migration.')
+        require(sending_mode(previous) == sending_mode(config)
+                and previous['volume'] == config['volume'] and previous['account'] == config['account'],
+                'Changing the supervisor network, account or volume requires a separate migration.')
         config['instance'] = previous['instance']
     execute([COSIGN, 'verify', config['image'], '--certificate-identity',
              'https://github.com/zunderlabs/zunder-guard/.github/workflows/release.yml@refs/tags/' + config['tag'],
@@ -264,7 +276,7 @@ def install(args):
     docker('pull', config['image'])
     check_config(config, transient=True)
     require(args.key_stdin or sys.stdin.isatty(), 'Use a terminal for the hidden prompt, or pass --key-stdin.')
-    key = sys.stdin.buffer.readline(257) if args.key_stdin else (getpass.getpass('API wallet key (hidden): ') + '\n').encode()
+    key = read_key_frame(sys.stdin.buffer) if args.key_stdin else (getpass.getpass('API wallet key (hidden): ') + '\n').encode()
     require(re.fullmatch(rb'(?:0x)?[a-fA-F0-9]{64}\r?\n?', key), 'Invalid API wallet key format.')
     try:
         # Existing initialized mainnet homes already have api_wallet. Read-only mount
@@ -284,7 +296,24 @@ def install(args):
     atomic(UNIT_PATH, UNIT_SOURCE.read_bytes())
     execute([SYSTEMCTL, 'daemon-reload'])
     execute([SYSTEMCTL, 'enable', UNIT])
-    print('Supervisor installed and enabled, but STOPPED. Review the mainnet journal and start explicitly.')
+    print('Supervisor installed and enabled, but STOPPED. Review the ' + sending_mode(config) + ' journal and start explicitly.')
+
+
+def read_key_frame(stream):
+    # Exactly one LF-terminated frame; bound malformed input without consuming another frame.
+    # A buffered readline may steal the next frame from a child inheriting fd 0.
+    source = getattr(stream, 'raw', stream)
+    key = bytearray()
+    while len(key) < 257:
+        value = source.read(1)
+        if not value:
+            break
+        key.extend(value)
+        if value == b'\n':
+            break
+    key = bytes(key)
+    require(re.fullmatch(rb'(?:0x)?[a-fA-F0-9]{64}\r?\n', key), 'Invalid private stdin key frame.')
+    return key
 
 
 def credential_stdin():
@@ -323,9 +352,11 @@ def runtime(config):
     argv = [DOCKER, '--config', str(BASE / 'docker-config'), '--host', 'unix:///var/run/docker.sock',
             'run', '-i', *container_args(config), '--name', NAME,
             '--label', LABEL + '=' + config['instance'], '--cidfile', str(RUNTIME / 'container.id'),
-            '--publish', '127.0.0.1:8547:8547', '--env', 'ZUNDER_GUARD_LISTEN=0.0.0.0:8547',
-            '--env', 'ZUNDER_MAINNET_CONFIRM=' + config['account'], config['image'],
-            'run', '--network', 'mainnet', '--key-stdin']
+            '--publish', '127.0.0.1:8547:8547', '--env', 'ZUNDER_GUARD_LISTEN=0.0.0.0:8547']
+    mode = sending_mode(config)
+    if mode == 'mainnet':
+        argv += ['--env', 'ZUNDER_MAINNET_CONFIRM=' + config['account']]
+    argv += [config['image'], 'run', '--network', mode, '--key-stdin']
     # systemd has now installed the credential namespace. Open it afresh on each
     # ExecStart, after non-secret preflight commands, and forward only descriptor 0.
     credential_stdin()
@@ -341,6 +372,7 @@ def main():
     for flag in ('image', 'tag', 'volume', 'account', 'confirm-account'):
         setup.add_argument('--' + flag, required=True)
     setup.add_argument('--key-stdin', action='store_true')
+    setup.add_argument('--network', choices=('mainnet', 'testnet'), default='mainnet')
     commands.add_parser('run')
     commands.add_parser('stop')
     args = parser.parse_args()

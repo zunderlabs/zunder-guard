@@ -21,9 +21,12 @@ param(
   [string]$Account = $env:ZUNDER_GUARD_ACCOUNT,
   # A licence key (zgl1_...) for the account; not a secret.
   [string]$Licence = $env:ZUNDER_GUARD_LICENCE,
-  # paper (default) or testnet; with -NonInteractive only paper (a testnet key is typed).
+  # Paper by default; protected Testnet additionally requires ManagedService and private KeyStdin.
   [string]$Network = '',
   [switch]$NonInteractive,
+  # Explicit protected Testnet SCM path; key frames stay on private standard input.
+  [switch]$ManagedService,
+  [switch]$KeyStdin,
   # Download, verify and install; no setup.
   [switch]$InstallOnly,
   # Replace an existing configuration (the journals are kept).
@@ -182,6 +185,11 @@ function Assert-ZgHelperPolicy {
   }
 }
 
+function Get-ZgLoaderRecordNetwork($Record) {
+  $mode = if ($Record.PSObject.Properties.Name -contains 'mode') { $Record.mode } else { 'mainnet' }
+  if ($mode -cnotin @('mainnet','testnet')) { throw 'Unsupported owned sending network.' }
+  return $mode
+}
 function Assert-ZgInteractiveConsole {
   if ([Console]::IsInputRedirected -or [Console]::IsOutputRedirected -or $Host.Name -ne 'ConsoleHost') { throw 'Mainnet needs an elevated interactive console; EOF or cancellation never confirms setup.' }
 }
@@ -189,13 +197,20 @@ function Read-ZgPublicPrompt([string]$Message) { return Microsoft.PowerShell.Uti
 function Invoke-ZgLifecycleHelper([string[]]$Words) {
   Assert-ZgHelperPolicy
   & $ZgPowerShell @Words
-  if ($LASTEXITCODE -ne 0) { throw 'Verified mainnet helper did not complete. Organization execution policy remains authoritative; no policy was changed. Inspect the preceding error and use the retained helper Status/Resume only for an owned pending setup.' }
+  if ($LASTEXITCODE -ne 0) { throw 'Verified service helper did not complete. Organization execution policy remains authoritative; no policy was changed. Inspect the preceding error and use the retained helper Status/Resume only for an owned pending setup.' }
 }
-function Install-ZgMainnet($Rules,$Account,$ConfirmAccount,$EquityCap,$Licence,$Id,$Tag,$Source,$NonInteractive,$InstallOnly,$Force,$InstallDir) {
-  if ($NonInteractive -or $InstallOnly -or $Force -or $InstallDir) { throw 'Mainnet refuses NonInteractive, InstallOnly, Force and alternate InstallDir.' }
+function Install-ZgMainnet($Rules,$Account,$ConfirmAccount,$EquityCap,$Licence,$Id,$Tag,$Source,$NonInteractive,$InstallOnly,$Force,$InstallDir,$Network='mainnet',$KeyStdin=$false) {
+  if ($Network -cnotin @('mainnet','testnet')) { throw 'Unsupported protected service network.' }
+  if ($Network -eq 'mainnet') {
+    if ($NonInteractive -or $KeyStdin -or $InstallOnly -or $Force -or $InstallDir) { throw 'Mainnet refuses NonInteractive, KeyStdin, InstallOnly, Force and alternate InstallDir.' }
+  } else {
+    if (-not $NonInteractive -or -not $KeyStdin -or $InstallOnly -or $Force -or $InstallDir -or -not [Console]::IsInputRedirected) { throw 'Protected Testnet requires NonInteractive, private KeyStdin and the machine installation.' }
+    if (-not $Account -or -not $ConfirmAccount -or -not $EquityCap -or -not $Rules) { throw 'Protected Testnet requires explicit account, repeated account, equity cap and rules.' }
+    if (-not $Id.StartsWith('testnet-',[StringComparison]::Ordinal)) { throw 'Testnet requires a separate testnet- instance identity.' }
+  }
   $providedVerifier = $env:ZUNDER_GUARD_COSIGN
   Initialize-ZgMachineContext
-  Assert-ZgInteractiveConsole
+  if ($Network -eq 'mainnet') { Assert-ZgInteractiveConsole }
   if ($Id -notmatch '^[A-Za-z0-9-]{1,64}$') { throw 'Invalid service instance Id.' }
   if (-not $Account) { $Account = Read-ZgPublicPrompt 'Hyperliquid main account address' }
   if ($Account -notmatch '^0x[0-9a-fA-F]{40}$') { throw 'Main account must have 40 hex digits.' }
@@ -230,10 +245,10 @@ function Install-ZgMainnet($Rules,$Account,$ConfirmAccount,$EquityCap,$Licence,$
       Assert-ZgPath $transaction
       if ([IO.FileInfo]::new($transaction).Length -gt 65536) { throw 'Oversized owned transaction refused.' }
       $prior = [IO.File]::ReadAllText($transaction) | Microsoft.PowerShell.Utility\ConvertFrom-Json
-      if ($prior.schema -ne 1 -or $prior.id -cne $Id -or $prior.account -cne $Account.ToLowerInvariant()) { throw 'Existing transaction identity differs; nothing was changed.' }
+      if ($prior.schema -ne 1 -or $prior.id -cne $Id -or $prior.account -cne $Account.ToLowerInvariant() -or (Get-ZgLoaderRecordNetwork $prior) -cne $Network) { throw 'Existing transaction identity differs; nothing was changed.' }
       Microsoft.PowerShell.Utility\Write-Host "Verified lifecycle helper: $helper"
       if ($prior.phase -in @('activation-committed','stopped','admitted-disabled','journal-present','rolled-back')) {
-        Microsoft.PowerShell.Utility\Write-Host "Existing instance retained. Explicit upgrade: $invocation -Action Upgrade -Id '$Id' -ReleaseDir '$cache' -Tag '$Tag' -ConfirmAccount '$ConfirmAccount'"
+        Microsoft.PowerShell.Utility\Write-Host "Existing instance retained. Explicit upgrade: $invocation -Action Upgrade -Network '$Network' -Id '$Id' -ReleaseDir '$cache' -Tag '$Tag' -ConfirmAccount '$ConfirmAccount'"
         Microsoft.PowerShell.Utility\Write-Host 'No service was stopped or started. For activation without upgrade use the retained installation helper Start command.'
         return
       }
@@ -242,16 +257,18 @@ function Install-ZgMainnet($Rules,$Account,$ConfirmAccount,$EquityCap,$Licence,$
       $action = 'Resume'
     }
     $words = @('-NoLogo','-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-File',$helper,'-Action',$action,'-Id',$Id,'-ReleaseDir',$cache,'-Tag',$Tag,'-Account',$Account,'-ConfirmAccount',$ConfirmAccount,'-EquityCap',$EquityCap)
+    if ($Network -eq 'testnet') { $words += @('-Network','testnet','-KeyStdin') }
     if ($Rules) { $words += @('-Rules',$Rules) }
     if ($Licence) { $words += @('-Licence',$Licence) }
     Invoke-ZgLifecycleHelper $words
     Microsoft.PowerShell.Utility\Write-Host "Verified lifecycle helper: $helper"
-    Microsoft.PowerShell.Utility\Write-Host 'Nothing started. Review the printed JournalInit and Start commands separately.'
+    if ($Network -eq 'testnet') { Microsoft.PowerShell.Utility\Write-Host 'Nothing started. Use the printed Testnet Start command; its fresh journal is already initialized.' }
+    else { Microsoft.PowerShell.Utility\Write-Host 'Nothing started. Review the printed JournalInit and Start commands separately.' }
   } finally { if ($stage -and [IO.Directory]::Exists($stage)) { [IO.Directory]::Delete($stage,$true) } }
 }
 
 function Install-ZunderGuard {
-  param($Rules, $Account, $Licence, $Network, $NonInteractive, $InstallOnly, $Force, $InstallDir, $Id, $ConfirmAccount, $EquityCap)
+  param($Rules, $Account, $Licence, $Network, $NonInteractive, $InstallOnly, $Force, $InstallDir, $Id, $ConfirmAccount, $EquityCap, $ManagedService, $KeyStdin)
   $ErrorActionPreference = 'Stop'
   $ProgressPreference = 'SilentlyContinue'
   $V = '@VERSION@'
@@ -265,8 +282,10 @@ function Install-ZunderGuard {
   $CosignVersion = 'v3.1.3'
   $CosignSha256 = '9fe59be0eca1271873ce019061335eb1ac419b7059202e797828467ddabe33be'
 
-  if ($Network -eq 'mainnet') {
-    Install-ZgMainnet $Rules $Account $ConfirmAccount $EquityCap $Licence $Id $V $Base $NonInteractive $InstallOnly $Force $InstallDir
+  if ($KeyStdin -and ($Network -ne 'testnet' -or -not $ManagedService)) { throw 'Private KeyStdin requires explicit protected Testnet service setup.' }
+  if ($ManagedService -and $Network -notin @('mainnet','testnet')) { throw 'Managed service requires a sending network.' }
+  if ($Network -eq 'mainnet' -or ($Network -eq 'testnet' -and $ManagedService)) {
+    Install-ZgMainnet $Rules $Account $ConfirmAccount $EquityCap $Licence $Id $V $Base $NonInteractive $InstallOnly $Force $InstallDir $Network $KeyStdin
     return
   }
 
@@ -398,4 +417,4 @@ function Install-ZunderGuard {
 }
 
 Install-ZunderGuard -Rules $Rules -Account $Account -Licence $Licence -Network $Network -NonInteractive:$NonInteractive `
-  -InstallOnly:$InstallOnly -Force:$Force -InstallDir $InstallDir -Id $Id -ConfirmAccount $ConfirmAccount -EquityCap $EquityCap
+  -InstallOnly:$InstallOnly -Force:$Force -InstallDir $InstallDir -Id $Id -ConfirmAccount $ConfirmAccount -EquityCap $EquityCap -ManagedService:$ManagedService -KeyStdin:$KeyStdin

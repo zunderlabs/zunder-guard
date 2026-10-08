@@ -328,6 +328,8 @@ jobs:
         run: python3 -B deploy/guard/test/distribution.py DockerBuildContext
       - name: Container installer transaction and ownership checks
         run: python3 -B deploy/guard/test/container-installer.py
+      - name: Protected testnet credential dispatch checks
+        run: python3 -B deploy/guard/test/protected-testnet-dispatch.py
       - name: Publication gate regressions (no network or signing)
         run: |
           python3 -B deploy/guard/test/release-policy.py

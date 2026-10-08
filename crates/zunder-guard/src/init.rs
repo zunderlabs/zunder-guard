@@ -402,6 +402,9 @@ pub struct InitOptions {
     /// Set nothing up for the key (the installer checks and stores it
     /// itself, through `key check`).
     pub no_key: bool,
+    /// Protected testnet installer: read/check the key once and retain only its
+    /// public address. Never store it in the interactive user's credential store.
+    pub check_key_only: bool,
     pub listen: Option<String>,
     /// The config's `ip_share` (1 when not given).
     pub ip_share: Option<rust_decimal::Decimal>,
@@ -757,6 +760,21 @@ pub async fn init(
                 "on mainnet the rules may not be looser than the mainnet ceiling (Zunder's default risk frame and Guard's pinned limits): {field} is"
             ));
         }
+    } else if mode == GuardMode::Testnet
+        && let Some(cap_text) = &options.equity_cap
+    {
+        // An explicit Testnet cap tightens sizing and journal limits exactly as
+        // requested; the existing policy validator supplies both bounds.
+        let cap = Decimal::from_str(cap_text.trim())
+            .map_err(|_| InitError::Refused(format!("`{cap_text}` is not a number")))?;
+        policy.max_trading_equity_usd = Some(cap);
+        policy
+            .validate()
+            .map_err(|error| InitError::Refused(error.to_string()))?;
+    }
+
+    if options.check_key_only && (!options.no_key || mode != GuardMode::Testnet) {
+        return refused("protected key-check setup requires testnet and no key storage");
     }
 
     // 4. The API wallet key, for a sending mode: never shown; checked with
@@ -766,11 +784,18 @@ pub async fn init(
     // means "do not store it" there.
     let mainnet = mode == GuardMode::Mainnet;
     let secret: Option<Zeroizing<String>> = if mode == GuardMode::Paper
-        || (options.no_key && !mainnet)
+        || (options.no_key && !mainnet && !options.check_key_only)
     {
         None
     } else {
         Some(match key_input {
+            Some(reader) if options.check_key_only => {
+                let frame = crate::service::read_key_frame(reader)
+                    .map_err(|error| InitError::Refused(error.to_string()))?;
+                let text =
+                    std::str::from_utf8(&frame).expect("key frame was already validated as UTF-8");
+                Zeroizing::new(text.to_owned())
+            }
             Some(reader) => read_secret_line(reader)?,
             None if interactive => {
                 prompter.ask_secret("API wallet private key (not shown while typing):")?
@@ -1491,6 +1516,236 @@ mod tests {
                 "{error}"
             );
             assert!(!dir.path().join("guard.toml").exists());
+        }
+    }
+
+    #[tokio::test]
+    async fn protected_testnet_checks_wallet_without_storing_the_private_key() {
+        let dir = TestDir::new("init-protected-testnet");
+        let options = InitOptions {
+            non_interactive: true,
+            account: Some(ACCOUNT.into()),
+            mode: Some(GuardMode::Testnet),
+            no_key: true,
+            check_key_only: true,
+            ..options(&dir)
+        };
+        let mut input = format!("{}\n", KEY.trim_start_matches("0x"))
+            .as_bytes()
+            .to_vec();
+        let mut reader = input.as_slice();
+        let kept = Kept::default();
+        let mut prompt = script(&[]);
+        let outcome = init(
+            &options,
+            &mut prompt,
+            Some(&mut reader),
+            &agent(),
+            &kept,
+            &mut counter(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome.mode, "testnet");
+        assert!(outcome.config.api_wallet.is_some());
+        assert!(!outcome.config.allow_mainnet);
+        assert!(outcome.stored.is_none());
+        assert!(kept.0.borrow().is_none());
+        assert!(!prompt.output.contains(&KEY[2..]));
+        input.iter_mut().for_each(|byte| *byte = 0);
+    }
+
+    #[tokio::test]
+    async fn protected_testnet_explicit_cap_reaches_config_journal_and_risk_sizing() {
+        let dir = TestDir::new("init-protected-testnet-cap");
+        let options = InitOptions {
+            non_interactive: true,
+            account: Some(ACCOUNT.into()),
+            mode: Some(GuardMode::Testnet),
+            no_key: true,
+            check_key_only: true,
+            equity_cap: Some("40".into()),
+            ..options(&dir)
+        };
+        let frame = format!("{KEY}\n");
+        let mut reader = frame.as_bytes();
+        let kept = Kept::default();
+        let outcome = init(
+            &options,
+            &mut script(&[]),
+            Some(&mut reader),
+            &agent(),
+            &kept,
+            &mut counter(),
+        )
+        .await
+        .unwrap();
+        let persisted = GuardConfig::load(&options.config).unwrap();
+        assert_eq!(persisted.policy.max_trading_equity_usd, Some(dec!(40)));
+        assert_eq!(outcome.config.policy, persisted.policy);
+        let limits = persisted.policy.risk_limits();
+        let scope = persisted.journal_scope(false).unwrap();
+        let journal =
+            zunder_venue::PersistentRisk::open_for(&dir.path().join("risk.jsonl"), &limits, &scope)
+                .unwrap();
+        assert_eq!(
+            journal.engine().limits().max_trading_equity_usd,
+            Some(dec!(40))
+        );
+        assert_eq!(journal.engine().limits().risk_per_trade, dec!(0.02));
+        // Hand calculation, before costs: min(1000, 40) * 2% = 0.80 USDC.
+        // Entry100 minus stop99 is 1 USDC/unit, so quantity is also 0.80.
+        // Its 80 USDC notional is below the existing 40*5=200 leverage cap.
+        let quantity = journal
+            .engine()
+            .size_entry(&zunder_risk::SizeRequest {
+                equity: dec!(1000),
+                side: zunder_core::Side::Buy,
+                entry: dec!(100),
+                stop: dec!(99),
+                round_trip_cost: Decimal::ZERO,
+                open_risk: Decimal::ZERO,
+                open_notional: Decimal::ZERO,
+                qty_step: Decimal::ZERO,
+                min_notional: Decimal::ZERO,
+            })
+            .unwrap();
+        assert_eq!(quantity, dec!(0.8));
+        assert_eq!(quantity * dec!(1), dec!(0.8));
+        assert!(kept.0.borrow().is_none());
+    }
+
+    #[tokio::test]
+    async fn invalid_testnet_cap_refuses_before_key_read_or_any_config_journal_write() {
+        for cap in ["not-a-number", "", "0", "-1", "2500.01"] {
+            let dir = TestDir::new("init-protected-testnet-invalid-cap");
+            let options = InitOptions {
+                non_interactive: true,
+                account: Some(ACCOUNT.into()),
+                mode: Some(GuardMode::Testnet),
+                no_key: true,
+                check_key_only: true,
+                equity_cap: Some(cap.into()),
+                ..options(&dir)
+            };
+            let mut reader: &[u8] = b"must stay unread";
+            let kept = Kept::default();
+            let error = init(
+                &options,
+                &mut script(&[]),
+                Some(&mut reader),
+                &agent(),
+                &kept,
+                &mut counter(),
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                error.to_string().contains("not a number")
+                    || error.to_string().contains("max_trading_equity_usd"),
+                "{error}"
+            );
+            assert_eq!(reader, b"must stay unread");
+            assert!(kept.0.borrow().is_none());
+            assert!(!options.config.exists());
+            assert!(!dir.path().join("guard.toml.new").exists());
+            assert!(!dir.path().join("risk.jsonl").exists());
+        }
+    }
+
+    #[tokio::test]
+    async fn protected_testnet_network_mismatch_is_refused_before_reading_a_key() {
+        let dir = TestDir::new("init-protected-network-refusal");
+        let options = InitOptions {
+            non_interactive: true,
+            account: Some(ACCOUNT.into()),
+            mode: Some(GuardMode::Testnet),
+            network: Some(GuardNetwork::Mainnet),
+            no_key: true,
+            check_key_only: true,
+            ..options(&dir)
+        };
+        let mut input: &[u8] = b"unread private input";
+        let kept = Kept::default();
+        assert!(
+            init(
+                &options,
+                &mut script(&[]),
+                Some(&mut input),
+                &agent(),
+                &kept,
+                &mut counter()
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(input, b"unread private input");
+        assert!(kept.0.borrow().is_none());
+        assert!(!options.config.exists());
+    }
+
+    #[tokio::test]
+    async fn protected_testnet_unapproved_wallet_cannot_commit_config_or_store_key() {
+        let dir = TestDir::new("init-protected-role-refusal");
+        let options = InitOptions {
+            non_interactive: true,
+            account: Some(ACCOUNT.into()),
+            mode: Some(GuardMode::Testnet),
+            no_key: true,
+            check_key_only: true,
+            ..options(&dir)
+        };
+        let bytes = format!("{}\n", KEY.trim_start_matches("0x")).into_bytes();
+        let mut input = bytes.as_slice();
+        let kept = Kept::default();
+        let missing = FakeVenue(serde_json::json!({"role": "missing"}));
+        assert!(
+            init(
+                &options,
+                &mut script(&[]),
+                Some(&mut input),
+                &missing,
+                &kept,
+                &mut counter()
+            )
+            .await
+            .is_err()
+        );
+        assert!(kept.0.borrow().is_none());
+        assert!(!options.config.exists());
+    }
+
+    #[tokio::test]
+    async fn protected_key_check_cannot_be_used_for_mainnet_or_key_storage() {
+        for mode in [GuardMode::Mainnet, GuardMode::Testnet] {
+            let dir = TestDir::new("init-protected-key-refusal");
+            let options = InitOptions {
+                non_interactive: true,
+                account: Some(ACCOUNT.into()),
+                mode: Some(mode),
+                no_key: mode == GuardMode::Mainnet,
+                check_key_only: true,
+                confirm_mainnet: Some(ACCOUNT.into()),
+                equity_cap: Some("100".into()),
+                ..options(&dir)
+            };
+            let mut input: &[u8] = b"must not be read";
+            let kept = Kept::default();
+            assert!(
+                init(
+                    &options,
+                    &mut script(&[]),
+                    Some(&mut input),
+                    &agent(),
+                    &kept,
+                    &mut counter()
+                )
+                .await
+                .is_err()
+            );
+            assert_eq!(input, b"must not be read");
+            assert!(kept.0.borrow().is_none());
+            assert!(!options.config.exists());
         }
     }
 

@@ -1,7 +1,7 @@
 #!/bin/sh
 # Internal signed release helper. The authenticated Unix installer owns the
 # sudo/bootstrap boundary; never invoke a Cellar/user-writable broker as root.
-# Usage: install-service.sh ROOT_PRIVATE_RELEASE_STAGE vX.Y.Z [rules] [account] [cap] [listen] [share] [licence]
+# Usage: install-service.sh ROOT_PRIVATE_RELEASE_STAGE vX.Y.Z [rules] [account] [cap] [listen] [share] [licence] [mainnet|testnet] [0|1]
 # Stage: cosign, SHA256SUMS, SHA256SUMS.sigstore.json, versioned Darwin archive.
 set -eu
 PATH=/usr/bin:/bin:/usr/sbin:/sbin
@@ -19,7 +19,7 @@ ulimit -Hc 0 || fail 'cannot disable hard core limit'
 if ! { [ "$(ulimit -Sc)" = 0 ] && [ "$(ulimit -Hc)" = 0 ]; }; then
   fail 'core dump limits not disabled'
 fi
-if ! { [ "$#" -ge 2 ] && [ "$#" -le 8 ]; }; then
+if ! { [ "$#" -ge 2 ] && [ "$#" -le 10 ]; }; then
   fail 'expected private release stage, version, optional public setup values'
 fi
 stage=$1
@@ -30,6 +30,16 @@ cap=${5:-}
 listen=${6:-}
 share=${7:-}
 licence=${8:-}
+network=${9:-mainnet}
+non_interactive=${10:-0}
+case "$network:$non_interactive" in
+  mainnet:0) credential_id=mainnet; service_user=_zunder_guard; state_name=state; identity_name=service-identity; binding_name=bindings; log=/var/log/zunder-guard.log; confirm_flag=--confirm-mainnet ;;
+  testnet:1) credential_id=testnet-native; service_user=_zunder_guard_testnet; state_name=state-testnet; identity_name=service-identity-testnet; binding_name=bindings-testnet; log=/var/log/zunder-guard-testnet.log; confirm_flag=--confirm-account ;;
+  *) fail 'mainnet requires interactive consent; testnet requires explicit private stdin setup' ;;
+esac
+if [ "$network" = testnet ]; then
+  [ -p /dev/fd/0 ] || fail 'testnet service requires a private stdin pipe'
+fi
 case "$version" in v[0-9]*) ;; *) fail 'expected a versioned release' ;; esac
 case "$version" in *[!a-zA-Z0-9.-]*) fail 'invalid release tag' ;; esac
 trusted() {
@@ -73,7 +83,7 @@ trap 'rm -f "$bin_stage"' EXIT HUP INT TERM
 tar -xOzf "$stage/$archive" zunder-guard >"$bin_stage"
 sha=$(shasum -a 256 "$bin_stage" | awk '{print $1}')
 base='/Library/Application Support/Zunder Guard'
-for dir in '/Library/Application Support' "$base" "$base/releases" "$base/bindings"; do
+for dir in '/Library/Application Support' "$base" "$base/releases" "$base/$binding_name"; do
   if [ ! -e "$dir" ]; then mkdir -m 0755 "$dir"; fi
   trusted "$dir"
 done
@@ -100,8 +110,7 @@ for notice in LICENSE NOTICE THIRD_PARTY_LICENSES.md; do
 done
 # Dedicated identity creation is separate from binding/keys. Never adopt an
 # existing similarly named account without our root-owned ownership marker.
-service_user=_zunder_guard
-identity="$base/service-identity"
+identity="$base/$identity_name"
 if id "$service_user" >/dev/null 2>&1; then
   [ -f "$identity" ] || fail 'existing service account lacks Guard ownership marker'
   trusted "$identity"
@@ -133,7 +142,7 @@ gid=$(id -g "$service_user")
 if ! { [ "$uid" != 0 ] && [ "$gid" != 0 ]; }; then
   fail 'service identity must not be root'
 fi
-home="$base/state"
+home="$base/$state_name"
 if [ ! -e "$home" ]; then install -d -o "$uid" -g "$gid" -m 0700 "$home"; fi
 if ! { [ ! -L "$home" ] && [ -d "$home" ]; }; then
   fail 'unsafe service state directory'
@@ -141,9 +150,9 @@ fi
 if ! { [ "$(stat -f %u "$home")" = "$uid" ] && [ "$(stat -f %Lp "$home")" = 700 ]; }; then
   fail 'state ownership or permissions mismatch'
 fi
-label=com.zunderlabs.guard.mainnet
+label="com.zunderlabs.guard.$credential_id"
 plist="/Library/LaunchDaemons/$label.plist"
-active="$base/bindings/active.json"
+active="$base/$binding_name/active.json"
 # Do not perform upgrade or credential replacement while a broker is running.
 if launchctl print "system/$label" >/dev/null 2>&1; then
   fail 'stop your bot and boot out the existing Guard service before upgrading'
@@ -152,7 +161,13 @@ else
   [ "$code" = 113 ] || fail 'cannot establish service is unloaded'
 fi
 if [ ! -e "$home/guard.toml" ]; then
-  set -- "$exe" --home "$home" init --interactive --network mainnet
+  set -- "$exe" --home "$home" init --network "$network"
+  if [ "$network" = testnet ]; then
+    [ -n "$rules" ] && [ -n "$account" ] && [ -n "$cap" ] && [ -n "$licence" ] || fail 'testnet service requires explicit rules, account, cap and licence'
+    set -- "$@" --service-key-check --non-interactive --no-key --key-stdin
+  else
+    set -- "$@" --interactive
+  fi
   [ -z "$rules" ] || set -- "$@" --rules "$rules"
   [ -z "$account" ] || set -- "$@" --account "$account"
   [ -z "$cap" ] || set -- "$@" --equity-cap "$cap"
@@ -163,8 +178,10 @@ if [ ! -e "$home/guard.toml" ]; then
 else
   [ -z "$rules$account$cap$listen$share$licence" ] || fail 'existing service configuration is preserved; upgrade without setup options, then use explicit service management commands'
 fi
+# A reused service state must match the selected network before credential access.
+[ "$(sudo -n -u "$service_user" -- "$exe" --home "$home" config get mode)" = "$network" ] || fail 'existing service configuration names another network'
 account=$(sudo -n -u "$service_user" -- "$exe" --home "$home" config get account)
-next="$base/bindings/$sha.json"
+next="$base/$binding_name/$sha.json"
 same_release=0
 old_exe=""
 if [ -e "$active" ] || [ -L "$active" ]; then
@@ -188,13 +205,17 @@ if [ "$same_release" -eq 0 ]; then
   if [ -e "$next" ] || [ -L "$next" ]; then
     fail 'next binding exists; inspect or explicitly recover the interrupted install'
   fi
-  "$exe" --home "$home" service prepare --credential-id mainnet --uid "$uid" --gid "$gid" \
-    --confirm-mainnet "$account" >"$next"
+  "$exe" --home "$home" service prepare --credential-id "$credential_id" --uid "$uid" --gid "$gid" \
+    "$confirm_flag" "$account" >"$next"
   chmod 0644 "$next"
   if [ -n "$old_exe" ]; then
-    "$old_exe" service migrate-credential --binding "$active" --next-binding "$next" --confirm-mainnet "$account"
+    "$old_exe" service migrate-credential --binding "$active" --next-binding "$next" "$confirm_flag" "$account"
   else
-    "$exe" service provision --binding "$next" --confirm-mainnet "$account"
+    if [ "$network" = testnet ]; then
+      "$exe" service provision --binding "$next" "$confirm_flag" "$account" --key-stdin
+    else
+      "$exe" service provision --binding "$next" "$confirm_flag" "$account"
+    fi
   fi
   checked_binding=$next
 else
@@ -205,7 +226,7 @@ fi
 "$exe" service check --binding "$checked_binding"
 # The final service pointer changes only after the new creator can read its item.
 # Same-release reinstall retains both existing binding files byte-for-byte.
-active_next="$base/bindings/.active-next.json"
+active_next="$base/$binding_name/.active-next.json"
 if [ "$same_release" -eq 0 ]; then
   [ ! -L "$active_next" ] || fail 'unsafe binding destination'
   install -o root -g wheel -m 0644 "$next" "$active_next"
@@ -214,7 +235,7 @@ fi
 trusted /Library/LaunchDaemons
 [ ! -L "$plist" ] || fail 'unsafe launchd plist destination'
 [ ! -e "$plist" ] || trusted "$plist"
-plist_next="$base/bindings/.launchd-next.plist"
+plist_next="$base/$binding_name/.launchd-next.plist"
 [ ! -L "$plist_next" ] || fail 'unsafe plist staging destination'
 cat >"$plist_next" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -229,17 +250,17 @@ cat >"$plist_next" <<PLIST
 <key>AbandonProcessGroup</key><false/>
 <key>SoftResourceLimits</key><dict><key>Core</key><integer>0</integer></dict>
 <key>HardResourceLimits</key><dict><key>Core</key><integer>0</integer></dict>
-<key>StandardOutPath</key><string>/var/log/zunder-guard.log</string>
-<key>StandardErrorPath</key><string>/var/log/zunder-guard.log</string>
+<key>StandardOutPath</key><string>$log</string>
+<key>StandardErrorPath</key><string>$log</string>
 </dict></plist>
 PLIST
 chown root:wheel "$plist_next"
 chmod 0644 "$plist_next"
 plutil -lint "$plist_next" >/dev/null
 # Create the log privately, never follow an existing symlink or relax its mode.
-[ ! -L /var/log/zunder-guard.log ] || fail 'unsafe service log destination'
-if [ ! -e /var/log/zunder-guard.log ]; then install -o root -g wheel -m 0600 /dev/null /var/log/zunder-guard.log; fi
-if ! { [ "$(stat -f %u /var/log/zunder-guard.log)" = 0 ] && [ "$(stat -f %Lp /var/log/zunder-guard.log)" = 600 ]; }; then
+[ ! -L "$log" ] || fail 'unsafe service log destination'
+if [ ! -e "$log" ]; then install -o root -g wheel -m 0600 /dev/null "$log"; fi
+if ! { [ "$(stat -f %u "$log")" = 0 ] && [ "$(stat -f %Lp "$log")" = 600 ]; }; then
   fail 'service log must be root-only'
 fi
 # The job is unloaded. A failure/crash between these renames cannot launch a
@@ -247,6 +268,10 @@ fi
 # Immutable prior binding and release remain available for explicit recovery.
 if [ "$same_release" -eq 0 ]; then mv -f "$active_next" "$active"; fi
 mv -f "$plist_next" "$plist"
-printf '%s\n' 'Installed mainnet service; nothing was started. Keep previous release and Keychain item until upgrade checks pass.'
-printf 'If this account has no mainnet journal, initialize it explicitly:\n  sudo -u %s env ZUNDER_MAINNET_CONFIRM=%s ZUNDER_GUARD_HOME="%s" "%s" journal-init --mode mainnet --note "your name, why, date"\n' "$service_user" "$account" "$home" "$exe"
+printf 'Installed %s service; nothing was started. Keep previous release and Keychain item until upgrade checks pass.\n' "$network"
+if [ "$network" = mainnet ]; then
+  printf 'If this account has no mainnet journal, initialize it explicitly:\n  sudo -u %s env ZUNDER_MAINNET_CONFIRM=%s ZUNDER_GUARD_HOME="%s" "%s" journal-init --mode mainnet --note "your name, why, date"\n' "$service_user" "$account" "$home" "$exe"
+else
+  printf 'If this account has no testnet journal, initialize it explicitly:\n  sudo -u %s env ZUNDER_GUARD_HOME="%s" "%s" journal-init --mode testnet --note "automated testnet installation"\n' "$service_user" "$home" "$exe"
+fi
 printf 'Then explicitly start and check:\n  sudo launchctl bootstrap system "%s"\n  sudo -u %s "%s" --home "%s" health\n  sudo -u %s "%s" --home "%s" status\n' "$plist" "$service_user" "$exe" "$home" "$service_user" "$exe" "$home"

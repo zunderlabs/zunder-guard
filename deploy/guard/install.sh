@@ -57,6 +57,8 @@ Usage: sh install.sh [options]
   --network NAME        paper (default when asked), testnet or mainnet
   --account 0x…         Hyperliquid account address
   --key-file PATH       file holding the API wallet key (read by this script, never echoed)
+  --key-stdin           protected managed TESTNET only: private framed stdin, no prompts
+                        Linux needs systemd-creds; macOS/container use their secure broker
   --confirm-mainnet 0x… the account address again; required for mainnet without prompts
   --equity-cap USDC     mainnet: the most equity Guard sizes from (at most 2500); required for
                         mainnet without prompts
@@ -69,7 +71,7 @@ Usage: sh install.sh [options]
   --prefix DIR          binary directory (default /usr/local/bin as root, else ~/.local/bin);
                         notices go in ../share/licenses/zunder-guard for a bin directory,
                         otherwise DIR/share/licenses/zunder-guard
-  --container           guided Linux mainnet Docker service with encrypted credential
+  --container           protected Linux mainnet/testnet Docker service with encrypted credential
   --volume NAME         explicit named volume for container setup (default zunder-guard-data)
   --install-only        verify and replace binary/notices only; no setup or service changes
                         stop Guard first; restart it yourself after checking the release
@@ -79,7 +81,7 @@ Usage: sh install.sh [options]
 EOF
 }
 
-RULES="" NETWORK="" ACCOUNT="" KEY_FILE="" CONFIRM="" CAP="" PREFIX="" LISTEN="" SHARE="" LICENCE="" NONINTERACTIVE=0 NO_SERVICE=0 FORCE=0 INSTALL_ONLY=0 SETUP_OPTIONS=0 CONTAINER=0 VOLUME=""
+RULES="" NETWORK="" ACCOUNT="" KEY_FILE="" KEY_STDIN=0 CONFIRM="" CAP="" PREFIX="" LISTEN="" SHARE="" LICENCE="" NONINTERACTIVE=0 NO_SERVICE=0 FORCE=0 INSTALL_ONLY=0 SETUP_OPTIONS=0 CONTAINER=0 VOLUME=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --rules | --network | --account | --key-file | --confirm-mainnet | --equity-cap | --prefix | --listen | --ip-share | --licence | --volume)
@@ -100,6 +102,7 @@ while [ $# -gt 0 ]; do
       esac
       shift 2
       ;;
+    --key-stdin) KEY_STDIN=1 && SETUP_OPTIONS=1 && shift ;;
     --container) CONTAINER=1 && SETUP_OPTIONS=1 && shift ;;
     --install-only) INSTALL_ONLY=1 && shift ;;
     --non-interactive) NONINTERACTIVE=1 && shift ;;
@@ -114,11 +117,26 @@ done
 if [ "$CONTAINER" -eq 1 ]; then
   PATH=/usr/sbin:/usr/bin:/sbin:/bin
   export PATH
-  [ "$NETWORK" = mainnet ] || die "--container requires --network mainnet"
-  [ "$INSTALL_ONLY$NONINTERACTIVE$NO_SERVICE$FORCE" = 0000 ] || die "container mode requires interactive managed setup"
+  case "$NETWORK" in mainnet | testnet) ;; *) die "--container requires --network mainnet or testnet" ;; esac
+  [ "$INSTALL_ONLY$NO_SERVICE$FORCE" = 000 ] || die "container mode requires managed setup"
+  if [ "$NETWORK" = mainnet ]; then
+    [ "$NONINTERACTIVE$KEY_STDIN" = 00 ] || die "mainnet container setup retains interactive confirmation and hidden input"
+  else
+    [ "$NONINTERACTIVE$KEY_STDIN" = 00 ] || [ "$NONINTERACTIVE$KEY_STDIN" = 11 ] \
+      || die "unattended testnet container setup requires --non-interactive --key-stdin"
+  fi
   [ -z "$KEY_FILE$CONFIRM$PREFIX$LISTEN" ] || die "container mode does not accept key-file, confirm-mainnet, prefix or listen"
 elif [ -n "$VOLUME" ]; then
   die "--volume requires --container"
+fi
+
+if [ "$KEY_STDIN" -eq 1 ]; then
+  [ "$NETWORK" = testnet ] && [ "$NONINTERACTIVE" -eq 1 ] && [ "$NO_SERVICE" -eq 0 ] \
+    || die "--key-stdin requires explicit testnet, non-interactive managed setup"
+  [ -z "$KEY_FILE$CONFIRM" ] || die "testnet private stdin cannot be combined with a key file or mainnet consent"
+fi
+if [ "$NETWORK" = testnet ] && [ -n "$CONFIRM" ]; then
+  die "testnet setup accepts no mainnet confirmation"
 fi
 
 if [ "$INSTALL_ONLY" -eq 1 ] && [ "$SETUP_OPTIONS" -eq 1 ]; then
@@ -150,7 +168,9 @@ elif [ "$NONINTERACTIVE" -eq 1 ]; then
   [ -n "$NETWORK" ] || die "--non-interactive needs --network"
   if [ "$NETWORK" != paper ]; then
     [ -n "$ACCOUNT" ] || die "$NETWORK needs --account"
-    if [ -z "$KEY_FILE" ] || [ ! -r "$KEY_FILE" ]; then die "$NETWORK needs --key-file with a readable file"; fi
+    if [ "$KEY_STDIN" -eq 0 ] && { [ -z "$KEY_FILE" ] || [ ! -r "$KEY_FILE" ]; }; then
+      die "$NETWORK needs --key-file with a readable file (protected testnet also accepts --key-stdin)"
+    fi
   fi
   if [ "$NETWORK" = mainnet ] && [ "$CONFIRM" != "$ACCOUNT" ]; then
     die "mainnet needs --confirm-mainnet naming the same account"
@@ -210,7 +230,7 @@ fetch() {
 
 # Container mode never installs/replaces a native Guard binary.
 if [ "$CONTAINER" -eq 1 ]; then
-  [ "$OS" = linux ] || die "--container mainnet requires Linux systemd and local Docker"
+  [ "$OS" = linux ] || die "--container requires Linux systemd and local Docker"
   [ -x /usr/bin/python3 ] || die "Python 3.11 or newer is required for container installation"
   /usr/bin/python3 -I -c 'import sys; sys.exit(sys.version_info < (3, 11))' || die "Python 3.11 or newer is required"
   for asset in SHA256SUMS SHA256SUMS.sigstore.json install-container.py container-supervisor.py container-operations.py zunder-guard-container.service zunder-guard-setup-guardian.service "zunder-guard-$VERSION.image.txt"; do
@@ -224,12 +244,11 @@ if [ "$CONTAINER" -eq 1 ]; then
     /usr/bin/sudo -v || die "administrator installation was not authorized"
     CONTAINER_SUDO=/usr/bin/sudo
   fi
-  $CONTAINER_SUDO /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME=/root LANG=C.UTF-8 \
-    /usr/bin/python3 -I - "$TMP" "$COSIGN_SHA256" "$VERSION" "$VOLUME" "$ACCOUNT" "$RULES" "$CAP" "$SHARE" "$LICENCE" <<'CONTAINER_BOOTSTRAP'
+  CONTAINER_BOOTSTRAP_CODE=$(cat <<'CONTAINER_BOOTSTRAP'
 import hashlib, os, pathlib, re, resource, shutil, stat, subprocess, sys, tempfile
 resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
 os.umask(0o077)
-source, pinned, version, volume, account, rules, cap, share, licence = sys.argv[1:]
+source, pinned, version, volume, account, rules, cap, share, licence, network, noninteractive, key_stdin = sys.argv[1:]
 if not re.fullmatch(r'v[0-9]+\.[0-9]+\.[0-9]+', version):
     raise SystemExit('Invalid release version')
 env = {'PATH': '/usr/sbin:/usr/bin:/sbin:/bin', 'HOME': '/root', 'LANG': 'C.UTF-8'}
@@ -291,18 +310,30 @@ try:
             os.link(pending, destination)  # refuse a concurrent replacement
         finally:
             os.unlink(pending)
-    options = ['--version', version]
+    options = ['--version', version, '--network', network]
+    if noninteractive == '1':
+        if network != 'testnet' or key_stdin != '1':
+            raise SystemExit('Unattended container setup is protected testnet only')
+        options += ['--non-interactive', '--key-stdin']
     for name, value in [('volume', volume), ('account', account), ('rules', rules),
                         ('equity-cap', cap), ('ip-share', share), ('licence', licence)]:
         if value:
             options += ['--' + name, value]
-    with open('/dev/tty', 'rb') as terminal:
-        result = subprocess.run(['/usr/bin/python3', '-I', str(stage / 'install-container.py'), *options],
-                                stdin=terminal, env=env, check=False)
+    command = ['/usr/bin/python3', '-I', str(stage / 'install-container.py'), *options]
+    if key_stdin == '1':
+        result = subprocess.run(command, stdin=sys.stdin.buffer, env=env, check=False)
+    else:
+        with open('/dev/tty', 'rb') as terminal:
+            result = subprocess.run(command, stdin=terminal, env=env, check=False)
     raise SystemExit(result.returncode)
 finally:
     shutil.rmtree(stage)
 CONTAINER_BOOTSTRAP
+  )
+  # Code is public and signed; stdin remains the caller's private pipe across
+  # sudo. No credential is placed in argv/environment or an extra inherited FD.
+  $CONTAINER_SUDO /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME=/root LANG=C.UTF-8 \
+    /usr/bin/python3 -I -c "$CONTAINER_BOOTSTRAP_CODE" "$TMP" "$COSIGN_SHA256" "$VERSION" "$VOLUME" "$ACCOUNT" "$RULES" "$CAP" "$SHARE" "$LICENCE" "$NETWORK" "$NONINTERACTIVE" "$KEY_STDIN"
   exit $?
 fi
 
@@ -418,13 +449,18 @@ fi
 
 # macOS mainnet uses a protected launchd broker, never a user-writable binary.
 # This branch is deliberately AFTER the reviewed --install-only early return.
-if [ "$OS" = darwin ] && [ "$NETWORK" = mainnet ] && [ "$NO_SERVICE" -eq 0 ]; then
+if [ "$OS" = darwin ] && { [ "$NETWORK" = mainnet ] || [ "$NETWORK" = testnet ]; } && [ "$NO_SERVICE" -eq 0 ]; then
   PATH=/usr/bin:/bin:/usr/sbin:/sbin
   export PATH
   if ! { [ -z "$KEY_FILE$CONFIRM" ] && [ "$FORCE" -eq 0 ]; }; then
     die "macOS managed mainnet requires hidden key input and interactive account confirmation; key-file, confirm-mainnet and force are refused"
   fi
-  [ "$NONINTERACTIVE" -eq 0 ] || die "macOS mainnet provisioning needs an interactive terminal; nothing was started"
+  if [ "$NETWORK" = mainnet ]; then
+    [ "$NONINTERACTIVE$KEY_STDIN" = 00 ] || die "macOS mainnet provisioning needs an interactive terminal; nothing was started"
+  else
+    [ "$NONINTERACTIVE$KEY_STDIN" = 00 ] || [ "$NONINTERACTIVE$KEY_STDIN" = 11 ] \
+      || die "unattended macOS testnet setup requires --non-interactive --key-stdin"
+  fi
   if [ "$(/usr/bin/id -u)" -ne 0 ]; then
     [ -x /usr/bin/sudo ] || die "macOS mainnet needs administrator installation"
     /usr/bin/sudo -v || die "administrator installation was not authorized"
@@ -481,9 +517,13 @@ expected=$(awk '$2 == "install-macos-service.sh" || $2 == "*install-macos-servic
 [ "$(shasum -a 256 "$stage/install-macos-service.sh" | awk '{print $1}')" = "$expected" ] || exit 2
 ROOT_VERIFY
   # Helper is now a verified, root-owned signed asset in root-private staging.
-  $MAC_SUDO /bin/sh "$MAC_STAGE/install-macos-service.sh" "$MAC_STAGE" "$VERSION" "$RULES" "$ACCOUNT" "$CAP" "$LISTEN" "$SHARE" "$LICENCE"
+  $MAC_SUDO /bin/sh "$MAC_STAGE/install-macos-service.sh" "$MAC_STAGE" "$VERSION" "$RULES" "$ACCOUNT" "$CAP" "$LISTEN" "$SHARE" "$LICENCE" "$NETWORK" "$NONINTERACTIVE"
   $MAC_SUDO /bin/rm -rf "$MAC_STAGE"
   exit 0
+fi
+
+if [ "$KEY_STDIN" -eq 1 ] && [ "$SERVICE" -ne 1 ]; then
+  die "protected testnet stdin requires the managed systemd service on Linux"
 fi
 
 # ---------------------------------------------------------------- 5: set up
@@ -511,6 +551,12 @@ if [ "$SERVICE" -eq 0 ]; then
   NO_MAINNET="mainnet is set up only as a systemd service on Linux (root or sudo), where the key reaches Guard from an encrypted credential; here, run it by hand with the key piped in: zunder-guard run --network mainnet --key-stdin"
 elif [ "$HAS_CREDS" -eq 0 ]; then
   NO_MAINNET="mainnet under systemd needs systemd-creds (systemd 250 or newer), so the key is never on disk in plain text; upgrade systemd, or run Guard by hand with the key piped in: zunder-guard run --network mainnet --key-stdin"
+fi
+if [ "$KEY_STDIN" -eq 1 ]; then
+  [ "$HAS_CREDS" -eq 1 ] || die "protected testnet stdin requires systemd-creds; plaintext fallback is refused"
+  if $SUDO test -e "$SERVICE_HOME/guard.toml"; then
+    [ "$(guard config get mode)" = testnet ] || die "testnet setup cannot adopt another network or paper state"
+  fi
 fi
 if [ "$NONINTERACTIVE" -eq 1 ] && [ "$NETWORK" = mainnet ] && [ -n "$NO_MAINNET" ]; then
   die "$NO_MAINNET. Nothing was set up."
@@ -563,7 +609,13 @@ if [ "$SERVICE" -eq 1 ]; then
     # never traced (set -x off from here on).
     { set +x; } 2>/dev/null
     if [ "$NONINTERACTIVE" -eq 1 ]; then
-      IFS= read -r KEY <"$KEY_FILE" || true
+      if [ "$KEY_STDIN" -eq 1 ]; then
+        IFS= read -r KEY || die "missing protected testnet key frame"
+        [ "${#KEY}" -eq 64 ] || die "protected testnet frame requires exactly 64 hex digits"
+        case "$KEY" in *[!0-9a-fA-F]*) die "invalid protected testnet key frame" ;; esac
+      else
+        IFS= read -r KEY <"$KEY_FILE" || true
+      fi
     else
       if [ "$NET" = mainnet ]; then
         say "Once more, for the encrypted credential the service reads it from (Guard checked it above and stored nothing):" >/dev/tty
