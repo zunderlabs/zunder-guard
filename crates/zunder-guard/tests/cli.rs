@@ -206,7 +206,15 @@ fn paper_reads_no_key_and_sending_needs_a_journal_first() {
         &["run", "--network", "testnet"],
         None,
     );
-    refused_with(&output, "the API wallet key");
+    // Credential Manager lookup on Windows happens after journal validation.
+    refused_with(
+        &output,
+        if cfg!(windows) {
+            "no risk journal"
+        } else {
+            "the API wallet key"
+        },
+    );
 }
 
 #[test]

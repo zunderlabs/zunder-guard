@@ -1,0 +1,480 @@
+#!/usr/bin/python3
+"""Verified interactive Linux container setup. Mainnet is never started by default."""
+import argparse
+import fcntl
+import hashlib
+import http.client
+import importlib.util
+import json
+import os
+from pathlib import Path
+import re
+import resource
+import stat
+import subprocess
+import sys
+import time
+import tomllib
+from decimal import Decimal
+import uuid
+
+STAGE = Path(__file__).resolve().parent
+BASE = Path('/etc/zunder-guard-container')
+LIB = Path('/usr/local/libexec/zunder-guard-container')
+UNIT_DIR = Path('/etc/systemd/system')
+UNIT = 'zunder-guard-container.service'
+GUARDIAN = 'zunder-guard-setup-guardian.service'
+GATE = BASE / 'install-transaction.json'
+DROPIN = UNIT_DIR / (UNIT + '.d') / '10-install-transaction.conf'
+SYSTEMCTL = '/usr/bin/systemctl'
+ENV = {'PATH': '/usr/sbin:/usr/bin:/sbin:/bin', 'HOME': '/root', 'LANG': 'C.UTF-8'}
+
+
+def load_module(name, file):
+    spec = importlib.util.spec_from_file_location(name, file)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+# Bootstrap authenticates these root-private files before invoking this script with -I.
+ops = load_module('container_operations', STAGE / 'container-operations.py')
+require = ops.require
+
+
+def run(*args):
+    result = subprocess.run(args, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, env=ENV, timeout=90, check=False)
+    require(result.returncode == 0, 'Required host command failed; setup remains stopped.')
+    return result.stdout.decode().strip()
+
+
+def mkdir(path, mode=0o700):
+    if not path.exists():
+        path.mkdir(mode=mode)
+    ops.trusted(path, True)
+    ops.parents(path)
+
+
+def file_write(path, data, mode=0o644):
+    import tempfile
+    ops.trusted(path.parent, True)
+    if path.exists() or path.is_symlink():
+        ops.trusted(path)
+    fd, temporary = tempfile.mkstemp(prefix='.verified-', dir=path.parent)
+    try:
+        with os.fdopen(fd, 'wb') as stream:
+            os.fchmod(stream.fileno(), mode)
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+        ops.sync_directory(path.parent)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def prompt(text):
+    with open('/dev/tty', 'r+') as terminal:
+        terminal.write(text + ' ')
+        terminal.flush()
+        answer = terminal.readline()
+    require(bool(answer), 'Terminal closed; activation remains inhibited.')
+    return answer.strip()
+
+
+def confirm(text, expected):
+    require(prompt(text) == expected, 'Confirmation did not match; setup remains stopped.')
+
+
+def enabled_state():
+    result = subprocess.run([SYSTEMCTL, 'is-enabled', UNIT], stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, env=ENV, timeout=15, check=False)
+    value = result.stdout.decode().strip()
+    if not value and not (UNIT_DIR / UNIT).exists():
+        value = 'not-found'
+    require(value in ('enabled', 'disabled', 'not-found'),
+            'Masked, indirect or externally managed service requires separate review.')
+    return value
+
+
+def active_state():
+    result = subprocess.run([SYSTEMCTL, 'is-active', UNIT], stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, env=ENV, timeout=15, check=False)
+    value = result.stdout.decode().strip()
+    require(value in ('active', 'inactive', 'failed', 'unknown'), 'Service is transitioning; try again later.')
+    return value
+
+
+def gate_text():
+    return ('[Unit]\n# Persist through enable, installer death and host reboot.\n'
+            'ConditionPathExists=!' + str(GATE) + '\n').encode()
+
+
+def verify_gate(loaded=True):
+    ops.trusted(DROPIN)
+    require(DROPIN.read_bytes() == gate_text() and GATE.exists(), 'Durable activation gate missing.')
+    ops.trusted(GATE)
+    if loaded:
+        loaded_paths = run(SYSTEMCTL, 'show', UNIT, '--property=DropInPaths', '--value').split()
+        require(str(DROPIN) in loaded_paths, 'Loaded systemd activation condition missing.')
+
+
+def inhibit(config, fresh):
+    mkdir(DROPIN.parent, 0o755)
+    if DROPIN.exists() or DROPIN.is_symlink():
+        ops.trusted(DROPIN)
+        require(DROPIN.read_bytes() == gate_text(), 'An external installation condition requires separate review.')
+    require(not any(path != DROPIN for path in DROPIN.parent.iterdir()),
+            'Other supervisor drop-ins require separate review before managed upgrade.')
+    if GATE.exists():
+        record = ops.read(GATE)
+        require(record.get('account') == config['account'] and record.get('volume') == config['volume']
+                and record.get('original_enabled') in ('enabled', 'disabled', 'not-found')
+                and re.fullmatch('[a-f0-9]{32}', record.get('transaction', '')),
+                'Incomplete transaction does not match this installation.')
+        require(not record.get('activation_committed', False), 'Unexpected transaction state.')
+        file_write(DROPIN, gate_text())
+    else:
+        record = {'transaction': uuid.uuid4().hex, 'account': config['account'], 'volume': config['volume'],
+                  'original_enabled': enabled_state(), 'original_active': active_state(),
+                  'fresh': fresh, 'phase': 'inhibited'}
+        file_write(DROPIN, gate_text())
+        ops.atomic(GATE, record)
+    run(SYSTEMCTL, 'daemon-reload')
+    verify_gate(loaded=(UNIT_DIR / UNIT).exists())
+    return record
+
+
+def phase(record, name):
+    record['phase'] = name
+    ops.atomic(GATE, record)
+
+
+def managed_assets():
+    return {
+        LIB / 'supervisor.py': STAGE / 'container-supervisor.py',
+        LIB / 'operations.py': STAGE / 'container-operations.py',
+        LIB / 'zunder-guard-container.service': STAGE / 'zunder-guard-container.service',
+        UNIT_DIR / UNIT: STAGE / 'zunder-guard-container.service',
+        UNIT_DIR / GUARDIAN: STAGE / GUARDIAN,
+    }
+
+
+def ownership_receipt():
+    path = BASE / 'managed-install.json'
+    if not path.exists() and not path.is_symlink():
+        return None
+    ops.trusted(path)
+    require(stat.S_IMODE(path.stat().st_mode) == 0o600, 'Managed receipt must be root-only.')
+    receipt = ops.read(path)
+    require(set(receipt) == {'version', 'account', 'volume', 'allowed_files', 'config_refs'}
+            and receipt['version'] == 1, 'Invalid managed-install receipt.')
+    require(set(receipt['allowed_files']) == {str(path) for path in managed_assets()},
+            'Unexpected managed-install file identities.')
+    require(all(isinstance(values, list) and values and
+                all(isinstance(value, str) and re.fullmatch('[a-f0-9]{64}', value) for value in values)
+                for values in receipt['allowed_files'].values()), 'Invalid managed-install hashes.')
+    require(isinstance(receipt['config_refs'], list), 'Invalid managed configuration references.')
+    return receipt
+
+
+def exact_loaded_command(command, expected):
+    # systemctl show --value renders each ExecStart as one {...} record. Our units
+    # contain a single direct exec with fixed, whitespace-free paths/arguments.
+    # Reject multiple records, duplicate fields and any different argument vector.
+    match = re.fullmatch(r'\{([^{}]*)\}', command.strip(), flags=re.S)
+    if not match:
+        return False
+    values = {}
+    for part in match[1].split(';'):
+        part = part.strip()
+        if not part:
+            continue
+        key, separator, value = part.partition('=')
+        if not separator or key.strip() in values:
+            return False
+        values[key.strip()] = value.strip()
+    return values.get('path') == expected[0] and values.get('argv[]', '').split() == expected
+
+
+def admit_services(config):
+    """Root-owned is not installer-owned: bind disk AND systemd's loaded fragment."""
+    receipt = ownership_receipt()
+    if receipt:
+        require(receipt['account'] == config['account'] and receipt['volume'] == config['volume'],
+                'Managed receipt names another account or volume.')
+    for target in managed_assets():
+        if target.exists() or target.is_symlink():
+            require(receipt is not None, 'Reserved service/helper exists without a managed-install receipt; refusing changes.')
+            ops.trusted(target)
+            ops.parents(target)
+            require(hashlib.sha256(target.read_bytes()).hexdigest() in receipt['allowed_files'][str(target)],
+                    'Installed service/helper differs from its managed receipt; refusing changes.')
+    config_path = BASE / 'config.json'
+    if config_path.exists() or config_path.is_symlink():
+        require(receipt is not None, 'Existing supervisor config has no managed-install receipt.')
+        current = ops.read(config_path)
+        require(any(isinstance(ref, dict) and set(ref) == {'account', 'volume', 'tag', 'image'}
+                    and all(current.get(key) == value for key, value in ref.items())
+                    for ref in receipt['config_refs']), 'Installed configuration identity differs from its receipt.')
+    if DROPIN.exists() or DROPIN.is_symlink():
+        require(receipt is not None, 'Reserved service drop-in is not owned by this installer.')
+        ops.trusted(DROPIN)
+        require(DROPIN.read_bytes() == gate_text(), 'Reserved service drop-in was replaced.')
+    for unit, helper in ((UNIT, LIB / 'supervisor.py'), (GUARDIAN, LIB / 'operations.py')):
+        fragment = run(SYSTEMCTL, 'show', unit, '--property=FragmentPath', '--value')
+        state = run(SYSTEMCTL, 'show', unit, '--property=LoadState', '--value')
+        dropins = run(SYSTEMCTL, 'show', unit, '--property=DropInPaths', '--value').split()
+        require(set(dropins) <= ({str(DROPIN)} if unit == UNIT else set()),
+                'Externally configured service drop-ins require separate review.')
+        if state == 'not-found':
+            require(not fragment and not (UNIT_DIR / unit).exists(), 'Unexpected unloaded reserved service file.')
+            continue
+        require(state == 'loaded' and receipt is not None and fragment == str(UNIT_DIR / unit),
+                'Systemd loaded an unowned reserved service fragment; refusing changes.')
+        require(helper.exists(), 'Managed service helper is missing.')
+        if unit == UNIT:
+            require(config_path.exists(), 'Managed runtime service configuration is missing.')
+        command = run(SYSTEMCTL, 'show', unit, '--property=ExecStart', '--value')
+        expected = (['/usr/bin/python3', str(helper), 'run'] if unit == UNIT
+                    else ['/usr/bin/python3', '-I', str(helper)])
+        require(exact_loaded_command(command, expected), 'Systemd loaded an unexpected service command.')
+
+
+def prepare_receipt(config):
+    # Authenticate ownership before admitting additional signed upgrade bytes. Persist this
+    # intent before any drop-in or helper replacement so interrupted upgrades remain resumable.
+    admit_services(config)
+    receipt = ownership_receipt() or {
+        'version': 1, 'account': config['account'], 'volume': config['volume'],
+        'allowed_files': {str(path): [] for path in managed_assets()}, 'config_refs': []}
+    for target, source in managed_assets().items():
+        digest = hashlib.sha256(source.read_bytes()).hexdigest()
+        if digest not in receipt['allowed_files'][str(target)]:
+            receipt['allowed_files'][str(target)].append(digest)
+    reference = {key: config[key] for key in ('account', 'volume', 'tag', 'image')}
+    if reference not in receipt['config_refs']:
+        receipt['config_refs'].append(reference)
+    ops.atomic(BASE / 'managed-install.json', receipt)
+
+
+def install_files(config):
+    admit_services(config)
+    mkdir(Path('/usr/local/libexec'), 0o755)
+    mkdir(LIB, 0o755)
+    for src, dst in [('container-supervisor.py', 'supervisor.py'),
+                     ('container-operations.py', 'operations.py'),
+                     ('zunder-guard-container.service', 'zunder-guard-container.service')]:
+        file_write(LIB / dst, (STAGE / src).read_bytes())
+    file_write(UNIT_DIR / GUARDIAN, (STAGE / GUARDIAN).read_bytes())
+    mkdir(ops.REGISTRY)
+    run(SYSTEMCTL, 'daemon-reload')
+    run(SYSTEMCTL, 'enable', GUARDIAN)
+    run(SYSTEMCTL, 'restart', GUARDIAN)
+    require(not ops.pending(), 'Prior transient setup cleanup is pending; rerun after guardian recovery.')
+
+
+def volume_names():
+    return ops.docker('volume', 'ls', '--format', '{{.Name}}').decode().splitlines()
+
+
+def verify_volume(config, owner=None):
+    values = json.loads(ops.docker('volume', 'inspect', config['volume']))
+    require(len(values) == 1 and values[0].get('Name') == config['volume']
+            and values[0].get('Driver') == 'local' and not values[0].get('Options'),
+            'Only local named volumes without driver options are supported.')
+    if owner:
+        require((values[0].get('Labels') or {}).get('com.zunderlabs.guard-install-volume') == owner,
+                'Volume already belonged to another installation; refusing adoption.')
+    require(not ops.identifiers('volume=' + config['volume']), 'Another container uses this volume.')
+
+
+def create_volume(config, record):
+    require(config['volume'] not in volume_names(), 'Volume name already exists; explicit adoption required.')
+    confirm('Type CREATE ' + config['volume'] + ' to create this NEW persistent volume:', 'CREATE ' + config['volume'])
+    ops.docker('volume', 'create', '--driver', 'local', '--label',
+               'com.zunderlabs.guard-install-volume=' + record['transaction'], config['volume'])
+    verify_volume(config, record['transaction'])
+    phase(record, 'volume-created')
+
+
+def readiness(config, expect_fee_free):
+    deadline = time.monotonic() + 60
+    while time.monotonic() < deadline:
+        try:
+            connection = http.client.HTTPConnection('127.0.0.1', 8547, timeout=2)
+            connection.request('GET', '/healthz')
+            response = connection.getresponse()
+            require(response.status == 200, 'Guard is not healthy.')
+            response.read()
+            connection.close()
+            connection = http.client.HTTPConnection('127.0.0.1', 8547, timeout=2)
+            connection.request('GET', '/guard/status')
+            response = connection.getresponse()
+            require(response.status == 200, 'Guard status unavailable.')
+            status = json.loads(response.read(1024 * 1024))
+            connection.close()
+            require(status.get('mode') == 'mainnet' and status.get('network') == 'mainnet'
+                    and status.get('account', '').lower() == config['account'].lower(), 'Guard account/mode mismatch.')
+            require(status.get('risk', {}).get('journal_ready') is True
+                    and status.get('risk', {}).get('state') == 'active'
+                    and 'killed' in status and status['killed'] is None,
+                    'Guard risk state is not ready; no automatic resume is permitted.')
+            fee = status.get('fee', {}).get('mode')
+            require(fee == 'fee_free' if expect_fee_free else fee in ('fee_free', 'builder'), 'Unexpected licence/fee state.')
+            if fee == 'builder':
+                require(status['fee'].get('approval', {}).get('state') in
+                        ('approved', 'unchecked', 'not_approved', 'refused',
+                         'refused_by_venue', 'refused_by_venue_builder'),
+                        'Builder approval state is unavailable or unsupported.')
+            return status
+        except (ops.Refused, OSError, ValueError, http.client.HTTPException):
+            time.sleep(1)
+    raise ops.Refused('Guard did not reach the expected healthy account/risk/licence state.')
+
+
+def activate(config, record, fresh, expect_fee_free):
+    verify_gate()
+    answer = prompt('Type START ' + config['account'] + ' to activate this mainnet Guard; anything else leaves it stopped:')
+    if answer != 'START ' + config['account']:
+        print('Installed and stopped. Boot activation remains inhibited; rerun this installer to continue.')
+        return
+    if fresh:
+        note = prompt('Who approved the first mainnet risk journal, and why?')
+        require(3 <= len(note) <= 512 and '\x00' not in note, 'An attributable journal note is required.')
+        ops.run(config, ['journal-init', '--mode', 'mainnet', '--note', note], readonly=False,
+                public_env=['ZUNDER_MAINNET_CONFIRM=' + config['account']])
+        phase(record, 'journal-initialized')
+    require(not ops.pending(), 'Transient cleanup must finish before activation.')
+    boot_enabled = record['original_enabled'] != 'disabled'
+    print('Boot recovery will be ' + ('enabled.' if boot_enabled else 'disabled (preserving previous state).'))
+    # This second choice also covers the enabled-state change on first installation.
+    confirm('Type ACTIVATE to commit that start/boot choice:', 'ACTIVATE')
+    run(SYSTEMCTL, 'enable' if boot_enabled else 'disable', UNIT)
+    verify_gate()
+    record['phase'] = 'ready-to-activate'
+    record['boot_enabled'] = boot_enabled
+    ops.atomic(BASE / 'last-install.json', record)
+    GATE.unlink()
+    ops.sync_directory(BASE)
+    try:
+        run(SYSTEMCTL, 'start', UNIT)
+        status = readiness(config, expect_fee_free)
+    except BaseException:
+        ops.atomic(GATE, record)
+        run(SYSTEMCTL, 'stop', UNIT)
+        raise
+    if status['fee']['mode'] == 'builder' and status['fee'].get('approval', {}).get('state') != 'approved':
+        print('Guard is installed and running, but pay-per-order approval is still needed (' +
+              status['fee'].get('approval', {}).get('state', 'unknown') + '). Entries remain blocked.')
+        print('Open https://zunderlabs.com/approve, select Hyperliquid Mainnet, and connect the main wallet for ' +
+              config['account'] + ' to review the builder approval. Do not use the API wallet.')
+        print('Before connecting your bot, recheck http://127.0.0.1:8547/guard/status: '
+              'fee.approval.state must be approved (or fee.mode must be fee_free with a valid licence).')
+        return
+    print('Guard ready on http://127.0.0.1:8547; account ' + config['account'] + '; fee mode ' + status['fee']['mode'] + '.')
+    print('Use the pairing code from setup to connect your bot after reviewing Guard status.')
+
+
+def main():
+    resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+    os.umask(0o077)
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--version', required=True)
+    for flag in ('volume', 'account', 'rules', 'equity-cap', 'ip-share', 'licence'):
+        parser.add_argument('--' + flag, default='')
+    args = parser.parse_args()
+    require(sys.platform == 'linux' and os.geteuid() == 0 and sys.stdin.isatty(), 'Linux root and a terminal are required.')
+    require(re.fullmatch('v[0-9]+\\.[0-9]+\\.[0-9]+', args.version), 'Invalid release version.')
+    for tool in (SYSTEMCTL, '/usr/bin/docker', '/usr/bin/systemd-creds', '/usr/bin/python3', '/usr/local/bin/cosign'):
+        ops.executable(tool)
+    mkdir(BASE)
+    mkdir(BASE / 'docker-config')
+    sup = load_module('container_supervisor', STAGE / 'container-supervisor.py')
+    sup.preflight(installing=True)
+    require(not list((BASE / 'docker-config').iterdir()), 'Docker config directory must be empty.')
+    lock = os.open(BASE / 'installer.lock', os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    # Held through main; a second installer never performs concurrent mutations.
+    existing = sup.load() if (BASE / 'config.json').exists() else None
+    pending_record = ops.read(GATE) if GATE.exists() else None
+    account = args.account or (existing or pending_record or {}).get('account') or prompt('Hyperliquid account (public 0x address):')
+    volume = args.volume or (existing or pending_record or {}).get('volume') or 'zunder-guard-data'
+    image = (STAGE / ('zunder-guard-' + args.version + '.image.txt')).read_text()
+    image = image[:-1] if image.endswith('\n') else image
+    config = {'image': image, 'tag': args.version, 'volume': volume, 'account': account, 'instance': uuid.uuid4().hex}
+    sup.validate(config)
+    if existing:
+        require(existing['account'] == account and existing['volume'] == volume, 'Existing account/volume cannot change here.')
+        require(not any((args.rules, args.equity_cap, args.ip_share, args.licence)),
+                'Existing setup options cannot be replaced by reinstall; use the documented configuration/licence command.')
+    if pending_record:
+        require(not any((args.rules, args.equity_cap, args.ip_share, args.licence)),
+                'Interrupted setup preserves existing choices; rerun without setup options.')
+    print('Verified release ' + args.version + '; mainnet account ' + account + '; persistent volume ' + volume + '.')
+    sup.execute([sup.COSIGN, 'verify', image, '--certificate-identity',
+                 'https://github.com/zunderlabs/zunder-guard/.github/workflows/release.yml@refs/tags/' + args.version,
+                 '--certificate-oidc-issuer', 'https://token.actions.githubusercontent.com'])
+    sup.docker('pull', image)
+    sup.image_ready(config)
+    fresh = not existing and not pending_record and volume not in volume_names()
+    if not fresh and not existing and not pending_record:
+        confirm('Type ADOPT ' + volume + ' only for a complete existing mainnet home with no other restart owner:', 'ADOPT ' + volume)
+    if existing:
+        confirm('Stop your bot. Type STOP to stop Guard and prepare the verified upgrade:', 'STOP')
+    prepare_receipt(config)
+    record = inhibit(config, fresh)
+    run(SYSTEMCTL, 'stop', UNIT) if (UNIT_DIR / UNIT).exists() else None
+    sup.inactive()
+    # After inhibition and stop, the existing supervisor alone may clean its admitted container.
+    if existing:
+        sup.cleanup(existing)
+    require(not ops.identifiers('name=^/zunder-guard-container$'), 'Foreign supervisor container exists.')
+    install_files(config)
+    phase(record, 'helpers-installed')
+    if fresh:
+        create_volume(config, record)
+        command = ['init', '--interactive', '--network', 'mainnet', '--account', account]
+        for name in ('rules', 'equity_cap', 'ip_share', 'licence'):
+            value = getattr(args, name)
+            if value:
+                command += ['--' + name.replace('_', '-'), value]
+        ops.run(config, command, interactive=True, readonly=False)
+        phase(record, 'initialized')
+    else:
+        verify_volume(config)
+    # Use the installed module so its trusted operation helper is the release-installed one.
+    sup = load_module('installed_supervisor', LIB / 'supervisor.py')
+    sup.check_config(config, transient=True)
+    public_config = tomllib.loads(ops.run(config, ['check-config'], read_config=True).decode())
+    cap = public_config.get('policy', {}).get('max_trading_equity_usd')
+    require(isinstance(cap, str) and 0 < Decimal(cap) <= 2500, 'Configured equity cap is missing or invalid.')
+    print('Configured mainnet equity cap: ' + cap + '. Initial pairing is emitted by init; reinstall preserves clients.')
+    admit_services(config)
+    repeated = prompt('Repeat the full account to authorize encrypted service provisioning:')
+    require(repeated == account, 'Account confirmation differs.')
+    # A separate process retains supervisor locking/preflight and its hidden terminal prompt.
+    result = subprocess.run(['/usr/bin/python3', '-I', str(LIB / 'supervisor.py'), 'install',
+                             '--tag', args.version, '--image', image, '--volume', volume,
+                             '--account', account, '--confirm-account', repeated], env=ENV, check=False)
+    require(result.returncode == 0, 'Encrypted supervisor installation failed; activation remains inhibited.')
+    verify_gate()
+    phase(record, 'installed-stopped')
+    # An interrupted/adopted home is never inferred fresh. Its missing journal needs explicit recovery.
+    activate(config, record, fresh, bool(args.licence))
+    os.close(lock)
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except ops.Refused as error:
+        print('Container installation refused: ' + str(error), file=sys.stderr)
+        sys.exit(1)
+    except (Exception, KeyboardInterrupt):
+        # Do not replay exception strings/subprocess output containing terminal/key material.
+        print('Container installation stopped. State is preserved; rerun the verified installer to continue.\n'
+              'If setup began, mainnet boot activation remains inhibited until successful explicit activation.', file=sys.stderr)
+        sys.exit(1)

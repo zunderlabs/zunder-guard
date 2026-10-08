@@ -509,6 +509,9 @@ struct Inner {
     /// the config file.
     licence: LicenceTrack,
     killed: Option<String>,
+    /// Positions in the first flatten snapshot after the kill latch.
+    /// Later account reads must not replace this with the post-close count.
+    positions_at_kill: Option<usize>,
     /// What reading the account needs and caches: taken out of `Inner` by
     /// the background sync while it reads, so that requests do not wait
     /// for the venue's answers.
@@ -932,6 +935,7 @@ impl<U: Upstream, C: Clock> Guard<U, C> {
             auth,
             licence: licence_track,
             killed: None,
+            positions_at_kill: None,
             caches: Caches {
                 account,
                 names: setup.config.policy.markets.hip3_dexes(),
@@ -3899,6 +3903,9 @@ impl<U: Upstream, C: Clock> Guard<U, C> {
     }
 
     async fn flatten(&self, inner: &mut Inner, now: u64, account: &AccountView, reason: &str) {
+        if inner.killed.is_some() && inner.positions_at_kill.is_none() {
+            inner.positions_at_kill = Some(account.positions.len());
+        }
         if !exposed(account) {
             return;
         }
@@ -4986,12 +4993,15 @@ impl<U: Upstream, C: Clock> Guard<U, C> {
         // Flatten now, not at the next sync.
         self.sync().await;
         let inner = self.inner.lock().await;
+        Self::kill_response(&inner)
+    }
+
+    fn kill_response(inner: &Inner) -> Value {
         json!({
             "status": "ok",
             "killed": inner.killed,
             "durable": inner.config.kill_file().exists(),
-            // Seen just before the flatten went out.
-            "positions_at_kill": inner.last_view.as_ref().map(|view| view.positions.len()),
+            "positions_at_kill": inner.positions_at_kill,
             "last_error": inner.last_error,
         })
     }
@@ -5612,6 +5622,121 @@ fn view_times(account: &AccountView) -> std::collections::BTreeMap<String, i64> 
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
+
+    struct UnreadableVenue;
+
+    impl Upstream for UnreadableVenue {
+        async fn info(&self, _: &Value) -> Result<Value, UpstreamError> {
+            Err(UpstreamError::NotSent("account unavailable".into()))
+        }
+
+        async fn exchange(&self, _: Vec<u8>) -> Result<Value, UpstreamError> {
+            panic!("the diagnostic snapshot tests must send nothing")
+        }
+
+        fn ws_url(&self) -> Option<String> {
+            None
+        }
+
+        fn sends_to(&self) -> Option<SigningNetwork> {
+            None
+        }
+    }
+
+    fn kill_snapshot_guard() -> (Arc<Guard<UnreadableVenue>>, crate::testdir::TestDir) {
+        let dir = crate::testdir::TestDir::new("kill-snapshot");
+        let config = GuardConfig {
+            network: Some(crate::config::GuardNetwork::Testnet),
+            account: Some("0x5e9ee1089755c3435139848e47e6635505d5a13a".into()),
+            state_dir: dir.path().to_owned(),
+            auth: zunder_guard_core::auth::AuthConfig {
+                clients: vec!["0x5e9ee1089755c3435139848e47e6635505d5a13a".into()],
+                ..Default::default()
+            },
+            ..GuardConfig::default()
+        };
+        let risk = PersistentRisk::initialise_for(
+            &config.risk_journal(true),
+            config.policy.risk_limits(),
+            &config.journal_scope(true).unwrap(),
+            Timestamp::from_millis(SystemClock.now_ms() as i64),
+            rust_decimal::dec!(10000),
+            "kill snapshot test",
+        )
+        .unwrap();
+        let journal = DecisionJournal::open(&config.decision_journal(true)).unwrap();
+        let guard = Guard::new(
+            Setup {
+                config,
+                mode: Mode::Paper,
+                risk,
+                journal,
+                fee: FeeMode::Off("test".into()),
+                fee_warning: None,
+                limits: Limits::default(),
+            },
+            UnreadableVenue,
+            SystemClock,
+        )
+        .unwrap();
+        (guard, dir)
+    }
+
+    #[tokio::test]
+    async fn the_kill_count_survives_a_post_flatten_account_read() {
+        // The fixture contains exactly one BTC position. Reproduce the
+        // later sync's flat view deterministically, without scheduler timing.
+        for initially_flat in [false, true] {
+            let (guard, _dir) = kill_snapshot_guard();
+            let mut account = view_for_expectations();
+            account.open_orders.clear();
+            if initially_flat {
+                account.positions.clear();
+            }
+            let expected = account.positions.len();
+            let mut inner = guard.inner.lock().await;
+            assert_eq!(inner.positions_at_kill, None);
+            guard
+                .flatten(&mut inner, 0, &account, "daily loss stop")
+                .await;
+            assert_eq!(inner.positions_at_kill, None);
+            inner.killed = Some("test kill".into());
+            guard.flatten(&mut inner, 1, &account, "test kill").await;
+            // The ordinary sync can replace last_view before kill() obtains
+            // its reply lock; it cannot change the original flatten snapshot.
+            account.positions.clear();
+            inner.last_view = Some(account.clone());
+            guard.flatten(&mut inner, 2, &account, "test kill").await;
+            assert_eq!(
+                Guard::<UnreadableVenue>::kill_response(&inner)["positions_at_kill"],
+                expected
+            );
+            assert_eq!(inner.last_view.as_ref().unwrap().positions.len(), 0);
+            // A later nonempty snapshot cannot overwrite an initial zero.
+            let later = view_for_expectations();
+            guard.flatten(&mut inner, 3, &later, "test kill").await;
+            assert_eq!(
+                Guard::<UnreadableVenue>::kill_response(&inner)["positions_at_kill"],
+                expected
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_kill_has_no_invented_position_count() {
+        let (guard, _dir) = kill_snapshot_guard();
+        {
+            let mut inner = guard.inner.lock().await;
+            inner.killed = Some("test kill".into());
+            // A stale view is not evidence of the unreadable flatten snapshot.
+            inner.last_view = Some(view_for_expectations());
+        }
+        guard.sync().await;
+        let inner = guard.inner.lock().await;
+        assert!(Guard::<UnreadableVenue>::kill_response(&inner)["positions_at_kill"].is_null());
+        assert_eq!(inner.killed.as_deref(), Some("test kill"));
+        assert!(inner.last_error.is_some());
+    }
 
     #[cfg(feature = "test-hooks")]
     mod durable_expiry {

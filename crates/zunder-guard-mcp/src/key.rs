@@ -48,9 +48,9 @@ pub enum KeyError {
 /// Read the key from `path`: a regular file (not a symbolic link) with no
 /// permission bits for the group or others (0600 or 0400).
 ///
-/// The checks are made on the file that was opened, not only on the path:
-/// the path must name, without a link, the same file (device and inode),
-/// so it cannot be swapped between the check and the read.
+/// Permissions are checked on the file that supplies the bytes. Unix additionally
+/// checks device/inode identity against the path; Windows uses a no-follow final
+/// open and queries its ACL through the same handle.
 pub fn from_file(path: &Path) -> Result<ClientKey, KeyError> {
     // Windows: open first, sharing read only (nobody can change, rename or
     // delete the file while it is open) and not following a reparse point,
@@ -64,7 +64,7 @@ pub fn from_file(path: &Path) -> Result<ClientKey, KeyError> {
                 KeyError::Unreadable
             }
         })?;
-        check_permissions(path)?;
+        check_permissions(&file)?;
         read_all(&mut file)
     }
     #[cfg(not(windows))]
@@ -113,8 +113,8 @@ fn check_permissions(meta: &fs::Metadata) -> Result<(), KeyError> {
 /// Windows: the file's ACL allows no one but this user, the owner, SYSTEM
 /// and Administrators (`zunder_venue::owner_only`).
 #[cfg(windows)]
-fn check_permissions(path: &Path) -> Result<(), KeyError> {
-    match zunder_venue::owner_only::check(path) {
+fn check_permissions(file: &std::fs::File) -> Result<(), KeyError> {
+    match zunder_venue::owner_only::check_opened(file) {
         Ok(None) => Ok(()),
         Ok(Some(_)) => Err(KeyError::TooOpen),
         Err(_) => Err(KeyError::Unreadable),
@@ -285,6 +285,11 @@ mod tests {
             from_file(&dir.join("missing")).unwrap_err(),
             KeyError::Unreadable
         );
+        let link = dir.join("link.key");
+        std::os::windows::fs::symlink_file(&path, &link)
+            .expect("the native CI runner must support the symlink fixture");
+        assert_eq!(from_file(&link).unwrap_err(), KeyError::NotRegular);
+        fs::remove_file(&link).unwrap();
         let granted = std::process::Command::new("icacls")
             .arg(&path)
             .args(["/grant", "*S-1-1-0:R"])

@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import shlex
 import stat
 import subprocess
 import tarfile
@@ -15,6 +16,47 @@ GUARD = Path(__file__).resolve().parents[1]
 TAG = 'v0.0.0'
 IMAGE = 'ghcr.io/zunderlabs/zunder-guard@sha256:' + 'b' * 64
 NOTICES = ('LICENSE', 'NOTICE', 'THIRD_PARTY_LICENSES.md')
+
+
+class DockerBuildContext(unittest.TestCase):
+    """Static admission contract; no Docker daemon or image-build claim."""
+    def patterns(self):
+        return [line.strip() for line in (GUARD / 'Dockerfile.dockerignore').read_text().splitlines()
+                if line.strip() and not line.lstrip().startswith('#')]
+
+    def test_runtime_data_copy_has_existing_narrow_context_admission(self):
+        # Derive the real COPY input rather than checking an unrelated constant.
+        copies = [shlex.split(line) for line in (GUARD / 'Dockerfile').read_text().splitlines()
+                  if line.startswith('COPY ') and shlex.split(line)[-1] == '/data/']
+        self.assertEqual(len(copies), 1)
+        sources = [part for part in copies[0][1:-1] if not part.startswith('--')]
+        self.assertEqual(sources, ['deploy/guard/container/volume-root/'])
+        source = sources[0]
+        volume = GUARD.parents[1] / source
+        self.assertTrue(volume.is_dir())
+        self.assertEqual(sorted(path.name for path in volume.iterdir()), ['.keep'])
+        self.assertTrue((volume / '.keep').is_file())
+        patterns = self.patterns()
+        self.assertEqual(patterns[0], '*')
+        self.assertEqual(patterns.count('!' + source), 1)
+        # Do not repair a COPY by exposing the container helpers or all deploy files.
+        for ancestor in Path(source).parents:
+            if str(ancestor) != '.':
+                self.assertNotIn('!' + ancestor.as_posix() + '/', patterns)
+                self.assertNotIn('!' + ancestor.as_posix(), patterns)
+        self.assertNotIn('!*', patterns)
+        self.assertNotIn('!**', patterns)
+
+    def test_secret_and_target_exclusions_override_every_allowlist_entry(self):
+        patterns = self.patterns()
+        final_allow = max(index for index, pattern in enumerate(patterns) if pattern.startswith('!'))
+        # Docker uses the last matching rule. These recursive exclusions must
+        # remain after ALL admissions, including the volume-root directory.
+        exclusions = ['**/target', '**/.env', '**/.env.*', '**/*.key', '**/*.pem']
+        for exclusion in exclusions:
+            self.assertIn(exclusion, patterns)
+            self.assertGreater(patterns.index(exclusion), final_allow)
+        self.assertEqual(patterns[final_allow + 1:], exclusions)
 
 
 class ReleaseRendering(unittest.TestCase):
@@ -37,21 +79,45 @@ class ReleaseRendering(unittest.TestCase):
     def test_digest_and_verified_cloud_loader_are_signed_payloads(self):
         result = self.render()
         self.assertEqual(result.returncode, 0, result.stderr)
-        for name in ('compose.yaml', 'fly.toml', 'render.yaml'):
+        for name in ('compose.yaml',):
             text = (self.dist / name).read_text()
             self.assertIn(IMAGE, text)
             self.assertNotIn('ghcr.io/zunderlabs/zunder-guard:', text)
         sha = hashlib.sha256((self.dist / 'i').read_bytes()).hexdigest()
-        for name in ('cloud-init.yaml', 'cloudformation.yaml'):
+        for name in ('cloudformation.yaml',):
             text = (self.dist / name).read_text()
             self.assertIn(f'/releases/download/{TAG}/i', text)
             self.assertIn(sha, text)
             self.assertIn('sha256sum -c -', text)
             self.assertIn('sh "$loader" --non-interactive --network paper', text)
             self.assertNotIn('https://zunderlabs.com/i', text)
+            self.assertIn("sudo systemctl stop zunder-guard && sudo sh i --force --rules '${Rules}' --account '${Account}'", text)
+            self.assertIn('sudo -u zunder-guard env ZUNDER_GUARD_HOME=/var/lib/zunder-guard /usr/local/bin/zunder-guard pair', text)
         sums = (self.dist / 'SHA256SUMS').read_text()
-        for name in ('i', self.descriptor.name, 'compose.yaml', 'cloud-init.yaml', 'cloudformation.yaml'):
+        for name in ('i', self.descriptor.name, 'compose.yaml', 'cloudformation.yaml'):
             self.assertIn(hashlib.sha256((self.dist / name).read_bytes()).hexdigest() + '  ' + name, sums)
+
+    def test_windows_service_helper_is_rendered_and_signed(self):
+        result = self.render()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        helper = self.dist / 'install-windows-service.ps1'
+        self.assertIn('Invoke-ZgLifecycle', helper.read_text())
+        line = hashlib.sha256(helper.read_bytes()).hexdigest() + '  ' + helper.name
+        self.assertEqual((self.dist / 'SHA256SUMS').read_text().splitlines().count(line), 1)
+
+    def test_windows_embedded_trust_and_lifecycle_sources_match(self):
+        shared = (GUARD / 'windows/bootstrap.ps1.inc').read_text()
+        journey = (GUARD / 'windows/loader-mainnet.ps1.inc').read_text()
+        lifecycle = (GUARD / 'windows/lifecycle.ps1.inc').read_text()
+        self.assertIn(shared + '\n' + journey, (GUARD / 'loader/i.ps1').read_text())
+        self.assertIn(shared + '\n' + lifecycle, (GUARD / 'windows/service.ps1').read_text())
+
+    def test_homebrew_preserves_every_notice_and_tests_the_installed_files(self):
+        self.assertEqual(self.render().returncode, 0)
+        formula = (self.dist / 'zunder-guard.rb').read_text()
+        self.assertIn('pkgshare.install "LICENSE", "NOTICE", "THIRD_PARTY_LICENSES.md"', formula)
+        self.assertIn('%w[LICENSE NOTICE THIRD_PARTY_LICENSES.md].each do |notice|', formula)
+        self.assertIn('assert_path_exists pkgshare/notice', formula)
 
     def test_missing_or_malformed_image_refuses_before_rendering(self):
         self.descriptor.unlink()
@@ -74,49 +140,70 @@ class ReleaseRendering(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertFalse((self.dist / 'SHA256SUMS').exists())
 
+    def test_deferred_provider_assets_refuse_and_repeated_render_is_stable(self):
+        self.assertEqual(self.render().returncode, 0)
+        first = (self.dist / 'SHA256SUMS').read_bytes()
+        self.assertEqual(self.render().returncode, 0)
+        self.assertEqual(first, (self.dist / 'SHA256SUMS').read_bytes())
+        for name in ('fly.toml', 'render.yaml', 'railway.json', 'cloud-init.yaml'):
+            self.assertFalse((self.dist / name).exists())
+            (self.dist / name).write_text('stale provider fixture')
+            result = self.render()
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn('deferred provider artifact', result.stderr)
+            (self.dist / name).unlink()
+
     def test_cloud_bootstrap_checks_before_execution_and_cleans_temp(self):
         self.assertEqual(self.render().returncode, 0)
         cloud = (self.dist / 'cloudformation.yaml').read_text()
-        command = cloud.split('            set -eu\n', 1)[1].split('\n          - ListenArg:', 1)[0]
+        command = cloud.split('            #!/bin/bash\n', 1)[1].split('\n          - ListenArg:', 1)[0]
         command = '\n'.join(line[12:] if line.startswith(' ' * 12) else line for line in command.splitlines())
-        command = 'set -eu\n' + command.replace("'${Rules}' ${ListenArg}", "'zr1_fixture'")
-        cloud_init = (self.dist / 'cloud-init.yaml').read_text()
-        cloud_init = cloud_init.split('    - >-\n', 1)[1].split('\nfinal_message:', 1)[0]
-        cloud_init = ' '.join(line.strip() for line in cloud_init.splitlines())
-        cloud_init = cloud_init.replace('"$(cat /etc/zunder-guard/rules)"', "'zr1_fixture'")
+        for name, value in {'AWS::Region': 'ap-northeast-1', 'AWS::StackId': 'fixture-stack',
+                            'Rules': 'zr1_fixture', 'Account': '0x' + '1' * 40, 'ListenArg': ''}.items():
+            command = command.replace('${' + name + '}', value)
         fakebin = self.root / 'bin'
         fakebin.mkdir()
         marker = self.root / 'executed'
-        # The fake curl supplies either the exact rendered loader or a tampered fixture.
         curl = fakebin / 'curl'
-        curl.write_text('#!/bin/sh\nwhile [ "$1" != -o ]; do shift; done\n'
+        curl.write_text('#!/bin/sh\ncase "$*" in *healthz*) exit 0;; esac\n'
+                        'while [ "$1" != -o ]; do shift; done\n'
                         'printf "%s\\n" "$2" > "$TEMP_PATH"\n'
                         '[ "${FAIL_DOWNLOAD:-}" != 1 ] || exit 22\ncp "$TEST_LOADER" "$2"\n')
         curl.chmod(0o755)
         shell = fakebin / 'sh'
         shell.write_text('#!/bin/sh\nprintf "%s\\n" "$*" > "$EXECUTED"\n')
         shell.chmod(0o755)
+        for name in ('apt-get', 'systemctl'):
+            path = fakebin / name
+            path.write_text('#!/bin/sh\nexit 0\n')
+            path.chmod(0o755)
+        aws = fakebin / 'aws'
+        aws.write_text('#!/bin/sh\nprintf "%s\\n" "$*" > "$SIGNAL"\n')
+        aws.chmod(0o755)
         env = dict(os.environ, PATH=str(fakebin) + os.pathsep + os.environ['PATH'],
-                   TEST_LOADER=str(self.dist / 'i'), EXECUTED=str(marker), TEMP_PATH=str(self.root / 'temp-path'))
+                   TEST_LOADER=str(self.dist / 'i'), EXECUTED=str(marker),
+                   SIGNAL=str(self.root / 'signal'), TEMP_PATH=str(self.root / 'temp-path'))
         original = (self.dist / 'i').read_bytes()
-        for name, bootstrap in (('cloud-init', cloud_init), ('CloudFormation', command)):
-            with self.subTest(template=name):
-                (self.dist / 'i').write_bytes(original)
-                env.pop('FAIL_DOWNLOAD', None)
-                good = subprocess.run(['/bin/sh', '-c', bootstrap], env=env, capture_output=True, text=True)
-                self.assertEqual(good.returncode, 0, good.stderr)
-                self.assertIn('--non-interactive --network paper --rules zr1_fixture', marker.read_text())
+        for mode in ('valid', 'tampered', 'download-fails'):
+            with self.subTest(mode=mode):
+                (self.dist / 'i').write_bytes(original if mode != 'tampered' else b'tampered fixture')
+                env['FAIL_DOWNLOAD'] = '1' if mode == 'download-fails' else '0'
+                result = subprocess.run(['bash', '-c', command], env=env, capture_output=True, text=True)
+                self.assertEqual(result.returncode == 0, mode == 'valid', result.stderr)
+                signal = (self.root / 'signal').read_text()
+                self.assertIn('--status ' + ('SUCCESS' if mode == 'valid' else 'FAILURE'), signal)
+                self.assertEqual(marker.exists(), mode == 'valid')
+                if marker.exists():
+                    self.assertIn('--non-interactive --network paper --rules zr1_fixture --account 0x', marker.read_text())
+                    marker.unlink()
                 self.assertFalse(Path((self.root / 'temp-path').read_text().strip()).exists())
-                marker.unlink()
-                (self.dist / 'i').write_text('tampered loader fixture\n')
-                bad = subprocess.run(['/bin/sh', '-c', bootstrap], env=env, capture_output=True, text=True)
-                self.assertNotEqual(bad.returncode, 0)
-                self.assertFalse(marker.exists())
-                self.assertFalse(Path((self.root / 'temp-path').read_text().strip()).exists())
-                env['FAIL_DOWNLOAD'] = '1'
-                self.assertNotEqual(subprocess.run(['/bin/sh', '-c', bootstrap], env=env, capture_output=True).returncode, 0)
-                self.assertFalse(marker.exists())
-                self.assertFalse(Path((self.root / 'temp-path').read_text().strip()).exists())
+                if mode != 'valid':
+                    import re
+                    diagnostic = re.search(r'root-only file (\S+);', result.stdout)
+                    if diagnostic:
+                        private_log = Path(diagnostic.group(1))
+                        self.assertEqual(stat.S_IMODE(private_log.stat().st_mode), 0o600)
+                        private_log.unlink()
 
 
 class InstallerNotices(unittest.TestCase):

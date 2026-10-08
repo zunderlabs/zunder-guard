@@ -340,7 +340,11 @@ impl GuardConfig {
         // The new file is the lock: created before the config is read, so
         // a second update at the same time fails rather than losing the
         // first one's change.
-        let mut file = zunder_venue::owner_only::create(&temporary)
+        #[cfg(windows)]
+        let created = crate::service::windows::create_config_update(path, &temporary);
+        #[cfg(not(windows))]
+        let created = zunder_venue::owner_only::create(&temporary);
+        let mut file = created
             .map_err(|error| {
                 write_error(format!(
                     "{} exists or cannot be created ({error}): another update may be running; remove it if not",
@@ -933,13 +937,19 @@ mod tests {
             )
         );
         assert_ne!(log.parent(), journal.parent());
-        // A directory that resolves to the state directory (the check
-        // compares paths, which `x/..` gets past while `x` does not exist):
-        // still another file than the journal.
+        // Unix cannot canonicalize through a nonexistent component;
+        // Windows normalizes x/.. to the existing state directory.
         let mut around = config.clone();
         around.emergency_dir = Some(config.state_dir.join("x").join(".."));
+        #[cfg(unix)]
         assert!(around.validate().is_ok());
+        #[cfg(windows)]
+        assert!(matches!(around.validate(), Err(ConfigError::EmergencyDir)));
         assert_ne!(around.emergency_log(false).file_name(), journal.file_name());
+        // Once the component exists, both platforms resolve the alias
+        // to the journal directory and must refuse it.
+        std::fs::create_dir(config.state_dir.join("x")).unwrap();
+        assert!(matches!(around.validate(), Err(ConfigError::EmergencyDir)));
         // Named as the state directory itself: refused.
         let mut same = config.clone();
         same.emergency_dir = Some(config.state_dir.clone());

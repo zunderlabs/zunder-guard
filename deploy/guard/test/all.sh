@@ -6,6 +6,9 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 python3 release-policy.py
+python3 native-readiness.py
+python3 macos-shell.py
+python3 -B distribution.py DockerBuildContext
 ./rules.sh
 ./lint.sh
 ./image.sh

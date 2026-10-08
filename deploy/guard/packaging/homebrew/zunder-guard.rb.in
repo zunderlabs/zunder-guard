@@ -37,11 +37,12 @@ class ZunderGuard < Formula
 
   def install
     bin.install "zunder-guard"
+    pkgshare.install "LICENSE", "NOTICE", "THIRD_PARTY_LICENSES.md"
   end
 
   # Paper mode on 127.0.0.1 (unless `init` chose another address). `run` sends only where
-  # --network says and only when that is the mode init recorded, so a testnet setup refuses to
-  # start under this service: run it with --network testnet instead (caveats).
+  # --network says and only when that is the mode init recorded, so a testnet or mainnet setup
+  # refuses this service. Sending modes use an explicit foreground start (caveats).
   service do
     run [opt_bin/"zunder-guard", "run", "--network", "paper"]
     environment_variables ZUNDER_GUARD_HOME: var/"zunder-guard"
@@ -52,21 +53,41 @@ class ZunderGuard < Formula
 
   def caveats
     <<~EOS
-      Set Guard up first. It shows your rules, then asks for the account, the mode (paper or
-      testnet; mainnet only under the SSH installer's systemd setup) and, for testnet, the API
-      wallet key with hidden input:
-        ZUNDER_GUARD_HOME=#{var}/zunder-guard zunder-guard init --interactive --rules zr1_...
-        ZUNDER_GUARD_HOME=#{var}/zunder-guard zunder-guard pair
-      Then start it, in paper mode:
+      Use the same home for setup, pairing, licence commands and every start:
+        export ZUNDER_GUARD_HOME="#{var}/zunder-guard"
+        zunder-guard init --interactive
+      Init creates your first client key and pairing code. To add another bot:
+        zunder-guard pair
+      Restart Guard after adding a client. Keep pairing output private.
+
+      Paper mode only:
         brew services start zunder-guard
-      For testnet, `run` must be told where to send (the service runs paper only):
-        ZUNDER_GUARD_HOME=#{var}/zunder-guard zunder-guard run --network testnet
-      Guard listens on 127.0.0.1:8547 only. AI agents: zunder-guard mcp (the agent kit's MCP
-      server), with its own client key from zunder-guard client add --out FILE.
+      For a testnet config, stop the service and run explicitly:
+        brew services stop zunder-guard
+        zunder-guard run --network testnet
+
+      Mainnet works in the foreground on macOS and Linux. Guided init asks you to
+      type mainnet, confirm the account and choose the equity cap; it checks the
+      API wallet key without storing it. At your go-ahead, initialize the mainnet
+      journal with journal-init --mode mainnet --note, then start with
+      run --network mainnet --key-stdin. Both commands require
+      ZUNDER_MAINNET_CONFIRM naming the configured account; run needs the key
+      from your secret manager on standard input at every start.
+      brew services cannot provide that credential and remains paper-only.
+      For unattended mainnet use the separately verified protected installer:
+      Linux uses systemd-creds; macOS uses System Keychain and launchd.
+      Never elevate a user-writable Homebrew Cellar executable for that setup.
+
+      Setup, licence activation, restart, upgrades and removal:
+        https://zunderlabs.com/docs/deploy/packages/
+      Guard's default listen address is 127.0.0.1:8547.
     EOS
   end
 
   test do
     assert_match "zunder-guard", shell_output("#{bin}/zunder-guard --version")
+    %w[LICENSE NOTICE THIRD_PARTY_LICENSES.md].each do |notice|
+      assert_path_exists pkgshare/notice
+    end
   end
 end

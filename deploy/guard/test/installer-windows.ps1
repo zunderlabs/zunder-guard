@@ -7,7 +7,7 @@
 #
 # Cases: install only; the full non-interactive paper setup, then run and health; a changed
 # archive, changed checksums, another release's signature and a missing archive each refused
-# before anything is installed; mainnet refused; nothing closes the calling PowerShell.
+# before anything is installed; mainnet alternate InstallDir refused; nothing closes the calling PowerShell.
 param(
   [Parameter(Mandatory)][string]$Release,
   [Parameter(Mandatory)][string]$Cosign
@@ -85,10 +85,13 @@ try {
   $R = Copy-Release 'no-archive'
   Remove-Item -LiteralPath (Join-Path $R $Zip)
   Expect-Refusal 'a missing archive' $R @{ InstallOnly = $true; InstallDir = (Join-Path $Work 't4') } ''
-  Expect-Refusal 'mainnet' $Release @{ Network = 'mainnet'; InstallDir = (Join-Path $Work 't5') } 'not offered on Windows'
+  Expect-Refusal 'mainnet' $Release @{ Network = 'mainnet'; InstallDir = (Join-Path $Work 't5') } 'Mainnet refuses NonInteractive, InstallOnly, Force and alternate InstallDir.'
   Expect-Refusal 'bad rules' $Release @{ Rules = 'nope'; InstallDir = (Join-Path $Work 't6') } 'zr1_'
 } finally {
   Remove-Item -LiteralPath $Work -Recurse -Force -ErrorAction SilentlyContinue
 }
 if ($Failed.Count -gt 0) { throw "i.ps1 tests failed: $($Failed -join ', ')" }
 Write-Host 'i.ps1 tests passed'
+# Expected native verifier refusals leave LASTEXITCODE nonzero.
+# Report success only after every assertion above has passed.
+exit 0

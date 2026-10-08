@@ -82,6 +82,8 @@ struct State {
     failing: Vec<String>,
     /// Dexes whose open orders carry a foreign coin.
     garbled: Vec<String>,
+    /// Open-order reads fail while the positions remain readable.
+    orders_fail: bool,
     /// The account's approved maximum builder fee (tenths of a bp), as
     /// `maxBuilderFee` answers; an order whose builder fee is above it is
     /// refused whole, as Hyperliquid does ("Builder fee has not been
@@ -277,6 +279,10 @@ impl MemoryVenue {
     /// Make a dex's open orders carry a coin of another dex.
     pub fn garble_orders(&self, dex: &str) {
         self.state.lock().unwrap().garbled.push(dex.to_owned());
+    }
+
+    pub fn fail_orders(&self) {
+        self.state.lock().unwrap().orders_fail = true;
     }
 
     /// The info requests received so far.
@@ -665,6 +671,9 @@ impl Upstream for MemoryVenue {
         }
         // The dex an answer is for: "" (or none) is the main dex.
         let dex = body["dex"].as_str().unwrap_or("");
+        if body["type"] == "frontendOpenOrders" && state.orders_fail {
+            return Err(UpstreamError::NotSent("orders unavailable".into()));
+        }
         if body["type"] == "clearinghouseState" && state.failing.iter().any(|f| f == dex) {
             return Err(UpstreamError::Status {
                 status: 500,

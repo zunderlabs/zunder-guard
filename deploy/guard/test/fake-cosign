@@ -22,5 +22,6 @@ done
 want_id=$(sed -n 's/.*"identity": *"\([^"]*\)".*/\1/p' "$bundle")
 want_sha=$(sed -n 's/.*"sha256": *"\([0-9a-f]*\)".*/\1/p' "$bundle")
 [ "$identity" = "$want_id" ] || { echo "fake cosign: identity $identity is not the signer $want_id" >&2; exit 1; }
-[ "$(sha256sum "$file" | cut -d' ' -f1)" = "$want_sha" ] || { echo "fake cosign: $file does not match the bundle" >&2; exit 1; }
+# Hash stdin so GNU's filename escaping cannot prefix the digest with a backslash.
+[ "$(sha256sum < "$file" | cut -d' ' -f1)" = "$want_sha" ] || { echo "fake cosign: $file does not match the bundle" >&2; exit 1; }
 echo "Verified OK (fake cosign)" >&2

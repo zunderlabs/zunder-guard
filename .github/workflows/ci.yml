@@ -29,6 +29,8 @@ jobs:
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo test --workspace --locked
+        env:
+          ZUNDER_FLOWS_CASES: "4000"
 
   # Windows: clippy and the tests natively (owner-only ACLs, the Credential Manager, Ctrl-C),
   # then the PowerShell installer against a release made from this build, under Windows
@@ -41,7 +43,53 @@ jobs:
           persist-credentials: false
       - run: rustup toolchain install
       - run: cargo clippy --locked --all-targets -p zunder-venue -p zunder-guard-core -p zunder-guard-mcp -p zunder-guard-rules -p zunder-guard -p zunder-redteam -- -D warnings
-      - run: cargo test --locked -p zunder-venue -p zunder-guard-core -p zunder-guard-mcp -p zunder-guard-rules -p zunder-guard
+      # The full model runs 4,000 histories per property on Linux. Windows
+      # exercises 400 per property on its native filesystem, including the
+      # generator's asserted coverage of every path, plus every native unit test.
+      - name: Native Windows tests (400 flow histories per property)
+        shell: pwsh
+        env:
+          ZUNDER_FLOWS_CASES: "400"
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $cargo = (Get-Command cargo -CommandType Application -ErrorAction Stop).Source
+          $arguments = @('test', '--no-fail-fast', '--locked', '-p', 'zunder-venue', '-p', 'zunder-guard-core', '-p', 'zunder-guard-mcp', '-p', 'zunder-guard-rules', '-p', 'zunder-guard')
+          $tests = Start-Process -FilePath $cargo -ArgumentList $arguments -NoNewWindow -PassThru
+          $finished = $false
+          try {
+            # Retain the process handle until its exit code has been collected.
+            $null = $tests.Handle
+            while (-not $tests.WaitForExit(30000)) {
+              Write-Host 'Native Windows tests are active; cumulative process counters:'
+              try {
+                Get-CimInstance -ClassName Win32_Process -OperationTimeoutSec 5 -Filter "Name = 'cargo.exe' OR Name LIKE 'flows_model%'" |
+                  Select-Object Name, ProcessId,
+                    @{Name='CpuSeconds';Expression={[math]::Round(([decimal]$_.KernelModeTime + [decimal]$_.UserModeTime) / 10000000, 1)}},
+                    ReadOperationCount, WriteOperationCount, WriteTransferCount |
+                  Format-Table -AutoSize
+              } catch {
+                Write-Warning 'Process counters are unavailable; the test exit code still determines this step.'
+              }
+            }
+            $tests.WaitForExit()
+            $testExit = $tests.ExitCode
+            $finished = $true
+          } finally {
+            try {
+              if (-not $finished -and -not $tests.HasExited) {
+                & "$env:SystemRoot\System32\taskkill.exe" /PID $tests.Id /T /F | Out-Host
+                if (-not $tests.WaitForExit(10000)) {
+                  Write-Warning 'The test child did not exit after termination; this step remains failed.'
+                }
+              }
+            } catch {
+              Write-Warning 'Test child cleanup failed; the original wrapper failure is retained.'
+            } finally {
+              $tests.Dispose()
+            }
+          }
+          if ($null -eq $testExit) { throw 'The test process supplied no exit code' }
+          exit $testExit
       - name: A local release from this build (the test double signs it)
         shell: bash
         run: |
@@ -68,6 +116,175 @@ jobs:
       - name: i.ps1 under PowerShell 7
         shell: pwsh
         run: deploy/guard/test/installer-windows.ps1 -Release $env:RELEASE_DIR -Cosign fakebin/cosign.cmd
+      - name: Windows ACL diagnostics on failure (empty files only)
+        if: failure()
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $root = Join-Path ([IO.Path]::GetTempPath()) ('guard-acl-' + [Guid]::NewGuid().ToString('N'))
+          $file = $null
+          function Show-Acl([string]$Path) {
+            $env:ZUNDER_ACL_PATH = $Path
+            $child = [Diagnostics.Process]::new()
+            $child.StartInfo.FileName = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
+            $child.StartInfo.Arguments = '-NoProfile -NonInteractive -Command "(Get-Acl -LiteralPath $env:ZUNDER_ACL_PATH).Sddl; try { ([Security.Principal.SecurityIdentifier]''LA'').Value } catch { '''' }"'
+            $child.StartInfo.UseShellExecute = $false
+            $child.StartInfo.RedirectStandardOutput = $true
+            $child.StartInfo.RedirectStandardError = $true
+            try {
+              $child.Start() | Out-Null
+              $stdout = $child.StandardOutput.ReadToEndAsync()
+              $stderr = $child.StandardError.ReadToEndAsync()
+              $child.WaitForExit()
+              [ordered]@{
+                stdout = $stdout.Result; stderr = $stderr.Result
+                stdout_length = $stdout.Result.Length; exit_code = $child.ExitCode
+              } | ConvertTo-Json -Compress
+            } finally { $child.Dispose() }
+            $acl = Get-Acl -LiteralPath $Path -ErrorAction Stop
+            $raw = [Security.AccessControl.RawSecurityDescriptor]::new($acl.GetSecurityDescriptorBinaryForm(), 0)
+            [ordered]@{
+              path = $Path; sddl = $acl.Sddl
+              owner = $acl.GetOwner([Security.Principal.SecurityIdentifier]).Value
+              protected = $acl.AreAccessRulesProtected
+              control_flags = $raw.ControlFlags.ToString()
+              dacl_null = ($null -eq $raw.DiscretionaryAcl)
+            } | ConvertTo-Json -Compress
+          }
+          try {
+            New-Item -ItemType Directory -Path $root | Out-Null
+            $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+            & "$env:SystemRoot\System32\icacls.exe" $root /inheritance:r /grant:r "*${sid}:(OI)(CI)F" /q
+            if ($LASTEXITCODE -ne 0) { throw 'Folder ACL command failed' }
+            Show-Acl $root
+            $path = Join-Path $root 'empty'
+            $sharing = [IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete
+            $file = [IO.FileStream]::new($path, [IO.FileMode]::CreateNew, [IO.FileAccess]::ReadWrite, $sharing)
+            Show-Acl $path
+            & "$env:SystemRoot\System32\icacls.exe" $path /inheritance:d /q
+            if ($LASTEXITCODE -ne 0) { throw 'File ACL command failed' }
+            Show-Acl $path
+          } finally {
+            if ($null -ne $file) { $file.Dispose() }
+            Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue
+            Remove-Item Env:ZUNDER_ACL_PATH -ErrorAction SilentlyContinue
+          }
+
+  # Native proof runs on PR/main before any release tag. No secrets or publication.
+  macos-service:
+    name: macOS service (${{ matrix.arch }})
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            arch: arm64
+          - runner: macos-15-intel
+            arch: x86_64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 50
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Identify the native runner and exact source
+        env:
+          EXPECTED_ARCH: ${{ matrix.arch }}
+          SOURCE_SHA: ${{ github.sha }}
+        run: |
+          mkdir -p native-macos-evidence
+          test "$RUNNER_ENVIRONMENT" = github-hosted
+          test "$(uname -s)" = Darwin
+          test "$(uname -m)" = "$EXPECTED_ARCH"
+          sw_vers > native-macos-evidence/os.txt
+          uname -m > native-macos-evidence/architecture.txt
+          git rev-parse HEAD > native-macos-evidence/source-commit.txt
+          test "$(cat native-macos-evidence/source-commit.txt)" = "$SOURCE_SHA"
+          shasum -a 256 Cargo.lock rust-toolchain.toml \
+            crates/zunder-guard/src/service.rs crates/zunder-guard/src/service/macos.rs \
+            crates/zunder-guard/examples/macos_service_fixture.rs deploy/guard/macos/native-ci.sh \
+            deploy/guard/macos/crash-report-scan.py deploy/guard/macos/test-crash-report-scan.py \
+            > native-macos-evidence/source-sha256.txt
+          printf '%s\n' 'Synthetic native service gates only. Pre-login reboot, full signed installer lifecycle and crash-report coverage beyond the bounded synthetic fixture scan remain separate release gates.' > native-macos-evidence/scope.txt
+      - name: macOS bootstrap tool resolution and shell regressions (no privilege)
+        run: |
+          /usr/bin/python3 -B deploy/guard/test/macos-bootstrap.py
+          /usr/bin/python3 -B deploy/guard/test/macos-shell.py
+      - name: Crash-report scanner deterministic hit, miss and scope tests
+        run: /usr/bin/python3 -B deploy/guard/macos/test-crash-report-scan.py
+      - name: Install the repository-pinned toolchain
+        run: |
+          rustup toolchain install
+          rustc -Vv > native-macos-evidence/toolchain.txt
+      - name: Typecheck and lint native broker, CLI and synthetic fixture
+        run: |
+          set +e
+          cargo clippy --locked -p zunder-guard --lib --bin zunder-guard --example macos_service_fixture -- -D warnings > native-macos-evidence/clippy.log 2>&1
+          result=$?
+          set -e
+          printf '%s\n' "$result" > native-macos-evidence/clippy-exit-code.txt
+          exit "$result"
+      - name: Private Keychain isolation and core-limit tests
+        run: |
+          set +e
+          cargo test --locked -p zunder-guard --lib service::macos::tests -- --test-threads=1 > native-macos-evidence/private-keychain-tests.log 2>&1
+          result=$?
+          set -e
+          printf '%s\n' "$result" > native-macos-evidence/private-keychain-exit-code.txt
+          exit "$result"
+      - name: Build the exact broker and non-shipped fixture
+        run: |
+          set +e
+          cargo build --locked -p zunder-guard --bin zunder-guard --example macos_service_fixture > native-macos-evidence/build.log 2>&1
+          result=$?
+          set -e
+          printf '%s\n' "$result" > native-macos-evidence/build-exit-code.txt
+          test "$result" = 0
+          shasum -a 256 target/debug/zunder-guard target/debug/examples/macos_service_fixture > native-macos-evidence/binary-sha256.txt
+      - name: System Keychain and launchd synthetic lifecycle
+        run: |
+          set +e
+          # Driver output intentionally belongs to the unprivileged evidence directory.
+          # shellcheck disable=SC2024
+          /usr/bin/sudo /usr/bin/env GITHUB_ACTIONS="$GITHUB_ACTIONS" RUNNER_OS="$RUNNER_OS" RUNNER_ENVIRONMENT="$RUNNER_ENVIRONMENT" /bin/bash \
+            deploy/guard/macos/native-ci.sh "$PWD/target/debug/examples/macos_service_fixture" "$PWD/native-macos-evidence" \
+            > native-macos-evidence/system-service-driver.log 2>&1
+          result=$?
+          set -e
+          printf '%s\n' "$result" > native-macos-evidence/system-service-driver-exit-code.txt
+          test "$result" = 0
+          test "$(cat native-macos-evidence/system-service-exit-code.txt)" = 0
+          test "$(cat native-macos-evidence/cleanup-errors.txt)" = 0
+          test -s native-macos-evidence/system-service-result.txt
+          test "$(cat native-macos-evidence/crash-report-scan-exit-code.txt)" = 0
+          test -s native-macos-evidence/crash-report-scan.txt
+      - name: Redact logs before retaining evidence
+        id: redact
+        if: always()
+        run: |
+          mkdir -p native-macos-evidence
+          # Logs can contain synthetic test scalars or snippets from compiler diagnostics.
+          # Keep explicit source/binary hash files intact; never upload raw crash dumps.
+          for log in native-macos-evidence/*.log; do
+            test -f "$log" || continue
+            /usr/bin/sed -E 's/(0x)?[[:xdigit:]]{64}/[redacted-64-hex]/g' "$log" > "$log.redacted"
+            /bin/mv "$log.redacted" "$log"
+          done
+      - name: Retain redacted native evidence
+        if: always() && steps.redact.outcome == 'success'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: native-macos-pr-${{ matrix.arch }}-${{ github.sha }}
+          path: |
+            native-macos-evidence/*.txt
+            native-macos-evidence/*.log
+          if-no-files-found: error
+          retention-days: 7
 
   deny:
     runs-on: ubuntu-24.04
@@ -99,9 +316,24 @@ jobs:
         run: |
           sudo apt-get update -q && sudo apt-get install -yq shellcheck
           shellcheck -s sh deploy/guard/install.sh deploy/guard/loader/i.sh
-          shellcheck deploy/guard/packaging/*.sh deploy/guard/github/*.sh deploy/guard/test/*.sh
+          shellcheck deploy/guard/packaging/*.sh deploy/guard/github/*.sh deploy/guard/test/*.sh deploy/guard/macos/*.sh
+      - name: AWS publication and bootstrap regressions
+        run: |
+          python3 deploy/guard/github/test_publish_aws_template.py
+          python3 -m pip install PyYAML==6.0.3
+          python3 deploy/guard/test/aws_template_test.py
+      - name: Container supervisor contract (synthetic only; no native restart claim)
+        run: python3 -B deploy/guard/test/container-supervisor.py
+      - name: Docker build context admission and exclusions
+        run: python3 -B deploy/guard/test/distribution.py DockerBuildContext
+      - name: Container installer transaction and ownership checks
+        run: python3 -B deploy/guard/test/container-installer.py
       - name: Publication gate regressions (no network or signing)
-        run: python3 -B deploy/guard/test/release-policy.py
+        run: |
+          python3 -B deploy/guard/test/release-policy.py
+          python3 -B deploy/guard/test/native-readiness.py
+          python3 -B deploy/guard/test/macos-shell.py
+          python3 -B deploy/guard/github/test_publish_loaders.py
       - name: actionlint
         run: |
           docker run --rm -v "$PWD:/repo:ro" -w /repo rhysd/actionlint:1.7.12 \

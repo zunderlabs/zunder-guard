@@ -8,8 +8,7 @@
 # Needs the five archives package.sh made in <dist-dir> (Linux, macOS, Windows). Adds
 # install.sh, i (the loader for zunderlabs.com/i), i.ps1 (the Windows installer for
 # zunderlabs.com/i.ps1), zunder-guard.rb (Homebrew tap), the three winget manifests, the
-# deployment templates with the image pinned to its immutable digest (compose.yaml, fly.toml,
-# render.yaml, railway.json, cloud-init.yaml, cloudformation.yaml), then SHA256SUMS over every
+# AWS template and Docker Compose with the image pinned to its immutable digest, then SHA256SUMS over every
 # file. Signing SHA256SUMS (cosign, in the workflow) covers them all.
 set -euo pipefail
 [ $# -eq 2 ] || { echo "usage: render.sh <version> <dist-dir>" >&2; exit 2; }
@@ -17,6 +16,10 @@ VERSION=$1 DIST=$2
 HERE=$(cd "$(dirname "$0")" && pwd)
 [[ $VERSION =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "version must look like v1.2.3, got $VERSION" >&2; exit 2; }
 NUMBER=${VERSION#v}
+# Deferred providers are not part of this release; stale files must not enter its signed manifest.
+for deferred in fly.toml render.yaml railway.json cloud-init.yaml azuredeploy.json linode-stackscript.sh vultr-cloud-init.yaml oci-terraform.zip; do
+  [ ! -e "$DIST/$deferred" ] || { echo "deferred provider artifact: $deferred" >&2; exit 1; }
+done
 EPOCH=${SOURCE_DATE_EPOCH:-0}
 RELEASE_DATE=$(date -u -d "@$EPOCH" +%F)
 IMAGE=ghcr.io/zunderlabs/zunder-guard
@@ -58,16 +61,18 @@ render() { # template output
 }
 
 render "$HERE/../install.sh" "$DIST/install.sh"
+# Internal macOS helper is independently covered by the signed release manifest.
+render "$HERE/../macos/install-service.sh" "$DIST/install-macos-service.sh"
 render "$HERE/../loader/i.sh" "$DIST/i"
 render "$HERE/../loader/i.ps1" "$DIST/i.ps1"
+render "$HERE/../windows/service.ps1" "$DIST/install-windows-service.ps1"
 render "$HERE/homebrew/zunder-guard.rb.in" "$DIST/zunder-guard.rb"
 for m in ZunderLabs.ZunderGuard ZunderLabs.ZunderGuard.installer ZunderLabs.ZunderGuard.locale.en-US; do
   render "$HERE/winget/$m.yaml.in" "$DIST/$m.yaml"
 done
 # The signed release templates bind the immutable image reference in the checksummed image
 # descriptor. A version tag can move, so it is never used as the release deployment reference.
-for t in compose.yaml templates/fly.toml templates/render.yaml templates/railway.json \
-  templates/cloud-init.yaml templates/cloudformation.yaml; do
+for t in compose.yaml templates/cloudformation.yaml; do
   out="$DIST/$(basename "$t")"
   sed -e "s|$IMAGE:latest|$IMAGE_REF|g" "$HERE/../$t" >"$out"
   if sed "s|$IMAGE_REF||g" "$out" | grep -Fq "$IMAGE"; then
@@ -83,37 +88,28 @@ python3 - "$DIST" "$VERSION" "$LOADER_SHA" <<'PY'
 import pathlib, sys
 dist, version, sha = pathlib.Path(sys.argv[1]), sys.argv[2], sys.argv[3]
 url = f"https://github.com/zunderlabs/zunder-guard/releases/download/{version}/i"
-verify = ("loader=$(mktemp); trap 'rm -f \"$loader\"' 0; "
-          f"curl -fsSL --proto '=https' -o \"$loader\" '{url}'; "
-          f"printf '%s  %s\\n' '{sha}' \"$loader\" | sha256sum -c -; ")
-
 def replace_once(text, old, new, name):
     if text.count(old) != 1:
         sys.exit(f"{name}: expected cloud bootstrap block absent or duplicated")
     return text.replace(old, new)
 
-path = dist / "cloud-init.yaml"
-text = path.read_text()
-text = replace_once(text,
-    'curl -fsSL --proto =https https://zunderlabs.com/i\n      | sh -s --',
-    'set -eu; ' + verify + 'sh "$loader"', path.name)
-text = replace_once(text,
-    '#   ssh -t root@<server> "curl -fsSL https://zunderlabs.com/i | sh -s -- --rules <your zr1_…>"',
-    f'#   Over SSH: download {url}, verify SHA-256 {sha},\n'
-    '#   then run sudo sh i --rules <your zr1_…> for guided setup.', path.name)
-path.write_text(text)
-
 path = dist / "cloudformation.yaml"
 text = path.read_text()
 text = replace_once(text,
-    'curl -fsSL --proto =https https://zunderlabs.com/i \\\n              | sh -s --',
-    verify.replace('; ', ';\n            ') + 'sh "$loader"', path.name)
+    'curl -fsSL --proto \'=https\' --retry 3 -o "$loader" https://zunderlabs.com/i',
+    f'curl -fsSL --proto \'=https\' --retry 3 -o "$loader" \'{url}\'\n'
+    f'            printf \'%s  %s\\n\' \'{sha}\' "$loader" | sha256sum -c -', path.name)
 text = replace_once(text,
-    'In the session: sudo sh -c "curl -fsSL https://zunderlabs.com/i | sh -s -- --rules ${Rules}"',
+    "Download and verify this release's installer, then stop Guard and run guided setup with --force --rules '${Rules}' --account '${Account}'.",
     f'In the session: download {url}, verify SHA-256 {sha},\n'
-    "      then sudo sh i --rules '${Rules}' for guided setup.", path.name)
+    "      then run sudo systemctl stop zunder-guard && sudo sh i --force --rules '${Rules}' --account '${Account}'\n"
+    "      for guided setup. This replaces bootstrap configuration and client pairings; journals are preserved.", path.name)
 path.write_text(text)
 PY
+# The installer/guardian are release bytes, authenticated before privilege/key handling.
+for pair in 'install-container.py:install-container.py' 'supervisor.py:container-supervisor.py' 'operations.py:container-operations.py' 'zunder-guard-container.service:zunder-guard-container.service' 'zunder-guard-setup-guardian.service:zunder-guard-setup-guardian.service'; do
+  cp "$HERE/../container/${pair%%:*}" "$DIST/${pair#*:}"
+done
 chmod 0644 "$DIST"/*
 
 (cd "$DIST" && find . -maxdepth 1 -type f ! -name 'SHA256SUMS*' -printf '%f\n' | LC_ALL=C sort \
