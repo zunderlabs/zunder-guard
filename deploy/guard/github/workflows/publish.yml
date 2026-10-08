@@ -120,7 +120,7 @@ jobs:
           [ "$(git -C gate rev-parse HEAD)" = "$SOURCE_SHA" ] || { echo "Checkout differs from event commit" >&2; exit 1; }
           jq -e --arg source "$SOURCE_SHA" --arg tag "$TAG" \
             '.source == $source and .tag == $tag' rel/.verified-release-source.json >/dev/null
-      - name: Require actual four-platform Homebrew entrypoint evidence
+      - name: Require Homebrew entrypoint evidence for the release platforms
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.event.release.tag_name || github.ref_name }}

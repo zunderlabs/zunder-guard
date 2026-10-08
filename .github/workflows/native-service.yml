@@ -102,7 +102,7 @@ jobs:
           $FixtureHash = (Get-FileHash ./target/debug/examples/windows_service_fixture.exe -Algorithm SHA256).Hash.ToLowerInvariant()
           $Observations = @()
           foreach ($Shell in @('pwsh','ps51')) {
-            $Observation = Get-Content -Raw -LiteralPath "./native-service-receipt/wer-policy-$Shell.json.admission.json" | ConvertFrom-Json
+            $Observation = Get-Content -Raw -LiteralPath "./native-service-receipt/wer-policy-$Shell.json.admission.json" | ConvertFrom-Json -DateKind String
             if ($Observation.version -ne 1 -or $Observation.invocation_id -notmatch '^[0-9a-f]{32}$' -or [DateTimeOffset]::Parse($Observation.started_utc) -lt $ObservationStarted -or [DateTimeOffset]::Parse($Observation.finished_utc) -lt [DateTimeOffset]::Parse($Observation.started_utc) -or -not $Observation.cleanup_complete -or $Observation.releaseReady -or $Observation.source_helper_sha256 -cne $HelperHash -or $Observation.harness_sha256 -cne $HarnessHash -or $Observation.fixture_sha256 -cne $FixtureHash) { throw 'Stale or inexact native observation.' }
             if (($Shell -eq 'pwsh' -and $Observation.powershell -cne $PSVersionTable.PSVersion.ToString()) -or ($Shell -eq 'ps51' -and $Observation.powershell -notmatch '^5\.1\.')) { throw 'Native observation PowerShell binding differs.' }
             if (($Observation.result -ceq 'positive-synthetic-lifecycle' -and $Observation.positive_lifecycle_verified -ceq $true) -or ($Observation.result -ceq 'expected-policy-refusal' -and $Observation.positive_lifecycle_verified -ceq $false)) { $Observations += $Observation } else { throw 'Unknown or inconsistent native observation.' }

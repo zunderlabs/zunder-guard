@@ -29,10 +29,11 @@ COMMON = {'signed_install', 'credential_confinement', 'account_network_risk', 'p
           'fee_licence', 'explicit_stop', 'restart', 'crash_recovery', 'state_preservation',
           'host_reboot', 'signed_reinstall', 'interrupted_replacement_rollback', 'prior_version_upgrade'}
 # Source policy, never a subset selected by the report.
+# Every distributed binary remains mandatory, independently of the rehearsal matrix.
+ARTIFACT_PLATFORMS = ('linux-amd64', 'linux-arm64', 'darwin-amd64', 'darwin-arm64', 'windows-amd64')
 ROUTES = {
     'linux-amd64-systemd': ('linux-amd64', set()),
     'linux-arm64-systemd': ('linux-arm64', set()),
-    'darwin-amd64-keychain': ('darwin-amd64', set()),
     'darwin-arm64-keychain': ('darwin-arm64', set()),
     'windows-amd64-scm': ('windows-amd64', {'pre_login_readiness'}),
     'linux-amd64-container': ('linux-amd64', {'daemon_restart', 'single_instance', 'interrupted_setup_boot_inhibition'}),
@@ -49,7 +50,7 @@ CHANNELS = {
     'native': (REPORT, 'operator-attested-native-rehearsal', ROUTES, COMMON),
     'homebrew': ('homebrew-readiness.json', 'operator-attested-homebrew-channel',
                  {platform + '-homebrew': (platform, set()) for platform in
-                  ('linux-amd64', 'linux-arm64', 'darwin-amd64', 'darwin-arm64')}, HOMEBREW_CHECKS),
+                  ('linux-amd64', 'linux-arm64', 'darwin-arm64')}, HOMEBREW_CHECKS),
     'aws': ('aws-readiness.json', 'operator-attested-aws-channel',
             {'aws-ap-northeast-1-arm64': ('linux-arm64', set())}, AWS_CHECKS),
 }
@@ -235,7 +236,7 @@ def required_inventory(tag, hashes, channel='native'):
                 'install-container.py', 'container-supervisor.py', 'container-operations.py',
                 'zunder-guard-container.service', 'zunder-guard-setup-guardian.service',
                 f'zunder-guard-{tag}.image.txt'}
-    for platform, _ in ROUTES.values():
+    for platform in ARTIFACT_PLATFORMS:
         required.add(f'zunder-guard-{tag}-{platform}.' + ('zip' if platform.startswith('windows') else 'tar.gz'))
     if channel == 'homebrew': required.add('zunder-guard.rb')
     if channel == 'aws': required.add('cloudformation.yaml')

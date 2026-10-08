@@ -78,7 +78,7 @@ class Readiness(unittest.TestCase):
                  'install-container.py', 'container-supervisor.py', 'container-operations.py',
                  'zunder-guard-container.service', 'zunder-guard-setup-guardian.service']
         names += sorted({f'zunder-guard-{TAG}-{platform}.' + ('zip' if platform.startswith('windows') else 'tar.gz')
-                         for platform, _ in native.ROUTES.values()})
+                         for platform in native.ARTIFACT_PLATFORMS})
         hashes = {}
         for name in names:
             data = ('SYNTHETIC VALIDATOR INPUT: ' + name).encode()
@@ -134,6 +134,19 @@ class Readiness(unittest.TestCase):
         self.assertEqual(result['operator']['role'], 'maintain')
         self.assertEqual(result['report_sha256'], native.sha(self.api.bytes[self.report_id]))
         self.assertEqual(set(result['assets']), set(self.report['artifacts']) | {'SHA256SUMS', native.REPORT, 'native-evidence-fixture.txt'})
+
+    def test_intel_mac_keeps_signed_inventory_without_separate_rehearsal(self):
+        self.assertNotIn('darwin-amd64-keychain', native.ROUTES)
+        self.assertNotIn('darwin-amd64-homebrew', native.CHANNELS['homebrew'][2])
+        self.assertIn('darwin-arm64-keychain', native.ROUTES)
+        self.assertIn('darwin-arm64-homebrew', native.CHANNELS['homebrew'][2])
+        name = f'zunder-guard-{TAG}-darwin-amd64.tar.gz'
+        hashes = dict(self.report['artifacts'])
+        native.required_inventory(TAG, hashes)
+        del hashes[name]
+        for channel in native.CHANNELS:
+            with self.subTest(channel=channel), self.assertRaises(native.Refused):
+                native.required_inventory(TAG, hashes, channel)
 
     def test_missing_pending_synthetic_and_boolean_reports_refuse(self):
         original = copy.deepcopy(self.report)
@@ -323,7 +336,7 @@ class ChannelReadiness(unittest.TestCase):
             with self.subTest(channel=channel), self.assertRaises(native.Refused):
                 native.verify(self.api, TAG, self.directory, channel)
 
-    def test_four_homebrew_platforms_with_exact_formula_pass(self):
+    def test_required_homebrew_platforms_with_exact_formula_pass(self):
         self.channel('homebrew')
         result = native.verify(self.api, TAG, self.directory, 'homebrew')
         self.assertEqual(result['channel'], 'homebrew')

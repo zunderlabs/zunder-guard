@@ -85,11 +85,16 @@ The top-level object has exactly these fields:
 | `platforms` | Complete matrix below; not a report-selected subset |
 
 The platform keys are `linux-amd64-systemd`, `linux-arm64-systemd`,
-`darwin-amd64-keychain`, `darwin-arm64-keychain`, `windows-amd64-scm`,
+`darwin-arm64-keychain`, `windows-amd64-scm`,
 `linux-amd64-container` and `linux-arm64-container`. Each has `os` (observed OS/build),
 `host` (redacted identifier) and `checks`. Required signed archives and helpers are also
 checked against release inventory. Every software asset's current GitHub SHA-256 digest
 must agree with the authenticated manifest; missing API digest fails closed.
+
+macOS release rehearsals use Apple Silicon. Intel macOS retains its native CI build,
+tests, synthetic service checks and signed installer smoke, and its signed archive remains
+mandatory in the release inventory. A separate Intel signed-service/reboot or Homebrew
+rehearsal is not required. Apple Silicon rehearsal evidence is not Intel reboot evidence.
 
 Every platform's checks contain exactly:
 
@@ -140,7 +145,7 @@ seeding an archive cache does not prove the customer download/bootstrap path.
 
 After native proof permits the immutable Guard release to become public:
 
-1. **Homebrew:** on native Linux and macOS, each AMD64 and ARM64, place the exact signed
+1. **Homebrew:** on native Linux AMD64 and ARM64 and macOS Apple Silicon, place the exact signed
    `zunder-guard.rb` in a disposable local rehearsal tap without changing its bytes or URLs.
    Use a fresh Homebrew cache so installation actually fetches the published signed archive.
    Check install, version/notices, configured paths, initialization/pairing, licence activation,
@@ -161,7 +166,7 @@ After native proof permits the immutable Guard release to become public:
    its publisher independently; native success cannot substitute for it.
 
 Homebrew's exact platform keys are `linux-amd64-homebrew`, `linux-arm64-homebrew`,
-`darwin-amd64-homebrew`, `darwin-arm64-homebrew`. Each uses the same `os`, `host`, `checks`
+`darwin-arm64-homebrew`. Each uses the same `os`, `host`, `checks`
 shape, with these exact checks: `signed_formula_install`, `installed_binary_and_notices`,
 `configuration_paths`, `init_pairing`, `licence_activation`, `service_start_stop_restart`,
 `signed_reinstall_state_preservation`, `uninstall_preserves_state`, `prior_version_upgrade`.
@@ -212,7 +217,7 @@ or reruns unrelated channel writes. Latest-stable checks remain in the Homebrew,
 loader and image publishers. AWS retains immutable per-version template publication.
 
 **Website activation is an operator gate.** The site currently has one
-`PUBLIC_GUARD_RELEASED` flag. Leave it off until native release readiness, all four Homebrew
+`PUBLIC_GUARD_RELEASED` flag. Leave it off until native release readiness, all required Homebrew
 entrypoints and official tap installation, AWS bootstrap and the published launch template,
 and the other advertised install links have actually passed. The publication code enforces
 native and per-channel gates; it does not read or enforce the website flag. Source preparation

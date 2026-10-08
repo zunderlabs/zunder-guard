@@ -57,6 +57,8 @@ macOS (x86_64 and arm64), plus Windows x86_64, are on the
 Mainnet on Linux and macOS uses the separately verified protected service installer:
 `curl -fsSL https://zunderlabs.com/i | sh -s -- --network mainnet`, including after Homebrew
 installation. Homebrew's own service is for paper rehearsal.
+macOS release rehearsals use Apple Silicon. Intel builds retain native CI tests and signed
+installer smoke checks; a separate Intel service/reboot rehearsal is not part of release qualification.
 
 On native x64 Windows, open an elevated interactive PowerShell terminal:
 
