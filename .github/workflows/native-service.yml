@@ -64,6 +64,23 @@ jobs:
           $ErrorActionPreference = 'Stop'
           & ./deploy/guard/test/windows-mainnet-policy.ps1
       - run: rustup toolchain install
+      - name: SCM argument and timeout regressions (PowerShell 7 and 5.1)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          rustc --edition=2024 deploy/guard/test/windows-scm-argv.rs -o "$env:RUNNER_TEMP/scm-argv.exe"
+          if ($LASTEXITCODE -ne 0) { throw 'Native argv recorder build failed.' }
+          & ./deploy/guard/test/windows-scm-argv.ps1 -ServicePath ./deploy/guard/windows/service.ps1 -Recorder "$env:RUNNER_TEMP/scm-argv.exe"
+          & ./deploy/guard/test/windows-wait-started.ps1
+          rustc --edition=2024 deploy/guard/test/windows-policy-fixture.rs -o "$env:RUNNER_TEMP/policy-fixture.exe"
+          if ($LASTEXITCODE -ne 0) { throw 'Policy-refusal recorder build failed.' }
+          & ./deploy/guard/test/windows-policy-refusal.ps1 -HarnessPath ./deploy/guard/test/windows-service-native.ps1 -Recorder "$env:RUNNER_TEMP/policy-fixture.exe"
+          & "$env:SystemRoot/System32/WindowsPowerShell/v1.0/powershell.exe" -NoProfile -NonInteractive -File ./deploy/guard/test/windows-scm-argv.ps1 -ServicePath ./deploy/guard/windows/service.ps1 -Recorder "$env:RUNNER_TEMP/scm-argv.exe"
+          if ($LASTEXITCODE -ne 0) { throw 'PowerShell 5.1 argv regression failed.' }
+          & "$env:SystemRoot/System32/WindowsPowerShell/v1.0/powershell.exe" -NoProfile -NonInteractive -File ./deploy/guard/test/windows-wait-started.ps1
+          if ($LASTEXITCODE -ne 0) { throw 'PowerShell 5.1 wait regression failed.' }
+          & "$env:SystemRoot/System32/WindowsPowerShell/v1.0/powershell.exe" -NoProfile -NonInteractive -File ./deploy/guard/test/windows-policy-refusal.ps1 -HarnessPath ./deploy/guard/test/windows-service-native.ps1 -Recorder "$env:RUNNER_TEMP/policy-fixture.exe"
+          if ($LASTEXITCODE -ne 0) { throw 'PowerShell 5.1 policy-refusal regression failed.' }
       - run: cargo clippy --locked -p zunder-guard --all-targets -- -D warnings
       - name: Compile native and exercise synthetic credential, ACL and process containment
         shell: pwsh
@@ -76,9 +93,26 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Elevated native ACL test failed.' }
           cargo build --locked -p zunder-guard --example windows_service_fixture
           if ($LASTEXITCODE -ne 0) { throw 'SCM fixture build failed.' }
-          & ./deploy/guard/test/windows-service-native.ps1 -Fixture ./target/debug/examples/windows_service_fixture.exe -PolicyDiagnostic ./native-service-receipt/wer-policy-pwsh.json
-          & "$env:SystemRoot/System32/WindowsPowerShell/v1.0/powershell.exe" -NoProfile -NonInteractive -File ./deploy/guard/test/windows-service-native.ps1 -Fixture ./target/debug/examples/windows_service_fixture.exe -PolicyDiagnostic ./native-service-receipt/wer-policy-ps51.json
-          if ($LASTEXITCODE -ne 0) { throw 'PowerShell 5.1 SCM fixture failed.' }
+          $ObservationStarted = [DateTimeOffset]::UtcNow
+          & ./deploy/guard/test/windows-service-native.ps1 -ObservePolicyRefusal -Fixture ./target/debug/examples/windows_service_fixture.exe -PolicyDiagnostic ./native-service-receipt/wer-policy-pwsh.json
+          & "$env:SystemRoot/System32/WindowsPowerShell/v1.0/powershell.exe" -NoProfile -NonInteractive -File ./deploy/guard/test/windows-service-native.ps1 -ObservePolicyRefusal -Fixture ./target/debug/examples/windows_service_fixture.exe -PolicyDiagnostic ./native-service-receipt/wer-policy-ps51.json
+          if ($LASTEXITCODE -ne 0) { throw 'PowerShell 5.1 SCM observation failed.' }
+          $HelperHash = (Get-FileHash ./deploy/guard/windows/service.ps1 -Algorithm SHA256).Hash.ToLowerInvariant()
+          $HarnessHash = (Get-FileHash ./deploy/guard/test/windows-service-native.ps1 -Algorithm SHA256).Hash.ToLowerInvariant()
+          $FixtureHash = (Get-FileHash ./target/debug/examples/windows_service_fixture.exe -Algorithm SHA256).Hash.ToLowerInvariant()
+          $Observations = @()
+          foreach ($Shell in @('pwsh','ps51')) {
+            $Observation = Get-Content -Raw -LiteralPath "./native-service-receipt/wer-policy-$Shell.json.admission.json" | ConvertFrom-Json
+            if ($Observation.version -ne 1 -or $Observation.invocation_id -notmatch '^[0-9a-f]{32}$' -or [DateTimeOffset]::Parse($Observation.started_utc) -lt $ObservationStarted -or [DateTimeOffset]::Parse($Observation.finished_utc) -lt [DateTimeOffset]::Parse($Observation.started_utc) -or -not $Observation.cleanup_complete -or $Observation.releaseReady -or $Observation.source_helper_sha256 -cne $HelperHash -or $Observation.harness_sha256 -cne $HarnessHash -or $Observation.fixture_sha256 -cne $FixtureHash) { throw 'Stale or inexact native observation.' }
+            if (($Shell -eq 'pwsh' -and $Observation.powershell -cne $PSVersionTable.PSVersion.ToString()) -or ($Shell -eq 'ps51' -and $Observation.powershell -notmatch '^5\.1\.')) { throw 'Native observation PowerShell binding differs.' }
+            if (($Observation.result -ceq 'positive-synthetic-lifecycle' -and $Observation.positive_lifecycle_verified -ceq $true) -or ($Observation.result -ceq 'expected-policy-refusal' -and $Observation.positive_lifecycle_verified -ceq $false)) { $Observations += $Observation } else { throw 'Unknown or inconsistent native observation.' }
+          }
+          if ($Observations[0].invocation_id -ceq $Observations[1].invocation_id) { throw 'Duplicate native observation.' }
+          $PositiveLifecycle = @($Observations | Where-Object { $_.positive_lifecycle_verified }).Count -eq 2
+          $Verified = @('machine protection round trip','immutable ACL refusal','reparse refusal','Job child and descendant termination','stdin EOF stop','framing and exact runtime config snapshot admission','independent randomized admission and lifecycle models')
+          $LifecycleChecks = @('acknowledged SCM Stop wins over transient child exit','SCM Session-0 virtual account','machine decryption under service identity','broker death containment','four transient retries','service-owned renewal/admin access','bounded runtime crash dump scan')
+          $Pending = @('broker crash artifact scan','signed production installer upgrade rollback','unattended reboot before user login')
+          if ($PositiveLifecycle) { $Verified += $LifecycleChecks } else { $Verified += 'observed hosted crash policy refused before secret admission'; $Pending += $LifecycleChecks }
           $Errors = $null
           $Tokens = $null
           [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $PWD 'deploy/guard/windows/service.ps1'),[ref]$Tokens,[ref]$Errors) | Out-Null
@@ -88,8 +122,10 @@ jobs:
             os = [Environment]::OSVersion.VersionString
             architecture = [Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()
             credentials = 'synthetic only; no venue traffic'
-            verified = @('machine protection round trip','immutable ACL refusal','reparse refusal','Job child and descendant termination','stdin EOF stop','framing and exact runtime config snapshot admission','independent randomized admission and lifecycle models','acknowledged SCM Stop wins over transient child exit','SCM Session-0 virtual account','machine decryption under service identity','broker death containment','four transient retries','service-owned renewal/admin access','bounded runtime crash dump scan')
-            pending = @('broker crash artifact scan','signed production installer upgrade rollback','unattended reboot before user login')
+            verified = $Verified
+            pending = $Pending
+            observations = $Observations
+            positive_lifecycle_verified = $PositiveLifecycle
             releaseReady = $false
           } | ConvertTo-Json -Depth 8 | Set-Content native-service-receipt/windows.json
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

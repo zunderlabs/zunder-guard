@@ -4,7 +4,8 @@
 param(
   [Parameter(Mandatory,ParameterSetName='Lifecycle')][string]$Fixture,
   [Parameter(Mandatory,ParameterSetName='PolicyOnly')][switch]$DiagnosticsOnly,
-  [Parameter(Mandatory)][string]$PolicyDiagnostic
+  [Parameter(Mandatory)][string]$PolicyDiagnostic,
+  [Parameter(ParameterSetName='Lifecycle')][switch]$ObservePolicyRefusal
 )
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
@@ -66,7 +67,66 @@ $Sid = $null
 $CreatedBases = @()
 $PreviousWer = $null
 $HadWer = $false
-function Invoke-Sc([string[]]$Words) { & $Sc @Words | Out-Host; if ($LASTEXITCODE) { throw 'SCM fixture operation failed.' } }
+$WerChanged = $false
+$ScSource = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '../windows/service.ps1'))
+$ScTokens = $null; $ScErrors = $null
+$ScAst = [System.Management.Automation.Language.Parser]::ParseFile($ScSource,[ref]$ScTokens,[ref]$ScErrors)
+if ($ScErrors.Count) { throw 'Production SCM helper parse failure.' }
+foreach ($FunctionName in @('ConvertTo-ZgNativeArgument','Invoke-ZgSc')) {
+  $Nodes = @($ScAst.FindAll({ param($Node) $Node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $Node.Name -eq $FunctionName },$true))
+  if ($Nodes.Count -ne 1) { throw 'Production SCM function missing or duplicated.' }
+  Invoke-Expression $Nodes[0].Extent.Text
+}
+$script:ZgSc = $Sc
+function Invoke-Sc([string[]]$Words) { Invoke-ZgSc $Words }
+$Admission = [ordered]@{version=1;invocation_id=[Guid]::NewGuid().ToString('N');started_utc=[DateTimeOffset]::UtcNow.ToString('o');finished_utc=$null;result='pending';positive_lifecycle_verified=$false;cleanup_complete=$false;releaseReady=$false;powershell=$PSVersionTable.PSVersion.ToString();source_helper_sha256=(Get-FileHash -LiteralPath $ScSource -Algorithm SHA256).Hash.ToLowerInvariant();fixture_sha256=(Get-FileHash -LiteralPath $Fixture -Algorithm SHA256).Hash.ToLowerInvariant();harness_sha256=(Get-FileHash -LiteralPath $PSCommandPath -Algorithm SHA256).Hash.ToLowerInvariant()}
+$Admission | ConvertTo-Json | Set-Content -LiteralPath ($PolicyDiagnostic+'.admission.json') -Encoding UTF8
+function Assert-SyntheticPolicyRefusal([string]$Executable) {
+  # Only the public fixture runs here; no configuration, credential or venue request.
+  $info = [Diagnostics.ProcessStartInfo]::new()
+  $info.FileName = $Executable
+  $info.Arguments = 'prepare-fixture'
+  $info.UseShellExecute = $false
+  $info.CreateNoWindow = $true
+  $info.RedirectStandardOutput = $true
+  $info.RedirectStandardError = $true
+  $process = [Diagnostics.Process]::new()
+  $process.StartInfo = $info
+  $started = $false
+  $clock = [Diagnostics.Stopwatch]::StartNew()
+  try {
+    $started = $process.Start()
+    if (-not $started) { throw 'Policy-refusal fixture could not start.' }
+    $streams = @(
+      @{reader=$process.StandardOutput;buffer=[char[]]::new(513);text=[Text.StringBuilder]::new()},
+      @{reader=$process.StandardError;buffer=[char[]]::new(513);text=[Text.StringBuilder]::new()}
+    )
+    foreach ($stream in $streams) { $stream.task=$stream.reader.ReadAsync($stream.buffer,0,513) }
+    if (-not $process.WaitForExit(10000)) { throw 'Policy-refusal fixture timed out.' }
+    foreach ($stream in $streams) {
+      do {
+        $remaining = 12000 - [int]$clock.ElapsedMilliseconds
+        if ($remaining -le 0 -or -not $stream.task.Wait($remaining)) { throw 'Policy-refusal output timed out.' }
+        $count = $stream.task.Result
+        if ($stream.text.Length + $count -gt 512) { throw 'Oversized policy-refusal fixture output.' }
+        if ($count -gt 0) {
+          $null = $stream.text.Append($stream.buffer,0,$count)
+          $stream.task = $stream.reader.ReadAsync($stream.buffer,0,513-$stream.text.Length)
+        }
+      } while ($count -gt 0)
+    }
+    if ($process.ExitCode -ne 1 -or $streams[0].text.Length -ne 0 -or $streams[1].text.ToString().Trim() -cne 'Error: service refused: managed WER or LocalDumps policy prevents service secret admission') {
+      throw 'Fixture did not refuse the observed crash policy at secret admission.'
+    }
+  } finally {
+    try {
+      if ($started -and -not $process.HasExited) {
+        $process.Kill()
+        if (-not $process.WaitForExit(5000)) { throw 'Policy-refusal fixture cleanup failed.' }
+      }
+    } finally { $process.Dispose() }
+  }
+}
 function Set-FixtureAcl([string]$Path, [bool]$Writable = $false, [bool]$Public = $false) {
   $Item = Get-Item -LiteralPath $Path -Force
   if ($Item.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'Reparse fixture refused.' }
@@ -85,7 +145,7 @@ function Set-FixtureAcl([string]$Path, [bool]$Writable = $false, [bool]$Public =
 function Wait-Started([int]$Count) {
   $Deadline = [DateTime]::UtcNow.AddSeconds(45)
   do {
-    $Lines = if (Test-Path -LiteralPath $Log) { @(Get-Content -LiteralPath $Log | Where-Object { $_ -match '^started \d+$' }) } else { @() }
+    $Lines = @(if (Test-Path -LiteralPath $Log) { Get-Content -LiteralPath $Log | Where-Object { $_ -match '^started \d+$' } })
     if ($Lines.Count -ge $Count) { return [int]($Lines[-1] -split ' ')[1] }
     Start-Sleep -Milliseconds 100
   } while ([DateTime]::UtcNow -lt $Deadline)
@@ -109,13 +169,27 @@ try {
   Copy-Item -LiteralPath $Fixture -Destination $Exe
   $ImagePath = '"' + $Exe + '" service run --binding "' + $Binding + '"'
   Invoke-Sc @('create',$Name,'binPath=',$ImagePath,'start=','demand','obj=',"NT SERVICE\$Name")
+  $Registered = Get-CimInstance Win32_Service -Filter "Name='$Name'"
+  if ($Registered.PathName -cne $ImagePath -or $Registered.StartName -cne "NT SERVICE\$Name") { throw 'SCM registration changed quoted executable/binding or virtual identity.' }
   $Sid = ([Security.Principal.NTAccount]::new("NT SERVICE\$Name")).Translate([Security.Principal.SecurityIdentifier]).Value
   foreach ($Path in @($Root,$Bin,$Exe)) { Set-FixtureAcl $Path }
   Set-FixtureAcl $Runtime $true
   New-Item -Path $Wer -Force | Out-Null
-  $Existing = Get-ItemProperty -LiteralPath $Wer -Name 'zunder-guard.exe' -ErrorAction SilentlyContinue
-  if ($Existing) { $PreviousWer = $Existing.'zunder-guard.exe'; $HadWer = $true }
+  $WerKey = Get-Item -LiteralPath $Wer
+  try {
+    if ($WerKey.GetValueNames() -contains 'zunder-guard.exe') {
+      if ($WerKey.GetValueKind('zunder-guard.exe') -ne [Microsoft.Win32.RegistryValueKind]::DWord) { throw 'Existing WER exclusion type refused before mutation.' }
+      $PreviousWer = $WerKey.GetValue('zunder-guard.exe'); $HadWer = $true
+    }
+  } finally { $WerKey.Dispose() }
+  $WerChanged = $true
   New-ItemProperty -LiteralPath $Wer -Name 'zunder-guard.exe' -Value 1 -PropertyType DWord -Force | Out-Null
+  if ($ObservePolicyRefusal -and @($PolicyRows | Where-Object { $_.status -eq 'present' }).Count -gt 0) {
+    Assert-SyntheticPolicyRefusal $Exe
+    $Admission.result='expected-policy-refusal'
+    Write-Host 'Observed crash policy correctly refused before fixture credential admission; positive SCM lifecycle remains pending on this host.'
+    return
+  }
   $Json = & $Exe prepare-fixture --id $Id --home $Runtime --service-name $Name --service-sid $Sid
   if ($LASTEXITCODE) { throw 'Synthetic fixture preparation failed.' }
   [IO.File]::WriteAllText($Binding,($Json -join "`n"),[Text.UTF8Encoding]::new($false)); Set-FixtureAcl $Binding
@@ -174,12 +248,24 @@ try {
   if ($NewDumps.Count) { throw 'Synthetic credential runtime crash created a dump artifact.' }
   & $Exe service remove-credential --binding $Binding; if ($LASTEXITCODE) { throw 'Stopped credential removal failed.' }
   if (Test-Path -LiteralPath $Credential) { throw 'Encrypted fixture credential remains.' }
+  $Admission.result='positive-synthetic-lifecycle'; $Admission.positive_lifecycle_verified=$true
   Write-Host 'Native SCM virtual identity, machine decryption, stdin stop, broker death containment, four transient retries, accepted Stop versus transient exit, renewal/admin ACL, bounded WER dump scan after synthetic runtime crash and credential cleanup passed.'
 } finally {
   Stop-Fixture
   if (Get-Service -Name $Name -ErrorAction SilentlyContinue) { Invoke-Sc @('delete',$Name) }
   foreach ($Path in @($Root,$Bin)) { if (Test-Path -LiteralPath $Path) { Remove-Item -LiteralPath $Path -Recurse -Force } }
   foreach ($Path in $CreatedBases) { if (Test-Path -LiteralPath $Path) { Remove-Item -LiteralPath $Path -Force } }
-  if ($HadWer) { New-ItemProperty -LiteralPath $Wer -Name 'zunder-guard.exe' -Value $PreviousWer -PropertyType DWord -Force | Out-Null }
-  elseif (Test-Path -LiteralPath $Wer) { Remove-ItemProperty -LiteralPath $Wer -Name 'zunder-guard.exe' -ErrorAction SilentlyContinue }
+  if ($WerChanged) {
+    if ($HadWer) {
+      New-ItemProperty -LiteralPath $Wer -Name 'zunder-guard.exe' -Value $PreviousWer -PropertyType DWord -Force | Out-Null
+      $Restored = Get-Item -LiteralPath $Wer
+      if ($Restored.GetValueKind('zunder-guard.exe') -ne [Microsoft.Win32.RegistryValueKind]::DWord -or $Restored.GetValue('zunder-guard.exe') -ne $PreviousWer) { throw 'WER exclusion restoration differs.' }
+    } else {
+      Remove-ItemProperty -LiteralPath $Wer -Name 'zunder-guard.exe' -ErrorAction Stop
+      if ((Get-Item -LiteralPath $Wer).GetValueNames() -contains 'zunder-guard.exe') { throw 'WER exclusion remains after cleanup.' }
+    }
+  }
+  $Admission.cleanup_complete=$true; $Admission.finished_utc=[DateTimeOffset]::UtcNow.ToString('o')
+  $Admission | ConvertTo-Json | Set-Content -LiteralPath ($PolicyDiagnostic+'.admission.json') -Encoding UTF8
+
 }

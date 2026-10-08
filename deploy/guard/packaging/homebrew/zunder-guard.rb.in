@@ -74,7 +74,9 @@ class ZunderGuard < Formula
       ZUNDER_MAINNET_CONFIRM naming the configured account; run needs the key
       from your secret manager on standard input at every start.
       brew services cannot provide that credential and remains paper-only.
-      For unattended mainnet use the Linux installer with systemd-creds.
+      For unattended mainnet use the separately verified protected installer:
+      Linux uses systemd-creds; macOS uses System Keychain and launchd.
+      Never elevate a user-writable Homebrew Cellar executable for that setup.
 
       Setup, licence activation, restart, upgrades and removal:
         https://zunderlabs.com/docs/deploy/packages/

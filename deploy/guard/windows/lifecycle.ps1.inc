@@ -3,9 +3,39 @@ function Test-ZgSamePath([string]$Left,[string]$Right) {
   if ($Right.StartsWith('\\?\')) { $Right=$Right.Substring(4) }
   return [string]::Equals([IO.Path]::GetFullPath($Left),[IO.Path]::GetFullPath($Right),[StringComparison]::OrdinalIgnoreCase)
 }
+function ConvertTo-ZgNativeArgument([string]$Value) {
+  # Windows argv quoting: double backslashes before quotes and at the quoted end.
+  if ($Value.IndexOf([char]0) -ge 0) { throw 'NUL in SCM argument refused; transaction remains pending.' }
+  $quoted = [regex]::Replace($Value,'(\\*)"','$1$1\"')
+  $quoted = [regex]::Replace($quoted,'(\\+)$','$1$1')
+  return '"'+$quoted+'"'
+}
 function Invoke-ZgSc([string[]]$Words) {
-  & $ZgSc @Words | Microsoft.PowerShell.Core\Out-Host
-  if ($LASTEXITCODE -ne 0) { throw 'SCM operation failed; transaction remains pending.' }
+  $arguments = (@(foreach ($word in $Words) { ConvertTo-ZgNativeArgument $word }) -join ' ')
+  $info = [Diagnostics.ProcessStartInfo]::new()
+  $info.FileName = $ZgSc
+  $info.Arguments = $arguments
+  $info.UseShellExecute = $false
+  $info.CreateNoWindow = $true
+  # Inherit output directly: no buffered drains or EOF waits beyond the deadline.
+  $process = [Diagnostics.Process]::new()
+  $process.StartInfo = $info
+  $started = $false
+  try {
+    $started = $process.Start()
+    if (-not $started) { throw 'SCM client could not start; transaction remains pending.' }
+    if (-not $process.WaitForExit(30000)) { throw 'SCM client timed out; transaction remains pending.' }
+    if ($process.ExitCode -ne 0) { throw 'SCM operation failed; transaction remains pending.' }
+  } finally {
+    try {
+      if ($started -and -not $process.HasExited) {
+        $process.Kill()
+        if (-not $process.WaitForExit(5000)) { throw 'SCM client did not exit after termination.' }
+      }
+    } catch {
+      throw 'SCM client cleanup failed; transaction remains pending.'
+    } finally { $process.Dispose() }
+  }
 }
 function Get-ZgService {
   $service = CimCmdlets\Get-CimInstance Win32_Service -Filter "Name='$ZgServiceName'"

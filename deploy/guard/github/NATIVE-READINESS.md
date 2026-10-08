@@ -13,6 +13,21 @@ client pairing secrets. A maintainer uploads the completed report and adopts its
 as their own attestation; the verifier labels this **operator-attested native rehearsal**.
 GitHub uploader identity and software signatures do not cryptographically prove a reboot.
 
+## Candidate Windows coverage
+
+Hosted Windows runners can carry an existing `LocalDumps` policy that production service
+admission deliberately refuses. Candidate CI records that exact refusal before fixture
+setup, with no credentials admitted, and reports `positive_lifecycle_verified=false`.
+It also runs native unit, ACL, argument-preservation and timeout tests under PowerShell 7
+and Windows PowerShell 5.1. The workflow credits positive synthetic SCM lifecycle checks
+only when both shells actually complete them and their source-bound cleanup receipts agree.
+It does not remove or rename managed crash-policy keys to obtain a passing job.
+
+A clean disposable owned Windows machine supplies separate positive synthetic lifecycle
+evidence. Neither environment proves the signed customer installer, actual account/licence
+readiness, unattended reboot or pre-login readiness. Those observations below remain
+mandatory before promotion; a green candidate workflow does not close them.
+
 ## Collect and upload
 
 1. Authenticate existing human `gh` access to `github.com`. The report uploader must currently
@@ -171,14 +186,30 @@ credentials. It rechecks native evidence too. The shared verified Actions artifa
 only release bytes and public source/evidence bindings, including the hidden source marker.
 
 If publishing variables are enabled before evidence exists, only the corresponding channel
-job fails. After uploading genuine evidence, rerun that specific failed job from the existing
-publish run, not the entire release pipeline: `gh run rerun RUN_ID --job JOB_ID --repo
-zunderlabs/zunder-guard`. GitHub's job rerun includes dependent jobs, and these channel jobs
-have none. Check its result and current artifact availability. Enabling a previously disabled
-variable does not schedule publication: request a rerun of that specific skipped job and
-confirm GitHub actually starts it with the variable enabled. If it stays skipped or the
-verified artifact has expired, stop and repair the scoped publication run; do not republish
-Guard merely to trigger every channel again. No channel success is inferred from a skip.
+job fails. After uploading genuine evidence, rerun that specific failed job while its verified
+artifact remains available: `gh run rerun RUN_ID --job JOB_ID --repo zunderlabs/zunder-guard`.
+
+For previously skipped jobs or expired artifacts, dispatch a fresh, scoped run on the exact
+public release tag. That tag must contain this recovery-capable workflow, also present on the
+default branch for GitHub to offer dispatch. It does not publish or alter the release:
+
+```sh
+gh workflow run publish.yml --repo zunderlabs/zunder-guard --ref v1.0.0 -f channel=homebrew
+```
+
+Other choices are `aws-template`, `installers` and `latest`. The selected channel's existing
+enable variable, protected environment and scoped permissions still apply. Winget is excluded
+from recovery and remains deferred. Branch refs, drafts, prereleases and malformed tags fail
+before verification. Each fresh run repeats successful exact-source CI/release checks,
+signatures, provenance and native attestation into a new artifact; Homebrew/AWS recheck their
+channel attestation before publishing. No expired artifact or skipped check is accepted as
+proof. Inspect the selected job: a disabled variable still means it did not publish. Every product-source checkout uses the immutable event commit, checks HEAD before executing
+release tooling, and compares the authenticated release source marker with that same commit.
+A branch sharing the tag name cannot supply publisher code; a moved or mismatched source fails.
+
+Only the selected channel runs after verification; recovery never republishes the release
+or reruns unrelated channel writes. Latest-stable checks remain in the Homebrew, canonical
+loader and image publishers. AWS retains immutable per-version template publication.
 
 **Website activation is an operator gate.** The site currently has one
 `PUBLIC_GUARD_RELEASED` flag. Leave it off until native release readiness, all four Homebrew

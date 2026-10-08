@@ -24,6 +24,9 @@ default branch. The formula is added by the product's release workflow, not hand
    serialized, rejects versions older than the current formula, and both publisher and tap
    CI require the latest stable release. Permit the App to create release branches and
    PRs. The workflow must already exist on the tap default branch before its first formula PR.
+   Every PR triggers the four required jobs, including documentation-only changes. An empty
+   bootstrap is explicitly classified as untested; deleting an existing formula fails.
+   Once a formula exists, all PRs run the signed formula and native lifecycle checks.
 3. Publish the fully gated signed release. `publish.yml` first runs `verify-release.sh`, which
    checks successful CI and release runs at the exact commit, the checksum signature,
    every asset, SLSA provenance and immutable image signature/provenance. If any check fails,
@@ -41,14 +44,17 @@ default branch. The formula is added by the product's release workflow, not hand
 5. Review and merge the passing PR. Record the tag, product commit, tap commit, formula hash
    and native CI URL. Then run the lifecycle checks below. Enabling the variable after the
    event does not replay publication; rerun the failed/skipped publication as appropriate,
-   or use the verified manual recovery path. Reruns reuse the release branch and open PR,
+   or dispatch `publish.yml` on the exact published tag with `channel=homebrew` for fresh
+   verification (see `github/NATIVE-READINESS.md`), or use the verified manual recovery path. Reruns reuse the release branch and open PR,
    never force-push, and no-op if the default branch already holds the exact signed formula.
 
-The initial/recovery manual path uses the same gate, with existing authorized GitHub access:
+The initial/recovery manual path requires both native and Homebrew channel evidence, with existing authorized GitHub access:
 
 ```sh
 GITHUB_REPOSITORY=zunderlabs/zunder-guard \
   bash deploy/guard/github/verify-release.sh vX.Y.Z /absolute/path/to/new-verified-release
+GITHUB_REPOSITORY=zunderlabs/zunder-guard \
+  python3 -B deploy/guard/github/native-readiness.py verify vX.Y.Z /absolute/path/to/new-verified-release --channel homebrew
 ```
 
 Use the verifier's documented tools (`gh`, `cosign`, `slsa-verifier`, `jq`, GNU checksum tools).

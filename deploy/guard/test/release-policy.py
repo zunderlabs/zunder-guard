@@ -552,6 +552,187 @@ class ImagePublication(unittest.TestCase):
             self.assertEqual(json.loads((root/'call').read_text()),
                              ['buildx', 'imagetools', 'create', '-t', 'ghcr.io/zunderlabs/zunder-guard:latest', REF])
 
+class DistributionRecovery(unittest.TestCase):
+    def setUp(self):
+        self.workflow = yaml.safe_load((SCRIPT.parent / 'workflows/publish.yml').read_text())
+        self.jobs = self.workflow['jobs']
+        self.tap = yaml.safe_load((SCRIPT.parent.parent / 'packaging/homebrew/tap-verify.yml').read_text())
+
+    def test_recovery_selects_one_existing_channel_and_fresh_verification(self):
+        events = self.workflow.get('on', self.workflow.get(True))
+        self.assertEqual(events['workflow_dispatch']['inputs']['channel']['options'],
+                         ['homebrew', 'aws-template', 'installers', 'latest'])
+        for name in ['homebrew', 'aws-template', 'installers', 'latest']:
+            job = self.jobs[name]
+            self.assertEqual(job['needs'], 'verify')
+            self.assertIn("github.event_name == 'release'", job['if'])
+            self.assertIn("inputs.channel == '" + name + "'", job['if'])
+            for other in {'homebrew', 'aws-template', 'installers', 'latest'} - {name}:
+                self.assertNotIn("inputs.channel == '" + other + "'", job['if'])
+            self.assertNotIn('always(', job['if'])
+        self.assertEqual(self.jobs['winget']['if'], "github.event_name == 'release' && vars.WINGET == 'enabled'")
+        verify = self.jobs['verify']['steps']
+        self.assertIn('exact public stable release', verify[0]['name'])
+        self.assertTrue(any('bash deploy/guard/github/verify-release.sh "$TAG" rel' in s.get('run', '') for s in verify))
+        self.assertFalse(any('download-artifact@' in s.get('uses', '') for s in verify))
+        for job in self.jobs.values():
+            for step in job.get('steps', []):
+                if 'actions/checkout@' in step.get('uses', '') and step.get('with', {}).get('repository') is None:
+                    self.assertEqual(step['with']['ref'], '${{ github.sha }}')
+        self.assertEqual(self.jobs['aws-template']['environment'], 'aws-template-publish')
+        self.assertEqual(self.jobs['installers']['environment'], 'installer-publish')
+
+    def test_source_binding_precedes_execution_and_write_credentials(self):
+        verify = self.jobs['verify']['steps']
+        check = next(s for s in verify if 'verify-release.sh' in s.get('run', ''))
+        self.assertEqual(check['env']['SOURCE_SHA'], '${{ github.sha }}')
+        self.assertLess(check['run'].index('git rev-parse HEAD'), check['run'].index('bash deploy/guard'))
+        self.assertLess(check['run'].index('bash deploy/guard'), check['run'].index('jq -e'))
+        for name in ['homebrew', 'aws-template', 'installers']:
+            steps = self.jobs[name]['steps']
+            binding = next(s for s in steps if s.get('name') == 'Bind verified release source to immutable checkout')
+            self.assertEqual(binding['env']['SOURCE_SHA'], '${{ github.sha }}')
+            bind_at = steps.index(binding)
+            self.assertTrue(any('download-artifact@' in s.get('uses', '') for s in steps[:bind_at]))
+            for index, step in enumerate(steps):
+                if ('--channel ' in step.get('run', '') or 'publish-loaders.py' in step.get('run', '') or
+                        'create-github-app-token@' in step.get('uses', '') or
+                        'configure-aws-credentials@' in step.get('uses', '')):
+                    self.assertLess(bind_at, index)
+
+    def test_same_named_branch_cannot_supply_verified_checkout_source(self):
+        verify = next(s for s in self.jobs['verify']['steps'] if 'verify-release.sh' in s.get('run', ''))
+        binding = next(s for s in self.jobs['aws-template']['steps']
+                       if s.get('name') == 'Bind verified release source to immutable checkout')
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            def git(*args):
+                return subprocess.check_output(['git', *args], cwd=root, stderr=subprocess.DEVNULL, text=True).strip()
+            git('init', '-q')
+            (root/'README.md').write_text('trusted tag source\n')
+            git('add', '.')
+            git('-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '-qm', 'trusted')
+            source = git('rev-parse', 'HEAD'); git('tag', TAG)
+            git('switch', '-c', TAG)
+            (root/'README.md').write_text('same-name branch source\n')
+            git('add', '.')
+            git('-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '-qm', 'branch')
+            other = git('rev-parse', 'HEAD')
+            self.assertNotEqual(source, other)
+            self.assertEqual(git('rev-parse', 'refs/tags/' + TAG), source)
+            self.assertEqual(git('rev-parse', 'refs/heads/' + TAG), other)
+            # Model the pinned checkout's immutable SHA input, not an ambiguous short ref.
+            git('checkout', '--detach', source)
+            fixture = root/'deploy/guard/github/verify-release.sh'
+            fixture.parent.mkdir(parents=True)
+            fixture.write_text('#!/bin/sh\nset -eu\nmkdir -p rel\nprintf x > verifier-called\n'
+                               'printf \'{"tag":"%s","source":"%s"}\\n\' "$TAG" "$TEST_SOURCE" > rel/.verified-release-source.json\n')
+            env = dict(os.environ, SOURCE_SHA=source, TEST_SOURCE=source, TAG=TAG)
+            for script in [verify['run'], binding['run']]:
+                result = subprocess.run(['bash', '-c', script], cwd=root, env=env, capture_output=True, text=True)
+                self.assertEqual(result.returncode, 0, result.stderr)
+            # A verifier authenticated a different commit: neither producer nor consumer admits it.
+            result = subprocess.run(['bash', '-c', verify['run']], cwd=root,
+                                    env=dict(env, TEST_SOURCE=other), capture_output=True, text=True)
+            self.assertNotEqual(result.returncode, 0)
+            result = subprocess.run(['bash', '-c', binding['run']], cwd=root, env=env, capture_output=True, text=True)
+            self.assertNotEqual(result.returncode, 0)
+            # Even a matching-looking marker cannot authorize executing the wrong checkout.
+            git('checkout', '--detach', other)
+            (root/'verifier-called').unlink()
+            for script in [verify['run'], binding['run']]:
+                result = subprocess.run(['bash', '-c', script], cwd=root, env=env, capture_output=True, text=True)
+                self.assertNotEqual(result.returncode, 0)
+            self.assertFalse((root/'verifier-called').exists())
+
+    def test_dispatch_admission_executes_and_refuses_invalid_release_or_ref(self):
+        step = self.jobs['verify']['steps'][0]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            gh = root / 'gh'
+            gh.write_text('#!/usr/bin/env python3\nimport os\nprint(os.environ["RELEASE_JSON"])\n')
+            gh.chmod(0o755)
+            env = dict(os.environ, PATH=str(root) + os.pathsep + os.environ['PATH'],
+                       TAG=TAG, EVENT='workflow_dispatch', REF_TYPE='tag', CHANNEL='homebrew',
+                       GITHUB_REPOSITORY='zunderlabs/zunder-guard')
+            base = {'tag_name': TAG, 'draft': False, 'prerelease': False}
+            cases = [({}, {}, True), ({'REF_TYPE': 'branch'}, {}, False),
+                     ({'CHANNEL': 'winget'}, {}, False), ({'TAG': 'main'}, {}, False),
+                     ({}, {'tag_name': 'v9.0.0'}, False), ({}, {'draft': True}, False),
+                     ({}, {'prerelease': True}, False), ({}, {'draft': None}, False),
+                     ({'EVENT': 'release', 'CHANNEL': ''}, {}, True)]
+            for change, release, succeeds in cases:
+                with self.subTest(change=change, release=release):
+                    result = subprocess.run(['bash', '-c', step['run']], cwd=root,
+                        env=dict(env, **change, RELEASE_JSON=json.dumps(dict(base, **release))),
+                        capture_output=True, text=True)
+                    self.assertEqual(result.returncode == 0, succeeds, result.stderr)
+
+    def test_tap_all_prs_keep_four_checks_and_gate_every_install_step(self):
+        events = self.tap.get('on', self.tap.get(True))
+        self.assertIsNone(events['pull_request'])
+        self.assertEqual(events['push'], {'branches': ['main']})
+        job = self.tap['jobs']['verified-native-install']
+        self.assertEqual(job['strategy']['matrix']['os'],
+                         ['macos-15', 'macos-15-intel', 'ubuntu-24.04', 'ubuntu-24.04-arm'])
+        steps = job['steps']
+        self.assertEqual(steps[0]['with']['fetch-depth'], 0)
+        self.assertEqual(steps[1]['id'], 'scope')
+        self.assertEqual(steps[1]['env']['BASE_SHA'], '${{ github.event.pull_request.base.sha || github.event.before }}')
+        for step in steps[2:]:
+            self.assertEqual(step['if'], "steps.scope.outputs.formula == 'true'")
+        self.assertIn('no formula installation was tested', steps[1]['run'])
+
+    def test_tap_admission_runs_against_real_git_base_and_head(self):
+        script = self.tap['jobs']['verified-native-install']['steps'][1]['run']
+        cases = [('bootstrap docs', False, 'absent', True, False),
+                 ('formula first PR', False, 'file', True, True),
+                 ('formula docs PR', True, 'file', True, True),
+                 ('formula deletion', True, 'absent', False, False),
+                 ('formula directory', False, 'directory', False, False),
+                 ('formula symlink', False, 'symlink', False, False),
+                 ('missing base commit', False, 'missing-base', False, False),
+                 ('first push', False, 'zero-base', True, False),
+                 ('invalid base', False, 'invalid-base', False, False)]
+        for label, had_formula, head, succeeds, tested in cases:
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                def git(*args):
+                    return subprocess.check_output(['git', *args], cwd=root, stderr=subprocess.DEVNULL, text=True).strip()
+                git('init', '-q')
+                (root/'README.md').write_text('fixture\n')
+                (root/'Formula').mkdir()
+                formula = root/'Formula/zunder-guard.rb'
+                if had_formula: formula.write_text('base formula\n')
+                git('add', '.')
+                git('-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid',
+                    'commit', '-qm', 'fixture')
+                base = git('rev-parse', 'HEAD')
+                if formula.exists(): formula.unlink()
+                if head == 'file': formula.write_text('candidate formula\n')
+                if head == 'directory': formula.mkdir()
+                if head == 'symlink': formula.symlink_to('../README.md')
+                if head == 'missing-base': base = 'f' * 40
+                if head == 'zero-base': base = '0' * 40
+                if head == 'invalid-base': base = 'main'
+                output, summary = root/'output', root/'summary'
+                result = subprocess.run(['bash', '-c', script], cwd=root,
+                    env=dict(os.environ, BASE_SHA=base, GITHUB_OUTPUT=str(output), GITHUB_STEP_SUMMARY=str(summary)),
+                    capture_output=True, text=True)
+                self.assertEqual(result.returncode == 0, succeeds, result.stderr)
+                if succeeds:
+                    self.assertEqual(output.read_text(), 'formula=' + str(tested).lower() + '\n')
+                    self.assertEqual(summary.exists(), not tested)
+                else:
+                    self.assertFalse(output.exists())
+
+    def test_manual_recovery_requires_channel_gate_before_formula_copy(self):
+        source = (SCRIPT.parent.parent / 'packaging/homebrew/README.md').read_text()
+        manual = source.split('The initial/recovery manual path', 1)[1]
+        self.assertLess(manual.index('verify-release.sh'), manual.index('--channel homebrew'))
+        self.assertLess(manual.index('--channel homebrew'), manual.index('Copy only the verified'))
+
+
 
 if __name__ == '__main__':
     unittest.main()
