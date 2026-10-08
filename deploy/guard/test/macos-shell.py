@@ -36,7 +36,7 @@ class MacShellTests(unittest.TestCase):
             self.assertEqual(data['ProgramArguments'], ['/safe/broker', 'service', 'run', '--binding', '/safe/binding.json'])
             self.assertEqual(data['HardResourceLimits']['Core'], 0)
 
-    def installer_tail(self, reject_plist=False):
+    def installer_tail(self, reject_plist=False, same_release=False):
         # Execute the newly reachable tail. Every privileged utility is a stub;
         # only relative files in the temporary fixture can be renamed.
         block = INSTALL[INSTALL.index('cat >"$plist_next" <<PLIST'):]
@@ -45,7 +45,7 @@ class MacShellTests(unittest.TestCase):
             Path(directory, 'active.json').write_text('old binding')
             setup = '''plist_next=next.plist; plist=active.plist; label=com.example.fixture
 exe=/safe/broker; active_next=next.json; active=active.json
-service_user=_fixture; account=synthetic; home=/safe/home
+service_user=_fixture; account=synthetic; home=/safe/home; same_release=SAME_RELEASE
 chown() { printf 'chown\\n' >> calls; }
 chmod() { printf 'chmod\\n' >> calls; }
 plutil() { printf 'plutil\\n' >> calls; return REJECT; }
@@ -58,17 +58,17 @@ mv() {
   command mv "$@"
 }
 fail() { exit 2; }
-'''.replace('REJECT', '1' if reject_plist else '0')
+'''.replace('REJECT', '1' if reject_plist else '0').replace('SAME_RELEASE', '1' if same_release else '0')
             result = run(setup + block, directory)
             binding = Path(directory, 'active.json').read_text()
             calls = Path(directory, 'calls').read_text() if Path(directory, 'calls').exists() else ''
             plist = Path(directory, 'active.plist')
             if not reject_plist:
                 self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertEqual(binding, 'new binding')
+                self.assertEqual(binding, 'old binding' if same_release else 'new binding')
                 self.assertEqual(plistlib.loads(plist.read_bytes())['Label'], 'com.example.fixture')
                 self.assertTrue(calls.startswith('chown\nchmod\nplutil\n'))
-                self.assertEqual(calls.count('rename\n'), 2)
+                self.assertEqual(calls.count('rename\n'), 1 if same_release else 2)
                 self.assertIn('nothing was started', result.stdout)
             else:
                 self.assertNotEqual(result.returncode, 0)
@@ -79,8 +79,121 @@ fail() { exit 2; }
     def test_installer_tail_promotes_binding_and_plist_only_after_validation(self):
         self.installer_tail()
 
+    def test_same_release_tail_preserves_active_binding_and_only_replaces_validated_plist(self):
+        self.installer_tail(same_release=True)
+
     def test_installer_tail_validation_failure_preserves_prior_binding(self):
         self.installer_tail(reject_plist=True)
+
+    def reinstall_admission(self, scenario):
+        # Execute the actual installer admission branch. The broker and root
+        # ownership/Keychain checks are conspicuous synthetic stubs; these tests
+        # prove shell control flow and preservation, never native readiness.
+        block = fragment(INSTALL, 'next="$base/bindings/$sha.json"', '# Constant paths and hex release hash only:')
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            (base / 'bindings').mkdir()
+            broker = base / 'broker'
+            broker.write_text('''#!/bin/sh
+printf '%s\\n' "$*" >> "$FIXTURE_CALLS"
+case "$*" in *"service check"*) [ "${CHECK_FAIL:-0}" = 0 ] || exit 29 ;; esac
+case "$*" in *"service prepare"*) printf '{}\\n' ;; esac
+''')
+            broker.chmod(0o755)
+            import hashlib
+            import json
+            import shlex
+            sha = hashlib.sha256(broker.read_bytes()).hexdigest()
+            active = base / 'bindings/active.json'
+            versioned = base / ('bindings/' + sha + '.json')
+            active_data = {'executable': str(broker), 'executable_sha256': sha,
+                           'admission_config_sha256': 'explicit-current-readmission'}
+            if scenario == 'wrong_executable_hash':
+                active_data['executable_sha256'] = '0' * 64
+            if scenario in ('alternate_executable', 'different_release'):
+                copy = base / 'other-broker'
+                copy.write_bytes(broker.read_bytes() + (b'\n# synthetic prior version\n' if scenario == 'different_release' else b''))
+                copy.chmod(0o755)
+                active_data['executable'] = str(copy)
+                if scenario == 'different_release': active_data['executable_sha256'] = hashlib.sha256(copy.read_bytes()).hexdigest()
+            if scenario not in ('first_install', 'orphan_versioned'):
+                active.write_text(json.dumps(active_data))
+            if scenario not in ('first_install', 'missing_versioned', 'different_release', 'wrong_executable_hash'):
+                versioned.write_text('synthetic original immutable admission\n')
+            if scenario == 'symlink_active':
+                active.unlink()
+                active.symlink_to(versioned)
+            if scenario == 'symlink_versioned':
+                versioned.unlink()
+                versioned.symlink_to(active)
+            before = {path.name: path.read_bytes() for path in (active, versioned) if path.is_file()}
+            setup = '\n'.join([
+                'base=' + shlex.quote(str(base)), 'exe=' + shlex.quote(str(broker)),
+                'active=' + shlex.quote(str(active)), 'sha=' + sha,
+                'home=/synthetic/home; uid=450; gid=450; account=synthetic',
+                'export FIXTURE_CALLS=' + shlex.quote(str(base / 'calls')),
+                'export CHECK_FAIL=' + ('1' if scenario == 'credential_refused' else '0'),
+                '''fail() { printf '%s\\n' "$*" >&2; exit 2; }
+trusted() {
+  [ -e "$1" ] && [ ! -L "$1" ] || fail 'synthetic trusted-path refusal'
+  [ "${REJECT_TRUST:-}" != "$1" ] || fail 'synthetic ownership refusal'
+}
+plutil() { python3 -c 'import json,sys; print(json.load(open(sys.argv[2]))[sys.argv[1]])' "$2" "$6"; }
+install() { printf 'pointer-copy\\n' >> "$FIXTURE_CALLS"; cp "$7" "$8"; }
+''',
+                'REJECT_TRUST=' + (shlex.quote(str(active)) if scenario == 'untrusted_active' else ''),
+            ])
+            result = run(setup + '\n' + block + "\nprintf '%s\\n' admitted\n", directory)
+            calls = (base / 'calls').read_text() if (base / 'calls').exists() else ''
+            if scenario in ('same_release', 'first_install', 'different_release'):
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout, 'admitted\n')
+            else:
+                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+            for name, content in before.items():
+                self.assertEqual((base / 'bindings' / name).read_bytes(), content)
+            if scenario == 'same_release':
+                self.assertIn('service check --binding ' + str(active), calls)
+                self.assertNotIn('service prepare', calls)
+                self.assertNotIn('service provision', calls)
+                self.assertNotIn('migrate-credential', calls)
+                self.assertNotIn('pointer-copy', calls)
+                self.assertFalse((base / 'bindings/.active-next.json').exists())
+            elif scenario == 'first_install':
+                self.assertIn('service prepare', calls)
+                self.assertIn('service provision', calls)
+                self.assertIn('service check --binding ' + str(versioned), calls)
+                self.assertIn('pointer-copy', calls)
+            elif scenario == 'different_release':
+                self.assertIn('service prepare', calls)
+                self.assertIn('migrate-credential', calls)
+                self.assertNotIn('service provision', calls)
+                self.assertIn('service check --binding ' + str(versioned), calls)
+                self.assertIn('pointer-copy', calls)
+            elif scenario == 'credential_refused':
+                self.assertIn('service check --binding ' + str(active), calls)
+                self.assertNotIn('pointer-copy', calls)
+                self.assertNotIn('migrate-credential', calls)
+            else:
+                self.assertEqual(calls, '')
+
+    def test_same_signed_release_reuses_active_admission_and_preserves_bindings(self):
+        self.reinstall_admission('same_release')
+
+    def test_same_release_credential_refusal_preserves_bindings(self):
+        self.reinstall_admission('credential_refused')
+
+    def test_reinstall_invalid_existing_authority_refused_before_key_read(self):
+        for scenario in ('wrong_executable_hash', 'alternate_executable', 'missing_versioned',
+                         'symlink_active', 'symlink_versioned', 'untrusted_active', 'orphan_versioned'):
+            with self.subTest(scenario=scenario):
+                self.reinstall_admission(scenario)
+
+    def test_different_release_retains_existing_migration_path(self):
+        self.reinstall_admission('different_release')
+
+    def test_first_install_still_prepares_provisions_and_checks_new_binding(self):
+        self.reinstall_admission('first_install')
 
     def test_installer_conjunction_guards_reject_either_failed_condition(self):
         # Execute each real guard without privilege. Every acceptable combination

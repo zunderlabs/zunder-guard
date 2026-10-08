@@ -1,6 +1,6 @@
 # Windows mainnet installation candidate
 
-This verified machine-service path is prepared for the first signed v1.0.0 release. It is not yet a native-tested released installer. Do not replace already signed/versioned assets. Publication requires independent code review, Windows 5.1/7 tests, the native service checks and released-image install/upgrade proof. Pre-login reboot is a separate gate.
+This verified machine-service path is prepared for the first signed v1.0.1 release. It is not yet a native-tested released installer. Do not replace already signed/versioned assets. Publication requires independent code review, Windows 5.1/7 tests, the native service checks and released-image install/upgrade proof. Pre-login reboot is a separate gate.
 
 Open an elevated, trusted Windows PowerShell console explicitly, then run the verified published loader:
 

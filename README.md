@@ -37,9 +37,9 @@ Read it first if you prefer: `curl -fsSLO https://zunderlabs.com/i && less i && 
 Docker paper rehearsal (`linux/amd64`, `linux/arm64`):
 
 ```sh
-docker run -it --rm --log-driver=none -v zunder-guard:/data ghcr.io/zunderlabs/zunder-guard:v1.0.0 init --interactive --network paper --rules zr1_…
+docker run -it --rm --log-driver=none -v zunder-guard:/data ghcr.io/zunderlabs/zunder-guard:v1.0.1 init --interactive --network paper --rules zr1_…
 docker run -d --name zunder-guard --init --restart unless-stopped -v zunder-guard:/data \
-  -e ZUNDER_GUARD_LISTEN=0.0.0.0:8547 -p 127.0.0.1:8547:8547 ghcr.io/zunderlabs/zunder-guard:v1.0.0
+  -e ZUNDER_GUARD_LISTEN=0.0.0.0:8547 -p 127.0.0.1:8547:8547 ghcr.io/zunderlabs/zunder-guard:v1.0.1
 ```
 
 After a testnet setup add `-e ZUNDER_GUARD_NETWORK=testnet`: Guard sends only where it is told
@@ -78,7 +78,7 @@ AI agents: `zunder-guard mcp` is an MCP server with guarded trading tools (`docs
 ## Verify a release
 
 ```sh
-V=v1.0.0; R=https://github.com/zunderlabs/zunder-guard/releases/download/$V
+V=v1.0.1; R=https://github.com/zunderlabs/zunder-guard/releases/download/$V
 curl -fsSLO "$R/SHA256SUMS" -O "$R/SHA256SUMS.sigstore.json" -O "$R/zunder-guard-$V-linux-amd64.tar.gz"
 cosign verify-blob --bundle SHA256SUMS.sigstore.json \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com \
@@ -91,9 +91,9 @@ Every release also carries SBOMs (SPDX and CycloneDX) and SLSA provenance; the i
 the same way. The Linux binaries are reproducible:
 
 ```sh
-git checkout v1.0.0
+git checkout v1.0.1
 docker buildx build -f deploy/guard/Dockerfile --target bin-build --platform linux/amd64 -o out .
-sha256sum out/zunder-guard   # equals the binary in zunder-guard-v1.0.0-linux-amd64.tar.gz
+sha256sum out/zunder-guard   # equals the binary in zunder-guard-v1.0.1-linux-amd64.tar.gz
 ```
 
 ## Build and test from source

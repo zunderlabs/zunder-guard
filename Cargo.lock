@@ -2774,7 +2774,7 @@ checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
 
 [[package]]
 name = "zunder-core"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "rust_decimal",
  "serde",
@@ -2782,7 +2782,7 @@ dependencies = [
 
 [[package]]
 name = "zunder-guard"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -2828,7 +2828,7 @@ dependencies = [
 
 [[package]]
 name = "zunder-guard-core"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "base64 0.22.1",
  "ed25519-dalek",
@@ -2846,7 +2846,7 @@ dependencies = [
 
 [[package]]
 name = "zunder-guard-mcp"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -2866,7 +2866,7 @@ dependencies = [
 
 [[package]]
 name = "zunder-guard-rules"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "base64 0.22.1",
  "rust_decimal",
@@ -2878,7 +2878,7 @@ dependencies = [
 
 [[package]]
 name = "zunder-redteam"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -2895,7 +2895,7 @@ dependencies = [
 
 [[package]]
 name = "zunder-risk"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "rust_decimal",
  "serde",
@@ -2906,7 +2906,7 @@ dependencies = [
 
 [[package]]
 name = "zunder-venue"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "proptest",
  "reqwest",
