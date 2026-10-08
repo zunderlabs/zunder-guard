@@ -1,12 +1,55 @@
 # Disposable hosted Windows runner only. Exercises production broker/DPAPI/ACL/Job
 # code with a non-shipped fixture binary that cannot start Guard or contact a venue.
-[CmdletBinding()]
-param([Parameter(Mandatory)][string]$Fixture)
+[CmdletBinding(DefaultParameterSetName='Lifecycle')]
+param(
+  [Parameter(Mandatory,ParameterSetName='Lifecycle')][string]$Fixture,
+  [Parameter(Mandatory,ParameterSetName='PolicyOnly')][switch]$DiagnosticsOnly,
+  [Parameter(Mandatory)][string]$PolicyDiagnostic
+)
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
-if ($env:GITHUB_ACTIONS -ne 'true' -or $env:RUNNER_OS -ne 'Windows') { throw 'Hosted native CI only.' }
+if ($env:GITHUB_ACTIONS -ne 'true' -or $env:RUNNER_OS -ne 'Windows' -or $env:RUNNER_ENVIRONMENT -ne 'github-hosted') { throw 'Hosted native CI only.' }
 $Principal = [Security.Principal.WindowsPrincipal]::new([Security.Principal.WindowsIdentity]::GetCurrent())
 if (-not $Principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { throw 'Elevated runner required.' }
+# Read-only metadata for exactly the four Registry64 keys admission checks.
+# Never inspect values/subkeys or print exception text. HKCU here is the elevated
+# runner's hive; this is not a claim about the virtual service account's hive.
+$PolicyPaths = @(
+  'SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps',
+  'SOFTWARE\Policies\Microsoft\Windows\Windows Error Reporting'
+)
+$PolicyRows = @(
+  foreach ($Hive in @([Microsoft.Win32.RegistryHive]::LocalMachine, [Microsoft.Win32.RegistryHive]::CurrentUser)) {
+    foreach ($PolicyPath in $PolicyPaths) {
+      $BaseKey = $null
+      $PolicyKey = $null
+      $State = 'unreadable'
+      try {
+        $BaseKey = [Microsoft.Win32.RegistryKey]::OpenBaseKey($Hive, [Microsoft.Win32.RegistryView]::Registry64)
+        $PolicyKey = $BaseKey.OpenSubKey($PolicyPath, $false)
+        # OpenSubKey can return null for errors too; this does not prove absence.
+        $State = if ($null -eq $PolicyKey) { 'absent-or-unreadable' } else { 'present' }
+      } catch {
+        $State = 'unreadable'
+      } finally {
+        if ($null -ne $PolicyKey) { $PolicyKey.Dispose() }
+        if ($null -ne $BaseKey) { $BaseKey.Dispose() }
+      }
+      [ordered]@{ hive = $Hive.ToString(); path = $PolicyPath; view = 'Registry64'; status = $State }
+    }
+  }
+)
+$PolicyJson = [ordered]@{
+  version = 1
+  scope = 'read-only key existence; elevated runner identity; not readiness evidence'
+  keys = $PolicyRows
+} | ConvertTo-Json -Depth 4
+if ($PolicyRows.Count -ne 4 -or $PolicyJson.Length -gt 4096) { throw 'Invalid policy diagnostic shape.' }
+[IO.File]::WriteAllText($PolicyDiagnostic, $PolicyJson, [Text.UTF8Encoding]::new($false))
+# Parameter-set selection guarantees PolicyOnly cannot fall through, even with
+# an explicitly false switch value. Metadata is not a readiness verdict.
+if ($PSCmdlet.ParameterSetName -eq 'PolicyOnly') { return }
+# Continue unchanged: production admission must still refuse any present policy.
 $Id = 'ci-' + [Guid]::NewGuid().ToString('N')
 $Name = "ZunderGuard-$Id"
 $DataBase = Join-Path ([Environment]::GetFolderPath('CommonApplicationData')) 'ZunderGuard'

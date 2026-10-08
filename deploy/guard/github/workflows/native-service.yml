@@ -11,6 +11,35 @@ concurrency:
   group: native-service-candidate-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: false
 jobs:
+  windows-policy-diagnostics:
+    name: Windows policy observation (${{ matrix.runner }})
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [windows-2025, windows-2022]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Observe policy keys only (PowerShell 7; no fixture or Rust build)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & ./deploy/guard/test/windows-service-native.ps1 -DiagnosticsOnly -PolicyDiagnostic "$env:RUNNER_TEMP/wer-policy-pwsh.json"
+      - name: Observe policy keys only (PowerShell 5.1; no fixture or Rust build)
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & ./deploy/guard/test/windows-service-native.ps1 -DiagnosticsOnly -PolicyDiagnostic "$env:RUNNER_TEMP/wer-policy-ps51.json"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: windows-policy-${{ matrix.runner }}-${{ github.sha }}
+          path: ${{ runner.temp }}/wer-policy-*.json
+          if-no-files-found: warn
+
   windows:
     name: windows-service-native
     runs-on: windows-2025
@@ -47,8 +76,8 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Elevated native ACL test failed.' }
           cargo build --locked -p zunder-guard --example windows_service_fixture
           if ($LASTEXITCODE -ne 0) { throw 'SCM fixture build failed.' }
-          & ./deploy/guard/test/windows-service-native.ps1 -Fixture ./target/debug/examples/windows_service_fixture.exe
-          & "$env:SystemRoot/System32/WindowsPowerShell/v1.0/powershell.exe" -NoProfile -NonInteractive -File ./deploy/guard/test/windows-service-native.ps1 -Fixture ./target/debug/examples/windows_service_fixture.exe
+          & ./deploy/guard/test/windows-service-native.ps1 -Fixture ./target/debug/examples/windows_service_fixture.exe -PolicyDiagnostic ./native-service-receipt/wer-policy-pwsh.json
+          & "$env:SystemRoot/System32/WindowsPowerShell/v1.0/powershell.exe" -NoProfile -NonInteractive -File ./deploy/guard/test/windows-service-native.ps1 -Fixture ./target/debug/examples/windows_service_fixture.exe -PolicyDiagnostic ./native-service-receipt/wer-policy-ps51.json
           if ($LASTEXITCODE -ne 0) { throw 'PowerShell 5.1 SCM fixture failed.' }
           $Errors = $null
           $Tokens = $null
