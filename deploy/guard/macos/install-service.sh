@@ -185,7 +185,9 @@ if [ -e "$active" ] || [ -L "$active" ]; then
   fi
 fi
 if [ "$same_release" -eq 0 ]; then
-  [ ! -e "$next" ] && [ ! -L "$next" ] || fail 'next binding exists; inspect or explicitly recover the interrupted install'
+  if [ -e "$next" ] || [ -L "$next" ]; then
+    fail 'next binding exists; inspect or explicitly recover the interrupted install'
+  fi
   "$exe" --home "$home" service prepare --credential-id mainnet --uid "$uid" --gid "$gid" \
     --confirm-mainnet "$account" >"$next"
   chmod 0644 "$next"
