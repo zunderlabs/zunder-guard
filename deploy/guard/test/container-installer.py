@@ -698,5 +698,94 @@ class NativeFixtureBuild(unittest.TestCase):
         self.assertTrue(raised.exception.__suppress_context__)
 
 
+class NativeCleanupAcknowledgement(unittest.TestCase):
+    def setUp(self):
+        self.native = module('native_cleanup_fixture', SOURCE / 'test/container-native/installer.py')
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.base = Path(self.tmp.name)
+        self.operation = 'a' * 32
+        self.identifier = 'b' * 64
+        self.directory = self.base / 'operations' / self.operation
+        self.directory.mkdir(parents=True)
+        self.record = dict(version=2, operation=self.operation, boot=BOOT, image=IMAGE, volume=self.native.VOLUME)
+        self.done = dict(version=2, outcome='removed', boot=BOOT, id=self.identifier)
+        self.write('record.json', self.record)
+        self.write('id.json', self.identifier)
+        self.clock = 0
+        self.sleeps = 0
+
+    def write(self, name, value):
+        (self.directory / name).write_text(json.dumps(value))
+
+    def run_cleanup(self, on_sleep=None, docker=None):
+        def sleep(seconds):
+            self.clock += seconds
+            self.sleeps += 1
+            if on_sleep:
+                on_sleep()
+        with patch.object(self.native, 'BASE', self.base), \
+             patch.object(self.native, 'docker', side_effect=docker or (lambda *args: '')), \
+             patch.object(self.native.time, 'monotonic', side_effect=lambda: self.clock), \
+             patch.object(self.native.time, 'sleep', side_effect=sleep):
+            self.native.wait_cleanup(self.operation, self.identifier, BOOT, IMAGE)
+
+    def test_container_absence_before_delayed_ack_is_not_failure(self):
+        self.run_cleanup(on_sleep=lambda: self.write('done.json', self.done))
+        self.assertEqual(self.sleeps, 1)
+        self.assertEqual(self.clock, .5)
+
+    def test_missing_ack_exhausts_only_existing_ninety_second_phase(self):
+        with self.assertRaisesRegex(RuntimeError, 'cleanup failed: ack-pending'):
+            self.run_cleanup()
+        self.assertEqual(self.clock, 90)
+
+    def test_valid_ack_does_not_pass_while_container_remains(self):
+        self.write('done.json', self.done)
+        with self.assertRaisesRegex(RuntimeError, 'cleanup failed: container-present'):
+            self.run_cleanup(docker=lambda *args: self.identifier)
+        self.assertEqual(self.clock, 90)
+
+    def test_valid_current_operation_ack_passes(self):
+        self.write('done.json', self.done)
+        self.run_cleanup()
+        self.assertEqual(self.sleeps, 0)
+
+    def test_wrong_or_legacy_receipts_are_rejected(self):
+        for update in [dict(version=1), dict(outcome='never-dispatched'), dict(boot='stale'), dict(id='c' * 64)]:
+            with self.subTest(update=update):
+                self.write('done.json', {**self.done, **update})
+                with self.assertRaisesRegex(RuntimeError, 'record-or-probe-failed'):
+                    self.run_cleanup()
+
+    def test_wrong_operation_binding_and_empty_registry_do_not_pass(self):
+        self.write('done.json', self.done)
+        for update in [dict(operation='f' * 32), dict(boot='stale'), dict(image='foreign'), dict(volume='foreign')]:
+            with self.subTest(update=update):
+                self.write('record.json', {**self.record, **update})
+                with self.assertRaisesRegex(RuntimeError, 'record-or-probe-failed'):
+                    self.run_cleanup()
+        self.write('record.json', self.record)
+        self.write('id.json', 'f' * 64)
+        with self.assertRaisesRegex(RuntimeError, 'record-or-probe-failed'):
+            self.run_cleanup()
+        shutil.rmtree(self.directory)
+        with self.assertRaisesRegex(RuntimeError, 'record-or-probe-failed'):
+            self.run_cleanup()
+
+    def test_probe_errors_and_malformed_or_oversized_receipts_are_redacted(self):
+        def fail(*args):
+            raise RuntimeError('PRIVATE-CREDENTIAL /secret/path')
+        with self.assertRaisesRegex(RuntimeError, 'record-or-probe-failed') as caught:
+            self.run_cleanup(docker=fail)
+        self.assertNotIn('PRIVATE', str(caught.exception))
+        self.assertTrue(caught.exception.__suppress_context__)
+        for raw in ['PRIVATE malformed', 'PRIVATE' * 600]:
+            (self.directory / 'done.json').write_text(raw)
+            with self.assertRaisesRegex(RuntimeError, 'record-or-probe-failed') as caught:
+                self.run_cleanup()
+            self.assertNotIn('PRIVATE', str(caught.exception))
+
+
 if __name__ == '__main__':
     unittest.main()

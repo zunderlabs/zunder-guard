@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import shlex
 import stat
 import subprocess
 import tarfile
@@ -15,6 +16,47 @@ GUARD = Path(__file__).resolve().parents[1]
 TAG = 'v0.0.0'
 IMAGE = 'ghcr.io/zunderlabs/zunder-guard@sha256:' + 'b' * 64
 NOTICES = ('LICENSE', 'NOTICE', 'THIRD_PARTY_LICENSES.md')
+
+
+class DockerBuildContext(unittest.TestCase):
+    """Static admission contract; no Docker daemon or image-build claim."""
+    def patterns(self):
+        return [line.strip() for line in (GUARD / 'Dockerfile.dockerignore').read_text().splitlines()
+                if line.strip() and not line.lstrip().startswith('#')]
+
+    def test_runtime_data_copy_has_existing_narrow_context_admission(self):
+        # Derive the real COPY input rather than checking an unrelated constant.
+        copies = [shlex.split(line) for line in (GUARD / 'Dockerfile').read_text().splitlines()
+                  if line.startswith('COPY ') and shlex.split(line)[-1] == '/data/']
+        self.assertEqual(len(copies), 1)
+        sources = [part for part in copies[0][1:-1] if not part.startswith('--')]
+        self.assertEqual(sources, ['deploy/guard/container/volume-root/'])
+        source = sources[0]
+        volume = GUARD.parents[1] / source
+        self.assertTrue(volume.is_dir())
+        self.assertEqual(sorted(path.name for path in volume.iterdir()), ['.keep'])
+        self.assertTrue((volume / '.keep').is_file())
+        patterns = self.patterns()
+        self.assertEqual(patterns[0], '*')
+        self.assertEqual(patterns.count('!' + source), 1)
+        # Do not repair a COPY by exposing the container helpers or all deploy files.
+        for ancestor in Path(source).parents:
+            if str(ancestor) != '.':
+                self.assertNotIn('!' + ancestor.as_posix() + '/', patterns)
+                self.assertNotIn('!' + ancestor.as_posix(), patterns)
+        self.assertNotIn('!*', patterns)
+        self.assertNotIn('!**', patterns)
+
+    def test_secret_and_target_exclusions_override_every_allowlist_entry(self):
+        patterns = self.patterns()
+        final_allow = max(index for index, pattern in enumerate(patterns) if pattern.startswith('!'))
+        # Docker uses the last matching rule. These recursive exclusions must
+        # remain after ALL admissions, including the volume-root directory.
+        exclusions = ['**/target', '**/.env', '**/.env.*', '**/*.key', '**/*.pem']
+        for exclusion in exclusions:
+            self.assertIn(exclusion, patterns)
+            self.assertGreater(patterns.index(exclusion), final_allow)
+        self.assertEqual(patterns[final_allow + 1:], exclusions)
 
 
 class ReleaseRendering(unittest.TestCase):

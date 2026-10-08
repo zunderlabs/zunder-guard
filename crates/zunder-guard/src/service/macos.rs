@@ -136,7 +136,20 @@ fn credential_account(binding: &ServiceBinding) -> Result<String> {
         hash.update((field.len() as u64).to_be_bytes());
         hash.update(field.as_bytes());
     }
-    Ok(format!("mainnet-{:x}", hash.finalize()))
+    // sha3 0.12's digest array has no LowerHex implementation. Encode every
+    // byte, including leading zeroes, to preserve the existing credential slot.
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let suffix: String = hash
+        .finalize()
+        .iter()
+        .flat_map(|byte| {
+            [
+                char::from(HEX[usize::from(byte >> 4)]),
+                char::from(HEX[usize::from(byte & 15)]),
+            ]
+        })
+        .collect();
+    Ok(format!("mainnet-{suffix}"))
 }
 
 /// The label is public metadata and contains no wallet credential.
@@ -289,7 +302,7 @@ pub fn remove(binding: &ServiceBinding) -> Result<()> {
 /// The child must have lost root and all privileged supplementary groups
 /// before it reads even one byte from its supervised pipe.
 pub fn verify_child(binding: &ServiceBinding) -> Result<()> {
-    use nix::unistd::{getegid, getgroups};
+    use nix::unistd::getegid;
     verify_no_core_dumps()?;
     let ServiceIdentity::Macos { uid, gid } = &binding.identity else {
         return Err(refused("service binding belongs to another platform"));
@@ -299,18 +312,31 @@ pub fn verify_child(binding: &ServiceBinding) -> Result<()> {
             "Guard child has not assumed its admitted service identity",
         ));
     }
-    let groups = getgroups().map_err(|_| refused("cannot inspect child groups"))?;
-    if groups.iter().any(|group| matches!(group.as_raw(), 0 | 80)) {
-        return Err(refused(
-            "Guard child retained a privileged supplementary group",
-        ));
-    }
+    // rustix calls the unaliased libc getgroups kernel symbol on macOS.
+    // id -G and getgrouplist consult configured membership instead and cannot
+    // establish what supplementary groups this process actually inherited.
+    verify_inherited_groups(rustix::process::getgroups())?;
     if fs::canonicalize(std::env::current_exe()?)? != binding.executable {
         return Err(refused(
             "Guard child executable differs from service admission",
         ));
     }
     binding.validate()?;
+    Ok(())
+}
+
+fn verify_inherited_groups(groups: rustix::io::Result<Vec<rustix::process::Gid>>) -> Result<()> {
+    let groups = groups.map_err(|_| refused("cannot inspect child groups"))?;
+    // Darwin includes the effective GID. An empty result is not evidence of
+    // successful identity confinement. Errors or changing group counts fail closed.
+    if groups.is_empty() {
+        return Err(refused("cannot establish child groups"));
+    }
+    if groups.iter().any(|group| matches!(group.as_raw(), 0 | 80)) {
+        return Err(refused(
+            "Guard child retained a privileged supplementary group",
+        ));
+    }
     Ok(())
 }
 
@@ -679,6 +705,65 @@ mod tests {
     use super::*;
     use crate::testdir::TestDir;
     use security_framework::os::macos::keychain::CreateOptions;
+
+    #[test]
+    fn inherited_group_validation_rejects_privilege_and_lookup_failure() {
+        use rustix::process::Gid;
+        for groups in [vec![450], vec![450, 451], vec![450, 450]] {
+            let groups = groups.into_iter().map(Gid::from_raw).collect();
+            assert!(verify_inherited_groups(Ok(groups)).is_ok());
+        }
+        for groups in [
+            vec![],
+            vec![0, 450],
+            vec![450, 0],
+            vec![450, 0, 451],
+            vec![80, 450],
+            vec![450, 80],
+            vec![450, 80, 451],
+        ] {
+            let groups = groups.into_iter().map(Gid::from_raw).collect();
+            assert!(verify_inherited_groups(Ok(groups)).is_err());
+        }
+        assert!(verify_inherited_groups(Err(rustix::io::Errno::IO)).is_err());
+    }
+
+    #[test]
+    fn native_inherited_groups_include_the_effective_gid() {
+        // Read-only kernel query; never changes this test process's identity.
+        let groups = rustix::process::getgroups().expect("read inherited groups");
+        let effective = nix::unistd::getegid().as_raw();
+        assert!(groups.iter().any(|group| group.as_raw() == effective));
+    }
+
+    #[test]
+    fn credential_slot_hex_preserves_fixed_digest_bytes_and_leading_zeroes() {
+        // Independently calculated with Python hashlib.sha3_256: each of home,
+        // account, API wallet, credential ID and executable hash is preceded
+        // by its UTF-8 byte length encoded as an unsigned 8-byte big-endian value.
+        let mut binding = ServiceBinding {
+            version: 1,
+            credential_id: "fixture-slot".into(),
+            mode: "mainnet".into(),
+            account: "0x1111111111111111111111111111111111111111".into(),
+            api_wallet: "0x2222222222222222222222222222222222222222".into(),
+            home: "/fixture/state".into(),
+            config: "/fixture/state/guard.toml".into(),
+            executable: "/fixture/zunder-guard".into(),
+            executable_sha256: "ab".repeat(32),
+            admission_config_sha256: "cd".repeat(32),
+            identity: ServiceIdentity::Macos { uid: 450, gid: 450 },
+        };
+        assert_eq!(
+            credential_account(&binding).expect("slot"),
+            "mainnet-66b2540af1af04f42689f3742b5bd6deeb47745c89aa141fd079da8fe4c62b1e"
+        );
+        binding.credential_id = "fixture-slot-78".into();
+        assert_eq!(
+            credential_account(&binding).expect("leading-zero slot"),
+            "mainnet-00ed4f53a5389b6154a2cd51e4e2c3d85a3fc3d0d906c9dbce575cc5c3cfa115"
+        );
+    }
 
     const FIXTURE_SERVICE: &str = "com.zunderlabs.guard.native-ci.synthetic";
     const FIXTURE_ACCOUNT: &str = "fixture-only-never-a-venue-account";

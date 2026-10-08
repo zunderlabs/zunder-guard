@@ -127,6 +127,51 @@ def wait(predicate, timeout=90):
     raise RuntimeError('Native installer fixture deadline exceeded')
 
 
+def wait_cleanup(operation, identifier, boot, image):
+    """Container absence precedes durable guardian acknowledgement; require both."""
+    require(isinstance(operation, str) and re.fullmatch('[a-f0-9]{32}', operation)
+            and re.fullmatch('[a-f0-9]{64}', identifier), 'Invalid fixture cleanup identity.')
+    directory = BASE / 'operations' / operation
+    state = 'ack-pending'
+
+    def read_record(name):
+        path = directory / name
+        require(not path.is_symlink(), 'Invalid fixture cleanup record.')
+        with path.open('rb') as stream:
+            raw = stream.read(4097)
+        require(len(raw) <= 4096, 'Invalid fixture cleanup record.')
+        return json.loads(raw)
+
+    def complete():
+        nonlocal state
+        try:
+            record = read_record('record.json')
+            require(isinstance(record, dict) and record.get('version') == 2
+                    and record.get('operation') == operation and record.get('boot') == boot
+                    and record.get('image') == image and record.get('volume') == VOLUME
+                    and read_record('id.json') == identifier, 'Invalid fixture cleanup record.')
+            if docker('ps', '-aq', '--filter', 'label=com.zunderlabs.guard-install-operation'):
+                state = 'container-present'
+                return False
+            state = 'ack-pending'
+            try:
+                done = read_record('done.json')
+            except FileNotFoundError:
+                return False
+            require(isinstance(done, dict) and done.get('version') == 2
+                    and done.get('outcome') == 'removed' and done.get('id') == identifier
+                    and done.get('boot') == boot, 'Invalid fixture cleanup receipt.')
+            return True
+        except (OSError, ValueError, TypeError, RuntimeError):
+            state = 'record-or-probe-failed'
+            raise RuntimeError('Native installer cleanup observation failed.') from None
+
+    try:
+        wait(complete)  # Existing 90-second cleanup phase; no second acknowledgement phase.
+    except RuntimeError:
+        raise RuntimeError('Native installer cleanup failed: ' + state) from None
+
+
 def setup():
     require(not BASE.exists() and not WORK.exists(), 'Fresh isolated guest fixture required.')
     WORK.mkdir(mode=0o700)
@@ -167,15 +212,15 @@ def setup():
                 'Fresh volume must be writable by nonroot and synthetic stdin must arrive.')
         require(info['HostConfig']['LogConfig']['Type'] == 'none' and not info.get('LogPath'), 'Client output could be persisted.')
         require(info['HostConfig']['RestartPolicy']['Name'] in ('no', ''), 'Temporary restart policy exists.')
+        operation = info['Config']['Labels'].get('com.zunderlabs.guard-install-operation')
         if victim == 'wrapper':
             process.kill()
         else:
             children = Path(f'/proc/{process.pid}/task/{process.pid}/children').read_text().split()
             require(len(children) == 1, 'Expected one attached Docker client.')
             os.kill(int(children[0]), signal.SIGKILL)
-        wait(lambda: not docker('ps', '-aq', '--filter', 'label=com.zunderlabs.guard-install-operation'))
+        wait_cleanup(operation, identifier, evidence['boot_before'], image)
         process.wait(timeout=120)
-        require(all((p / 'done.json').exists() for p in (BASE / 'operations').iterdir() if p.is_dir()), 'Cleanup not acknowledged.')
         evidence['checks'].append(victim + '-loss-exact-id-cleanup-no-docker-log')
     # A harmless service stands in for Guard. Reproduce helper enable with an open transaction.
     unit = '[Unit]\nDescription=Synthetic boot-gate sentinel\n[Service]\nType=oneshot\nExecStart=/usr/bin/touch ' + str(WORK / 'boot-started') + '\n[Install]\nWantedBy=multi-user.target\n'

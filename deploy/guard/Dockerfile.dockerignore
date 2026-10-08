@@ -10,6 +10,7 @@
 !THIRD_PARTY_LICENSES.md
 !crates/
 !deploy/guard/rules/
+!deploy/guard/container/volume-root/
 !tests/redteam/
 !dist/linux-*/zunder-guard
 **/target

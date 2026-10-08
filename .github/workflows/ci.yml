@@ -324,6 +324,8 @@ jobs:
           python3 deploy/guard/test/aws_template_test.py
       - name: Container supervisor contract (synthetic only; no native restart claim)
         run: python3 -B deploy/guard/test/container-supervisor.py
+      - name: Docker build context admission and exclusions
+        run: python3 -B deploy/guard/test/distribution.py DockerBuildContext
       - name: Container installer transaction and ownership checks
         run: python3 -B deploy/guard/test/container-installer.py
       - name: Publication gate regressions (no network or signing)
