@@ -414,6 +414,31 @@ async fn a_dex_the_rules_do_not_name_is_refused_reported_and_never_touched() {
 }
 
 #[tokio::test]
+async fn a_kill_counts_only_the_readable_part_of_a_partial_account() {
+    let running = start("hip3-kill-partial").await;
+    running.venue().add_position("ETH", "1");
+    running.venue().add_position("xyz:GOLD", "0.5");
+    running.venue().fail_reads("xyz");
+    let killed = post(
+        &running.url,
+        "/guard/kill",
+        &signed(zunder_guard_core::kill_wire("partial account")),
+    )
+    .await;
+    assert_eq!(killed["positions_at_kill"], 1, "{killed}");
+    assert!(
+        killed["last_error"].as_str().unwrap().contains("xyz"),
+        "{killed}"
+    );
+    // One managed dex is unreadable; the count cannot claim its position
+    // was observed or closed. The readable ETH position was closed.
+    let positions = running.venue().positions();
+    assert_eq!(positions.len(), 1, "{positions:?}");
+    assert_eq!(positions[0]["position"]["coin"], "xyz:GOLD");
+    assert!(running.dir.path().join("kill").exists());
+}
+
+#[tokio::test]
 async fn guard_protects_hip3_positions_and_counts_their_losses_account_wide() {
     let running = start("hip3-protect").await;
     // An xyz:GOLD long found without a stop: Guard's own stop, 2% below the

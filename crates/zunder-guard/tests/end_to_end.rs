@@ -698,6 +698,7 @@ async fn a_signed_kill_request_pulls_the_switch_and_flattens() {
     let body = kill_request(&client, "agent saw a bug", now());
     let killed = post(&guard.url, "/guard/kill", &body).await;
     assert_eq!(killed["status"], "ok", "{killed}");
+    assert_eq!(killed["positions_at_kill"], 1, "{killed}");
     assert!(
         killed["killed"]
             .as_str()
@@ -716,9 +717,41 @@ async fn a_signed_kill_request_pulls_the_switch_and_flattens() {
         .json_text()
         .await;
     assert!(status["killed"].is_string(), "{status}");
+    let sends = guard.venue().received().len();
+    let already = post(
+        &guard.url,
+        "/guard/kill",
+        &kill_request(&client, "already stopped", now()),
+    )
+    .await;
+    assert_eq!(already["already"], true, "{already}");
+    assert_eq!(already["durable"], true, "{already}");
+    assert!(already.get("positions_at_kill").is_none(), "{already}");
+    assert_eq!(guard.venue().received().len(), sends);
+    tokio::time::sleep(std::time::Duration::from_millis(2)).await;
     // And entries are refused, with the code as a field.
     let refused = post(&guard.url, "/exchange", &ccxt_market_buy("0.1", now())).await;
     assert_eq!(refused["code"], "kill_switch", "{refused}");
+}
+
+#[tokio::test]
+async fn a_kill_counts_the_positions_only_fallback_snapshot() {
+    let guard = start(false).await;
+    guard.venue().add_position("BTC", "0.01");
+    // Open-order reads fail, but positions remain readable, so the
+    // positions-only fallback still closes BTC.
+    guard.venue().fail_orders();
+    let client = GuardKey::from_hex(CLIENT_KEY).unwrap();
+    let killed = post(
+        &guard.url,
+        "/guard/kill",
+        &kill_request(&client, "orders unreadable", now()),
+    )
+    .await;
+    assert_eq!(killed["positions_at_kill"], 1, "{killed}");
+    assert!(killed["last_error"].is_string(), "{killed}");
+    assert!(guard.venue().positions().is_empty());
+    assert!(guard.dir.path().join("kill").exists());
 }
 
 #[tokio::test]
