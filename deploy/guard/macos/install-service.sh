@@ -165,25 +165,49 @@ else
 fi
 account=$(sudo -n -u "$service_user" -- "$exe" --home "$home" config get account)
 next="$base/bindings/$sha.json"
-[ ! -e "$next" ] || fail 'next binding exists; inspect or explicitly recover the interrupted install'
-"$exe" --home "$home" service prepare --credential-id mainnet --uid "$uid" --gid "$gid" \
-  --confirm-mainnet "$account" >"$next"
-chmod 0644 "$next"
-if [ -f "$active" ]; then
+same_release=0
+old_exe=""
+if [ -e "$active" ] || [ -L "$active" ]; then
   trusted "$active"
+  [ -f "$active" ] || fail 'active binding must be a regular file'
   old_exe=$(plutil -extract executable raw -o - "$active")
   old_sha=$(plutil -extract executable_sha256 raw -o - "$active")
   trusted "$old_exe"
   [ "$(shasum -a 256 "$old_exe" | awk '{print $1}')" = "$old_sha" ] || fail 'previous admitted executable changed'
-  "$old_exe" service migrate-credential --binding "$active" --next-binding "$next" --confirm-mainnet "$account"
-else
-  "$exe" service provision --binding "$next" --confirm-mainnet "$account"
+  if [ "$old_sha" = "$sha" ]; then
+    [ "$old_exe" = "$exe" ] || fail 'same release binding names another executable'
+    # The active binding includes explicit readmission after pairing changes;
+    # the immutable versioned binding is retained as its original admission.
+    # No authority is taken from that archival binding during a reinstall.
+    trusted "$next"
+    [ -f "$next" ] || fail 'versioned binding must be a regular file'
+    same_release=1
+  fi
 fi
-"$exe" service check --binding "$next"
+if [ "$same_release" -eq 0 ]; then
+  [ ! -e "$next" ] && [ ! -L "$next" ] || fail 'next binding exists; inspect or explicitly recover the interrupted install'
+  "$exe" --home "$home" service prepare --credential-id mainnet --uid "$uid" --gid "$gid" \
+    --confirm-mainnet "$account" >"$next"
+  chmod 0644 "$next"
+  if [ -n "$old_exe" ]; then
+    "$old_exe" service migrate-credential --binding "$active" --next-binding "$next" --confirm-mainnet "$account"
+  else
+    "$exe" service provision --binding "$next" --confirm-mainnet "$account"
+  fi
+  checked_binding=$next
+else
+  checked_binding=$active
+fi
+# The installed signed executable validates the current admission, config and
+# exact credential readback. Same-release reinstall never provisions/migrates.
+"$exe" service check --binding "$checked_binding"
 # The final service pointer changes only after the new creator can read its item.
+# Same-release reinstall retains both existing binding files byte-for-byte.
 active_next="$base/bindings/.active-next.json"
-[ ! -L "$active_next" ] || fail 'unsafe binding destination'
-install -o root -g wheel -m 0644 "$next" "$active_next"
+if [ "$same_release" -eq 0 ]; then
+  [ ! -L "$active_next" ] || fail 'unsafe binding destination'
+  install -o root -g wheel -m 0644 "$next" "$active_next"
+fi
 # Constant paths and hex release hash only: no user text enters XML.
 trusted /Library/LaunchDaemons
 [ ! -L "$plist" ] || fail 'unsafe launchd plist destination'
@@ -219,7 +243,7 @@ fi
 # The job is unloaded. A failure/crash between these renames cannot launch a
 # half-admitted broker: old executable/new binding hash mismatch fails closed.
 # Immutable prior binding and release remain available for explicit recovery.
-mv -f "$active_next" "$active"
+if [ "$same_release" -eq 0 ]; then mv -f "$active_next" "$active"; fi
 mv -f "$plist_next" "$plist"
 printf '%s\n' 'Installed mainnet service; nothing was started. Keep previous release and Keychain item until upgrade checks pass.'
 printf 'If this account has no mainnet journal, initialize it explicitly:\n  sudo -u %s env ZUNDER_MAINNET_CONFIRM=%s ZUNDER_GUARD_HOME="%s" "%s" journal-init --mode mainnet --note "your name, why, date"\n' "$service_user" "$account" "$home" "$exe"
