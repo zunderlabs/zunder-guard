@@ -1,0 +1,30 @@
+name: release-e2e
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Exact signed release tag
+        required: true
+        type: string
+  workflow_run:
+    workflows: [release]
+    types: [completed]
+permissions: {}
+concurrency:
+  group: zunder-dedicated-testnet-account
+  cancel-in-progress: false
+jobs:
+  trusted:
+    if: >-
+      github.repository == 'zunderlabs/zunder-guard' && github.ref == 'refs/heads/main' &&
+      (github.event_name == 'workflow_dispatch' ||
+       (github.event.workflow_run.conclusion == 'success' &&
+        github.event.workflow_run.event == 'push' &&
+        github.event.workflow_run.head_repository.full_name == 'zunderlabs/zunder-guard'))
+    permissions:
+      contents: read
+      packages: read
+      actions: read
+      id-token: write
+      attestations: write
+    uses: zunderlabs/zunder-guard/.github/workflows/release-e2e-run.yml@de4a51431dd122459c855eb8f8b6698a1e42e275

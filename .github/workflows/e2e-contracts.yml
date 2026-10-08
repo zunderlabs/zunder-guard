@@ -1,0 +1,24 @@
+name: release-e2e-contracts
+on:
+  push:
+    branches: [main]
+  pull_request:
+permissions:
+  contents: read
+concurrency:
+  group: release-e2e-contracts-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  contracts:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Offline testnet execution and control regressions
+        run: |
+          python3 -B deploy/guard/e2e/test-journey.py
+          python3 -B deploy/guard/e2e/test-orchestrator.py
+          python3 -B deploy/guard/e2e/test-host-control.py
+          python3 -B deploy/guard/e2e/test-actions-artifacts.py
