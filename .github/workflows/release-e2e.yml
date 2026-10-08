@@ -27,4 +27,4 @@ jobs:
       actions: read
       id-token: write
       attestations: write
-    uses: zunderlabs/zunder-guard/.github/workflows/release-e2e-run.yml@de4a51431dd122459c855eb8f8b6698a1e42e275
+    uses: zunderlabs/zunder-guard/.github/workflows/release-e2e-run.yml@3ed61a284dfda0db54cf71eab3efa8b212a1d7ab
