@@ -17,7 +17,7 @@ class Admission(unittest.TestCase):
             'workflow_ref':REPOSITORY+'/'+CALLER+'@refs/heads/main',
             'job_workflow_ref':REPOSITORY+'/'+WORKFLOW+'@'+SHA,'run_id':'123','run_attempt':'1'}
         p='repos/'+REPOSITORY+'/'
-        self.rows={p:{'id':REPOSITORY_ID,'full_name':REPOSITORY,'owner':{'id':OWNER_ID}},
+        self.rows={p[:-1]:{'id':REPOSITORY_ID,'full_name':REPOSITORY,'owner':{'id':OWNER_ID}},
             p+'environments/'+ENVIRONMENT:{'deployment_branch_policy':{'protected_branches':False,'custom_branch_policies':True}},
             p+'environments/'+ENVIRONMENT+'/deployment-branch-policies?per_page=100':{'total_count':1,'branch_policies':[{'name':'main','type':'branch'}]},
             p+'actions/runs/123/attempts/1':{'id':123,'run_attempt':1,'event':'workflow_dispatch','head_sha':CALLER_SHA,
@@ -60,7 +60,7 @@ class Admission(unittest.TestCase):
         admit(lambda p:self.rows[p],value,PRODUCER,SHA,WORKFLOWS,checkpoint=names.append)
         self.assertEqual(names,list(ADMISSION_CLAUSES))
         prefix='repos/'+REPOSITORY+'/'
-        for path,clause in [(prefix,'repository_request'),(prefix+'environments/'+ENVIRONMENT,'environment_request'),
+        for path,clause in [(prefix[:-1],'repository_request'),(prefix+'environments/'+ENVIRONMENT,'environment_request'),
             (prefix+'environments/'+ENVIRONMENT+'/deployment-branch-policies?per_page=100','branch_policies_request'),
             (prefix+'actions/runs/123/attempts/1','run_attempt_request')]:
             names=[]
@@ -73,6 +73,18 @@ class Admission(unittest.TestCase):
         wrong={**self.rows[prefix+'actions/runs/123/attempts/1'],'status':'completed'}
         with self.assertRaises(Refused):admit(lambda p:wrong if p.endswith('/attempts/1')else self.rows[p],value,PRODUCER,SHA,WORKFLOWS,checkpoint=names.append)
         self.assertEqual(names[-1],'run_attempt_identity')
+    def test_repository_request_is_exact_canonical_and_trailing_slash_is_404(self):
+        value=claims_before_sts(self.token(),SHA);calls=[]
+        canonical='repos/'+REPOSITORY
+        def actual_route_fixture(path):
+            calls.append(path)
+            status=200 if path in self.rows else 404
+            if status!=200:raise RuntimeError('Fixed fixture HTTP404')
+            return self.rows[path]
+        with self.assertRaises(RuntimeError):actual_route_fixture(canonical+'/')
+        calls.clear()
+        self.assertFalse(admit(actual_route_fixture,value,PRODUCER,SHA,WORKFLOWS)['release_ready'])
+        self.assertEqual(calls[0],canonical);self.assertNotIn(canonical+'/',calls)
     def test_owner_role_cannot_read_native_epoch_or_bulk_history(self):
         from acceptance_owner_policy import documents,OWNER_ARN
         value=documents(SHA);rows=value['permissions']['Statement']

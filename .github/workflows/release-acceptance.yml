@@ -12,7 +12,7 @@ jobs:
       contents: read
       actions: read
       id-token: write
-    uses: zunderlabs/zunder-guard/.github/workflows/release-acceptance-run.yml@89a0746c28b25a407c4c20911ce13153f8993585
+    uses: zunderlabs/zunder-guard/.github/workflows/release-acceptance-run.yml@c49843c953a1bd8ebe714c0258cf3bf4f951778f
   negative:
     needs: verify
     if: github.ref == 'refs/heads/main'
@@ -20,4 +20,4 @@ jobs:
       contents: read
       actions: read
       id-token: write
-    uses: zunderlabs/zunder-guard/.github/workflows/release-owner-admission-negative.yml@89a0746c28b25a407c4c20911ce13153f8993585
+    uses: zunderlabs/zunder-guard/.github/workflows/release-owner-admission-negative.yml@c49843c953a1bd8ebe714c0258cf3bf4f951778f

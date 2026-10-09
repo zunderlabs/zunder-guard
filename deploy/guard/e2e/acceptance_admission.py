@@ -138,7 +138,7 @@ def admit(api,identity,workflows,checkout_source,caller_workflows,*,checkpoint=N
     mark('control_workflow_audit');hashes=audit_workflows(workflows,identity['source'],caller=False)
     mark('caller_workflow_audit');caller_hashes=audit_workflows(caller_workflows,identity['source'])
     prefix='repos/'+REPOSITORY+'/'
-    mark('repository_request');repo=api(prefix)
+    mark('repository_request');repo=api('repos/'+REPOSITORY)
     mark('repository_identity')
     need(repo.get('id')==REPOSITORY_ID and repo.get('full_name')==REPOSITORY
          and repo.get('owner',{}).get('id')==OWNER_ID,'Canonical repository identity changed')
