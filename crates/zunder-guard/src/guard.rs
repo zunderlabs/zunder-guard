@@ -269,9 +269,8 @@ struct LicenceTrack {
     error: Option<String>,
     /// The last expiry warning given: 14, 7 or 1 days.
     warned: Option<i64>,
-    /// The config file watched for a new key, and its last modification
-    /// time and length.
-    file: Option<(std::path::PathBuf, Option<(SystemTime, u64)>)>,
+    /// The config file read at each sync for a new licence key.
+    file: Option<std::path::PathBuf>,
     /// The public key licences are checked against, and the builders a
     /// fallback charges (the production constants; tests' own).
     public_key: Option<[u8; 32]>,
@@ -347,13 +346,6 @@ impl LicenceTrack {
             "auto_update": auto_update,
         })
     }
-}
-
-/// A file's modification time and length: when either changes, it is read
-/// again.
-fn file_print(path: &std::path::Path) -> Option<(SystemTime, u64)> {
-    let meta = std::fs::metadata(path).ok()?;
-    Some((meta.modified().ok()?, meta.len()))
 }
 
 /// Every licence alert starts with this, so that a newer one replaces it.
@@ -4325,14 +4317,13 @@ impl<U: Upstream, C: Clock> Guard<U, C> {
     }
 
     /// Watch the config file at `path` for a new licence key (`zunder-guard
-    /// licence set`): read at every sync when it changed, and only for the
-    /// `licence` key; every other setting still needs a restart.
+    /// licence set`): read at every sync, apply only a changed licence
+    /// key; every other setting still needs a restart.
     pub async fn watch_config(&self, path: std::path::PathBuf) {
         let mut inner = self.inner.lock().await;
         // Startup can wait for key input after loading its config. Reconcile
-        // now so a licence installed during that wait is not marked as seen
-        // before its key has ever been applied.
-        inner.licence.file = Some((path, None));
+        // now so a licence installed during that wait is applied before serving.
+        inner.licence.file = Some(path);
         Self::licence_tick(&mut inner, self.clock.now_ms(), true);
     }
 
@@ -4340,27 +4331,25 @@ impl<U: Upstream, C: Clock> Guard<U, C> {
     /// `read_file`, a new key in the watched config file; then expiry (the
     /// fee from this moment on) and the warnings before it.
     fn licence_tick(inner: &mut Inner, now: u64, read_file: bool) {
-        if read_file && let Some((path, seen)) = inner.licence.file.clone() {
-            let modified = file_print(&path);
-            if modified != seen {
-                match GuardConfig::load(&path) {
-                    Ok(config) => {
-                        inner.licence.file = Some((path, modified));
-                        inner.licence.file_error = None;
-                        if config.licence != inner.licence.key {
-                            inner.licence.key = config.licence;
-                            inner.licence.warned = None;
-                            Self::licence_apply(inner, now, "a new licence key in the config file");
-                        }
+        if read_file && let Some(path) = inner.licence.file.clone() {
+            // Equal-length replacements can retain the same modification time.
+            // Read the config itself at every sync; only a changed key is applied.
+            match GuardConfig::load(&path) {
+                Ok(config) => {
+                    inner.licence.file_error = None;
+                    if config.licence != inner.licence.key {
+                        inner.licence.key = config.licence;
+                        inner.licence.warned = None;
+                        Self::licence_apply(inner, now, "a new licence key in the config file");
                     }
-                    Err(error) => {
-                        let text = format!(
-                            "{LICENCE_ALERT}the config file could not be read for a new licence key ({error}); Guard keeps the key it runs with"
-                        );
-                        if inner.licence.file_error.as_deref() != Some(text.as_str()) {
-                            inner.licence.file_error = Some(text.clone());
-                            Self::licence_alert(inner, now, Some(&text));
-                        }
+                }
+                Err(error) => {
+                    let text = format!(
+                        "{LICENCE_ALERT}the config file could not be read for a new licence key ({error}); Guard keeps the key it runs with"
+                    );
+                    if inner.licence.file_error.as_deref() != Some(text.as_str()) {
+                        inner.licence.file_error = Some(text.clone());
+                        Self::licence_alert(inner, now, Some(&text));
                     }
                 }
             }
