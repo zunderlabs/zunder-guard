@@ -1,0 +1,46 @@
+# GitHub documents job.workflow_sha; actionlint1.7.12 has an older strict job type.
+# The JSON round trip preserves the job context; offline tests bind these exact expressions.
+name: immutable owner STS denial probe
+
+on:
+  workflow_call:
+
+permissions: {}
+
+jobs:
+  deny:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    environment: release-owner-controller
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ fromJSON(toJSON(job)).workflow_sha }}
+          persist-credentials: false
+      - name: Fixed hashed admission runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          /usr/bin/python3 -m venv "$RUNNER_TEMP/admission-runtime"
+          "$RUNNER_TEMP/admission-runtime/bin/python" -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes -r deploy/guard/e2e/admission-requirements.txt
+          mkdir -m 700 "$RUNNER_TEMP/admission-receipts"
+      - name: Genuine alternate workflow token must fail STS; no owner parameter access
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CONTROL_SOURCE: ${{ fromJSON(toJSON(job)).workflow_sha }}
+          PYTHONDONTWRITEBYTECODE: '1'
+        run: |
+          set -euo pipefail
+          ulimit -c 0
+          "$RUNNER_TEMP/admission-runtime/bin/python" -B deploy/guard/e2e/acceptance_identity.py --negative --control-source "$CONTROL_SOURCE" --output "$RUNNER_TEMP/admission-receipts/negative.json"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: owner-admission-negative-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/admission-receipts/negative.json
+          if-no-files-found: error
+          retention-days: 7
