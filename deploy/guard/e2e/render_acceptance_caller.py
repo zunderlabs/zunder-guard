@@ -21,6 +21,7 @@ jobs:
     if: github.ref == 'refs/heads/main'
     permissions:
       contents: read
+      actions: read
       id-token: write
     uses: '''+REPOSITORY+'/'+WORKFLOW+'@'+source+'''
   negative:
@@ -28,6 +29,7 @@ jobs:
     if: github.ref == 'refs/heads/main'
     permissions:
       contents: read
+      actions: read
       id-token: write
     uses: '''+REPOSITORY+'/'+NEGATIVE_WORKFLOW+'@'+source+'\n'
 

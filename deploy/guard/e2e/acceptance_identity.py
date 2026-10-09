@@ -19,6 +19,9 @@ from run_producers import write_new
 PROBE_STAGES=('arguments','memory_preflight','checkout','oidc_request','positive_claims','control_workflows','caller_workflows','admission','negative_claims','sdk_initialization','sts_assumption','response_validation','receipt_write')
 _current_stage='arguments'
 _current_claim_clause='unknown'
+_current_admission_clause='unknown'
+_current_api_clause='unknown'
+API_CLAUSES=('repository','environment','branch_policies','run_attempt','git_commit','git_tree','git_blob')
 def stage(name):
     global _current_stage
     need(type(name)is str and name in PROBE_STAGES,'Fixed admission stage required');_current_stage=name
@@ -27,10 +30,33 @@ def claim_checkpoint(name):
     global _current_claim_clause
     need(type(name)is str and name in CLAIM_CLAUSES,'Fixed claim diagnostic required');_current_claim_clause=name
 
+def admission_checkpoint(name):
+    global _current_admission_clause
+    need(type(name)is str and name in ADMISSION_CLAUSES,'Fixed admission diagnostic required');_current_admission_clause=name
+
+def api_checkpoint(path):
+    global _current_api_clause
+    prefix='repos/'+REPOSITORY+'/'
+    routes=((r'', 'repository'),(r'environments/'+ENVIRONMENT,'environment'),
+        (r'environments/'+ENVIRONMENT+r'/deployment-branch-policies\?per_page=100','branch_policies'),
+        (r'actions/runs/[1-9][0-9]{0,18}/attempts/[1-9][0-9]{0,2}','run_attempt'),
+        (r'git/commits/[0-9a-f]{40}','git_commit'),(r'git/trees/[0-9a-f]{40}\?recursive=1','git_tree'),
+        (r'git/blobs/[0-9a-f]{40}','git_blob'))
+    _current_api_clause='unknown'
+    need(type(path)is str and path.startswith(prefix),'Canonical GitHub admission API required')
+    match=[name for pattern,name in routes if re.fullmatch(pattern,path[len(prefix):])]
+    need(len(match)==1,'Fixed GitHub admission API route required');_current_api_clause=match[0]
+
 def safe_failure_message():
     value=_current_stage if type(_current_stage)is str and _current_stage in PROBE_STAGES else 'unknown'
     clause=_current_claim_clause if type(_current_claim_clause)is str and _current_claim_clause in CLAIM_CLAUSES else 'unknown'
     suffix=(' clause='+clause)if value=='positive_claims'else ''
+    if value=='admission':
+        current=_current_admission_clause if type(_current_admission_clause)is str and _current_admission_clause in ADMISSION_CLAUSES else 'unknown'
+        suffix=' clause='+current
+    if value in('control_workflows','caller_workflows','admission'):
+        current=_current_api_clause if type(_current_api_clause)is str and _current_api_clause in API_CLAUSES else 'unknown'
+        suffix+=' api='+current
     return 'Actual owner admission probe incomplete at stage='+value+suffix+'; no owner key was read.'
 
 def no_swap():
@@ -65,7 +91,7 @@ def oidc_token():
     return value['value']
 
 def github_api(path):
-    need(path.startswith('repos/'+REPOSITORY+'/'),'Canonical GitHub admission API required')
+    api_checkpoint(path)
     token=os.environ.get('GH_TOKEN','');need(token,'Actual workflow read token required')
     return http_json('https://api.github.com/'+path,token)
 
@@ -78,7 +104,7 @@ def probe(control_source,negative=False):
         stage('positive_claims');identity=claims_before_sts(token,control_source,checkpoint=claim_checkpoint)
         stage('control_workflows');control_workflows=workflows_at(github_api,control_source)
         stage('caller_workflows');caller_workflows=workflows_at(github_api,identity['caller_source'])
-        stage('admission');admission=admit(github_api,identity,control_workflows,checkout,caller_workflows)
+        stage('admission');admission=admit(github_api,identity,control_workflows,checkout,caller_workflows,checkpoint=admission_checkpoint)
     else:
         # The separate negative workflow receives a genuine correctly signed
         # token. Do not alter a JWT and confuse invalid signature with IAM denial.

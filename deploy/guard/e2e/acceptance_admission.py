@@ -125,24 +125,35 @@ def workflows_at(api,source):
     return rows
 
 
-def admit(api,identity,workflows,checkout_source,caller_workflows):
+ADMISSION_CLAUSES=('checkout_source','control_workflow_audit','caller_workflow_audit','repository_request','repository_identity',
+    'environment_request','environment_policy','branch_policies_request','branch_policy_identity','run_attempt_request','run_attempt_identity')
+
+def admit(api,identity,workflows,checkout_source,caller_workflows,*,checkpoint=None):
     """api reads actual GitHub state. Never accept a caller-supplied admission receipt."""
+    def mark(name):
+        need(name in ADMISSION_CLAUSES,'Fixed admission clause required')
+        if checkpoint is not None:checkpoint(name)
+    mark('checkout_source')
     need(checkout_source==identity['source'],'Actual checkout differs from signed controller source')
-    hashes=audit_workflows(workflows,identity['source'],caller=False)
-    caller_hashes=audit_workflows(caller_workflows,identity['source'])
+    mark('control_workflow_audit');hashes=audit_workflows(workflows,identity['source'],caller=False)
+    mark('caller_workflow_audit');caller_hashes=audit_workflows(caller_workflows,identity['source'])
     prefix='repos/'+REPOSITORY+'/'
-    repo=api(prefix)
+    mark('repository_request');repo=api(prefix)
+    mark('repository_identity')
     need(repo.get('id')==REPOSITORY_ID and repo.get('full_name')==REPOSITORY
          and repo.get('owner',{}).get('id')==OWNER_ID,'Canonical repository identity changed')
-    environment=api(prefix+'environments/'+ENVIRONMENT)
+    mark('environment_request');environment=api(prefix+'environments/'+ENVIRONMENT)
+    mark('environment_policy')
     branch_policy=environment.get('deployment_branch_policy')
     need(branch_policy=={'protected_branches':False,'custom_branch_policies':True},'Owner environment must use exact main policy')
-    branches=api(prefix+'environments/'+ENVIRONMENT+'/deployment-branch-policies?per_page=100')
+    mark('branch_policies_request');branches=api(prefix+'environments/'+ENVIRONMENT+'/deployment-branch-policies?per_page=100')
+    mark('branch_policy_identity')
     need(branches.get('total_count')==1 and type(branches.get('branch_policies')) is list
          and len(branches['branch_policies'])==1
          and branches['branch_policies'][0].get('name')=='main'
          and branches['branch_policies'][0].get('type')=='branch','Owner environment admits other refs')
-    run=api(prefix+'actions/runs/'+str(identity['run_id'])+'/attempts/'+str(identity['attempt']))
+    mark('run_attempt_request');run=api(prefix+'actions/runs/'+str(identity['run_id'])+'/attempts/'+str(identity['attempt']))
+    mark('run_attempt_identity')
     need(run.get('id')==identity['run_id'] and run.get('run_attempt')==identity['attempt']
          and run.get('event')=='workflow_dispatch' and run.get('head_sha')==identity['caller_source']
          and run.get('head_branch')=='main' and run.get('path')==CALLER
