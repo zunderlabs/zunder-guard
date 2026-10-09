@@ -1,0 +1,21 @@
+name: release acceptance admission
+on:
+  workflow_dispatch:
+permissions: {}
+concurrency:
+  group: release-owner-admission
+  cancel-in-progress: false
+jobs:
+  verify:
+    if: github.ref == 'refs/heads/main'
+    permissions:
+      contents: read
+      id-token: write
+    uses: zunderlabs/zunder-guard/.github/workflows/release-acceptance-run.yml@dd8d2ec08b5320b2fb96947e1ae17d0a6435149c
+  negative:
+    needs: verify
+    if: github.ref == 'refs/heads/main'
+    permissions:
+      contents: read
+      id-token: write
+    uses: zunderlabs/zunder-guard/.github/workflows/release-owner-admission-negative.yml@dd8d2ec08b5320b2fb96947e1ae17d0a6435149c
