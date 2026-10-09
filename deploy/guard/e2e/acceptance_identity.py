@@ -18,13 +18,20 @@ from run_producers import write_new
 
 PROBE_STAGES=('arguments','memory_preflight','checkout','oidc_request','positive_claims','control_workflows','caller_workflows','admission','negative_claims','sdk_initialization','sts_assumption','response_validation','receipt_write')
 _current_stage='arguments'
+_current_claim_clause='unknown'
 def stage(name):
     global _current_stage
     need(type(name)is str and name in PROBE_STAGES,'Fixed admission stage required');_current_stage=name
 
+def claim_checkpoint(name):
+    global _current_claim_clause
+    need(type(name)is str and name in CLAIM_CLAUSES,'Fixed claim diagnostic required');_current_claim_clause=name
+
 def safe_failure_message():
     value=_current_stage if type(_current_stage)is str and _current_stage in PROBE_STAGES else 'unknown'
-    return 'Actual owner admission probe incomplete at stage='+value+'; no owner key was read.'
+    clause=_current_claim_clause if type(_current_claim_clause)is str and _current_claim_clause in CLAIM_CLAUSES else 'unknown'
+    suffix=(' clause='+clause)if value=='positive_claims'else ''
+    return 'Actual owner admission probe incomplete at stage='+value+suffix+'; no owner key was read.'
 
 def no_swap():
     need(sys.platform=='linux' and Path('/proc/swaps').is_file()
@@ -68,7 +75,7 @@ def probe(control_source,negative=False):
     need(checkout==control_source,'Actual probe checkout differs')
     stage('oidc_request');token=oidc_token()
     if not negative:
-        stage('positive_claims');identity=claims_before_sts(token,control_source)
+        stage('positive_claims');identity=claims_before_sts(token,control_source,checkpoint=claim_checkpoint)
         stage('control_workflows');control_workflows=workflows_at(github_api,control_source)
         stage('caller_workflows');caller_workflows=workflows_at(github_api,identity['caller_source'])
         stage('admission');admission=admit(github_api,identity,control_workflows,checkout,caller_workflows)
