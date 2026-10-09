@@ -1,0 +1,885 @@
+{
+  "schema": 1,
+  "kind": "fixed-public-linux-transfer-file-map",
+  "files": [
+    {
+      "path": "bootstrap/bootstrap.py",
+      "sha256": "3df2f256b0fe5d594cbf3d304a151633f95ac2b9c69a7a6ea6471486c4e5f123",
+      "bytes": 31120
+    },
+    {
+      "path": "bundle/amd64-bundle.json",
+      "sha256": "cf2c002f5467a16015c376b9bbc7f949bef9d919de55774f34f77e983ccc2b38",
+      "bytes": 41643
+    },
+    {
+      "path": "bundle/keyring.gpg",
+      "sha256": "80a36b0a6de2f69f49d2df75ef473ccde121e9e190b9ea01d20a4f63778d5c31",
+      "bytes": 3607
+    },
+    {
+      "path": "bundle/repo/dists/noble-security/InRelease",
+      "sha256": "3f6ed46e7941d106b4adaac60f67222a233a5fa142ac2a97da94abd60c96defd",
+      "bytes": 126127
+    },
+    {
+      "path": "bundle/repo/dists/noble-security/main/binary-amd64/Packages",
+      "sha256": "ca4a5192f93d79c25350239cc3b09538c055e4bda59d6f9fd598425d6c07dcd6",
+      "bytes": 6100046
+    },
+    {
+      "path": "bundle/repo/dists/noble-security/main/binary-amd64/Packages.xz",
+      "sha256": "6bf98290defad249c1ea90a2d3724450b20deb3fe190ffc8626f9f4cc3d0462d",
+      "bytes": 1120844
+    },
+    {
+      "path": "bundle/repo/dists/noble-security/universe/binary-amd64/Packages",
+      "sha256": "b6dd8810d73a2898b51e112520b8c713b31f29c8479366ac41ee6fd70e8237f8",
+      "bytes": 7660536
+    },
+    {
+      "path": "bundle/repo/dists/noble-security/universe/binary-amd64/Packages.xz",
+      "sha256": "71a7a251910e837a7503d18bb63baa877ce4fb294997b78eb92ecc10c54bdaf1",
+      "bytes": 1219656
+    },
+    {
+      "path": "bundle/repo/dists/noble-updates/InRelease",
+      "sha256": "a76f0a997bd76dc95b932044ad72395e6a8d196d61988974b0defc7e56c55e86",
+      "bytes": 126125
+    },
+    {
+      "path": "bundle/repo/dists/noble-updates/main/binary-amd64/Packages",
+      "sha256": "06da1af52fde38eaf307eeae2f7e912c4ecc87a911891fa1566f0cdfed46b5d8",
+      "bytes": 7433942
+    },
+    {
+      "path": "bundle/repo/dists/noble-updates/main/binary-amd64/Packages.xz",
+      "sha256": "bfa2c5268d2c66c83b121ed54457bf5f80bd1ba450f27c86c873683909bb4d6c",
+      "bytes": 1374912
+    },
+    {
+      "path": "bundle/repo/dists/noble-updates/universe/binary-amd64/Packages",
+      "sha256": "e0380bbc7a9f4bd2a8417f1229159867be55a25e85d76442d67e3b1ba2aac6f6",
+      "bytes": 10614268
+    },
+    {
+      "path": "bundle/repo/dists/noble-updates/universe/binary-amd64/Packages.xz",
+      "sha256": "7d282b89baf7ae2602d08d44f661082cc856bbd5cef07f2063854e4682419eb6",
+      "bytes": 1702152
+    },
+    {
+      "path": "bundle/repo/dists/noble/InRelease",
+      "sha256": "cdb2f31d809f589719a53c6ad15f255b27569c4059542ada282aaa21b8e164b0",
+      "bytes": 255850
+    },
+    {
+      "path": "bundle/repo/dists/noble/main/binary-amd64/Packages",
+      "sha256": "8f6f71ae839c8cba390a7643fcbbdacddb0bc7d12c1583a2dd80a1f8443a30e5",
+      "bytes": 7165069
+    },
+    {
+      "path": "bundle/repo/dists/noble/main/binary-amd64/Packages.xz",
+      "sha256": "2a6a199e1031a5c279cb346646d594993f35b1c03dd4a82aaa0323980dd92451",
+      "bytes": 1401160
+    },
+    {
+      "path": "bundle/repo/dists/noble/universe/binary-amd64/Packages",
+      "sha256": "687ffc969e7700137677b9cfe2f614ee2d638052a91a7c9bf31f3f6a3040a99a",
+      "bytes": 73379142
+    },
+    {
+      "path": "bundle/repo/dists/noble/universe/binary-amd64/Packages.xz",
+      "sha256": "ba9057fa1b91438cc8a1d26808d00c85389fe101d0c1496254df97236405599a",
+      "bytes": 15037908
+    },
+    {
+      "path": "outer/README.md",
+      "sha256": "9e51b71bbf7945e53bb5d259caa63f2bedc6ea6bc1de2bf9edd7b5748b3c6ad2",
+      "bytes": 13737
+    },
+    {
+      "path": "outer/controller/control.test.ts",
+      "sha256": "b2005da144953769b71e2bf018db83d677ddb86bc138c51105f3d0e98a0838ab",
+      "bytes": 1386
+    },
+    {
+      "path": "outer/controller/control.ts",
+      "sha256": "12658198893da77323824fdc3c20cbff3aae284ba4c181c48bce32bf573bb954",
+      "bytes": 3266
+    },
+    {
+      "path": "outer/controller/entry.test.ts",
+      "sha256": "5885acdd7ef99415ff7509b3f6689c0ccb2af7841321ab94249ea840e2cf1607",
+      "bytes": 1732
+    },
+    {
+      "path": "outer/controller/entry.ts",
+      "sha256": "06bf30f3e9d5c97ad908495edae848a4dd4abebaeb533dcedc88b17d41406d46",
+      "bytes": 14176
+    },
+    {
+      "path": "outer/controller/nss-trust.test.ts",
+      "sha256": "5fc9b9bb58b1b32eeefc092839634f4eb40638ebdcee918d9e65f0d32e04c363",
+      "bytes": 3586
+    },
+    {
+      "path": "outer/controller/nss-trust.ts",
+      "sha256": "dc1237cbdd7067fc451f2d7c572480d29a5c7a8583009f04ef3cb797ee35b2fa",
+      "bytes": 10524
+    },
+    {
+      "path": "outer/controller/policy.test.ts",
+      "sha256": "3e8ea9c31fde941795365eed2563f9a1e737cca441aafd17cf4b0e885d2a2805",
+      "bytes": 2146
+    },
+    {
+      "path": "outer/controller/policy.ts",
+      "sha256": "e58835e2cdc8b2b1145f471ae906605310d3fbe0bf9f89ccbdd77c604dc16cdb",
+      "bytes": 3534
+    },
+    {
+      "path": "outer/controller/tsconfig.json",
+      "sha256": "58547564c1e1ee3d678cea945c05a3a2192942b4bdd580e1a02e159e1e306311",
+      "bytes": 432
+    },
+    {
+      "path": "outer/inventory/README.md",
+      "sha256": "573a691b5f908a51de0913c6bb41ceb2d3b2b707ca657bbcccd1e2e32b8d4eca",
+      "bytes": 12663
+    },
+    {
+      "path": "outer/inventory/checks.json",
+      "sha256": "7a78ca29bf94bd86438be422ede16ce560f12cdce7168ca23eccedef29f85d35",
+      "bytes": 678
+    },
+    {
+      "path": "outer/inventory/generate-inventory.mjs",
+      "sha256": "8c325d3241f7a3252a9cd5980caa36dcf2c7d21e41a010af0335c545cf256d07",
+      "bytes": 6367
+    },
+    {
+      "path": "outer/inventory/inventory.json",
+      "sha256": "143e4f07acb7c3a8c273fa0aa5ea1e00a3eb730096ccdec473f56fd8598169ec",
+      "bytes": 14059
+    },
+    {
+      "path": "outer/inventory/local-package-files.json",
+      "sha256": "01321c1b14f23b58957afe6c82aedaf4b59227890566fe7f06e4d4f30f010cd2",
+      "bytes": 251675
+    },
+    {
+      "path": "outer/inventory/manifest.json",
+      "sha256": "89b944ac1fd6a683f740bab7edb3db52eaf1b6120dc51528c3d3e241a59abdd5",
+      "bytes": 2105
+    },
+    {
+      "path": "outer/inventory/metadata/bubblewrap-README.md",
+      "sha256": "0c1dc12c6d94017c45e220fc0e5b679f24c0f09494bdd4bc7157d8abcd75c001",
+      "bytes": 10687
+    },
+    {
+      "path": "outer/inventory/metadata/cft-151.0.7922.34.json",
+      "sha256": "fabbb413bc61deccd5ca5731a84737937dfaffafdb033c3f392db2964c96f98e",
+      "bytes": 2138
+    },
+    {
+      "path": "outer/inventory/metadata/noble-InRelease",
+      "sha256": "cdb2f31d809f589719a53c6ad15f255b27569c4059542ada282aaa21b8e164b0",
+      "bytes": 255850
+    },
+    {
+      "path": "outer/inventory/metadata/noble-security-InRelease",
+      "sha256": "3f6ed46e7941d106b4adaac60f67222a233a5fa142ac2a97da94abd60c96defd",
+      "bytes": 126127
+    },
+    {
+      "path": "outer/inventory/metadata/noble-updates-InRelease",
+      "sha256": "814f886a833feeaf7f0289b8f8e57bdacc09209d17656cadade0962f8115ac11",
+      "bytes": 126125
+    },
+    {
+      "path": "outer/inventory/metadata/node-26.11.1-shasums.txt",
+      "sha256": "75ff0c104acddb008964dd5feb88f58844b652820cb1cb01696f95031372b293",
+      "bytes": 3171
+    },
+    {
+      "path": "outer/inventory/metadata/node-26.8.1-shasums.asc",
+      "sha256": "d1e2716a1f5406c6a9f037666ae0afa25255949f19a5b0f721dfe36670041d74",
+      "bytes": 3423
+    },
+    {
+      "path": "outer/inventory/metadata/node-26.8.1-shasums.sig",
+      "sha256": "28668868e17828d2eb9f8b7fc82791c92ae291fa886f3b9ddbd1f6ac30bb5099",
+      "bytes": 119
+    },
+    {
+      "path": "outer/inventory/metadata/node-26.8.1-shasums.txt",
+      "sha256": "4f1c377505ddc3a872821cd333b72d9743673a41c939508d877e8cd8d4379336",
+      "bytes": 3145
+    },
+    {
+      "path": "outer/inventory/metadata/node-README.md",
+      "sha256": "402f35f68a3dfd93443e60f1c4a237fba8a2e75594ed811ebcbcbc3dfa89c486",
+      "bytes": 41791
+    },
+    {
+      "path": "outer/inventory/metadata/node-release-keys.kbx",
+      "sha256": "610b8d249da3d5733f5a128def2dd0294dbbf5b5713e6ca2529db8db419dee00",
+      "bytes": 95960
+    },
+    {
+      "path": "outer/inventory/metadata/retrieval-extra.json",
+      "sha256": "cccc60843e30e512594a934f18583bd87cf541a7c7e199324dc010fb4959c2d4",
+      "bytes": 1262
+    },
+    {
+      "path": "outer/inventory/metadata/retrieval.json",
+      "sha256": "8bd3eac3696d90a80b2314f00d255be188ce15e3718b8dbae625a9914af7a982",
+      "bytes": 1658
+    },
+    {
+      "path": "outer/inventory/node-signature-verification.json",
+      "sha256": "58925aff65a8d4c5f5e0a6f43f716e773ed3abce6f25911c72d5c55d5cdee015",
+      "bytes": 1182
+    },
+    {
+      "path": "outer/inventory/r2/README.md",
+      "sha256": "77b67bc930b7335ccfa3c87d57a8317e2c5683ba5c1ad4f84d5bb457b6a874c7",
+      "bytes": 4538
+    },
+    {
+      "path": "outer/inventory/r2/checks.json",
+      "sha256": "a1cf3c7dcc75ccaaca746aeccac962fee5a2d22527359db4b38315dc1abd0f21",
+      "bytes": 981
+    },
+    {
+      "path": "outer/inventory/r2/evidence/acquisition.json",
+      "sha256": "6163f5b4b079147c3565ee8fde9a38b3585fd25c9fa42646dc268d391400a0f9",
+      "bytes": 1019
+    },
+    {
+      "path": "outer/inventory/r2/evidence/chrome-complete-tree.json",
+      "sha256": "418c095df1fcf5549612c8129b1dd4e24897acdc48ae63c1d0408e1ecdfd645d",
+      "bytes": 61350
+    },
+    {
+      "path": "outer/inventory/r2/evidence/provider-r11-source-manifest.json",
+      "sha256": "2062f0d0c72da57ac479eec52a695592f4b1e88d36a6ec70e824db4fefb9a99f",
+      "bytes": 2892
+    },
+    {
+      "path": "outer/inventory/r2/evidence/verified-public-packages.json",
+      "sha256": "3b894c293e24d5d3b1e747757a0def29dd84a43312d095287f6eb69c4d92997c",
+      "bytes": 412099
+    },
+    {
+      "path": "outer/inventory/r2/generate-inventory.mjs",
+      "sha256": "fbc1a42cb048220bdc3df7a4ed72a0e06a3aa90acda054be03aa62ae1eb239f4",
+      "bytes": 6756
+    },
+    {
+      "path": "outer/inventory/r2/inventory.json",
+      "sha256": "db61182a29002e4a44096066eb7452aceb7a4ce8ee40f25222972512ba936e09",
+      "bytes": 256589
+    },
+    {
+      "path": "outer/inventory/r2/manifest.json",
+      "sha256": "d9ca514d98d4c965a49d10dfe61d2dcffbfe1232a1291128b91d2863e10b562a",
+      "bytes": 1068
+    },
+    {
+      "path": "outer/owned/deploy/guard/e2e/NO-KEY-WALLET-BOUNDARY.md",
+      "sha256": "453863f60d46a006c605e5ecd572a8597d1ba15bbc041f55a8315f661fffff30",
+      "bytes": 4609
+    },
+    {
+      "path": "outer/owned/deploy/guard/e2e/PRIVATE-BOUNDARY.md",
+      "sha256": "eaf8cb4d3ef5abd8970ddc706ba949e3653968fe0c2ebf50cb2d5177a2208487",
+      "bytes": 8424
+    },
+    {
+      "path": "outer/owned/deploy/guard/e2e/private_boundary.py",
+      "sha256": "f58c7c0c52161b45ffe636b895067ea1924feaff3eaea1ac7fffd6f11d15d6e5",
+      "bytes": 12184
+    },
+    {
+      "path": "outer/owned/deploy/guard/e2e/private_boundary_fixture.py",
+      "sha256": "289e8512d85e6712915761af4e7a61f884c0a38664bf328e7b31ddc358b28149",
+      "bytes": 626
+    },
+    {
+      "path": "outer/owned/deploy/guard/e2e/private_browser_launcher.py",
+      "sha256": "b20be55efd07d3d1b1f88f902434b125e7856b7064c3a9358af0bb6941e50d85",
+      "bytes": 8548
+    },
+    {
+      "path": "outer/owned/deploy/guard/e2e/private_control_entry.py",
+      "sha256": "0c7e0a020933dd5da1412ba23d9a7bc99259182cdb2463922cb863a7fcd37a78",
+      "bytes": 807
+    },
+    {
+      "path": "outer/owned/deploy/guard/e2e/private_kernel_probe_launcher.py",
+      "sha256": "abdeee74d3a61949f05881188dec4a11d73d2396e281666d6025990d6e227e90",
+      "bytes": 6434
+    },
+    {
+      "path": "outer/owned/deploy/guard/e2e/private_process_entry.py",
+      "sha256": "a66ea8d866f0a13798240aaed52d7de797ac6997137a79e255182cfc25f9859a",
+      "bytes": 907
+    },
+    {
+      "path": "outer/owned/deploy/guard/e2e/private_process_scope.py",
+      "sha256": "48974ae2f1bbf046199410d6699b891906a763d36a158b86ce1bc9d32d7f1787",
+      "bytes": 12525
+    },
+    {
+      "path": "outer/owned/deploy/guard/e2e/private_scope_watchdog.py",
+      "sha256": "8d26479ec66dd930d1da5549416bd89c4ebd7e103b50e7c31945ded1bd8c5fbd",
+      "bytes": 7282
+    },
+    {
+      "path": "outer/owned/deploy/guard/e2e/release_flow.py",
+      "sha256": "5d06ea326465b0fb9d7fb715b171a5217fb82e01d4457accfc0ec01bd5cc3347",
+      "bytes": 10289
+    },
+    {
+      "path": "outer/owned/deploy/guard/e2e/root_network_flow.mjs",
+      "sha256": "00a944548bf8a8cc29ead8add199ef8afff9b537d40d9526cac5948fe3a77aab",
+      "bytes": 5500
+    },
+    {
+      "path": "outer/owned/deploy/guard/e2e/root_tls_capability.mjs",
+      "sha256": "22dd078eb2633d761a1be68617462b55e41cf0b9b4c1f59c2fea03f0dad7dac8",
+      "bytes": 8374
+    },
+    {
+      "path": "outer/owned/deploy/guard/e2e/run_no_key_wallet_boundary.py",
+      "sha256": "e828b1a25c2286a8b628d2d4f892f63ac9e9cc03001e25b0bd913603df089b18",
+      "bytes": 30080
+    },
+    {
+      "path": "outer/owned/deploy/guard/e2e/test_no_key_wallet_boundary.py",
+      "sha256": "38621520e1affce69cf5e3039702aaccbe31c0e0df6c7a60b633ed10ad98edda",
+      "bytes": 6821
+    },
+    {
+      "path": "outer/owned/deploy/guard/e2e/test_private_boundary.py",
+      "sha256": "69f4dd37cc90a7544b238e3722ac4cba864aa5d1ceec77b6789aa7a704890643",
+      "bytes": 8659
+    },
+    {
+      "path": "outer/owned/deploy/guard/e2e/test_private_kernel_probe_launcher.py",
+      "sha256": "639a12829b32646f8b77f573ecca67cdcf84ff8fa4bce9352efd2f4ddcb68046",
+      "bytes": 4466
+    },
+    {
+      "path": "outer/owned/deploy/guard/e2e/test_private_process_scope.py",
+      "sha256": "8a68d661ec1f3b71ced300df442bffefda245f8871ae3ba3fb58bd9ecf68ff9f",
+      "bytes": 5600
+    },
+    {
+      "path": "outer/owned/deploy/guard/e2e/test_root_network_flow.mjs",
+      "sha256": "4241c9b79ab041320f97aec37ebbf874505ca7f59713a5cb19ccfdd6c2f3c09a",
+      "bytes": 6570
+    },
+    {
+      "path": "outer/owned/deploy/guard/e2e/test_root_tls_deadline.mjs",
+      "sha256": "05347c748db054fbcc45281a4d4a5d23b26f5b5cb3de506d7903607a9b409990",
+      "bytes": 5247
+    },
+    {
+      "path": "outer/owned/web/testnet-journey/wallet-extension/DRIVER-STATUS.md",
+      "sha256": "f066d814c93499d58375933fd110668441e6fd2d724879ca12350801156bc413",
+      "bytes": 4785
+    },
+    {
+      "path": "outer/owned/web/testnet-journey/wallet-extension/INTERFACES.md",
+      "sha256": "e711fc1211d11e6a40032cd977bdef4b2dfaf37e12fd873c78ef4e34bbe70ebe",
+      "bytes": 20746
+    },
+    {
+      "path": "outer/owned/web/testnet-journey/wallet-extension/NETWORK-SPEC.md",
+      "sha256": "b83ef7ec069746e068d852451c2fbadb119349c06b7449fb7a4d53d3b09f4f66",
+      "bytes": 8124
+    },
+    {
+      "path": "outer/owned/web/testnet-journey/wallet-extension/SPEC.md",
+      "sha256": "6f38d019eed145db70b8a8bdece9c5607e1ae791cb926dd47945b8cc56486aa0",
+      "bytes": 25453
+    },
+    {
+      "path": "outer/owned/web/testnet-journey/wallet-extension/boundary.test.ts",
+      "sha256": "3f7486cfe7d3147341d2dcd2675b0b8a2cc4c9a66cc8a9d28033f3afdda25e03",
+      "bytes": 10594
+    },
+    {
+      "path": "outer/owned/web/testnet-journey/wallet-extension/driver-control.ts",
+      "sha256": "8448e15cc73b92c50b75be5e2ed5b1ee809ccfac36fb822d4e0bfa1c95c4628d",
+      "bytes": 11543
+    },
+    {
+      "path": "outer/owned/web/testnet-journey/wallet-extension/driver-files.ts",
+      "sha256": "5b1260b63fb4cdd8b90515070b6c21a676d4e5930d1b62f8c39b4a8b97d7292f",
+      "bytes": 8754
+    },
+    {
+      "path": "outer/owned/web/testnet-journey/wallet-extension/driver-flow.ts",
+      "sha256": "df768f55eaa0cf2d46417a9959c246b2fa90dfc26480e9f9ad749dea78e967d8",
+      "bytes": 8398
+    },
+    {
+      "path": "outer/owned/web/testnet-journey/wallet-extension/driver-launcher.ts",
+      "sha256": "410ef729baad4563930bf93b413ea65ff322322831736cedf871ff3f7e213a29",
+      "bytes": 2288
+    },
+    {
+      "path": "outer/owned/web/testnet-journey/wallet-extension/driver-policy.ts",
+      "sha256": "d8239b9150873aa07ab696236af2013dc69ed99e26c5e8c68607a978502e6ee0",
+      "bytes": 11313
+    },
+    {
+      "path": "outer/owned/web/testnet-journey/wallet-extension/driver-ui.ts",
+      "sha256": "ed8fcf4b0ee4e8a8e86dcb9c3c4213792c0e8222628d29487eb8cdc3ccc18a16",
+      "bytes": 14614
+    },
+    {
+      "path": "outer/owned/web/testnet-journey/wallet-extension/driver.test.ts",
+      "sha256": "1ab1db111bd07b7adeda64918e57ae1865fb62ebafadb501a69056a75e7a0ea2",
+      "bytes": 15528
+    },
+    {
+      "path": "outer/owned/web/testnet-journey/wallet-extension/driver.ts",
+      "sha256": "acc19e431991d441d6aa20abdd62c9f09c01bde3661734ac8a0ce47e7b4a8d6f",
+      "bytes": 1916
+    },
+    {
+      "path": "outer/owned/web/testnet-journey/wallet-extension/linux-runtime.test.ts",
+      "sha256": "986778eb0bf728211ffbd40854505a5e75cf165f87e8f51c6db852a1bc0a386d",
+      "bytes": 2628
+    },
+    {
+      "path": "outer/owned/web/testnet-journey/wallet-extension/linux-runtime.ts",
+      "sha256": "b610f1072a09b3993bd0f4c1c3371de643f37700867f63ab5f451d3061563d2f",
+      "bytes": 6299
+    },
+    {
+      "path": "outer/owned/web/testnet-journey/wallet-extension/mount-policy.ts",
+      "sha256": "196f188cdc082c827c56d53f674f22373a5cebebccc16edb81ef4b911b318ebe",
+      "bytes": 2837
+    },
+    {
+      "path": "outer/owned/web/testnet-journey/wallet-extension/network-linux.ts",
+      "sha256": "53118eec188ebf1797bfd118e1d88844f09e5521af974d3bb6fca4741d2b3b62",
+      "bytes": 13880
+    },
+    {
+      "path": "outer/owned/web/testnet-journey/wallet-extension/network.ts",
+      "sha256": "cfc1e57bdd4cb649a3369690a13ddb23335f22e67aec7baeedaf85f237dea1b7",
+      "bytes": 7902
+    },
+    {
+      "path": "outer/owned/web/testnet-journey/wallet-extension/parent-flow-loader.test.ts",
+      "sha256": "a64de7cd723d86e8a8b460708096b4c676ea5d6d533624f9226e29c3cc1d835b",
+      "bytes": 6428
+    },
+    {
+      "path": "outer/owned/web/testnet-journey/wallet-extension/parent-flow-loader.ts",
+      "sha256": "29b9ca2ae15e3f40d1aa31c5f78e547fb51c9338325a5d613ae1ef71f094b3ae",
+      "bytes": 14445
+    },
+    {
+      "path": "outer/owned/web/testnet-journey/wallet-extension/proxy-policy.ts",
+      "sha256": "8e824539c6a2b7c38cb81d330d970ece1240693241ec6bf7704aa09efa40c241",
+      "bytes": 22744
+    },
+    {
+      "path": "outer/owned/web/testnet-journey/wallet-extension/proxy.test.ts",
+      "sha256": "c7a58e8789c42b80da88d7a6f0b12da5eb3cde05b12a90684fc3d493368d1a8a",
+      "bytes": 15319
+    },
+    {
+      "path": "outer/owned/web/testnet-journey/wallet-extension/proxy.ts",
+      "sha256": "d867a1f6e5dbd90d98d09373489738517c735196c27df203335fe152738eb943",
+      "bytes": 12623
+    },
+    {
+      "path": "outer/owned/web/testnet-journey/wallet-extension/tls-material.ts",
+      "sha256": "ec89b6fcdbbe8fe16b8c7ed01b569585d1ae8fc2a279fbe171ba315c9b1c6628",
+      "bytes": 5216
+    },
+    {
+      "path": "outer/owned/web/testnet-journey/wallet-extension/tsconfig.boundary.json",
+      "sha256": "185ab5a180a1d5c8710b449e7034e567d9b4c6cb3f663194a5e99bc5b10cebe7",
+      "bytes": 379
+    },
+    {
+      "path": "outer/owned/web/testnet-journey/wallet-extension/tsconfig.driver.json",
+      "sha256": "f4de477519b8816c5b0e81ffff606482b2c35a14e65fa367f0b6f1c0c38e54a5",
+      "bytes": 392
+    },
+    {
+      "path": "outer/owned/web/testnet-journey/wallet-extension/tsconfig.linux-runtime.json",
+      "sha256": "eecff4f5673b950872dc470b1cdb8ecb5e7a8f5743c8d4dee946a0461a1bf3ad",
+      "bytes": 332
+    },
+    {
+      "path": "outer/owned/web/testnet-journey/wallet-extension/tsconfig.parent-loader.json",
+      "sha256": "ebe6c56442c163387ec3d8f2603a5bbb962b4eb8c5d8c4016faa4e52959aa6c4",
+      "bytes": 465
+    },
+    {
+      "path": "outer/owned/website-probe-source/contract.mjs",
+      "sha256": "6fe4be1c3bfd1f77a2e6fe6c76adfc79bd8c615484f1c49b896d8b9eac08c162",
+      "bytes": 3616
+    },
+    {
+      "path": "outer/owned/website-probe-source/linux-probe.mjs",
+      "sha256": "d43ba9ee45076e561685d4bf14596191c9462647ff6c986772756f59c2105a16",
+      "bytes": 7704
+    },
+    {
+      "path": "outer/package.json",
+      "sha256": "6d1d8e51c08727c8ced25be4222c88963e0333ec95e9dd3f4af306dae6469a15",
+      "bytes": 193
+    },
+    {
+      "path": "outer/probes/README.md",
+      "sha256": "f5120d9eaf08cba2cc13fb6efdf387cb50ec79405c67ba4bdf8787294fc7db2d",
+      "bytes": 12605
+    },
+    {
+      "path": "outer/probes/browser-probes.mjs",
+      "sha256": "982fc8705c4ad125bd247a026ee8bb8fd22dc814ac6b67a81cbcf02d352a5cec",
+      "bytes": 4674
+    },
+    {
+      "path": "outer/probes/cleanup-verifier.mjs",
+      "sha256": "0728965c0e5dcdbea6ae2e35ef31c4a37ca274b100f79abc6a5607501f1de95d",
+      "bytes": 6840
+    },
+    {
+      "path": "outer/probes/collect-teardown.mjs",
+      "sha256": "6eb37b184e38fa141da47a8f81d3cb3f9e5f6207f62b4883659a11fa6af7c6c9",
+      "bytes": 5288
+    },
+    {
+      "path": "outer/probes/contract.mjs",
+      "sha256": "6fe4be1c3bfd1f77a2e6fe6c76adfc79bd8c615484f1c49b896d8b9eac08c162",
+      "bytes": 3616
+    },
+    {
+      "path": "outer/probes/host-fixtures.mjs",
+      "sha256": "c93487c0e7e5d9b85c21b19e08422947adef01f2508e3faefc50eac0afd254b6",
+      "bytes": 7944
+    },
+    {
+      "path": "outer/probes/linux-probe.mjs",
+      "sha256": "d43ba9ee45076e561685d4bf14596191c9462647ff6c986772756f59c2105a16",
+      "bytes": 7704
+    },
+    {
+      "path": "outer/probes/probes.test.mjs",
+      "sha256": "404dedfcca4a37bedbafdb54173559902822bebcbcfb3384897a18bb86a533d9",
+      "bytes": 11112
+    },
+    {
+      "path": "outer/probes/source-manifest-r4.json",
+      "sha256": "781ae5278570a44023adfb4d0d66a1bdf88db90e56c1dd55cc7d4a3b8e2041ed",
+      "bytes": 2110
+    },
+    {
+      "path": "outer/probes/source-report-r4.json",
+      "sha256": "c227093694a8d8221342400687950d691a649ab377a4de85e55a760567c04d2c",
+      "bytes": 957
+    },
+    {
+      "path": "runtime-archives/chrome-linux64.zip",
+      "sha256": "ae8736ac28bc69278551500f219fc749575648263c43ec5990749eff43b9fcf8",
+      "bytes": 193282658
+    },
+    {
+      "path": "runtime-archives/node-v26.8.1-linux-x64.tar.xz",
+      "sha256": "3e301118d7df53d563b7e96c1617545f26e2f76f9724be668d6cab65c15dda5d",
+      "bytes": 33703524
+    },
+    {
+      "path": "runtime-archives/npm/node_modules_@adraffy_ens-normalize.tgz",
+      "sha256": "7578f2dbf456f0f602e18c478886a579ed657d246f51417df1033b894fbab389",
+      "bytes": 228910
+    },
+    {
+      "path": "runtime-archives/npm/node_modules_@noble_curves.tgz",
+      "sha256": "b8deefbef49216803efff80fcf7f164ccbb1fa4888eed571678535710af1d0a3",
+      "bytes": 269106
+    },
+    {
+      "path": "runtime-archives/npm/node_modules_@noble_hashes.tgz",
+      "sha256": "f4b71760b6da6d251392c06c56f49cf12134a20b04e31980e2a59704505d8b0b",
+      "bytes": 113637
+    },
+    {
+      "path": "runtime-archives/npm/node_modules_aes-js.tgz",
+      "sha256": "e8206e064409c3162726b05ec8fffed3982ff4ee1ac0fe04ca043ab984751226",
+      "bytes": 397643
+    },
+    {
+      "path": "runtime-archives/npm/node_modules_ethers.tgz",
+      "sha256": "17355f81284ba8431953c77af803b122baf4670cdbf84907adf7cafcd745052b",
+      "bytes": 2722245
+    },
+    {
+      "path": "runtime-archives/npm/node_modules_ethers_node_modules_tslib.tgz",
+      "sha256": "70d057c311c797b234d8868f33330af39a977da94e92264257736b0b88d57e4c",
+      "bytes": 16229
+    },
+    {
+      "path": "runtime-archives/npm/node_modules_playwright-core.tgz",
+      "sha256": "954be1e183d0ddb9748fe0d2d08b0b66a9210c74dd75c397aeb70303b9f08a00",
+      "bytes": 3070300
+    },
+    {
+      "path": "runtime-archives/npm/node_modules_ws.tgz",
+      "sha256": "d08b726b3aae3a0fed5218a0d9a4b2ac8d75d4ad453a9271db55fe38e94eb4cf",
+      "bytes": 34987
+    },
+    {
+      "path": "seed-archives/065c2ab1abc9108b17d401016dc594b79750904390f095845c93bb06e1153acc.deb",
+      "sha256": "065c2ab1abc9108b17d401016dc594b79750904390f095845c93bb06e1153acc",
+      "bytes": 1603290
+    },
+    {
+      "path": "seed-archives/08d7baeff0285804178a8ed99b49514f210d38881bd118157cd9e222646c17a5.deb",
+      "sha256": "08d7baeff0285804178a8ed99b49514f210d38881bd118157cd9e222646c17a5",
+      "bytes": 707170
+    },
+    {
+      "path": "seed-archives/08eb17ba3b83378ed1e73d8335d0ce03b429c0bbeb07e374f536234edab02465.deb",
+      "sha256": "08eb17ba3b83378ed1e73d8335d0ce03b429c0bbeb07e374f536234edab02465",
+      "bytes": 1128326
+    },
+    {
+      "path": "seed-archives/09dfa5c881ab273ec6bc1830adcefdc407fcd619316e68fb26ca3a23d0fc9f54.deb",
+      "sha256": "09dfa5c881ab273ec6bc1830adcefdc407fcd619316e68fb26ca3a23d0fc9f54",
+      "bytes": 230606
+    },
+    {
+      "path": "seed-archives/09e929ceb9fc5d11757f28429b3151601c44db4c96e0bc5ad46c501c8d56f4f9.deb",
+      "sha256": "09e929ceb9fc5d11757f28429b3151601c44db4c96e0bc5ad46c501c8d56f4f9",
+      "bytes": 118192
+    },
+    {
+      "path": "seed-archives/0ee1015cccd063249e01c0cd0bf45f513c8ac9a1e5e485070c12e69192455e4a.deb",
+      "sha256": "0ee1015cccd063249e01c0cd0bf45f513c8ac9a1e5e485070c12e69192455e4a",
+      "bytes": 10764
+    },
+    {
+      "path": "seed-archives/22b7d47e3c0f7953a78d3cfd309d1b20771085de9220fbe610c0989b9e808c9b.deb",
+      "sha256": "22b7d47e3c0f7953a78d3cfd309d1b20771085de9220fbe610c0989b9e808c9b",
+      "bytes": 66020
+    },
+    {
+      "path": "seed-archives/2461f1beee9cb04c8942739fe1a2b37e7b7c2a3d518f0779dc75f9245baa3094.deb",
+      "sha256": "2461f1beee9cb04c8942739fe1a2b37e7b7c2a3d518f0779dc75f9245baa3094",
+      "bytes": 50436
+    },
+    {
+      "path": "seed-archives/250345b73e42a97ee71cae7c1e470897dfad3c639eb0a7aafe4f9a3a29871cb2.deb",
+      "sha256": "250345b73e42a97ee71cae7c1e470897dfad3c639eb0a7aafe4f9a3a29871cb2",
+      "bytes": 3475000
+    },
+    {
+      "path": "seed-archives/2b9caeb423efb540296a1cb20b872cc630c23908407ecb5c1c787a617622d664.deb",
+      "sha256": "2b9caeb423efb540296a1cb20b872cc630c23908407ecb5c1c787a617622d664",
+      "bytes": 121944
+    },
+    {
+      "path": "seed-archives/36de43b15853ccae0028e9a767613770c704833f82586f28eb262f0311adb8a8.deb",
+      "sha256": "36de43b15853ccae0028e9a767613770c704833f82586f28eb262f0311adb8a8",
+      "bytes": 11124
+    },
+    {
+      "path": "seed-archives/397f84347476a3c5786b39f3ff6f0f82866eb3d8be6d2ad3efeadf019efe5b80.deb",
+      "sha256": "397f84347476a3c5786b39f3ff6f0f82866eb3d8be6d2ad3efeadf019efe5b80",
+      "bytes": 649780
+    },
+    {
+      "path": "seed-archives/4254f11d782dfb970e78113519a59d440112ed43c4b56f709da0aef81da8651a.deb",
+      "sha256": "4254f11d782dfb970e78113519a59d440112ed43c4b56f709da0aef81da8651a",
+      "bytes": 1445132
+    },
+    {
+      "path": "seed-archives/42c5d4b00954f17c2c3c4b866844f691eb8b6d57bf08b59203e65f12dc84a4f9.deb",
+      "sha256": "42c5d4b00954f17c2c3c4b866844f691eb8b6d57bf08b59203e65f12dc84a4f9",
+      "bytes": 55282
+    },
+    {
+      "path": "seed-archives/45783969a9ece9d7b7b733b8c60981584c53c6bc5ee3b42d295d2f80d1285679.deb",
+      "sha256": "45783969a9ece9d7b7b733b8c60981584c53c6bc5ee3b42d295d2f80d1285679",
+      "bytes": 30406
+    },
+    {
+      "path": "seed-archives/45d3f530ba1f9d6e879ad46b92046fabab13fe50a82450e4f65557a3bbad1489.deb",
+      "sha256": "45d3f530ba1f9d6e879ad46b92046fabab13fe50a82450e4f65557a3bbad1489",
+      "bytes": 2070530
+    },
+    {
+      "path": "seed-archives/4bfe348b456db5b445a80e0a3ffb9e9a01b91499bb86e0e568ca3634b134da7e.deb",
+      "sha256": "4bfe348b456db5b445a80e0a3ffb9e9a01b91499bb86e0e568ca3634b134da7e",
+      "bytes": 34172
+    },
+    {
+      "path": "seed-archives/4d3e858dd57be617c49d87c5ddcdb35df744a4f0a559981256ae2ba174718584.deb",
+      "sha256": "4d3e858dd57be617c49d87c5ddcdb35df744a4f0a559981256ae2ba174718584",
+      "bytes": 41388
+    },
+    {
+      "path": "seed-archives/57ebb378c59d2f9ef479bee0abc933c560878cc10e2c3af8e05d6fdb2ed63da4.deb",
+      "sha256": "57ebb378c59d2f9ef479bee0abc933c560878cc10e2c3af8e05d6fdb2ed63da4",
+      "bytes": 10080
+    },
+    {
+      "path": "seed-archives/5d17bfb5683eb99f1be951fe48e1be5bf3c52391913b6b74a8aecf9b4f5e779f.deb",
+      "sha256": "5d17bfb5683eb99f1be951fe48e1be5bf3c52391913b6b74a8aecf9b4f5e779f",
+      "bytes": 397772
+    },
+    {
+      "path": "seed-archives/5d630480f04b4b442300ce847a3fa705ea4d14d80ba6de91f99b51a4e4953b08.deb",
+      "sha256": "5d630480f04b4b442300ce847a3fa705ea4d14d80ba6de91f99b51a4e4953b08",
+      "bytes": 209734
+    },
+    {
+      "path": "seed-archives/6745c9463432e619d7402b117ad4ac86c31dcd3999ba20daa9e395f6f9909d86.deb",
+      "sha256": "6745c9463432e619d7402b117ad4ac86c31dcd3999ba20daa9e395f6f9909d86",
+      "bytes": 650732
+    },
+    {
+      "path": "seed-archives/675b84971ffd4467707008c25ef7520f90ea7c23ef27b7a76b0dccf1d7c4dc3f.deb",
+      "sha256": "675b84971ffd4467707008c25ef7520f90ea7c23ef27b7a76b0dccf1d7c4dc3f",
+      "bytes": 1003702
+    },
+    {
+      "path": "seed-archives/6891faf325e996ebd28ef53ebb9c043dc96f67327500490affc3e89d366d35ed.deb",
+      "sha256": "6891faf325e996ebd28ef53ebb9c043dc96f67327500490affc3e89d366d35ed",
+      "bytes": 6150
+    },
+    {
+      "path": "seed-archives/6bac2a01979e210d9eac1d4d56747ec709ea60654744d66705dc3c36e7629e50.deb",
+      "sha256": "6bac2a01979e210d9eac1d4d56747ec709ea60654744d66705dc3c36e7629e50",
+      "bytes": 139430
+    },
+    {
+      "path": "seed-archives/8c6d3bac5a6197fa2f48b2d56f04f3ffecaa7082eeab91b0939f97a40adc88a6.deb",
+      "sha256": "8c6d3bac5a6197fa2f48b2d56f04f3ffecaa7082eeab91b0939f97a40adc88a6",
+      "bytes": 402610
+    },
+    {
+      "path": "seed-archives/96950b306889ff6e4248bb937b0a3b56e72dacf643fe732214ce375f0f6bbb36.deb",
+      "sha256": "96950b306889ff6e4248bb937b0a3b56e72dacf643fe732214ce375f0f6bbb36",
+      "bytes": 566292
+    },
+    {
+      "path": "seed-archives/9ba5dd55cdcf6121c147dc5cb87403169b5933e3a56da0de57774f2ce819cf06.deb",
+      "sha256": "9ba5dd55cdcf6121c147dc5cb87403169b5933e3a56da0de57774f2ce819cf06",
+      "bytes": 27442
+    },
+    {
+      "path": "seed-archives/a12d5d9ae70b798cbbf284080eae32b87367561fc9c24492f641b8860ac0f308.deb",
+      "sha256": "a12d5d9ae70b798cbbf284080eae32b87367561fc9c24492f641b8860ac0f308",
+      "bytes": 6320
+    },
+    {
+      "path": "seed-archives/a2bc05cfef021fdb84285036f98eda5ebec3c4b7a378f5aa2bdba5c4d3d8d586.deb",
+      "sha256": "a2bc05cfef021fdb84285036f98eda5ebec3c4b7a378f5aa2bdba5c4d3d8d586",
+      "bytes": 138572
+    },
+    {
+      "path": "seed-archives/a66ef54888a18e20b55dd3988177f6029caa81dc16198c043a715500b62cf06f.deb",
+      "sha256": "a66ef54888a18e20b55dd3988177f6029caa81dc16198c043a715500b62cf06f",
+      "bytes": 1547468
+    },
+    {
+      "path": "seed-archives/b102b62ce6a7313315223cff5e052bdf8fc0ad162c9e961ce0dc2202bc139ce2.deb",
+      "sha256": "b102b62ce6a7313315223cff5e052bdf8fc0ad162c9e961ce0dc2202bc139ce2",
+      "bytes": 9763994
+    },
+    {
+      "path": "seed-archives/b3b5a84181a38fd191820b2cdcc1a3eeb1cd6333ad472f2092f96e81047e9c74.deb",
+      "sha256": "b3b5a84181a38fd191820b2cdcc1a3eeb1cd6333ad472f2092f96e81047e9c74",
+      "bytes": 18154
+    },
+    {
+      "path": "seed-archives/b815a3d936718614e403035bb4a545e1323305ea624709bff2e9d94c214f9cc4.deb",
+      "sha256": "b815a3d936718614e403035bb4a545e1323305ea624709bff2e9d94c214f9cc4",
+      "bytes": 274470
+    },
+    {
+      "path": "seed-archives/c8810069e98cd343c4c5c64b3ef5a0bb1f526419cff3266cd99ed4c87ad99868.deb",
+      "sha256": "c8810069e98cd343c4c5c64b3ef5a0bb1f526419cff3266cd99ed4c87ad99868",
+      "bytes": 158120
+    },
+    {
+      "path": "seed-archives/c9ace99efc7726fe0035f921a9acf262a9723bbf35b861aab4f9075a0be67442.deb",
+      "sha256": "c9ace99efc7726fe0035f921a9acf262a9723bbf35b861aab4f9075a0be67442",
+      "bytes": 1375526
+    },
+    {
+      "path": "seed-archives/ceb6aa4da59fbcb8a3b0549b4280c60b7d849b519859797c8668bdfbe378fb3b.deb",
+      "sha256": "ceb6aa4da59fbcb8a3b0549b4280c60b7d849b519859797c8668bdfbe378fb3b",
+      "bytes": 1282284
+    },
+    {
+      "path": "seed-archives/d452689b9660845345a4c3e05e4ad82c082d5474e04031b7aa47f1a6d5610a6e.deb",
+      "sha256": "d452689b9660845345a4c3e05e4ad82c082d5474e04031b7aa47f1a6d5610a6e",
+      "bytes": 2334634
+    },
+    {
+      "path": "seed-archives/d648859fccde3c17b8b9b89993427564f91f394a39306db1f67bd5ea3ac42c6e.deb",
+      "sha256": "d648859fccde3c17b8b9b89993427564f91f394a39306db1f67bd5ea3ac42c6e",
+      "bytes": 69842
+    },
+    {
+      "path": "seed-archives/d686ace4080eca9c2d6ce8de69392a5ac56c846701894c0858922d4ce341a1d7.deb",
+      "sha256": "d686ace4080eca9c2d6ce8de69392a5ac56c846701894c0858922d4ce341a1d7",
+      "bytes": 80548
+    },
+    {
+      "path": "seed-archives/e1c6611d11ad7398326f1bf028afc34c3b14c51d917a3426b966ed4b9687fa58.deb",
+      "sha256": "e1c6611d11ad7398326f1bf028afc34c3b14c51d917a3426b966ed4b9687fa58",
+      "bytes": 47730
+    },
+    {
+      "path": "seed-archives/e579e72d091f6c7a13f5a756c31065b15aae5b81840d61b069355aa2283c07b4.deb",
+      "sha256": "e579e72d091f6c7a13f5a756c31065b15aae5b81840d61b069355aa2283c07b4",
+      "bytes": 117398
+    },
+    {
+      "path": "seed-archives/e5b42390b02c21851bc04e9557ec48539a913f9b09637220c4b1db0d1386b3fb.deb",
+      "sha256": "e5b42390b02c21851bc04e9557ec48539a913f9b09637220c4b1db0d1386b3fb",
+      "bytes": 615170
+    },
+    {
+      "path": "seed-archives/e691b9cc40841c41bbdc50bd794c876cb1b1801306ea27b06e9a1458180df1e9.deb",
+      "sha256": "e691b9cc40841c41bbdc50bd794c876cb1b1801306ea27b06e9a1458180df1e9",
+      "bytes": 23004
+    },
+    {
+      "path": "seed-archives/f2955a5e594f5724b58ad241d9231ea191cb36574a0d5e5ca6b661cd41d6256d.deb",
+      "sha256": "f2955a5e594f5724b58ad241d9231ea191cb36574a0d5e5ca6b661cd41d6256d",
+      "bytes": 19670
+    },
+    {
+      "path": "seed-archives/f6c91ec6dba02f8965c88f901205c7db72bc8bf38ef1fdfaaee51030dfa145ea.deb",
+      "sha256": "f6c91ec6dba02f8965c88f901205c7db72bc8bf38ef1fdfaaee51030dfa145ea",
+      "bytes": 1119922
+    }
+  ],
+  "authority": {
+    "outer_freeze_sha256": "045d5c1d7a066ec89f00f4989820ee08cb4be77d9a3ec40f6216a155e8fa8702",
+    "bootstrap_freeze_sha256": "434af1b225e449453293ff68db87b42637977b78611ec426d8624a9225ba7713",
+    "amd64_bundle_sha256": "cf2c002f5467a16015c376b9bbc7f949bef9d919de55774f34f77e983ccc2b38",
+    "seed_acquisition_sha256": "7a1579a2d0e1e23ff93c1a300cc49abb530b477deee7ddb44a6dfd02d744e320"
+  },
+  "actual_dependency_closure": false,
+  "installed_runtime": false,
+  "private_input": false
+}
