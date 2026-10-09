@@ -16,6 +16,16 @@ from acceptance_admission import *
 from native_epoch import private_diagnostics,ACCOUNT,REGION
 from run_producers import write_new
 
+PROBE_STAGES=('arguments','memory_preflight','checkout','oidc_request','positive_claims','control_workflows','caller_workflows','admission','negative_claims','sdk_initialization','sts_assumption','response_validation','receipt_write')
+_current_stage='arguments'
+def stage(name):
+    global _current_stage
+    need(type(name)is str and name in PROBE_STAGES,'Fixed admission stage required');_current_stage=name
+
+def safe_failure_message():
+    value=_current_stage if type(_current_stage)is str and _current_stage in PROBE_STAGES else 'unknown'
+    return 'Actual owner admission probe incomplete at stage='+value+'; no owner key was read.'
+
 def no_swap():
     need(sys.platform=='linux' and Path('/proc/swaps').is_file()
          and len(Path('/proc/swaps').read_text().splitlines())==1,'Actual hosted Linux no-swap required')
@@ -53,19 +63,19 @@ def github_api(path):
     return http_json('https://api.github.com/'+path,token)
 
 def probe(control_source,negative=False):
-    no_swap();private_diagnostics()
-    checkout=checkout_head()
+    stage('memory_preflight');no_swap();private_diagnostics()
+    stage('checkout');checkout=checkout_head()
     need(checkout==control_source,'Actual probe checkout differs')
-    token=oidc_token()
+    stage('oidc_request');token=oidc_token()
     if not negative:
-        identity=claims_before_sts(token,control_source)
-        control_workflows=workflows_at(github_api,control_source)
-        caller_workflows=workflows_at(github_api,identity['caller_source'])
-        admission=admit(github_api,identity,control_workflows,checkout,caller_workflows)
+        stage('positive_claims');identity=claims_before_sts(token,control_source)
+        stage('control_workflows');control_workflows=workflows_at(github_api,control_source)
+        stage('caller_workflows');caller_workflows=workflows_at(github_api,identity['caller_source'])
+        stage('admission');admission=admit(github_api,identity,control_workflows,checkout,caller_workflows)
     else:
         # The separate negative workflow receives a genuine correctly signed
         # token. Do not alter a JWT and confuse invalid signature with IAM denial.
-        parts=token.split('.');need(len(parts)==3,'Actual negative token missing')
+        stage('negative_claims');parts=token.split('.');need(len(parts)==3,'Actual negative token missing')
         claims=decode(base64.urlsafe_b64decode(parts[1]+'='*(-len(parts[1])%4)),32768)
         need(claims.get('repository_id')==str(REPOSITORY_ID) and claims.get('repository_owner_id')==str(OWNER_ID)
              and claims.get('ref')=='refs/heads/main' and claims.get('sub')==SUBJECT
@@ -74,6 +84,7 @@ def probe(control_source,negative=False):
              'Negative probe must change only the genuine reusable workflow identity')
         identity={'run_id':int(claims['run_id']),'attempt':int(claims['run_attempt']),'source':control_source}
         admission=None
+    stage('sdk_initialization')
     from botocore import UNSIGNED
     from botocore.config import Config
     import boto3
@@ -81,6 +92,7 @@ def probe(control_source,negative=False):
                   proxies={},signature_version=UNSIGNED)
     sts=boto3.session.Session().client('sts',region_name=REGION,endpoint_url='https://sts.'+REGION+'.amazonaws.com',config=config)
     private_diagnostics()
+    stage('sts_assumption')
     try:
         reply=sts.assume_role_with_web_identity(RoleArn=ROLE,RoleSessionName='acceptance-'+str(identity['run_id'])+'-'+str(identity['attempt']),
             WebIdentityToken=token,DurationSeconds=900)
@@ -91,7 +103,7 @@ def probe(control_source,negative=False):
                 'policy_denied':True,'owner_parameter_read':False,'release_ready':False}
     finally:token=None
     # Successful negative assumption is a setup failure. No SSM/KMS call exists.
-    credentials=reply.pop('Credentials',None)
+    stage('response_validation');credentials=reply.pop('Credentials',None)
     try:
         need(not negative and type(credentials) is dict and reply.get('SubjectFromWebIdentityToken')==SUBJECT
              and reply.get('Audience')=='sts.amazonaws.com','Owner role incorrectly admitted negative workflow')
@@ -109,8 +121,13 @@ def main():
     p.add_argument('--negative',action='store_true');p.add_argument('--output',type=Path,required=True)
     args=p.parse_args();need(re.fullmatch('[0-9a-f]{40}',args.control_source),'Actual reviewed source required')
     os.umask(0o077);need(args.output.is_absolute() and args.output.parent.is_dir() and not args.output.exists(),'Fresh private probe receipt required')
-    write_new(args.output,probe(args.control_source,args.negative))
-if __name__=='__main__':
+    receipt=probe(args.control_source,args.negative)
+    stage('receipt_write');write_new(args.output,receipt)
+def cli():
     signal.signal(signal.SIGTERM,lambda *_:(_ for _ in ()).throw(KeyboardInterrupt()))
+    stage('arguments')
     try:main()
-    except BaseException:print('Actual owner admission probe incomplete; no owner key was read.',file=sys.stderr);sys.exit(1)
+    except BaseException:print(safe_failure_message(),file=sys.stderr);return 1
+    return 0
+
+if __name__=='__main__':sys.exit(cli())

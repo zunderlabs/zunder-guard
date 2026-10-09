@@ -1,6 +1,8 @@
 """Synthetic SDK/token/workflow fixtures only; never actual STS proof."""
 import base64
 import json
+import contextlib
+import io
 from pathlib import Path
 from types import ModuleType,SimpleNamespace
 import unittest
@@ -62,6 +64,44 @@ class IdentityTests(unittest.TestCase):
         self.assertIn('/release-owner-admission-negative.yml@'+SOURCE,value)
         self.assertNotIn('${{',value)
         with self.assertRaises(Refused):render('main')
+    def test_diagnostics_only_fixed_stage_never_exception_or_token(self):
+        sentinel='synthetic.JWT.request.SDK.credential-never-log'
+        class Failure(Exception):
+            def __str__(self):raise AssertionError('Exception must never stringify')
+        for name in identity.PROBE_STAGES:
+            def fail():identity.stage(name);raise Failure(sentinel)
+            err=io.StringIO()
+            with patch.object(identity,'main',side_effect=fail),patch.object(identity.signal,'signal'),contextlib.redirect_stderr(err):
+                self.assertEqual(identity.cli(),1)
+            self.assertEqual(err.getvalue(), 'Actual owner admission probe incomplete at stage='+name+'; no owner key was read.\n')
+            self.assertNotIn(sentinel,err.getvalue())
+    def test_unknown_diagnostic_value_is_not_printed(self):
+        with patch.object(identity,'_current_stage','synthetic-token'):
+            self.assertIn('stage=unknown;',identity.safe_failure_message())
+            self.assertNotIn('synthetic-token',identity.safe_failure_message())
+        with self.assertRaises(Refused):identity.stage('synthetic-token')
+    def test_hosted_swap_remains_refused(self):
+        with patch.object(identity.sys,'platform','linux'),patch.object(identity.Path,'is_file',return_value=True),patch.object(identity.Path,'read_text',return_value='Filename Type Size Used Priority\n/swapfile file 100 0 -2\n'),patch.object(identity.resource,'setrlimit')as core:
+            with self.assertRaises(Refused):identity.no_swap()
+            core.assert_not_called()
+    def test_no_swap_and_core_zero_required(self):
+        with patch.object(identity.sys,'platform','linux'),patch.object(identity.Path,'is_file',return_value=True),patch.object(identity.Path,'read_text',return_value='Filename Type Size Used Priority\n'),patch.object(identity.resource,'setrlimit')as core,patch.object(identity.resource,'getrlimit',return_value=(0,0)):
+            identity.no_swap();core.assert_called_once_with(identity.resource.RLIMIT_CORE,(0,0))
+    def test_runtime_and_memory_preflight_exact_workflow_closure(self):
+        import yaml
+        repo=Path(__file__).resolve().parents[3]
+        for name,job in [('release-acceptance-run.yml','acceptance'),('release-owner-admission-negative.yml','deny')]:
+            template=repo/'deploy/guard/github/workflows'/name
+            published=repo/'.github/workflows'/name
+            self.assertEqual(published.read_bytes(),template.read_bytes())
+            steps=yaml.load(template.read_bytes(),Loader=yaml.BaseLoader)['jobs'][job]['steps']
+            memory=steps[1]['run'];runtime=steps[2]['run'];probe=steps[3]
+            self.assertIn('/usr/bin/sudo --non-interactive /usr/sbin/swapoff --all',memory)
+            self.assertIn("len(swaps.read_text().splitlines()) != 1",memory)
+            self.assertIn('ulimit -c 0',memory);self.assertNotIn('env',steps[1])
+            self.assertIn('--only-binary=:all: --require-hashes -r deploy/guard/e2e/admission-requirements.txt',runtime)
+            self.assertIn('GH_TOKEN',probe['env']);self.assertIn('acceptance_identity.py',probe['run'])
+            self.assertEqual(steps[0]['with']['persist-credentials'],'false')
     def test_actual_workflow_source_audit(self):
         from acceptance_admission import audit_workflows,WORKFLOW,CALLER
         from render_acceptance_caller import render

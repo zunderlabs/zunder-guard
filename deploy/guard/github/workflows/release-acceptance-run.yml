@@ -20,6 +20,19 @@ jobs:
         with:
           ref: ${{ fromJSON(toJSON(job)).workflow_sha }}
           persist-credentials: false
+      - name: Disable hosted swap before admission token requests
+        shell: bash
+        run: |
+          set -euo pipefail
+          ulimit -c 0
+          /usr/bin/sudo --non-interactive /usr/sbin/swapoff --all
+          /usr/bin/python3 -B - <<'PY_MEMORY'
+          from pathlib import Path
+          import sys
+          swaps = Path('/proc/swaps')
+          if sys.platform != 'linux' or not swaps.is_file() or len(swaps.read_text().splitlines()) != 1:
+              raise SystemExit('Hosted no-swap memory preflight refused.')
+          PY_MEMORY
       - name: Fixed hashed admission runtime
         shell: bash
         run: |
