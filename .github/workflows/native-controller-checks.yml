@@ -10,6 +10,10 @@ on:
       - deploy/guard/e2e/native/windows.ps1
       - deploy/guard/e2e/native/windows_native.cs
       - deploy/guard/e2e/native/test_windows_native.ps1
+      - deploy/guard/e2e/private_process_scope.py
+      - deploy/guard/e2e/private_process_entry.py
+      - deploy/guard/e2e/test_private_process_scope.py
+      - deploy/guard/e2e/release_flow.py
 
 permissions:
   contents: read
@@ -59,5 +63,41 @@ jobs:
         with:
           name: public-native-controller-${{ github.run_id }}-${{ github.run_attempt }}
           path: public-native-receipt/receipt.json
+          if-no-files-found: error
+          retention-days: 14
+
+  linux-private-process-fixtures:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Check bounded public scope fixtures
+        run: python3 -B deploy/guard/e2e/test_private_process_scope.py
+      - name: Exercise actual harmless detached-process containment
+        run: |
+          set -euo pipefail
+          sudo -n swapoff -a
+          mkdir public-provider-receipt
+          sudo -n python3 -B deploy/guard/e2e/test_private_process_scope.py --actual | tee public-provider-receipt/actual.json
+          python3 - <<'PYRECEIPT'
+          import hashlib,json,os
+          from pathlib import Path
+          paths=['private_process_scope.py','private_process_entry.py','test_private_process_scope.py','release_flow.py']
+          result=json.loads(Path('public-provider-receipt/actual.json').read_text())
+          assert result['kind']=='actual-no-key-cgroup-containment' and result['cleanup']['complete']
+          assert result['cleanup']['populated'] is False and result['cleanup']['cgroup_removed']
+          assert result['setsid_descendant'] and result['no_new_privileges'] and result['release_ready'] is False
+          result.update(source=os.environ['GITHUB_SHA'],workflow_sha=os.environ['GITHUB_WORKFLOW_SHA'],
+              run_id=os.environ['GITHUB_RUN_ID'],run_attempt=os.environ['GITHUB_RUN_ATTEMPT'],
+              source_hashes={p:hashlib.sha256(Path('deploy/guard/e2e',p).read_bytes()).hexdigest() for p in paths},
+              actual_private_input=False,actual_release_acceptance=False)
+          Path('public-provider-receipt/receipt.json').write_text(json.dumps(result,indent=2)+'\n')
+          PYRECEIPT
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: public-provider-containment-${{ github.run_id }}-${{ github.run_attempt }}
+          path: public-provider-receipt/
           if-no-files-found: error
           retention-days: 14
