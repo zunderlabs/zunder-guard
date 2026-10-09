@@ -1,0 +1,116 @@
+#!/usr/bin/env python3
+"""Actual no-venue-secret OIDC/STS admission probes. No operation on import."""
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path
+import resource
+import signal
+import sys
+import subprocess
+import time
+from urllib.parse import urlparse,parse_qsl,urlencode,urlunparse
+from urllib.request import Request,build_opener,ProxyHandler,HTTPRedirectHandler
+from acceptance_admission import *
+from native_epoch import private_diagnostics,ACCOUNT,REGION
+from run_producers import write_new
+
+def no_swap():
+    need(sys.platform=='linux' and Path('/proc/swaps').is_file()
+         and len(Path('/proc/swaps').read_text().splitlines())==1,'Actual hosted Linux no-swap required')
+    resource.setrlimit(resource.RLIMIT_CORE,(0,0));need(resource.getrlimit(resource.RLIMIT_CORE)==(0,0),'Actual core-zero required')
+
+def checkout_head():
+    result=subprocess.run(['/usr/bin/git','rev-parse','HEAD'],env={'PATH':'/usr/bin:/bin','LANG':'C.UTF-8'},
+        stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,timeout=5)
+    need(result.returncode==0 and len(result.stdout)<=128,'Actual source checkout read failed')
+    return result.stdout.decode().strip()
+
+class NoRedirect(HTTPRedirectHandler):
+    def redirect_request(self,*_):raise RuntimeError('Admission redirect refused')
+
+def http_json(url,token,limit=1048576):
+    opener=build_opener(ProxyHandler({}),NoRedirect())
+    with opener.open(Request(url,headers={'Authorization':'Bearer '+token,'Accept':'application/json'}),timeout=15) as response:
+        need(response.status==200,'Admission API request failed');raw=response.read(limit+1)
+    return decode(raw,limit)
+
+def oidc_token():
+    url=os.environ.get('ACTIONS_ID_TOKEN_REQUEST_URL','');bearer=os.environ.get('ACTIONS_ID_TOKEN_REQUEST_TOKEN','')
+    parsed=urlparse(url)
+    need(parsed.scheme=='https' and parsed.hostname is not None and parsed.hostname.endswith('.actions.githubusercontent.com')
+         and parsed.username is None and parsed.password is None and parsed.port in (None,443)
+         and parsed.fragment=='' and bearer and len(bearer)<32768,'Actual GitHub OIDC request endpoint required')
+    query=dict(parse_qsl(parsed.query));query['audience']='sts.amazonaws.com'
+    value=http_json(urlunparse(parsed._replace(query=urlencode(query))),bearer,32768)
+    need(type(value.get('value')) is str,'Actual OIDC token missing')
+    return value['value']
+
+def github_api(path):
+    need(path.startswith('repos/'+REPOSITORY+'/'),'Canonical GitHub admission API required')
+    token=os.environ.get('GH_TOKEN','');need(token,'Actual workflow read token required')
+    return http_json('https://api.github.com/'+path,token)
+
+def probe(control_source,negative=False):
+    no_swap();private_diagnostics()
+    checkout=checkout_head()
+    need(checkout==control_source,'Actual probe checkout differs')
+    token=oidc_token()
+    if not negative:
+        identity=claims_before_sts(token,control_source)
+        control_workflows=workflows_at(github_api,control_source)
+        caller_workflows=workflows_at(github_api,identity['caller_source'])
+        admission=admit(github_api,identity,control_workflows,checkout,caller_workflows)
+    else:
+        # The separate negative workflow receives a genuine correctly signed
+        # token. Do not alter a JWT and confuse invalid signature with IAM denial.
+        parts=token.split('.');need(len(parts)==3,'Actual negative token missing')
+        claims=decode(base64.urlsafe_b64decode(parts[1]+'='*(-len(parts[1])%4)),32768)
+        need(claims.get('repository_id')==str(REPOSITORY_ID) and claims.get('repository_owner_id')==str(OWNER_ID)
+             and claims.get('ref')=='refs/heads/main' and claims.get('sub')==SUBJECT
+             and claims.get('aud')=='sts.amazonaws.com' and claims.get('environment')==ENVIRONMENT
+             and claims.get('job_workflow_ref')==REPOSITORY+'/.github/workflows/release-owner-admission-negative.yml@'+control_source,
+             'Negative probe must change only the genuine reusable workflow identity')
+        identity={'run_id':int(claims['run_id']),'attempt':int(claims['run_attempt']),'source':control_source}
+        admission=None
+    from botocore import UNSIGNED
+    from botocore.config import Config
+    import boto3
+    config=Config(region_name=REGION,retries={'total_max_attempts':1,'mode':'standard'},connect_timeout=10,read_timeout=15,
+                  proxies={},signature_version=UNSIGNED)
+    sts=boto3.session.Session().client('sts',region_name=REGION,endpoint_url='https://sts.'+REGION+'.amazonaws.com',config=config)
+    private_diagnostics()
+    try:
+        reply=sts.assume_role_with_web_identity(RoleArn=ROLE,RoleSessionName='acceptance-'+str(identity['run_id'])+'-'+str(identity['attempt']),
+            WebIdentityToken=token,DurationSeconds=900)
+    except Exception as error:
+        code=getattr(error,'response',{}).get('Error',{}).get('Code')
+        need(negative and code=='AccessDenied','Actual STS probe did not meet expected policy outcome')
+        return {'schema':1,'kind':'actual-owner-oidc-negative-probe','identity':identity,
+                'policy_denied':True,'owner_parameter_read':False,'release_ready':False}
+    finally:token=None
+    # Successful negative assumption is a setup failure. No SSM/KMS call exists.
+    credentials=reply.pop('Credentials',None)
+    try:
+        need(not negative and type(credentials) is dict and reply.get('SubjectFromWebIdentityToken')==SUBJECT
+             and reply.get('Audience')=='sts.amazonaws.com','Owner role incorrectly admitted negative workflow')
+        assumed=reply.get('AssumedRoleUser',{}).get('Arn','')
+        need(assumed=='arn:aws:sts::'+ACCOUNT+':assumed-role/zunder-release-owner-controller/acceptance-'+str(identity['run_id'])+'-'+str(identity['attempt']),
+             'Actual assumed controller identity differs')
+        return {'schema':1,'kind':'actual-owner-oidc-positive-probe','admission':admission,
+                'assumed_role':assumed,'owner_parameter_read':False,'release_ready':False}
+    finally:
+        if credentials:credentials.clear()
+        reply.clear()
+
+def main():
+    p=argparse.ArgumentParser(description=__doc__);p.add_argument('--control-source',required=True)
+    p.add_argument('--negative',action='store_true');p.add_argument('--output',type=Path,required=True)
+    args=p.parse_args();need(re.fullmatch('[0-9a-f]{40}',args.control_source),'Actual reviewed source required')
+    os.umask(0o077);need(args.output.is_absolute() and args.output.parent.is_dir() and not args.output.exists(),'Fresh private probe receipt required')
+    write_new(args.output,probe(args.control_source,args.negative))
+if __name__=='__main__':
+    signal.signal(signal.SIGTERM,lambda *_:(_ for _ in ()).throw(KeyboardInterrupt()))
+    try:main()
+    except BaseException:print('Actual owner admission probe incomplete; no owner key was read.',file=sys.stderr);sys.exit(1)
