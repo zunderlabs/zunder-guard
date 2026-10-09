@@ -86,7 +86,7 @@ fail() { exit 2; }
     def test_installer_tail_validation_failure_preserves_prior_binding(self):
         self.installer_tail(reject_plist=True)
 
-    def reinstall_admission(self, scenario, network="mainnet"):
+    def reinstall_admission(self, scenario, network="mainnet", non_interactive="1"):
         # Execute the actual installer admission branch. The broker and root
         # ownership/Keychain checks are conspicuous synthetic stubs; these tests
         # prove shell control flow and preservation, never native readiness.
@@ -131,7 +131,7 @@ case "$*" in *"service prepare"*) printf '{}\\n' ;; esac
             setup = '\n'.join([
                 'base=' + shlex.quote(str(base)), 'exe=' + shlex.quote(str(broker)),
                 'active=' + shlex.quote(str(active)), 'sha=' + sha,
-                'home=/synthetic/home; uid=450; gid=450; account=synthetic; binding_name=bindings; credential_id=' + ('testnet-native' if network == 'testnet' else 'mainnet') + '; confirm_flag=' + ('--confirm-account' if network == 'testnet' else '--confirm-mainnet') + '; network=' + network,
+                'home=/synthetic/home; uid=450; gid=450; account=synthetic; binding_name=bindings; credential_id=' + ('testnet-native' if network == 'testnet' else 'mainnet') + '; confirm_flag=' + ('--confirm-account' if network == 'testnet' else '--confirm-mainnet') + '; network=' + network + '; non_interactive=' + non_interactive,
                 'export FIXTURE_CALLS=' + shlex.quote(str(base / 'calls')),
                 'export CHECK_FAIL=' + ('1' if scenario == 'credential_refused' else '0'),
                 '''fail() { printf '%s\\n' "$*" >&2; exit 2; }
@@ -157,7 +157,10 @@ install() { printf 'pointer-copy\\n' >> "$FIXTURE_CALLS"; cp "$7" "$8"; }
                 self.assertIn('--confirm-account' if network == 'testnet' else '--confirm-mainnet', calls)
                 self.assertNotIn('--confirm-mainnet' if network == 'testnet' else '--confirm-account', calls)
             if scenario == 'first_install' and network == 'testnet':
-                self.assertIn('--key-stdin', calls)
+                if non_interactive == '1':
+                    self.assertIn('--key-stdin', calls)
+                else:
+                    self.assertNotIn('--key-stdin', calls)
             if scenario == 'same_release':
                 self.assertIn('service check --binding ' + str(active), calls)
                 self.assertNotIn('service prepare', calls)
@@ -207,6 +210,9 @@ install() { printf 'pointer-copy\\n' >> "$FIXTURE_CALLS"; cp "$7" "$8"; }
             with self.subTest(scenario=scenario):
                 self.reinstall_admission(scenario, 'testnet')
 
+    def test_interactive_testnet_provisions_through_hidden_broker_input(self):
+        self.reinstall_admission('first_install', 'testnet', '0')
+
     def network_selection(self, arguments, piped=True):
         block = fragment(INSTALL, 'stage=$1', 'case "$version" in')
         import shlex
@@ -229,7 +235,7 @@ install() { printf 'pointer-copy\\n' >> "$FIXTURE_CALLS"; cp "$7" "$8"; }
         self.assertNotIn('SYNTHETIC-PIPE-FRAME', result.stdout + result.stderr)
 
     def test_wrong_network_noninteractive_combinations_refuse(self):
-        for network, noninteractive in [('mainnet', '1'), ('testnet', '0'), ('paper', '1'), ('testnet', 'yes'), ('MAINNET', '0')]:
+        for network, noninteractive in [('mainnet', '1'), ('paper', '1'), ('testnet', 'yes'), ('MAINNET', '0')]:
             with self.subTest(network=network, noninteractive=noninteractive):
                 result = self.network_selection(['/stage', 'v1.0.2', '', '', '', '', '', '', network, noninteractive])
                 self.assertEqual(result.returncode, 2)
@@ -240,7 +246,25 @@ install() { printf 'pointer-copy\\n' >> "$FIXTURE_CALLS"; cp "$7" "$8"; }
         self.assertEqual(result.returncode, 2)
         self.assertIn('private stdin pipe', result.stderr)
 
-    def init_selection(self, network, existing=False, options=True):
+    def test_interactive_testnet_helper_requires_actual_terminal(self):
+        import pty
+        import shlex
+        arguments = ['/stage', 'v1.0.2', '', '', '', '', '', '', 'testnet', '0']
+        refused = self.network_selection(arguments)
+        self.assertEqual(refused.returncode, 2)
+        self.assertIn('requires a terminal', refused.stderr)
+        block = fragment(INSTALL, 'stage=$1', 'case "$version" in')
+        setup = 'fail() { exit 2; }\nset -- ' + ' '.join(map(shlex.quote, arguments)) + '\n'
+        master, slave = pty.openpty()
+        try:
+            result = subprocess.run(['/bin/sh', '-c', 'set -eu\n' + setup + block],
+                                    stdin=slave, capture_output=True, text=True, timeout=10)
+        finally:
+            os.close(master)
+            os.close(slave)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def init_selection(self, network, existing=False, options=True, non_interactive=True, licence=True):
         import shlex
         block = fragment(INSTALL, 'if [ ! -e "$home/guard.toml" ]; then', '# A reused service state')
         with tempfile.TemporaryDirectory() as directory:
@@ -260,12 +284,14 @@ case "$*" in *'--key-stdin'*) IFS= read -r frame; [ "$frame" = SYNTHETIC-FIRST-F
                 'exe=' + shlex.quote(str(exe)), 'home=' + shlex.quote(str(home)),
                 'export FIXTURE_CALLS=' + shlex.quote(str(root / 'calls')),
                 'network=' + network,
+                'non_interactive=' + ('1' if non_interactive else '0'),
                 'service_user=_synthetic; listen=; share=',
                 'rules=zr1.synthetic; account=synthetic; cap=40; licence=synthetic-licence' if options else 'rules=; account=; cap=; licence=',
+                '' if licence else 'licence=',
                 'sudo() { shift 4; "$@"; }',
             ])
             after = '\n'
-            if network == 'testnet' and not existing:
+            if network == 'testnet' and not existing and non_interactive:
                 after += 'IFS= read -r second; [ "$second" = SYNTHETIC-SECOND-FRAME ]; '
             after += 'printf reached\n'
             result = subprocess.run(['/bin/sh', '-c', 'set -eu\n' + setup + '\n' + block + after],
@@ -287,12 +313,28 @@ case "$*" in *'--key-stdin'*) IFS= read -r frame; [ "$frame" = SYNTHETIC-FIRST-F
         self.assertEqual(result.returncode, 2)
         self.assertEqual(calls, '')
 
+    def test_unattended_testnet_licence_is_optional_and_preserved_when_supplied(self):
+        for supplied in (False, True):
+            with self.subTest(supplied=supplied):
+                result, calls = self.init_selection('testnet', licence=supplied)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual('--licence synthetic-licence' in calls, supplied)
+                self.assertIn('--no-key --key-stdin', calls)
+
     def test_mainnet_init_remains_interactive(self):
         result, calls = self.init_selection('mainnet')
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn('init --network mainnet --interactive', calls)
         self.assertNotIn('--key-stdin', calls)
         self.assertNotIn('--no-key', calls)
+
+    def test_interactive_testnet_init_checks_hidden_input_without_user_store(self):
+        result, calls = self.init_selection('testnet', non_interactive=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('init --network testnet --interactive --no-key --service-key-check', calls)
+        self.assertIn('--equity-cap 40', calls)
+        self.assertNotIn('--key-stdin', calls)
+        self.assertNotIn('--non-interactive', calls)
 
     def test_existing_testnet_config_is_preserved_without_consuming_key(self):
         result, calls = self.init_selection('testnet', existing=True, options=False)

@@ -1556,6 +1556,104 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn interactive_protected_testnet_checks_hidden_key_without_storing_it() {
+        let dir = TestDir::new("init-interactive-protected-testnet");
+        let options = InitOptions {
+            account: Some(ACCOUNT.into()),
+            mode: Some(GuardMode::Testnet),
+            equity_cap: Some("40".into()),
+            no_key: true,
+            check_key_only: true,
+            ..options(&dir)
+        };
+        let kept = Kept::default();
+        let mut prompt = script(&[""]);
+        let outcome = init(&options, &mut prompt, None, &agent(), &kept, &mut counter())
+            .await
+            .unwrap();
+        assert_eq!(outcome.mode, "testnet");
+        assert!(outcome.config.api_wallet.is_some());
+        assert!(!outcome.config.allow_mainnet);
+        assert_eq!(outcome.config.policy.max_trading_equity_usd, Some(dec!(40)));
+        assert!(outcome.stored.is_none());
+        assert!(kept.0.borrow().is_none());
+        assert!(prompt.output.contains("private key (not shown"));
+        assert!(!prompt.output.contains(&KEY[2..]));
+    }
+
+    #[tokio::test]
+    async fn protected_testnet_optional_licence_is_checked_before_private_key_input() {
+        use zunder_guard_core::licence::{Terms, issue, test_key};
+        let good = issue(
+            &Terms {
+                licensee: "Public test fixture".into(),
+                expires_at_ms: crate::guard::Clock::now_ms(&crate::guard::SystemClock) as i64
+                    + 86_400_000,
+                features: vec!["fee_free".into()],
+                accounts: vec![ACCOUNT.into()],
+                builder: None,
+            },
+            &test_key::SEED,
+        )
+        .unwrap();
+        for licence in [None, Some(good.clone())] {
+            let dir = TestDir::new("protected-testnet-optional-licence");
+            let options = InitOptions {
+                non_interactive: true,
+                account: Some(ACCOUNT.into()),
+                mode: Some(GuardMode::Testnet),
+                no_key: true,
+                check_key_only: true,
+                licence: licence.clone(),
+                licence_public_key: Some(test_key::public()),
+                ..options(&dir)
+            };
+            let frame = format!("{}\n", KEY.trim_start_matches("0x"));
+            let mut reader = frame.as_bytes();
+            let kept = Kept::default();
+            let outcome = init(
+                &options,
+                &mut script(&[]),
+                Some(&mut reader),
+                &agent(),
+                &kept,
+                &mut counter(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(outcome.config.licence, licence);
+            assert!(kept.0.borrow().is_none());
+        }
+        let dir = TestDir::new("protected-testnet-invalid-licence");
+        let options = InitOptions {
+            non_interactive: true,
+            account: Some(ACCOUNT.into()),
+            mode: Some(GuardMode::Testnet),
+            no_key: true,
+            check_key_only: true,
+            licence: Some("zgl1_forged.key".into()),
+            ..options(&dir)
+        };
+        let untouched = b"public invalid frame must not be read\n";
+        let mut reader = untouched.as_slice();
+        let kept = Kept::default();
+        let error = init(
+            &options,
+            &mut script(&[]),
+            Some(&mut reader),
+            &agent(),
+            &kept,
+            &mut counter(),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("licence key is refused"));
+        assert_eq!(reader, untouched);
+        assert!(kept.0.borrow().is_none());
+        assert!(!dir.path().join("guard.toml").exists());
+    }
+
+    #[tokio::test]
     async fn protected_testnet_explicit_cap_reaches_config_journal_and_risk_sizing() {
         let dir = TestDir::new("init-protected-testnet-cap");
         let options = InitOptions {

@@ -378,6 +378,48 @@ class BootTransactions(Stage):
 
 
 class ProtectedTestnetTransactions(Stage):
+    def test_interactive_fresh_setup_checks_hidden_key_without_user_store(self):
+        import argparse
+        import ast
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+        text = (SOURCE / 'container/install-container.py').read_text()
+        function = next(node for node in ast.parse(text).body
+                        if isinstance(node, ast.FunctionDef) and node.name == 'main')
+        fresh = next(node for node in function.body if isinstance(node, ast.If)
+                     and isinstance(node.test, ast.Name) and node.test.id == 'fresh')
+        code = compile(ast.Module(body=[fresh], type_ignores=[]), 'production-fresh-init', 'exec')
+        for network, cap in [('testnet', '40'), ('testnet', ''), ('mainnet', '')]:
+            with self.subTest(network=network, cap=cap):
+                args = argparse.Namespace(network=network, account=ACCOUNT, non_interactive=False,
+                                          key_stdin=False, equity_cap=cap, rules='', ip_share='', licence='')
+                runner = Mock()
+                prompt = Mock(return_value='40')
+                frame = Mock(side_effect=AssertionError('Interactive setup must not read stdin key frames'))
+                namespace = {**vars(self.wrapper), 'fresh': True, 'args': args, 'account': ACCOUNT,
+                             'config': self.config, 'record': {}, 'create_volume': Mock(),
+                             'phase': Mock(), 'ops': SimpleNamespace(run=runner),
+                             'sup': SimpleNamespace(read_key_frame=frame), 'prompt': prompt}
+                exec(code, namespace)
+                command = runner.call_args.args[1]
+                self.assertIn('--interactive', command)
+                self.assertNotIn('--key-stdin', command)
+                self.assertNotIn('--non-interactive', command)
+                self.assertEqual(runner.call_args.kwargs, {'interactive': True, 'readonly': False})
+                frame.assert_not_called()
+                if network == 'testnet':
+                    self.assertIn('--no-key', command)
+                    self.assertIn('--service-key-check', command)
+                    self.assertEqual(command[command.index('--equity-cap') + 1], '40')
+                    if not cap:
+                        prompt.assert_called_once()
+                        self.assertIn('TESTNET USDC', prompt.call_args.args[0])
+                    else:
+                        prompt.assert_not_called()
+                else:
+                    self.assertNotIn('--service-key-check', command)
+                    prompt.assert_not_called()
+
     calls = BootTransactions.calls
     inhibit = BootTransactions.inhibit
     def setUp(self):
@@ -437,6 +479,10 @@ class ProtectedTestnetTransactions(Stage):
         self.wrapper.validate_input(legacy, True)
         with self.assertRaises(self.ops.Refused):
             self.wrapper.validate_input(legacy, False)
+        interactive_testnet = argparse.Namespace(network='testnet', account='', non_interactive=False, key_stdin=False)
+        self.wrapper.validate_input(interactive_testnet, True)
+        with self.assertRaises(self.ops.Refused):
+            self.wrapper.validate_input(interactive_testnet, False)
 
     # Inherited generic transactions execute in the immutable Mainnet suite above.
     # Avoid inheriting Mainnet-only prompt/journal assumptions in this Testnet class.

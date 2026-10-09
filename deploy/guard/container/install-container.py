@@ -92,7 +92,7 @@ def sending_mode(config):
 
 def validate_input(args, terminal):
     require(args.network in ('mainnet', 'testnet'), 'Unsupported sending network.')
-    if args.network == 'testnet' or args.non_interactive or args.key_stdin:
+    if args.non_interactive or args.key_stdin:
         require(args.network == 'testnet' and args.non_interactive and args.key_stdin,
                 'Unattended private stdin provisioning requires explicit Testnet.')
         require(not terminal, 'Testnet key input must be a private redirected pipe, never an echoing terminal.')
@@ -375,7 +375,7 @@ def readiness(config, expect_fee_free):
 def activate(config, record, fresh, expect_fee_free, unattended=False):
     require(not unattended or sending_mode(config) == 'testnet', 'Only Testnet can activate unattended.')
     verify_gate()
-    answer = ('START ' + config['account']) if unattended else prompt('Type START ' + config['account'] + ' to activate this mainnet Guard; anything else leaves it stopped:')
+    answer = ('START ' + config['account']) if unattended else prompt('Type START ' + config['account'] + ' to activate this ' + sending_mode(config) + ' Guard; anything else leaves it stopped:')
     if answer != 'START ' + config['account']:
         print('Installed and stopped. Boot activation remains inhibited; rerun this installer to continue.')
         return
@@ -470,7 +470,7 @@ def main():
     fresh = not existing and not pending_record and volume not in volume_names()
     if not fresh and not existing and not pending_record:
         require(not args.non_interactive, 'Unattended setup cannot adopt an existing unowned volume.')
-        confirm('Type ADOPT ' + volume + ' only for a complete existing mainnet home with no other restart owner:', 'ADOPT ' + volume)
+        confirm('Type ADOPT ' + volume + ' only for a complete existing ' + args.network + ' home with no other restart owner:', 'ADOPT ' + volume)
     if existing and not args.non_interactive:
         confirm('Stop your bot. Type STOP to stop Guard and prepare the verified upgrade:', 'STOP')
     prepare_receipt(config)
@@ -488,6 +488,13 @@ def main():
         command = ['init', '--network', args.network, '--account', account]
         command += (['--non-interactive', '--no-key', '--key-stdin', '--service-key-check']
                     if args.key_stdin else ['--interactive'])
+        if args.network == 'testnet' and not args.key_stdin:
+            # Hidden input is checked by Guard; only the service supervisor
+            # persists the key through its protected encrypted credential path.
+            command += ['--no-key', '--service-key-check']
+            if not args.equity_cap:
+                args.equity_cap = prompt('The most equity Guard sizes from, in TESTNET USDC (at most 2500):')
+                require(bool(args.equity_cap), 'An explicit Testnet equity cap is required.')
         for name in ('rules', 'equity_cap', 'ip_share', 'licence'):
             value = getattr(args, name)
             if value:

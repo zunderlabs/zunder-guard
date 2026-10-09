@@ -34,11 +34,13 @@ network=${9:-mainnet}
 non_interactive=${10:-0}
 case "$network:$non_interactive" in
   mainnet:0) credential_id=mainnet; service_user=_zunder_guard; state_name=state; identity_name=service-identity; binding_name=bindings; log=/var/log/zunder-guard.log; confirm_flag=--confirm-mainnet ;;
-  testnet:1) credential_id=testnet-native; service_user=_zunder_guard_testnet; state_name=state-testnet; identity_name=service-identity-testnet; binding_name=bindings-testnet; log=/var/log/zunder-guard-testnet.log; confirm_flag=--confirm-account ;;
-  *) fail 'mainnet requires interactive consent; testnet requires explicit private stdin setup' ;;
+  testnet:0|testnet:1) credential_id=testnet-native; service_user=_zunder_guard_testnet; state_name=state-testnet; identity_name=service-identity-testnet; binding_name=bindings-testnet; log=/var/log/zunder-guard-testnet.log; confirm_flag=--confirm-account ;;
+  *) fail 'mainnet requires interactive consent; testnet requires hidden terminal or explicit private stdin setup' ;;
 esac
-if [ "$network" = testnet ]; then
+if [ "$network:$non_interactive" = testnet:1 ]; then
   [ -p /dev/fd/0 ] || fail 'testnet service requires a private stdin pipe'
+elif [ "$network" = testnet ]; then
+  [ -t 0 ] || fail 'interactive testnet service requires a terminal'
 fi
 case "$version" in v[0-9]*) ;; *) fail 'expected a versioned release' ;; esac
 case "$version" in *[!a-zA-Z0-9.-]*) fail 'invalid release tag' ;; esac
@@ -163,10 +165,19 @@ fi
 if [ ! -e "$home/guard.toml" ]; then
   set -- "$exe" --home "$home" init --network "$network"
   if [ "$network" = testnet ]; then
-    if ! { [ -n "$rules" ] && [ -n "$account" ] && [ -n "$cap" ] && [ -n "$licence" ]; }; then
-      fail 'testnet service requires explicit rules, account, cap and licence'
+    if [ "$non_interactive" = 1 ]; then
+      if ! { [ -n "$rules" ] && [ -n "$account" ] && [ -n "$cap" ]; }; then
+        fail 'unattended testnet service requires explicit rules, account and cap'
+      fi
+      set -- "$@" --service-key-check --non-interactive --no-key --key-stdin
+    else
+      if [ -z "$cap" ]; then
+        printf '%s ' 'The most equity Guard sizes from, in TESTNET USDC (at most 2500):'
+        IFS= read -r cap || fail 'terminal closed before the testnet equity cap'
+        [ -n "$cap" ] || fail 'an explicit testnet equity cap is required'
+      fi
+      set -- "$@" --interactive --no-key --service-key-check
     fi
-    set -- "$@" --service-key-check --non-interactive --no-key --key-stdin
   else
     set -- "$@" --interactive
   fi
@@ -213,7 +224,7 @@ if [ "$same_release" -eq 0 ]; then
   if [ -n "$old_exe" ]; then
     "$old_exe" service migrate-credential --binding "$active" --next-binding "$next" "$confirm_flag" "$account"
   else
-    if [ "$network" = testnet ]; then
+    if [ "$network:$non_interactive" = testnet:1 ]; then
       "$exe" service provision --binding "$next" "$confirm_flag" "$account" --key-stdin
     else
       "$exe" service provision --binding "$next" "$confirm_flag" "$account"

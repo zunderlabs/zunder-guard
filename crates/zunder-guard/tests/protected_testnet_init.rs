@@ -15,6 +15,36 @@ use zunder_guard::testdir::TestDir;
 
 const ACCOUNT: &str = "0x5e9ee1089755c3435139848e47e6635505d5a13a";
 
+#[test]
+fn interactive_protected_testnet_cli_refuses_redirected_input_before_key_read() {
+    let dir = TestDir::new("cli-interactive-protected-testnet");
+    let output = Command::new(env!("CARGO_BIN_EXE_zunder-guard"))
+        .env_clear()
+        .env("HOME", dir.path())
+        .arg("--home")
+        .arg(dir.path())
+        .args([
+            "init",
+            "--network",
+            "testnet",
+            "--interactive",
+            "--no-key",
+            "--service-key-check",
+            "--account",
+            ACCOUNT,
+            "--equity-cap",
+            "40",
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(2), "{stderr}");
+    assert!(stderr.contains("run it on a terminal"), "{stderr}");
+    assert!(!dir.path().join("guard.toml").exists());
+    assert!(!dir.path().join("risk.jsonl").exists());
+}
+
 fn protected_init(dir: &TestDir, cap: &str, input: &[u8]) -> Output {
     let mut child = Command::new(env!("CARGO_BIN_EXE_zunder-guard"))
         .env_clear()

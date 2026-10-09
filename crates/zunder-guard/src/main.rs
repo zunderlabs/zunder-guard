@@ -353,9 +353,9 @@ struct InitArgs {
     /// Windows machine-service staging identity; key handling stays inside Rust.
     #[arg(long, requires = "non_interactive", conflicts_with_all = ["no_key", "service_key_check"])]
     service_setup: Option<String>,
-    /// Protected testnet setup: check a framed stdin key and record its public
-    /// address without storing it; the admitted OS service provisions it later.
-    #[arg(long, requires_all = ["non_interactive", "no_key", "key_stdin"])]
+    /// Protected testnet setup: check a hidden terminal or framed stdin key and
+    /// record its public address without storing it; the OS service provisions it later.
+    #[arg(long, requires = "no_key")]
     service_key_check: bool,
     /// Rules from the website: a `zr1_…` code.
     #[arg(long, env = "ZUNDER_GUARD_RULES")]
@@ -797,12 +797,11 @@ fn validate_service_init_args(args: &InitArgs) -> Result<()> {
     if args.service_key_check
         && (args.network != Some(ModeArg::Testnet)
             || args.confirm_mainnet.is_some()
-            || !args.non_interactive
             || !args.no_key
-            || !args.key_stdin)
+            || args.non_interactive != args.key_stdin)
     {
         bail!(
-            "protected key check requires explicit testnet, no key storage and framed stdin; mainnet consent is refused"
+            "protected key check requires explicit testnet, no key storage and hidden terminal input or paired non-interactive framed stdin; mainnet consent is refused"
         );
     }
     if let Some(identity) = &args.service_setup {
@@ -889,6 +888,11 @@ async fn run_init(paths: &Paths, args: InitArgs) -> Result<()> {
         StoreArg::Auto => &file,
     };
     let mut random = init::os_random;
+    if args.service_key_check {
+        // Both hidden interactive input and private stdin retain the same
+        // credential-memory protection before any key is admitted.
+        zunder_guard::service::enforce_no_core_dumps()?;
+    }
     let outcome = if service_setup {
         // Rust owns hidden input or the bounded private testnet frame. No key
         // enters PowerShell arguments or its interactive-user credential store.
@@ -922,8 +926,7 @@ async fn run_init(paths: &Paths, args: InitArgs) -> Result<()> {
             )
             .await
         }
-    } else if args.service_key_check {
-        zunder_guard::service::enforce_no_core_dumps()?;
+    } else if args.service_key_check && args.key_stdin {
         let mut reader = stdin_fd()?;
         init::init(
             &options,
@@ -2260,6 +2263,43 @@ mod service_cli_tests {
             "--service-key-check",
         ]);
         assert!(validate_service_init_args(&mainnet).is_err());
+    }
+
+    #[test]
+    fn protected_testnet_key_check_admits_hidden_interactive_input_only() {
+        let words = [
+            "guard",
+            "init",
+            "--network",
+            "testnet",
+            "--interactive",
+            "--no-key",
+            "--service-key-check",
+        ];
+        assert!(validate_service_init_args(&init_args(&words)).is_ok());
+        for flag in ["--non-interactive", "--key-stdin"] {
+            let mut invalid = words.to_vec();
+            invalid.retain(|value| *value != "--interactive");
+            invalid.push(flag);
+            assert!(validate_service_init_args(&init_args(&invalid)).is_err());
+        }
+        for network in ["mainnet", "paper"] {
+            let mut invalid = words;
+            invalid[3] = network;
+            assert!(validate_service_init_args(&init_args(&invalid)).is_err());
+        }
+        let mut consent = words.to_vec();
+        consent.extend([
+            "--confirm-mainnet",
+            "0x1111111111111111111111111111111111111111",
+        ]);
+        assert!(validate_service_init_args(&init_args(&consent)).is_err());
+        let missing_no_key: Vec<_> = words
+            .iter()
+            .copied()
+            .filter(|value| *value != "--no-key")
+            .collect();
+        assert!(Cli::try_parse_from(missing_no_key).is_err());
     }
 
     #[test]
