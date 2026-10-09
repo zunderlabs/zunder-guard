@@ -146,10 +146,12 @@ class IdentityTests(unittest.TestCase):
             identity.no_swap();core.assert_called_once_with(identity.resource.RLIMIT_CORE,(0,0))
     def test_api_checkpoints_are_exact_fixed_routes_never_path_values(self):
         prefix='repos/'+REPOSITORY+'/'
-        routes={'repository':'','environment':'environments/'+ENVIRONMENT,
+        routes={'environment':'environments/'+ENVIRONMENT,
             'branch_policies':'environments/'+ENVIRONMENT+'/deployment-branch-policies?per_page=100',
             'run_attempt':'actions/runs/123/attempts/1','git_commit':'git/commits/'+SOURCE,
             'git_tree':'git/trees/'+SOURCE+'?recursive=1','git_blob':'git/blobs/'+SOURCE}
+        identity.api_checkpoint(prefix[:-1]);self.assertEqual(identity._current_api_clause,'repository')
+        with self.assertRaises(Refused):identity.api_checkpoint(prefix)
         for expected,path in routes.items():
             identity.api_checkpoint(prefix+path)
             self.assertEqual(identity._current_api_clause,expected)

@@ -37,13 +37,16 @@ def admission_checkpoint(name):
 def api_checkpoint(path):
     global _current_api_clause
     prefix='repos/'+REPOSITORY+'/'
-    routes=((r'', 'repository'),(r'environments/'+ENVIRONMENT,'environment'),
+    routes=((r'environments/'+ENVIRONMENT,'environment'),
         (r'environments/'+ENVIRONMENT+r'/deployment-branch-policies\?per_page=100','branch_policies'),
         (r'actions/runs/[1-9][0-9]{0,18}/attempts/[1-9][0-9]{0,2}','run_attempt'),
         (r'git/commits/[0-9a-f]{40}','git_commit'),(r'git/trees/[0-9a-f]{40}\?recursive=1','git_tree'),
         (r'git/blobs/[0-9a-f]{40}','git_blob'))
     _current_api_clause='unknown'
-    need(type(path)is str and path.startswith(prefix),'Canonical GitHub admission API required')
+    need(type(path)is str,'Canonical GitHub admission API required')
+    if path=='repos/'+REPOSITORY:
+        _current_api_clause='repository';return
+    need(path.startswith(prefix),'Canonical GitHub admission API required')
     match=[name for pattern,name in routes if re.fullmatch(pattern,path[len(prefix):])]
     need(len(match)==1,'Fixed GitHub admission API route required');_current_api_clause=match[0]
 
