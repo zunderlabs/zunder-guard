@@ -1,0 +1,33 @@
+name: Public Linux candidate inventory
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  inventory:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Exact public inventory source
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf '%s  %s\n' '004f7bf254d0bb03a9c8a7283a94563498882f5deea2c827eac6bd560407090c' 'deploy/guard/e2e/free_runner_inventory.sh' | sha256sum --check --strict
+          set +e
+          (sudo -n timeout --kill-after=5s 120s /usr/bin/bash deploy/guard/e2e/free_runner_inventory.sh) > public-linux-candidate.txt 2>&1
+          result=$?
+          set -e
+          printf '%s\n' "$result" > public-linux-candidate.exit
+          test "$result" = 0
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: always()
+        with:
+          name: public-linux-candidate-inventory
+          path: |
+            public-linux-candidate.txt
+            public-linux-candidate.exit
+          if-no-files-found: error
+          retention-days: 3

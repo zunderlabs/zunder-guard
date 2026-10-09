@@ -1349,3 +1349,89 @@ async fn a_bad_new_licence_key_or_an_unreadable_config_changes_nothing() {
         "{status}"
     );
 }
+
+/// A renewal and a wrong-account key have the same encoded length as the
+/// original key: 13-digit expiry, one 42-character account and fixed signature.
+/// Both must apply at the next sync even when the timestamp also stays equal.
+async fn same_metadata_licence_changes_are_read(atomic: bool) {
+    const DAY: u64 = 86_400_000;
+    let running = start(FeeMode::Builder(builder()), false).await;
+    running
+        .guard
+        .set_licence_keys_for_test(licence::test_key::public(), None, Some(BUILDER.into()))
+        .await;
+    let path = running.dir.path().join("guard.toml");
+    let config = base_config(&running.dir, false);
+    let first = licence_key((running.now() + 30 * DAY) as i64, &[ACCOUNT]);
+    let text = GuardConfig {
+        licence: Some(first),
+        ..config.clone()
+    }
+    .to_toml()
+    .unwrap();
+    std::fs::write(&path, &text).unwrap();
+    let original = std::fs::metadata(&path).unwrap();
+    let modified = original.modified().unwrap();
+    running.guard.watch_config(path.clone()).await;
+    assert_eq!(running.guard.status().await["fee"]["mode"], "fee_free");
+
+    let renewed_until = (running.now() + 31 * DAY) as i64;
+    let renewed = licence_key(renewed_until, &[ACCOUNT]);
+    let wrong_account = licence_key(
+        (running.now() + 30 * DAY) as i64,
+        &["0x0000000000000000000000000000000000000001"],
+    );
+    for (key, valid) in [(renewed, true), (wrong_account, false)] {
+        let next = GuardConfig {
+            licence: Some(key.clone()),
+            ..config.clone()
+        }
+        .to_toml()
+        .unwrap();
+        assert_eq!(next.len() as u64, original.len());
+        assert_ne!(std::fs::read_to_string(&path).unwrap(), next);
+        if atomic {
+            // Exercise the same synced atomic updater used by licence set/renewal.
+            GuardConfig::update(&path, |current| current.licence = Some(key)).unwrap();
+        } else {
+            std::fs::write(&path, next).unwrap();
+        }
+        // Force the old cache fingerprint without sleeps or OS clock assumptions.
+        let file = std::fs::File::options().write(true).open(&path).unwrap();
+        file.set_times(std::fs::FileTimes::new().set_modified(modified))
+            .unwrap();
+        drop(file);
+        let after = std::fs::metadata(&path).unwrap();
+        assert_eq!(after.len(), original.len());
+        assert_eq!(after.modified().unwrap(), modified);
+        running.guard.sync().await;
+        let status = running.guard.status().await;
+        if valid {
+            assert_eq!(
+                status["licence"]["expires_at_ms"], renewed_until,
+                "{status}"
+            );
+            assert_eq!(status["licence"]["state"], "active", "{status}");
+            assert_eq!(status["fee"]["mode"], "fee_free", "{status}");
+        } else {
+            assert_eq!(status["licence"]["state"], "not_used", "{status}");
+            assert_eq!(status["fee"]["mode"], "builder", "{status}");
+            assert!(
+                alerts(&status)
+                    .iter()
+                    .any(|alert| alert.contains("not for account")),
+                "{status}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn same_metadata_licence_rewrite_applies_at_the_next_sync() {
+    same_metadata_licence_changes_are_read(false).await;
+}
+
+#[tokio::test]
+async fn same_metadata_atomic_licence_replacement_applies_at_the_next_sync() {
+    same_metadata_licence_changes_are_read(true).await;
+}
