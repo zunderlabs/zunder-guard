@@ -55,6 +55,24 @@ class Admission(unittest.TestCase):
         self.assertEqual(row['token.actions.githubusercontent.com:ref'],'refs/heads/main')
         self.assertEqual(row['token.actions.githubusercontent.com:repository_id'],str(REPOSITORY_ID))
         self.assertNotIn('token.actions.githubusercontent.com:workflow_sha',row)
+    def test_admission_subclauses_do_not_emit_actual_api_body_or_path(self):
+        value=claims_before_sts(self.token(),SHA);names=[]
+        admit(lambda p:self.rows[p],value,PRODUCER,SHA,WORKFLOWS,checkpoint=names.append)
+        self.assertEqual(names,list(ADMISSION_CLAUSES))
+        prefix='repos/'+REPOSITORY+'/'
+        for path,clause in [(prefix,'repository_request'),(prefix+'environments/'+ENVIRONMENT,'environment_request'),
+            (prefix+'environments/'+ENVIRONMENT+'/deployment-branch-policies?per_page=100','branch_policies_request'),
+            (prefix+'actions/runs/123/attempts/1','run_attempt_request')]:
+            names=[]
+            def api(request):
+                if request==path:raise RuntimeError('synthetic-token-NEVER-LOG')
+                return self.rows[request]
+            with self.subTest(clause=clause),self.assertRaises(RuntimeError):admit(api,value,PRODUCER,SHA,WORKFLOWS,checkpoint=names.append)
+            self.assertEqual(names[-1],clause)
+        names=[]
+        wrong={**self.rows[prefix+'actions/runs/123/attempts/1'],'status':'completed'}
+        with self.assertRaises(Refused):admit(lambda p:wrong if p.endswith('/attempts/1')else self.rows[p],value,PRODUCER,SHA,WORKFLOWS,checkpoint=names.append)
+        self.assertEqual(names[-1],'run_attempt_identity')
     def test_owner_role_cannot_read_native_epoch_or_bulk_history(self):
         from acceptance_owner_policy import documents,OWNER_ARN
         value=documents(SHA);rows=value['permissions']['Statement']

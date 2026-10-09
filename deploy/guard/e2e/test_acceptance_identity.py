@@ -73,7 +73,8 @@ class IdentityTests(unittest.TestCase):
             err=io.StringIO()
             with patch.object(identity,'main',side_effect=fail),patch.object(identity.signal,'signal'),contextlib.redirect_stderr(err):
                 self.assertEqual(identity.cli(),1)
-            suffix=' clause=unknown'if name=='positive_claims'else ''
+            suffix=' clause=unknown'if name in('positive_claims','admission')else ''
+            if name in('control_workflows','caller_workflows','admission'):suffix+=' api=unknown'
             self.assertEqual(err.getvalue(), 'Actual owner admission probe incomplete at stage='+name+suffix+'; no owner key was read.\n')
             self.assertNotIn(sentinel,err.getvalue())
     def test_clause_diagnostic_never_emits_jwt_claim_values_or_exception(self):
@@ -143,6 +144,26 @@ class IdentityTests(unittest.TestCase):
     def test_no_swap_and_core_zero_required(self):
         with patch.object(identity.sys,'platform','linux'),patch.object(identity.Path,'is_file',return_value=True),patch.object(identity.Path,'read_text',return_value='Filename Type Size Used Priority\n'),patch.object(identity.resource,'setrlimit')as core,patch.object(identity.resource,'getrlimit',return_value=(0,0)):
             identity.no_swap();core.assert_called_once_with(identity.resource.RLIMIT_CORE,(0,0))
+    def test_api_checkpoints_are_exact_fixed_routes_never_path_values(self):
+        prefix='repos/'+REPOSITORY+'/'
+        routes={'repository':'','environment':'environments/'+ENVIRONMENT,
+            'branch_policies':'environments/'+ENVIRONMENT+'/deployment-branch-policies?per_page=100',
+            'run_attempt':'actions/runs/123/attempts/1','git_commit':'git/commits/'+SOURCE,
+            'git_tree':'git/trees/'+SOURCE+'?recursive=1','git_blob':'git/blobs/'+SOURCE}
+        for expected,path in routes.items():
+            identity.api_checkpoint(prefix+path)
+            self.assertEqual(identity._current_api_clause,expected)
+        sentinel='synthetic-token-NEVER-LOG'
+        with self.assertRaises(Refused):identity.api_checkpoint(prefix+sentinel)
+        with patch.object(identity,'_current_stage','admission'),patch.object(identity,'_current_admission_clause',sentinel),patch.object(identity,'_current_api_clause',sentinel):
+            self.assertIn('clause=unknown api=unknown;',identity.safe_failure_message())
+            self.assertNotIn(sentinel,identity.safe_failure_message())
+        identity._current_api_clause='unknown'
+    def test_documented_read_permission_propagates_from_caller(self):
+        import yaml
+        from render_acceptance_caller import render
+        for job in yaml.load(render(SOURCE),Loader=yaml.BaseLoader)['jobs'].values():
+            self.assertEqual(job['permissions'],{'contents':'read','actions':'read','id-token':'write'})
     def test_runtime_and_memory_preflight_exact_workflow_closure(self):
         import yaml
         repo=Path(__file__).resolve().parents[3]
@@ -150,7 +171,9 @@ class IdentityTests(unittest.TestCase):
             template=repo/'deploy/guard/github/workflows'/name
             published=repo/'.github/workflows'/name
             self.assertEqual(published.read_bytes(),template.read_bytes())
-            steps=yaml.load(template.read_bytes(),Loader=yaml.BaseLoader)['jobs'][job]['steps']
+            job_definition=yaml.load(template.read_bytes(),Loader=yaml.BaseLoader)['jobs'][job]
+            self.assertEqual(job_definition['permissions'],{'contents':'read','actions':'read','id-token':'write'})
+            steps=job_definition['steps']
             memory=steps[1]['run'];runtime=steps[2]['run'];probe=steps[3]
             self.assertIn('/usr/bin/sudo --non-interactive /usr/sbin/swapoff --all',memory)
             self.assertIn("len(swaps.read_text().splitlines()) != 1",memory)
