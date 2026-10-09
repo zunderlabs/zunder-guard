@@ -1,0 +1,63 @@
+name: Native controller checks
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [codex/native-controller-checks]
+  pull_request:
+    paths:
+      - .github/workflows/native-controller-checks.yml
+      - deploy/guard/e2e/native/windows.ps1
+      - deploy/guard/e2e/native/windows_native.cs
+      - deploy/guard/e2e/native/test_windows_native.ps1
+
+permissions:
+  contents: read
+
+concurrency:
+  group: native-controller-checks-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows-public-fixtures:
+    runs-on: windows-2025
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+      - name: Parse, compile and exercise public native fixtures
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & ./deploy/guard/e2e/native/test_windows_native.ps1
+          $Files = @('windows.ps1', 'windows_native.cs', 'test_windows_native.ps1')
+          $Hashes = @{}
+          foreach ($Name in $Files) {
+            $Hashes[$Name] = (Get-FileHash -LiteralPath ('deploy/guard/e2e/native/' + $Name) -Algorithm SHA256).Hash.ToLowerInvariant()
+          }
+          $Receipt = @{
+            schema = 1
+            kind = 'public-native-controller-fixture'
+            source = $env:GITHUB_SHA
+            run_id = $env:GITHUB_RUN_ID
+            run_attempt = $env:GITHUB_RUN_ATTEMPT
+            runner_os = $env:RUNNER_OS
+            powershell = $PSVersionTable.PSVersion.ToString()
+            files = $Hashes
+            parser_compile = 'passed'
+            public_job_frame_fixtures = 'passed'
+            venue_calls = 0
+            real_credentials = $false
+            guard_installation = $false
+            actual_release_acceptance = $false
+          }
+          New-Item -ItemType Directory -Path public-native-receipt | Out-Null
+          $Receipt | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath public-native-receipt/receipt.json -Encoding utf8
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: public-native-controller-${{ github.run_id }}-${{ github.run_attempt }}
+          path: public-native-receipt/receipt.json
+          if-no-files-found: error
+          retention-days: 14
