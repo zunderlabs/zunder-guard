@@ -27,6 +27,45 @@ foreach($Assignment in $Assignments){
   $Automatic=Get-Variable -Name $Name -ErrorAction SilentlyContinue
   if($null -ne $Automatic -and ([int]$Automatic.Options -band 3) -ne 0){throw 'Producer assigns a read-only or constant automatic variable'}
 }
+# Public SAM cmdlet fakes: never create or query an actual local identity.
+$ProbeNode=@($Ast.FindAll({param($Node)$Node -is [Management.Automation.Language.FunctionDefinitionAst] -and $Node.Name -ceq 'Probe-LocalUser'},$true))[0]
+Invoke-Expression $ProbeNode.Extent.Text
+function Get-LocalUser { [CmdletBinding()]param()
+  if($script:FakeQuery -ceq 'failure'){Write-Error 'Synthetic SAM unavailable'}
+  elseif($script:FakeQuery -ceq 'present'){return [PSCustomObject]@{Name='public-probe';Sid='public-sid'}}
+  elseif($script:FakeQuery -ceq 'duplicate'){return @([PSCustomObject]@{Name='public-probe'},[PSCustomObject]@{Name='public-probe'})}
+}
+$script:FakeQuery='absent';if($null -ne (Probe-LocalUser 'public-probe')){throw 'Successful SAM absence differs'}
+$script:FakeQuery='present';if((Probe-LocalUser 'public-probe').Sid -cne 'public-sid'){throw 'Successful SAM identity differs'}
+foreach($Case in @('failure','duplicate')){
+  $script:FakeQuery=$Case;$Refused=$false;try{$null=Probe-LocalUser 'public-probe'}catch{$Refused=$true}
+  if(-not $Refused){throw 'Unknown or ambiguous SAM query treated as absence'}
+}
+$AuditNode=@($Ast.FindAll({param($Node)$Node -is [Management.Automation.Language.FunctionDefinitionAst] -and $Node.Name -ceq 'Audit-Probe'},$true))[0]
+Invoke-Expression $AuditNode.Extent.Text
+function Save {}
+function Event {}
+function New-LocalUser { [CmdletBinding()]param([string]$Name,[object]$Password,[string]$Description,[DateTime]$AccountExpires)
+  $script:FakeCreated=$true;$script:FakeUser=[PSCustomObject]@{Name=$Name;Description=$Description;Sid=[PSCustomObject]@{Value='public-sid'}}
+  return $script:FakeUser
+}
+function Add-LocalGroupMember { [CmdletBinding()]param([string]$Group,[string]$Member);throw 'Synthetic group failure' }
+function Remove-LocalUser { [CmdletBinding()]param([string]$Name);$script:FakeCreated=$false;$script:FakeRemoved=$true }
+function Get-LocalUser { [CmdletBinding()]param()
+  if(($script:FakeCreated -and $script:AuditCase -ceq 'query-failure') -or ($script:FakeRemoved -and $script:AuditCase -ceq 'removal-readback-failure')){Write-Error 'Synthetic SAM unavailable'}
+  if($script:FakeCreated){return $script:FakeUser}
+}
+foreach($Case in @('query-failure','removal-readback-failure','successful-cleanup')){
+  $script:AuditCase=$Case;$script:FakeCreated=$false;$script:FakeRemoved=$false
+  $script:Plan=@{run_id=1;challenge='public-fixture'};$script:Checkpoint=@{pending=$null}
+  try{$null=Audit-Probe $false}catch{}
+  $Removed=$script:Checkpoint.probe_identity.ContainsKey('removed') -and $script:Checkpoint.probe_identity.removed
+  if($Case -ceq 'successful-cleanup'){
+    if($script:FakeCreated -or -not $Removed -or $null -ne $script:Checkpoint.pending){throw 'Successful owned cleanup differs'}
+  }elseif($Removed -or $null -eq $script:Checkpoint.pending){throw 'Unknown SAM query falsely cleared custody'}
+}
+foreach($Function in @('Get-LocalUser','New-LocalUser','Add-LocalGroupMember','Remove-LocalUser','Save','Event')){Remove-Item ('Function:\'+$Function)}
+
 $Code=Join-Path $PSScriptRoot 'windows_native.cs';Add-Type -Path $Code
 if($ParseCompileOnly){Write-Output 'PASS: exact Windows producer parser, public-only fee feature fixtures and native C# compile. Win32 Job/frame/lifecycle tests not executed.';return}
 if([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT){throw 'Actual harmless Win32 Job/frame tests require native Windows'}

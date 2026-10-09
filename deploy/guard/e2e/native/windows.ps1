@@ -236,11 +236,21 @@ function Interactive-Events {
   }
   return @($Rows|Sort-Object at)
 }
+function Probe-LocalUser([string]$Name) {
+  # Only a successful complete SAM query proves absence. Access/query failures
+  # must retain the pending custody record; localized errors are not absence.
+  $Users=@(Get-LocalUser -ErrorAction Stop)
+  Need ($Users.Count -le 1024) 'Local identity inventory bound'
+  $Matches=@($Users|Where-Object{$_.Name -ieq $Name})
+  Need ($Matches.Count -le 1) 'Ambiguous local identity inventory'
+  if($Matches.Count -eq 1){return $Matches[0]}
+  return $null
+}
 function Audit-Probe([bool]$RequireFirst,[long]$ReadyAt=0) {
   # Machine-operated native interactive auth proves SCM readiness before a real
   # type2 Security4624 boundary, without a person or desktop automation.
   $Name='zg-native-'+[Guid]::NewGuid().ToString('N').Substring(0,8)
-  Need (-not (Get-LocalUser -Name $Name -ErrorAction SilentlyContinue)) 'Probe local identity exists'
+  Need (-not (Probe-LocalUser $Name)) 'Probe local identity exists'
   $Created=$false;$Password=$null;$Secure=$null;$Sid=$null
   $Description='Zunder native read-only logon proof '+$script:Plan.run_id+' '+$script:Plan.challenge
   $script:Checkpoint.probe_identity=@{name=$Name;description=$Description;sid=$null;created=$false};$script:Checkpoint.pending='create-owned-machine-auth-probe';Save
@@ -252,7 +262,7 @@ function Audit-Probe([bool]$RequireFirst,[long]$ReadyAt=0) {
     $script:Checkpoint.probe_identity.sid=$Sid;$script:Checkpoint.probe_identity.created=$true;Save
     $Users=([Security.Principal.SecurityIdentifier]::new('S-1-5-32-545')).Translate([Security.Principal.NTAccount]).Value.Split('\')[-1]
     Add-LocalGroupMember -Group $Users -Member $Name
-    Need ((Get-LocalUser -Name $Name).Sid.Value -ceq $Sid) 'Owned machine-auth identity changed before logon'
+    Need ((Probe-LocalUser $Name).Sid.Value -ceq $Sid) 'Owned machine-auth identity changed before logon'
     $Observed=[DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
     Need ([ZunderNative]::InteractiveLogon($Name,$Password)) 'Actual type2 authentication failed'
     $Until=[DateTimeOffset]::UtcNow.AddSeconds(20);$Row=$null
@@ -264,13 +274,13 @@ function Audit-Probe([bool]$RequireFirst,[long]$ReadyAt=0) {
     return @{record_id=$Row.record_id;login_at=$Row.at.ToString('o');logon_type=2;ready_observed_at_ms=$ReadyAt;first_after_boot=$RequireFirst}
   }finally{
     try{
-      $User=Get-LocalUser -Name $Name -ErrorAction SilentlyContinue
+      $User=Probe-LocalUser $Name
       if($null -ne $User){
         Need ($User.Description -ceq $Description -and ($null -eq $Sid -or $User.Sid.Value -ceq $Sid)) 'Owned probe identity changed'
         # Planned random name was proven absent before creation. A matching
         # description also reconciles a cmdlet that created then threw.
         $script:Checkpoint.probe_identity.sid=$User.Sid.Value;$script:Checkpoint.probe_identity.created=$true;Save
-        Remove-LocalUser -Name $Name;Need (-not (Get-LocalUser -Name $Name -ErrorAction SilentlyContinue)) 'Owned probe identity remains'
+        Remove-LocalUser -Name $Name;Need (-not (Probe-LocalUser $Name)) 'Owned probe identity remains'
       }
       $script:Checkpoint.probe_identity.removed=$true;$script:Checkpoint.pending=$null;Save
     }finally{if($null -ne $Secure){$Secure.Dispose()};$Password=$null}
