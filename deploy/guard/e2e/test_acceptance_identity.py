@@ -73,8 +73,64 @@ class IdentityTests(unittest.TestCase):
             err=io.StringIO()
             with patch.object(identity,'main',side_effect=fail),patch.object(identity.signal,'signal'),contextlib.redirect_stderr(err):
                 self.assertEqual(identity.cli(),1)
-            self.assertEqual(err.getvalue(), 'Actual owner admission probe incomplete at stage='+name+'; no owner key was read.\n')
+            suffix=' clause=unknown'if name=='positive_claims'else ''
+            self.assertEqual(err.getvalue(), 'Actual owner admission probe incomplete at stage='+name+suffix+'; no owner key was read.\n')
             self.assertNotIn(sentinel,err.getvalue())
+    def test_clause_diagnostic_never_emits_jwt_claim_values_or_exception(self):
+        from acceptance_admission import claims_before_sts,WORKFLOW,CALLER,CLAIM_CLAUSES
+        baseline={'iss':'https://token.actions.githubusercontent.com','aud':'sts.amazonaws.com','sub':SUBJECT,
+            'repository':REPOSITORY,'repository_id':str(REPOSITORY_ID),'repository_owner_id':str(OWNER_ID),
+            'environment':ENVIRONMENT,'event_name':'workflow_dispatch','runner_environment':'github-hosted',
+            'sha':'b'*40,'ref':'refs/heads/main','workflow_sha':'b'*40,'job_workflow_sha':SOURCE,
+            'workflow_ref':REPOSITORY+'/'+CALLER+'@refs/heads/main','job_workflow_ref':REPOSITORY+'/'+WORKFLOW+'@'+SOURCE,
+            'run_id':'123','run_attempt':'1'}
+        encode=lambda value:base64.urlsafe_b64encode(json.dumps(value).encode()).decode().rstrip('=')
+        token=lambda value:encode({'alg':'RS256','kid':'synthetic-public-fixture'})+'.'+encode(value)+'.synthetic-invalid-signature'
+        emitted=[]
+        actual=claims_before_sts(token(baseline),SOURCE,checkpoint=emitted.append)
+        self.assertEqual(actual['run_id'],123);self.assertEqual(emitted,list(CLAIM_CLAUSES))
+        wrong={'subject':'sub','repository_id':'repository_id','environment':'environment',
+            'caller_workflow_sha':'workflow_sha','reusable_workflow_sha':'job_workflow_sha',
+            'caller_workflow_ref':'workflow_ref','reusable_workflow_ref':'job_workflow_ref','run_attempt':'run_attempt'}
+        sentinel='synthetic.JWT.claim-value-NEVER-LOG'
+        for clause,key in wrong.items():
+            emitted=[]
+            with self.subTest(clause=clause),self.assertRaises(Refused):claims_before_sts(token({**baseline,key:sentinel}),SOURCE,checkpoint=emitted.append)
+            self.assertEqual(emitted[-1],clause);self.assertTrue(set(emitted)<=set(CLAIM_CLAUSES))
+            with patch.object(identity,'_current_stage','positive_claims'),patch.object(identity,'_current_claim_clause',clause):
+                message=identity.safe_failure_message();self.assertIn('clause='+clause+';',message);self.assertNotIn(sentinel,message)
+        with patch.object(identity,'_current_stage','positive_claims'),patch.object(identity,'_current_claim_clause',sentinel):
+            self.assertIn('clause=unknown;',identity.safe_failure_message());self.assertNotIn(sentinel,identity.safe_failure_message())
+        with self.assertRaises(Refused):identity.claim_checkpoint(sentinel)
+    def test_immutable_subject_is_exact_and_legacy_subject_refused(self):
+        from acceptance_admission import claims_before_sts,trust_policy,WORKFLOW,CALLER
+        self.assertEqual(SUBJECT,'repo:zunderlabs@338317604/zunder-guard@1409357189:environment:release-owner-controller')
+        condition=trust_policy(SOURCE)['Statement'][0]['Condition']['StringEquals']
+        self.assertEqual(condition['token.actions.githubusercontent.com:sub'],SUBJECT)
+        self.assertEqual(condition['token.actions.githubusercontent.com:repository_id'],str(REPOSITORY_ID))
+        self.assertEqual(condition['token.actions.githubusercontent.com:repository_owner_id'],str(OWNER_ID))
+        base={'iss':'https://token.actions.githubusercontent.com','aud':'sts.amazonaws.com','sub':SUBJECT,
+            'repository':REPOSITORY,'repository_id':str(REPOSITORY_ID),'repository_owner_id':str(OWNER_ID),
+            'environment':ENVIRONMENT,'event_name':'workflow_dispatch','runner_environment':'github-hosted',
+            'sha':'b'*40,'ref':'refs/heads/main','workflow_sha':'b'*40,'job_workflow_sha':SOURCE,
+            'workflow_ref':REPOSITORY+'/'+CALLER+'@refs/heads/main','job_workflow_ref':REPOSITORY+'/'+WORKFLOW+'@'+SOURCE,
+            'run_id':'123','run_attempt':'1'}
+        encode=lambda value:base64.urlsafe_b64encode(json.dumps(value).encode()).decode().rstrip('=')
+        for subject in('repo:'+REPOSITORY+':environment:'+ENVIRONMENT,SUBJECT.replace('@338317604','@1'),
+            SUBJECT.replace('@1409357189','@2'),SUBJECT.replace('release-owner-controller','other')):
+            names=[];token=encode({'alg':'RS256','kid':'fixture'})+'.'+encode({**base,'sub':subject})+'.synthetic-invalid-signature'
+            with self.subTest(subject=subject),self.assertRaises(Refused):claims_before_sts(token,SOURCE,checkpoint=names.append)
+            self.assertEqual(names[-1],'subject')
+    def test_bad_structure_decode_and_algorithm_emit_only_fixed_clause(self):
+        from acceptance_admission import claims_before_sts
+        encode=lambda value:base64.urlsafe_b64encode(json.dumps(value).encode()).decode().rstrip('=')
+        cases=[('bad-token','token_structure'),('!.e30.signature','header_decode'),
+            (encode({'alg':'RS256','kid':'fixture'})+'.!.signature','payload_decode'),
+            (encode({'alg':'none','kid':'fixture'})+'.e30.signature','algorithm')]
+        for token,clause in cases:
+            names=[]
+            with self.subTest(clause=clause),self.assertRaises(Exception):claims_before_sts(token,SOURCE,checkpoint=names.append)
+            self.assertEqual(names[-1],clause)
     def test_unknown_diagnostic_value_is_not_printed(self):
         with patch.object(identity,'_current_stage','synthetic-token'):
             self.assertIn('stage=unknown;',identity.safe_failure_message())

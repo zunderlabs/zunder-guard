@@ -19,33 +19,48 @@ CALLER='.github/workflows/release-acceptance.yml'
 WORKFLOW='.github/workflows/release-acceptance-run.yml'
 NEGATIVE_WORKFLOW='.github/workflows/release-owner-admission-negative.yml'
 ROLE='arn:aws:iam::436632189317:role/zunder-release-owner-controller'
-SUBJECT='repo:'+REPOSITORY+':environment:'+ENVIRONMENT
+# GitHub immutable default for this actual post-15July2026 repository.
+# Exact repository/org IDs are also separately required by source and IAM.
+SUBJECT='repo:zunderlabs@338317604/zunder-guard@1409357189:environment:'+ENVIRONMENT
 
 
-def claims_before_sts(token,control_source):
-    """Untrusted decode for rejection only. STS must verify this exact JWT before SSM."""
-    need(type(token) is str and len(token)<=32768 and len(token.split('.'))==3,'Bounded GitHub OIDC token required')
+CLAIM_CLAUSES=('token_structure','header_decode','payload_decode','algorithm','key_identifier',
+    'issuer','audience','subject','repository','repository_id','repository_owner_id','environment',
+    'event','runner','control_source','caller_source','ref','caller_workflow_sha','reusable_workflow_sha',
+    'caller_workflow_ref','reusable_workflow_ref','run_id','run_attempt','attempt_bound')
+
+def claims_before_sts(token,control_source,*,checkpoint=None):
+    """Untrusted rejection only. Diagnostics emit fixed clause names, never JWT values."""
+    def mark(name):
+        need(name in CLAIM_CLAUSES,'Fixed OIDC clause required')
+        if checkpoint is not None:checkpoint(name)
+    mark('token_structure')
+    need(type(token)is str and len(token)<=32768 and len(token.split('.'))==3,'Bounded GitHub OIDC token required')
     header,payload,_=token.split('.')
     unpack=lambda raw:decode(base64.urlsafe_b64decode(raw+'='*(-len(raw)%4)),32768)
-    metadata=unpack(header);claims=unpack(payload)
-    need(metadata.get('alg')=='RS256' and type(metadata.get('kid')) is str,'Expected GitHub token algorithm required')
-    need(claims.get('iss')=='https://token.actions.githubusercontent.com'
-         and claims.get('aud')=='sts.amazonaws.com' and claims.get('sub')==SUBJECT,'Exact controller OIDC subject required')
-    need(claims.get('repository')==REPOSITORY and claims.get('repository_id')==str(REPOSITORY_ID)
-         and claims.get('repository_owner_id')==str(OWNER_ID) and claims.get('environment')==ENVIRONMENT
-         and claims.get('event_name')=='workflow_dispatch' and claims.get('runner_environment')=='github-hosted',
-         'Canonical hosted dispatched controller required')
-    need(type(control_source) is str and re.fullmatch('[0-9a-f]{40}',control_source),'Real reviewed controller commit required')
-    source=claims.get('sha')
-    need(type(source) is str and re.fullmatch('[0-9a-f]{40}',source)
-         and claims.get('ref')=='refs/heads/main' and claims.get('workflow_sha')==source
-         and claims.get('job_workflow_sha')==control_source
-         and claims.get('workflow_ref')==REPOSITORY+'/'+CALLER+'@refs/heads/main'
-         and claims.get('job_workflow_ref')==REPOSITORY+'/'+WORKFLOW+'@'+control_source,
-         'Main caller or SHA-pinned reusable workflow differs')
-    for name in ('run_id','run_attempt'):
-        need(type(claims.get(name)) is str and re.fullmatch('[1-9][0-9]{0,18}',claims[name]),'Exact workflow run identity required')
-    need(int(claims['run_attempt'])<=100,'Bounded workflow attempt required')
+    mark('header_decode');metadata=unpack(header)
+    mark('payload_decode');claims=unpack(payload)
+    mark('algorithm');need(metadata.get('alg')=='RS256','Expected GitHub token algorithm required')
+    mark('key_identifier');need(type(metadata.get('kid'))is str,'Expected GitHub token key identifier required')
+    checks=(('issuer','iss','https://token.actions.githubusercontent.com'),('audience','aud','sts.amazonaws.com'),
+        ('subject','sub',SUBJECT),('repository','repository',REPOSITORY),('repository_id','repository_id',str(REPOSITORY_ID)),
+        ('repository_owner_id','repository_owner_id',str(OWNER_ID)),('environment','environment',ENVIRONMENT),
+        ('event','event_name','workflow_dispatch'),('runner','runner_environment','github-hosted'))
+    for name,key,expected in checks:
+        mark(name);need(claims.get(key)==expected,'Canonical controller OIDC claim differs')
+    mark('control_source')
+    need(type(control_source)is str and re.fullmatch('[0-9a-f]{40}',control_source),'Real reviewed controller commit required')
+    source=claims.get('sha');mark('caller_source')
+    need(type(source)is str and re.fullmatch('[0-9a-f]{40}',source),'Exact caller commit required')
+    checks=(('ref','ref','refs/heads/main'),('caller_workflow_sha','workflow_sha',source),
+        ('reusable_workflow_sha','job_workflow_sha',control_source),
+        ('caller_workflow_ref','workflow_ref',REPOSITORY+'/'+CALLER+'@refs/heads/main'),
+        ('reusable_workflow_ref','job_workflow_ref',REPOSITORY+'/'+WORKFLOW+'@'+control_source))
+    for name,key,expected in checks:
+        mark(name);need(claims.get(key)==expected,'Main caller or SHA-pinned reusable workflow differs')
+    for name in('run_id','run_attempt'):
+        mark(name);need(type(claims.get(name))is str and re.fullmatch('[1-9][0-9]{0,18}',claims[name]),'Exact workflow run identity required')
+    mark('attempt_bound');need(int(claims['run_attempt'])<=100,'Bounded workflow attempt required')
     return {'source':control_source,'caller_source':source,'run_id':int(claims['run_id']),'attempt':int(claims['run_attempt']),
             'workflow':WORKFLOW,'caller':CALLER,'environment':ENVIRONMENT}
 
