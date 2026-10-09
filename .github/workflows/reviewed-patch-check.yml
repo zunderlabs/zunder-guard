@@ -7,7 +7,7 @@ on:
         required: true
         type: string
       patch_base64:
-        description: Public reviewed unified patch, base64 encoded, maximum 45000 characters
+        description: Public reviewed unified patch, base64 encoded, maximum 60000 characters
         required: true
         type: string
       patch_sha256:
@@ -64,9 +64,9 @@ jobs:
           expected = os.environ['PATCH_SHA256']
           encoded = os.environ['PATCH_BASE64']
           require(re.fullmatch('[0-9a-f]{64}', expected), 'Expected public patch SHA256 required')
-          require(0 < len(encoded) <= 45000, 'Public patch exceeds input boundary')
+          require(0 < len(encoded) <= 60000, 'Public patch exceeds input boundary')
           patch = base64.b64decode(encoded, validate=True)
-          require(0 < len(patch) <= 33750 and b'\x00' not in patch, 'Invalid public patch bytes')
+          require(0 < len(patch) <= 45000 and b'\x00' not in patch, 'Invalid public patch bytes')
           require(hashlib.sha256(patch).hexdigest() == expected, 'Public patch hash differs')
           base = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()
           require(base == os.environ['SOURCE_BASE'], 'Source base differs')
@@ -96,6 +96,7 @@ jobs:
               'schema': 1, 'kind': 'uncommitted-public-source-gate', 'base': base,
               'tree': tree, 'patch_sha256': expected, 'files': paths,
               'workflow_ref': os.environ['GITHUB_WORKFLOW_REF'],
+              'workflow_sha': os.environ['GITHUB_WORKFLOW_SHA'],
               'run_id': os.environ['GITHUB_RUN_ID'], 'run_attempt': os.environ['GITHUB_RUN_ATTEMPT'],
               'flow_histories_per_property': 4000, 'native_signed_release_evidence': False,
           }, indent=2) + '\n')
@@ -170,6 +171,7 @@ jobs:
               assert receipt['base']==os.environ['SOURCE_BASE'] and receipt['patch_sha256']==os.environ['PATCH_SHA256']
               assert receipt['run_id']==run and receipt['run_attempt']==attempt
               assert receipt['workflow_ref']==os.environ['GITHUB_WORKFLOW_REF']
+              assert receipt['workflow_sha']==os.environ['GITHUB_WORKFLOW_SHA']
               assert receipt['flow_histories_per_property']==4000
               patch=(folder/'reviewed.patch').read_bytes()
               assert hashlib.sha256(patch).hexdigest()==receipt['patch_sha256']
