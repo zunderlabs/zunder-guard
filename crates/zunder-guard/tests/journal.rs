@@ -411,32 +411,44 @@ async fn with_the_journal_broken_guard_refuses_entries_and_still_flattens() {
 #[tokio::test(flavor = "multi_thread")]
 async fn recovery_waits_for_expiry() {
     let dir = TestDir::new("journal-j3-wait");
-    let guard = start(dir.path(), venue(), true).await;
+    let clock = TestClock::new();
+    let guard = start_with(dir.path(), venue(), true, clock.clone()).await;
+    clock.advance(5_100);
     guard.upstream().swallow_answers(true);
-    guard.exchange(buy("3000", "0.1"), "http").await;
+    let request = signed_by(CLIENT_KEY, buy_wire(1, "3000", "0.1"), clock.now_ms());
+    let reply = guard.exchange(request, "http").await;
+    assert_ne!(reply["status"], "ok", "{reply}");
     let venue = guard.upstream().fork();
     venue.swallow_answers(false);
     drop(guard);
-    let guard = start(dir.path(), venue, false).await;
+    let guard = start_with(dir.path(), venue, false, clock.clone()).await;
     let pending = guard.pending_for_recovery().await;
     assert_eq!(pending.len(), 1);
-    // Expiry 8 s after the intent (which is more than 5 s old by now).
-    let started = std::time::Instant::now();
-    let recovering = {
-        let guard = guard.clone();
-        tokio::spawn(async move { guard.recover_after(pending, 8_000, 90_000).await })
-    };
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // Poll at the exact boundary on Guard's clock; venue/setup delays
+    // cannot consume the wait being tested.
+    let expires = u64::try_from(pending[0].at_ms + 8_000).unwrap();
+    clock.0.store(expires - 1, Ordering::SeqCst);
+    let reads_before = guard.upstream().info_log().len();
+    let mut recovering = std::pin::pin!(guard.recover_after(pending, 8_000, 90_000));
+    std::future::poll_fn(|cx| {
+        assert!(std::future::Future::poll(recovering.as_mut(), cx).is_pending());
+        std::task::Poll::Ready(())
+    })
+    .await;
     assert!(guard.recovering());
-    let reply = guard.exchange(buy("3000", "0.01"), "http").await;
+    let request = signed_by(CLIENT_KEY, buy_wire(1, "3000", "0.01"), clock.now_ms());
+    let reply = guard.exchange(request, "http").await;
     assert!(reply.to_string().contains("restart"), "{reply}");
-    assert_eq!(recovering.await.unwrap(), 1);
-    assert!(
-        started.elapsed() >= Duration::from_millis(1_500),
-        "{:?}",
-        started.elapsed()
-    );
+    assert_eq!(guard.upstream().info_log().len(), reads_before);
+    clock.advance(1);
+    let concluded = tokio::time::timeout(Duration::from_secs(10), recovering.as_mut())
+        .await
+        .expect("recovery concludes after the controlled expiry");
+    assert_eq!(concluded, 1);
     assert!(!guard.recovering());
+    let reads = guard.upstream().info_log();
+    assert_eq!(reads[reads_before..].len(), 1);
+    assert_eq!(reads[reads_before]["type"], "orderStatus");
     let recovered: Vec<Value> = guard
         .events(0)
         .await
