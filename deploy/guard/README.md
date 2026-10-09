@@ -216,8 +216,11 @@ CloudFormation reports success only after installation, service and local health
 Optional public access is restricted to one valid IPv4 /32 address. Installer output is
 captured in a root-only temporary file, removed on success, so client keys and pairing codes
 never enter cloud-init logs. On failure the console reports only the diagnostic file path.
-Use `PairPaper` to pair the running paper setup. `NextStep` deliberately stops Guard and
-replaces bootstrap configuration/client pairings through guided installation; journals remain.
+Use `PairPaper` to pair the running paper setup. `NextStep` points to
+[separate native activation](systemd/ACTIVATION.md). Stop the paper service and its bot,
+then explicitly select Testnet or Mainnet in a fresh service instance. The paper binary,
+configuration, client identities and journals are preserved; the sending instance gets
+its own identity, state and encrypted credential. There is no automatic Mainnet activation.
 
 The encrypted, tagged state volume is retained when the instance terminates. Stack deletion
 therefore needs an explicit follow-up volume deletion after any required backup to stop all

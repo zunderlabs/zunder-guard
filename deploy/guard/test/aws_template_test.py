@@ -28,6 +28,22 @@ RULES = 'zr1_eyJ2IjoxfQ'
 ACCOUNT = '0x' + '1' * 40
 
 class AwsTemplate(unittest.TestCase):
+    def test_next_step_requires_separate_explicit_sending_instance(self):
+        output = DOC['Outputs']['NextStep']
+        self.assertIsInstance(output['Value'], str)
+        self.assertIn('--service-instance testnet', output['Value'])
+        self.assertIn('--service-instance mainnet', output['Value'])
+        self.assertIn('Never use --force', output['Value'])
+        self.assertNotIn('replace', output['Description'].lower())
+        self.assertIn('stopped', output['Description'])
+        self.assertIn('ZUNDER_GUARD_HOME=/var/lib/zunder-guard', DOC['Outputs']['PairPaper']['Value'])
+
+    def test_native_instance_offline_contracts(self):
+        result = subprocess.run([os.environ.get('PYTHON', 'python3'),
+                                 str(Path(__file__).with_name('native-instance.py'))],
+                                capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
     def test_public_ingress_is_one_valid_ipv4_only(self):
         pattern = DOC['Parameters']['AllowedCidr']['AllowedPattern']
         for value in ['192.0.2.1/32', '255.255.255.255/32', '1.2.3.4/32']:

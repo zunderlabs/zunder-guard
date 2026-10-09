@@ -242,9 +242,9 @@ Outputs:
     Description: Avoid leftover storage charges after deleting this test stack.
     Value: The encrypted root EBS volume is retained on termination to protect Guard state. Back it up, then explicitly delete it when no longer needed. Replacing the instance does not automatically reattach it.
   NextStep:
-    Description: Deliberately replace bootstrap paper setup. Stop your bot first; replaces all client pairings, preserves journals. Failed setup leaves the service stopped.
-    Value: !Sub >-
-      Download and verify this release's installer, then stop Guard and run guided setup with --force --rules '${Rules}' --account '${Account}'.
+    Description: Preserve paper state and identities. Stop the paper bot and service; explicitly select a fresh Testnet or Mainnet service using the release activation guide. Mainnet stays stopped pending deliberate journal initialization.
+    Value: >-
+      Follow deploy/guard/systemd/ACTIVATION.md at the source commit named in this release. Use --service-instance testnet or --service-instance mainnet with matching --network, rules, account, equity cap, a separate loopback port and IP share. Never use --force to activate bootstrap paper state.
   PairPaper:
     Description: Keep paper mode. Add a bot client and rotate the browser pairing code in your private SSM session, then restart to apply.
     Value: >-
