@@ -115,8 +115,17 @@ jobs:
         env:
           FLOW_TEST: ${{ matrix.partition }}
         run: cargo test --locked -p zunder-venue --test flows_model "$FLOW_TEST" -- --exact
-      - if: matrix.partition == 'workspace'
-        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+      - name: Native pinned cargo-deny policy check
+        if: matrix.partition == 'workspace'
+        run: |
+          set -euo pipefail
+          test -n "${RUNNER_TEMP:-}"
+          test ! -e "$RUNNER_TEMP/zunder-patch-gate-cargo-deny-0.20.2"
+          test ! -L "$RUNNER_TEMP/zunder-patch-gate-cargo-deny-0.20.2"
+          mkdir -m 0700 "$RUNNER_TEMP/zunder-patch-gate-cargo-deny-0.20.2"
+          cargo install --locked --version 0.20.2 --root "$RUNNER_TEMP/zunder-patch-gate-cargo-deny-0.20.2" cargo-deny
+          test "$("$RUNNER_TEMP/zunder-patch-gate-cargo-deny-0.20.2/bin/cargo-deny" --version)" = 'cargo-deny 0.20.2'
+          "$RUNNER_TEMP/zunder-patch-gate-cargo-deny-0.20.2/bin/cargo-deny" --log-level warn --manifest-path ./Cargo.toml --all-features check
       - name: Require tested source bytes to remain unchanged
         env:
           PARTITION: ${{ matrix.partition }}
