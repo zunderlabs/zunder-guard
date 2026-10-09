@@ -7,6 +7,7 @@ back. Independent protection processes for unknown trading exposure must never
 be placed in this disposable scope.
 """
 import ctypes
+from hashlib import sha256
 import json
 import os
 from pathlib import Path
@@ -26,6 +27,27 @@ UID=62344
 GID=62344
 BASE=Path('/sys/fs/cgroup')
 ENTRY=Path(__file__).with_name('private_process_entry.py')
+
+
+def stage_entry(source,directory):
+    """Copy exact reviewed barrier bytes outside an inaccessible checkout."""
+    need(directory.is_absolute() and directory.parent==Path('/run') and not directory.exists(),
+         'Fresh owned bootstrap source directory required')
+    raw=source.read_bytes()
+    need(0<len(raw)<=16384,'Bounded frozen entry source required')
+    directory.mkdir(mode=0o711)
+    directory.chmod(0o711)
+    target=directory/'entry.py'
+    try:
+        with target.open('xb') as output:output.write(raw)
+        target.chmod(0o555)
+        need(directory.stat().st_uid==0 and directory.stat().st_mode&0o777==0o711
+             and target.is_file() and target.stat().st_uid==0 and target.stat().st_mode&0o777==0o555
+             and sha256(target.read_bytes()).digest()==sha256(raw).digest(),'Staged barrier bytes differ')
+        return target,sha256(raw).hexdigest()
+    except BaseException:
+        if target.exists():target.unlink()
+        directory.rmdir();raise
 
 
 def events(path):
@@ -52,6 +74,8 @@ class PrivateScope:
              and type(deadline_ms) is int and int(time.time()*1000)<deadline_ms<=int(time.time()*1000)+4500000,
              'Exact bounded private provider scope required')
         self.path=BASE/f'zunder-private-{run_id}-{attempt}'
+        self.entry_directory=Path('/run')/f'zunder-private-bootstrap-{run_id}-{attempt}'
+        self.entry=None;self.entry_sha256=None;self.python=None
         self.run_id=run_id;self.attempt=attempt
         self.deadline_ms=deadline_ms;self.processes=[];self.released=set();self.admitted=False;self.closed=False
 
@@ -70,6 +94,11 @@ class PrivateScope:
                 except FileNotFoundError:pass
         self.path.mkdir(mode=0o755)
         try:
+            self.python=Path('/usr/bin/python3').resolve(strict=True)
+            info=self.python.stat()
+            need(stat.S_ISREG(info.st_mode) and info.st_uid==0 and not info.st_mode&0o022
+                 and info.st_mode&0o111,'Trusted system Python executable required')
+            self.entry,self.entry_sha256=stage_entry(ENTRY,self.entry_directory)
             need((self.path/'cgroup.type').read_text().strip()=='domain'
                  and (self.path/'cgroup.kill').is_file(),'Actual cgroup kill/domain support required')
             migration_controls(BASE,self.path)
@@ -97,6 +126,16 @@ class PrivateScope:
                  'ZUNDER_TESTNET_PROVIDER_DEADLINE_MS','ZUNDER_ROOT_RUNTIME_APPROVAL'},
              'Clean private child environment required')
         network_inode=None
+        # This harmless access check runs before the private-input child exists.
+        # Do not infer reachability from the privileged parent's os.access().
+        def access_identity():
+            resource.setrlimit(resource.RLIMIT_CORE,(0,0));os.setgroups([]);os.setgid(GID);os.setuid(UID)
+        probe=subprocess.run([str(self.python),'-I','-B','-c',
+            'import os,sys;sys.exit(0 if os.access(sys.argv[1],os.R_OK) and os.access(sys.argv[2],os.X_OK) else 126)',
+            str(self.entry),argv[0]],env={'PATH':'/usr/bin:/bin','LANG':'C.UTF-8'},
+            stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,
+            preexec_fn=access_identity,timeout=5)
+        need(probe.returncode==0,'Unprivileged entry/runtime access preflight failed')
         if network_fd is not None:
             expected=Path('/run/netns')/f'zunder-site-{self.run_id}-{self.attempt}'
             current=os.fstat(network_fd);owned=expected.stat()
@@ -121,14 +160,16 @@ class PrivateScope:
                 resource.setrlimit(resource.RLIMIT_CORE,(0,0));os.setgroups([]);os.setgid(GID);os.setuid(UID)
                 libc=ctypes.CDLL(None,use_errno=True)
                 if libc.prctl(38,1,0,0,0)!=0:os._exit(126) # PR_SET_NO_NEW_PRIVS
-            command=[sys.executable,'-B',str(ENTRY),str(gate_read),str(self.deadline_ms),json.dumps(argv,separators=(',',':'))]
+            need(sha256(self.entry.read_bytes()).hexdigest()==self.entry_sha256,'Staged barrier source changed')
+            command=[str(self.python),'-I','-B',str(self.entry),str(gate_read),str(self.deadline_ms),json.dumps(argv,separators=(',',':'))]
             inherited=tuple(pass_fds)+(gate_read,)+((network_fd,) if network_fd is not None else ())
             child=subprocess.Popen(command,stdin=stdin,stdout=stdout,stderr=subprocess.DEVNULL,env=env,cwd=cwd,
                 pass_fds=inherited,close_fds=True,start_new_session=True,preexec_fn=isolate)
             self.processes.append(child) # Registered before barrier release and private input.
             (self.path/'cgroup.procs').write_text(str(child.pid))
             rows=(self.path/'cgroup.procs').read_text().splitlines()
-            need(str(child.pid) in rows and events(self.path/'cgroup.events'),'Actual provider cgroup membership differs')
+            need(str(child.pid) in rows and events(self.path/'cgroup.events') and child.poll() is None,
+                 'Actual provider cgroup membership differs; frozen child exited or placement failed')
             status=Path('/proc')/str(child.pid)/'status'
             need(re.search(r'^NoNewPrivs:\s+1$',status.read_text(),re.MULTILINE),'Private child can acquire privilege')
             if network_inode is not None:
@@ -155,7 +196,11 @@ class PrivateScope:
                 # which cannot execute work/private stdin before gate release.
                 child.kill()
             child.wait(timeout=2)
-        self.path.rmdir();self.closed=True
+        self.path.rmdir()
+        if self.entry is not None:
+            need(sha256(self.entry.read_bytes()).hexdigest()==self.entry_sha256,'Owned barrier source changed before cleanup')
+            self.entry.unlink();self.entry_directory.rmdir()
+        self.closed=True
         return {'complete':True,'populated':False,'cgroup_removed':True,'child_count':len(self.processes)}
 
     def tick(self):

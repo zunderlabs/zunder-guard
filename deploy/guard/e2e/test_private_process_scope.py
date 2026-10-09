@@ -7,11 +7,30 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest.mock import patch
 from release_flow import Refused
 from private_process_scope import PrivateScope,events,UID
 from private_process_scope import migration_controls
+from private_process_scope import stage_entry
 
 class ScopeTests(unittest.TestCase):
+    def test_entry_bytes_are_staged_readonly_outside_checkout(self):
+        from types import SimpleNamespace
+        from hashlib import sha256
+        with tempfile.TemporaryDirectory() as temp:
+            base=Path(temp);source=base/'reviewed.py';source.write_bytes(b'print("no-key")\n')
+            directory=base/'owned';original_stat=Path.stat
+            def owned_stat(path,*args,**kwargs):
+                info=original_stat(path,*args,**kwargs)
+                if path in (directory,directory/'entry.py'):
+                    return SimpleNamespace(st_uid=0,st_mode=info.st_mode)
+                return info
+            with patch('private_process_scope.Path',side_effect=lambda value:base if value=='/run' else Path(value)),patch.object(Path,'stat',owned_stat):
+                target,digest=stage_entry(source,directory)
+                self.assertEqual(target.read_bytes(),source.read_bytes())
+                self.assertEqual(digest,sha256(source.read_bytes()).hexdigest())
+                self.assertEqual(original_stat(directory).st_mode&0o777,0o711)
+                self.assertEqual(original_stat(target).st_mode&0o777,0o555)
     def test_common_ancestor_migration_permissions_are_required(self):
         from types import SimpleNamespace
         class FakePath:
@@ -52,7 +71,7 @@ if os.fork():raise SystemExit(0)
 with open(os.environ['HOME']+'/descendant.json','x')as f:json.dump({'pid':os.getpid(),'uid':os.getuid(),'no_new_privs':open('/proc/self/status').read().split('NoNewPrivs:')[1].split()[0]},f)
 time.sleep(25)
 """
-            process=scope.spawn([sys.executable,'-c',source],{'HOME':str(child_home),'PATH':'/usr/bin:/bin','LANG':'C.UTF-8'})
+            process=scope.spawn([str(scope.python),'-I','-B','-c',source],{'HOME':str(child_home),'PATH':'/usr/bin:/bin','LANG':'C.UTF-8'})
             process.stdin.close();process.wait(timeout=5)
             end=time.monotonic()+5;marker=child_home/'descendant.json'
             while not marker.exists():
