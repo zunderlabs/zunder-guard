@@ -346,6 +346,13 @@ slsa-verifier verify-image ghcr.io/zunderlabs/zunder-guard@sha256:<digest> \
 
 ### Reproducing a release
 
+The v1.0.4 build configuration uses ECR Public for the Rust builder and Google's
+Docker Hub cache for BuildKit and the Dockerfile frontend, each pinned by digest.
+These pins retain the selected upstream image bytes. An unavailable image stops
+the build; no alternate tag or registry is substituted. Cached images can be
+removed, so their continued availability is not guaranteed. The v1.0.3 tag remains
+unchanged.
+
 ```sh
 git clone https://github.com/zunderlabs/zunder-guard && cd zunder-guard && git checkout v1.0.2
 docker buildx build -f deploy/guard/Dockerfile --target bin-build --platform linux/amd64 -o out .

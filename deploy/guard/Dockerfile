@@ -1,4 +1,4 @@
-# syntax=docker/dockerfile:1
+# syntax=mirror.gcr.io/docker/dockerfile:1@sha256:4edf897a3ffa55b89f906fc8cc78afdb3f1834cc9c7083565e611a8a7d5fe99e
 # Zunder Guard container image (deploy/guard/README.md, "Docker"). Build context: the
 # repository root. Static musl binary, distroless runtime, non-root, no shell, no package manager.
 #
@@ -19,7 +19,7 @@
 ARG GUARD_SOURCE=build
 
 # ---------------------------------------------------------------- compile (native per platform)
-FROM rust:1.97.0-alpine3.22@sha256:3ab54ebc56cb9b6544edfbbb9f171d1576ecf86f5a0a37a231b0e32ff3b48e0c AS build
+FROM public.ecr.aws/docker/library/rust:1.97.0-alpine3.22@sha256:3ab54ebc56cb9b6544edfbbb9f171d1576ecf86f5a0a37a231b0e32ff3b48e0c AS build
 ARG GUARD_PACKAGE=zunder-guard
 # The image's toolchain must be the one rust-toolchain.toml pins; no download during the build.
 ENV RUSTUP_TOOLCHAIN=1.97.0 CARGO_INCREMENTAL=0 CARGO_TERM_COLOR=never
