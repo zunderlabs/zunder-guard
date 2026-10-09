@@ -67,7 +67,13 @@ class Fetch(unittest.TestCase):
           'release_id':123,'asset_id':456,'asset_name':'linux-public-transfer-20261009-r1.tar','bytes':10240,
           'sha256':'a'*64,'manifest_sha256':'b'*64,'source_commit':'c'*40,'draft':True,'public_subjects_only':True}
  def test_fixed_policy(self): self.assertEqual(f.policy(json.dumps(self.value())),self.value())
- def test_unbound_refuses(self): self.assertIsNone(f.POLICY_SHA)
+ def test_bound_policy_exact_digest(self):
+  raw=(HERE/'actual-transfer-policy.json').read_bytes()
+  self.assertEqual(hashlib.sha256(raw).hexdigest(),f.POLICY_SHA)
+  p=f.policy(raw)
+  self.assertEqual(p['release_id'],408349093); self.assertEqual(p['asset_id'],626199359)
+  self.assertEqual(p['bytes'],405309440)
+  self.assertEqual(p['sha256'],'1ce0ce0755c090975cd4eb09e11b39de4e793d01ba15f706331d48ce130576bb')
  def test_wrong_fields(self):
   for key,value in [('repository','outside/owner'),('tag','v1.0.3'),('asset_name','another'),('draft',False),('release_id',True),('bytes',f.LIMIT+1)]:
    with self.subTest(key=key):

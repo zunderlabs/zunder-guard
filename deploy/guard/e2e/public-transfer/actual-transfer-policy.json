@@ -1,0 +1,14 @@
+{
+  "asset_id": 626199359,
+  "asset_name": "linux-public-transfer-20261009-r1.tar",
+  "bytes": 405309440,
+  "draft": true,
+  "manifest_sha256": "292eb45a9871f2155ec7f4d75aaa1968c8a8231fefd67543fa28e0de6f45df19",
+  "public_subjects_only": true,
+  "release_id": 408349093,
+  "repository": "zunderlabs/zunder-guard",
+  "schema": 1,
+  "sha256": "1ce0ce0755c090975cd4eb09e11b39de4e793d01ba15f706331d48ce130576bb",
+  "source_commit": "371589cdf0615e225bcfa28e68f5b547ca52272b",
+  "tag": "public-runtime-transfer-20261009-r1"
+}

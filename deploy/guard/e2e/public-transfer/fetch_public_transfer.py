@@ -2,7 +2,7 @@
 """Fixed GitHub draft asset read using only the job's standard platform token."""
 import hashlib, json, os, re, signal, ssl, stat, threading, time, urllib.error, urllib.parse, urllib.request
 from pathlib import Path
-POLICY_SHA = None  # Root binds a reviewed actual release/asset policy in an additive successor.
+POLICY_SHA = '2c5097b0b8aeaf536e735ca8b8d930b852817716b69868b79a6af6e8d5c8d1af'
 HERE = Path(__file__).resolve().parent
 API = 'https://api.github.com/repos/zunderlabs/zunder-guard'
 LIMIT = 512 * 1024 * 1024
