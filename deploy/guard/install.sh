@@ -130,13 +130,17 @@ while [ $# -gt 0 ]; do
 done
 
 if [ "$PREPARE_IMAGE$PREPARED_IMAGE" != 00 ] || [ -n "$REGISTRY_AUTH$SOURCE_COMMIT" ]; then
-  [ "$CONTAINER" -eq 1 ] && [ "$NETWORK" = testnet ] || die "private image preparation requires explicit Linux container Testnet"
+  if ! { [ "$CONTAINER" -eq 1 ] && [ "$NETWORK" = testnet ]; }; then
+    die "private image preparation requires explicit Linux container Testnet"
+  fi
   printf '%s\n' "$SOURCE_COMMIT" | LC_ALL=C grep -Eq '^[0-9a-f]{40}$' || die "exact independently verified source commit required"
   [ "$PREPARE_IMAGE$PREPARED_IMAGE" = 10 ] || [ "$PREPARE_IMAGE$PREPARED_IMAGE" = 01 ] || die "choose prepare-image or prepared-image"
   if [ "$PREPARE_IMAGE" -eq 1 ]; then
     [ -n "$REGISTRY_AUTH" ] || die "prepare-image requires isolated registry-auth-dir"
-    [ -z "$RULES$ACCOUNT$KEY_FILE$CONFIRM$CAP$PREFIX$LISTEN$SHARE$LICENCE$VOLUME$SERVICE_INSTANCE" ] \
-      && [ "$KEY_STDIN$NONINTERACTIVE$NO_SERVICE$FORCE$INSTALL_ONLY" = 00000 ] || die "prepare-image admits no wallet/setup options"
+    if ! { [ -z "$RULES$ACCOUNT$KEY_FILE$CONFIRM$CAP$PREFIX$LISTEN$SHARE$LICENCE$VOLUME$SERVICE_INSTANCE" ] \
+      && [ "$KEY_STDIN$NONINTERACTIVE$NO_SERVICE$FORCE$INSTALL_ONLY" = 00000 ]; }; then
+      die "prepare-image admits no wallet/setup options"
+    fi
   else
     [ -z "$REGISTRY_AUTH" ] || die "registry auth is admitted only during prepare-image"
   fi
@@ -148,12 +152,15 @@ if [ -n "$SERVICE_INSTANCE" ]; then
   [ "$NETWORK" = "$SERVICE_INSTANCE" ] || die "service instance needs matching explicit --network"
   [ "$CONTAINER$NO_SERVICE$INSTALL_ONLY$FORCE" = 0000 ] || die "service instance requires fresh native managed setup; force is refused"
   [ -z "$PREFIX" ] || die "service instance uses its own fixed binary prefix"
-  [ -n "$RULES" ] && [ -n "$ACCOUNT" ] && [ -n "$CAP" ] && [ -n "$SHARE" ] \
-    || die "service instance needs explicit rules, account, equity-cap and ip-share"
+  if ! { [ -n "$RULES" ] && [ -n "$ACCOUNT" ] && [ -n "$CAP" ] && [ -n "$SHARE" ]; }; then
+    die "service instance needs explicit rules, account, equity-cap and ip-share"
+  fi
   case "$LISTEN" in 127.0.0.1:*) INSTANCE_PORT=${LISTEN#127.0.0.1:} ;; *) die "service instance listen must be 127.0.0.1:PORT" ;; esac
   case "$INSTANCE_PORT" in "" | *[!0-9]* | 0*) die "service instance port must be a decimal from 1 to 65535" ;; esac
-  [ "${#INSTANCE_PORT}" -le 5 ] && [ "$INSTANCE_PORT" -ge 1 ] && [ "$INSTANCE_PORT" -le 65535 ] \
-    && [ "$INSTANCE_PORT" -ne 8547 ] || die "service instance needs a valid port distinct from paper port 8547"
+  if ! { [ "${#INSTANCE_PORT}" -le 5 ] && [ "$INSTANCE_PORT" -ge 1 ] && [ "$INSTANCE_PORT" -le 65535 ] \
+    && [ "$INSTANCE_PORT" -ne 8547 ]; }; then
+    die "service instance needs a valid port distinct from paper port 8547"
+  fi
   case "$SHARE" in *[!0-9.]* | "") die "service instance ip-share is a decimal in (0, 1]" ;; esac
   printf '%s\n' "$SHARE" | awk '/^[0-9]+([.][0-9]+)?$/ && $0 + 0 > 0 && $0 + 0 <= 1 {good=1} END {exit !good}' \
     || die "service instance ip-share is a decimal in (0, 1]"

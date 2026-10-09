@@ -91,7 +91,11 @@ class ReleaseRendering(unittest.TestCase):
             self.assertIn('sha256sum -c -', text)
             self.assertIn('sh "$loader" --non-interactive --network paper', text)
             self.assertNotIn('https://zunderlabs.com/i', text)
-            self.assertIn("sudo systemctl stop zunder-guard && sudo sh i --force --rules '${Rules}' --account '${Account}'", text)
+            self.assertIn(f'/blob/{TAG}/deploy/guard/systemd/ACTIVATION.md', text)
+            self.assertIn('source commit in this release\'s provenance', text)
+            self.assertIn('--service-instance testnet or --service-instance mainnet with matching --network', text)
+            self.assertIn('Never use --force to activate bootstrap paper state.', text)
+            self.assertNotIn('sudo sh i --force', text)
             self.assertIn('sudo -u zunder-guard env ZUNDER_GUARD_HOME=/var/lib/zunder-guard /usr/local/bin/zunder-guard pair', text)
         sums = (self.dist / 'SHA256SUMS').read_text()
         for name in ('i', self.descriptor.name, 'compose.yaml', 'cloudformation.yaml'):
@@ -139,6 +143,21 @@ class ReleaseRendering(unittest.TestCase):
                                 capture_output=True, text=True)
         self.assertNotEqual(result.returncode, 0)
         self.assertFalse((self.dist / 'SHA256SUMS').exists())
+
+    def test_cloud_activation_template_drift_refuses_unsigned_manifest(self):
+        fixture = self.root / 'source-fixture'
+        shutil.copytree(GUARD, fixture, ignore=shutil.ignore_patterns('__pycache__', 'export'))
+        template = fixture / 'templates/cloudformation.yaml'
+        original = template.read_text()
+        guide = "Follow deploy/guard/systemd/ACTIVATION.md at the source commit named in this release."
+        for changed in (original.replace(guide, 'unknown guide'), original + '\n# ' + guide + '\n'):
+            with self.subTest(changed=changed):
+                template.write_text(changed)
+                result = subprocess.run(['bash', str(fixture / 'packaging/render.sh'), TAG, str(self.dist)],
+                                        capture_output=True, text=True)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn('expected cloud bootstrap block absent or duplicated', result.stderr)
+                self.assertFalse((self.dist / 'SHA256SUMS').exists())
 
     def test_deferred_provider_assets_refuse_and_repeated_render_is_stable(self):
         self.assertEqual(self.render().returncode, 0)
