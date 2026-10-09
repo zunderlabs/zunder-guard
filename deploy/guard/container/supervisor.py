@@ -191,6 +191,36 @@ def image_ready(config):
     require(obj.get('Config', {}).get('User') == '65532:65532', 'Signed image must use Guard nonroot UID.')
 
 
+PREPARED_IMAGE = Path('/etc/zunder-guard-container-image-prepared')
+
+
+def prepared_image(config, manifest, source):
+    """Root-prepared image cache; never an acceptance attestation."""
+    require(sending_mode(config) == 'testnet', 'Prepared private images are admitted on explicit Testnet only.')
+    require(re.fullmatch('[0-9a-f]{64}', manifest or '') and re.fullmatch('[0-9a-f]{40}', source or ''),
+            'Exact independently verified manifest/source binding required.')
+    for parent in PREPARED_IMAGE.parents:
+        trusted(parent, directory=True)
+    trusted(PREPARED_IMAGE, directory=True)
+    require(stat.S_IMODE(PREPARED_IMAGE.stat().st_mode) == 0o700
+            and {p.name for p in PREPARED_IMAGE.iterdir()} == {'receipt.json'}, 'Private prepared-image receipt required.')
+    receipt = PREPARED_IMAGE / 'receipt.json'
+    trusted(receipt)
+    info = receipt.stat()
+    require(stat.S_IMODE(info.st_mode) == 0o600 and info.st_nlink == 1 and info.st_size <= 65536,
+            'Bounded root-only prepared-image receipt required.')
+    value = json.loads(receipt.read_bytes())
+    require(set(value) == {'schema', 'tag', 'image', 'image_id', 'manifest_sha256', 'source_commit'}
+            and value['schema'] == 1 and value['tag'] == config['tag'] and value['image'] == config['image']
+            and value['manifest_sha256'] == manifest and value['source_commit'] == source,
+            'Prepared image does not bind this exact signed release/source.')
+    objects = docker_json('image', 'inspect', config['image'])
+    require(len(objects) == 1 and objects[0]['Id'] == value['image_id']
+            and config['image'] in objects[0].get('RepoDigests', []), 'Prepared immutable local image changed.')
+    image_ready(config)
+    return value
+
+
 def container_args(config, *, readonly_volume=False):
     mount = 'type=volume,source=' + config['volume'] + ',target=/data'
     if readonly_volume:
@@ -254,6 +284,10 @@ def inactive():
 
 
 def install(args):
+    supplied = (getattr(args, 'manifest_sha256', ''), getattr(args, 'source_commit', ''))
+    require((getattr(args, 'prepared_image', False) and all(supplied))
+            or (not getattr(args, 'prepared_image', False) and not any(supplied)),
+            'Prepared image/source inputs require an explicit matching admission.')
     config = dict(image=args.image, tag=args.tag, volume=args.volume,
                   account=args.account, instance=uuid.uuid4().hex)
     if getattr(args, 'network', 'mainnet') != 'mainnet':
@@ -269,11 +303,14 @@ def install(args):
                 and previous['volume'] == config['volume'] and previous['account'] == config['account'],
                 'Changing the supervisor network, account or volume requires a separate migration.')
         config['instance'] = previous['instance']
-    execute([COSIGN, 'verify', config['image'], '--certificate-identity',
-             'https://github.com/zunderlabs/zunder-guard/.github/workflows/release.yml@refs/tags/' + config['tag'],
-             '--certificate-oidc-issuer', 'https://token.actions.githubusercontent.com'])
+    if getattr(args, 'prepared_image', False):
+        prepared_image(config, args.manifest_sha256, args.source_commit)
+    else:
+        execute([COSIGN, 'verify', config['image'], '--certificate-identity',
+                 'https://github.com/zunderlabs/zunder-guard/.github/workflows/release.yml@refs/tags/' + config['tag'],
+                 '--certificate-oidc-issuer', 'https://token.actions.githubusercontent.com'])
+        docker('pull', config['image'])
     volume_exists(config)
-    docker('pull', config['image'])
     check_config(config, transient=True)
     require(args.key_stdin or sys.stdin.isatty(), 'Use a terminal for the hidden prompt, or pass --key-stdin.')
     key = read_key_frame(sys.stdin.buffer) if args.key_stdin else (getpass.getpass('API wallet key (hidden): ') + '\n').encode()
@@ -371,6 +408,9 @@ def main():
     setup = commands.add_parser('install')
     for flag in ('image', 'tag', 'volume', 'account', 'confirm-account'):
         setup.add_argument('--' + flag, required=True)
+    setup.add_argument('--prepared-image', action='store_true')
+    setup.add_argument('--manifest-sha256', default='')
+    setup.add_argument('--source-commit', default='')
     setup.add_argument('--key-stdin', action='store_true')
     setup.add_argument('--network', choices=('mainnet', 'testnet'), default='mainnet')
     commands.add_parser('run')

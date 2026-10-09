@@ -75,6 +75,10 @@ Usage: sh install.sh [options]
                         notices go in ../share/licenses/zunder-guard for a bin directory,
                         otherwise DIR/share/licenses/zunder-guard
   --container           protected Linux mainnet/testnet Docker service with encrypted credential
+  --prepare-image       container only: verify/pull private image before any wallet input
+  --registry-auth-dir D root-only isolated ghcr.io config; scrubbed by prepare-image
+  --prepared-image      use the exact source-bound image already prepared locally
+  --source-commit SHA   explicit independently verified source for prepared-image phases
   --volume NAME         explicit named volume for container setup (default zunder-guard-data)
   --install-only        verify and replace binary/notices only; no setup or service changes
                         stop Guard first; restart it yourself after checking the release
@@ -87,10 +91,10 @@ Usage: sh install.sh [options]
 EOF
 }
 
-RULES="" NETWORK="" ACCOUNT="" KEY_FILE="" KEY_STDIN=0 CONFIRM="" CAP="" PREFIX="" LISTEN="" SHARE="" LICENCE="" NONINTERACTIVE=0 NO_SERVICE=0 FORCE=0 INSTALL_ONLY=0 SETUP_OPTIONS=0 CONTAINER=0 VOLUME="" SERVICE_INSTANCE=""
+RULES="" NETWORK="" ACCOUNT="" KEY_FILE="" KEY_STDIN=0 CONFIRM="" CAP="" PREFIX="" LISTEN="" SHARE="" LICENCE="" NONINTERACTIVE=0 NO_SERVICE=0 FORCE=0 INSTALL_ONLY=0 SETUP_OPTIONS=0 CONTAINER=0 VOLUME="" SERVICE_INSTANCE="" PREPARE_IMAGE=0 PREPARED_IMAGE=0 REGISTRY_AUTH="" SOURCE_COMMIT=""
 while [ $# -gt 0 ]; do
   case "$1" in
-    --rules | --network | --account | --key-file | --confirm-mainnet | --equity-cap | --prefix | --listen | --ip-share | --licence | --volume | --service-instance)
+    --rules | --network | --account | --key-file | --confirm-mainnet | --equity-cap | --prefix | --listen | --ip-share | --licence | --volume | --service-instance | --registry-auth-dir | --source-commit)
       [ $# -ge 2 ] || die "$1 needs a value"
       [ "$1" = --prefix ] || SETUP_OPTIONS=1
       case "$1" in
@@ -106,10 +110,14 @@ while [ $# -gt 0 ]; do
         --licence) LICENCE=$2 ;;
         --volume) VOLUME=$2 ;;
         --service-instance) SERVICE_INSTANCE=$2 ;;
+        --registry-auth-dir) REGISTRY_AUTH=$2 ;;
+        --source-commit) SOURCE_COMMIT=$2 ;;
       esac
       shift 2
       ;;
     --key-stdin) KEY_STDIN=1 && SETUP_OPTIONS=1 && shift ;;
+    --prepare-image) PREPARE_IMAGE=1 && SETUP_OPTIONS=1 && shift ;;
+    --prepared-image) PREPARED_IMAGE=1 && SETUP_OPTIONS=1 && shift ;;
     --container) CONTAINER=1 && SETUP_OPTIONS=1 && shift ;;
     --install-only) INSTALL_ONLY=1 && shift ;;
     --non-interactive) NONINTERACTIVE=1 && shift ;;
@@ -120,6 +128,19 @@ while [ $# -gt 0 ]; do
     *) die "unknown option $1 (see --help)" ;;
   esac
 done
+
+if [ "$PREPARE_IMAGE$PREPARED_IMAGE" != 00 ] || [ -n "$REGISTRY_AUTH$SOURCE_COMMIT" ]; then
+  [ "$CONTAINER" -eq 1 ] && [ "$NETWORK" = testnet ] || die "private image preparation requires explicit Linux container Testnet"
+  printf '%s\n' "$SOURCE_COMMIT" | LC_ALL=C grep -Eq '^[0-9a-f]{40}$' || die "exact independently verified source commit required"
+  [ "$PREPARE_IMAGE$PREPARED_IMAGE" = 10 ] || [ "$PREPARE_IMAGE$PREPARED_IMAGE" = 01 ] || die "choose prepare-image or prepared-image"
+  if [ "$PREPARE_IMAGE" -eq 1 ]; then
+    [ -n "$REGISTRY_AUTH" ] || die "prepare-image requires isolated registry-auth-dir"
+    [ -z "$RULES$ACCOUNT$KEY_FILE$CONFIRM$CAP$PREFIX$LISTEN$SHARE$LICENCE$VOLUME$SERVICE_INSTANCE" ] \
+      && [ "$KEY_STDIN$NONINTERACTIVE$NO_SERVICE$FORCE$INSTALL_ONLY" = 00000 ] || die "prepare-image admits no wallet/setup options"
+  else
+    [ -z "$REGISTRY_AUTH" ] || die "registry auth is admitted only during prepare-image"
+  fi
+fi
 
 # A named sending service is a fresh installation, never a migration of paper state.
 if [ -n "$SERVICE_INSTANCE" ]; then
@@ -282,7 +303,7 @@ if [ "$CONTAINER" -eq 1 ]; then
 import hashlib, os, pathlib, re, resource, shutil, stat, subprocess, sys, tempfile
 resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
 os.umask(0o077)
-source, pinned, version, volume, account, rules, cap, share, licence, network, noninteractive, key_stdin = sys.argv[1:]
+source, pinned, version, volume, account, rules, cap, share, licence, network, noninteractive, key_stdin, prepare_image, prepared_image, registry_auth, source_commit = sys.argv[1:]
 if not re.fullmatch(r'v[0-9]+\.[0-9]+\.[0-9]+', version):
     raise SystemExit('Invalid release version')
 env = {'PATH': '/usr/sbin:/usr/bin:/sbin:/bin', 'HOME': '/root', 'LANG': 'C.UTF-8'}
@@ -345,6 +366,10 @@ try:
         finally:
             os.unlink(pending)
     options = ['--version', version, '--network', network]
+    if prepare_image == '1':
+        options += ['--prepare-image', '--registry-auth-dir', registry_auth, '--source-commit', source_commit]
+    elif prepared_image == '1':
+        options += ['--prepared-image', '--source-commit', source_commit]
     if noninteractive == '1':
         if network != 'testnet' or key_stdin != '1':
             raise SystemExit('Unattended container setup is protected testnet only')
@@ -354,7 +379,9 @@ try:
         if value:
             options += ['--' + name, value]
     command = ['/usr/bin/python3', '-I', str(stage / 'install-container.py'), *options]
-    if key_stdin == '1':
+    if prepare_image == '1':
+        result = subprocess.run(command, stdin=subprocess.DEVNULL, env=env, check=False)
+    elif key_stdin == '1':
         result = subprocess.run(command, stdin=sys.stdin.buffer, env=env, check=False)
     else:
         with open('/dev/tty', 'rb') as terminal:
@@ -367,7 +394,7 @@ CONTAINER_BOOTSTRAP
   # Code is public and signed; stdin remains the caller's private pipe across
   # sudo. No credential is placed in argv/environment or an extra inherited FD.
   $CONTAINER_SUDO /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME=/root LANG=C.UTF-8 \
-    /usr/bin/python3 -I -c "$CONTAINER_BOOTSTRAP_CODE" "$TMP" "$COSIGN_SHA256" "$VERSION" "$VOLUME" "$ACCOUNT" "$RULES" "$CAP" "$SHARE" "$LICENCE" "$NETWORK" "$NONINTERACTIVE" "$KEY_STDIN"
+    /usr/bin/python3 -I -c "$CONTAINER_BOOTSTRAP_CODE" "$TMP" "$COSIGN_SHA256" "$VERSION" "$VOLUME" "$ACCOUNT" "$RULES" "$CAP" "$SHARE" "$LICENCE" "$NETWORK" "$NONINTERACTIVE" "$KEY_STDIN" "$PREPARE_IMAGE" "$PREPARED_IMAGE" "$REGISTRY_AUTH" "$SOURCE_COMMIT"
   exit $?
 fi
 

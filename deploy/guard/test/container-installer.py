@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Nontrading installer transaction/guardian regressions. Python stdlib only."""
 import hashlib
+import base64
 import contextlib
 import io
 import importlib.util
@@ -594,7 +595,7 @@ class BuilderReadiness(Stage):
                 'risk': {'state': 'active', 'journal_ready': True},
                 'fee': {'mode': 'fee_free' if fee_free else 'builder', 'approval': {'state': state}}}
 
-    def read_status(self, status, expected=False):
+    def read_status(self, status, expected=False, configured_licence=None):
         class Response:
             def __init__(self, path): self.status = 200; self.path = path
             def read(self, *args): return json.dumps(status if self.path == '/guard/status' else {'status': 'healthy'}).encode()
@@ -606,7 +607,7 @@ class BuilderReadiness(Stage):
         with patch.object(self.wrapper.http.client, 'HTTPConnection', Connection), \
              patch.object(self.wrapper.time, 'monotonic', side_effect=[0, 1, 61]), \
              patch.object(self.wrapper.time, 'sleep'):
-            return self.wrapper.readiness(self.config, expected)
+            return self.wrapper.readiness(self.config, expected, configured_licence)
 
     def test_all_builder_approval_states_and_fee_free_have_honest_next_step(self):
         for state in ('approved', 'unchecked', 'not_approved', 'refused', 'refused_by_venue', 'refused_by_venue_builder', 'fee_free'):
@@ -658,7 +659,7 @@ class ProtectedTestnetReadiness(Stage):
 
     def test_testnet_readiness_requires_off_and_matching_network(self):
         good = self.status('approved')
-        good.update(mode='testnet', network='testnet', fee={'mode': 'off'})
+        good.update(mode='testnet', network='testnet', fee={'mode': 'off'}, licence={'state':'none'})
         self.assertEqual(self.read_status(good)['fee']['mode'], 'off')
         for changes in ({'mode': 'mainnet'}, {'network': 'mainnet'}, {'fee': {'mode': 'builder'}},
                         {'fee': {'mode': 'fee_free'}}, {'risk': {'journal_ready': True, 'state': 'halted'}}):
@@ -667,7 +668,29 @@ class ProtectedTestnetReadiness(Stage):
         with self.assertRaises(self.ops.Refused):
             self.read_status(good, expected=True)
         good['licence'] = {'state': 'active'}
-        self.assertEqual(self.read_status(good, expected=True)['fee']['mode'], 'off')
+        self.assertEqual(self.read_status(good, expected=True, configured_licence=self.key([]))['fee']['mode'], 'off')
+
+    @staticmethod
+    def key(features):
+        payload=json.dumps({'licensee':'public fixture','features':features,'accounts':[ACCOUNT],'expires_at_ms':1999999999999}).encode()
+        return 'zgl1_'+base64.urlsafe_b64encode(payload).rstrip(b'=').decode()+'.'+base64.urlsafe_b64encode(b'0'*64).rstrip(b'=').decode()
+
+    def test_exact_testnet_licence_feature_profiles_and_active_signature_state(self):
+        for features,fee in [(['fee_free'],'fee_free'),([],'off')]:
+            key=self.key(features)
+            good=self.status();good.update(mode='testnet',network='testnet',fee={'mode':fee},licence={'state':'active'})
+            self.assertEqual(self.read_status(good,expected=True,configured_licence=key)['fee']['mode'],fee)
+            # Reinstallation preserves the configured licence even without a new option.
+            self.assertEqual(self.read_status(good,configured_licence=key)['fee']['mode'],fee)
+            for changes in ({'fee':{'mode':'builder'}},{'fee':{'mode':'off'if fee=='fee_free'else'fee_free'}},
+                            {'licence':{'state':'none'}},{'licence':{'state':'not_used'}}):
+                with self.subTest(features=features,changes=changes),self.assertRaises(self.ops.Refused):
+                    self.read_status(dict(good,**changes),expected=True,configured_licence=key)
+
+    def test_invalid_configured_licence_is_not_discarded(self):
+        good=self.status();good.update(mode='testnet',network='testnet',fee={'mode':'off'},licence={'state':'active'})
+        for key in ('bad','zgl1_broken.signature',self.key(['unknown_feature'])):
+            with self.subTest(key=key),self.assertRaises(self.ops.Refused):self.read_status(good,expected=True,configured_licence=key)
 
 
 class Dispatch(unittest.TestCase):
@@ -758,6 +781,7 @@ class Bootstrap(unittest.TestCase):
                     return subprocess.CompletedProcess(argv, status)
                 args = ['bootstrap', str(incoming), pin, version, '', '', '', '', '', '', 'mainnet', '0', '0']
                 if case == 'testnet': args[-3:] = ['testnet', '1', '1']
+                args += ['0', '0', '', '']
                 with patch('sys.argv', args), patch('sys.stdin', private_input), patch('subprocess.run', side_effect=fake_run), patch('resource.setrlimit'):
                     with self.assertRaises(SystemExit) as result: exec(compile(code, 'real-bootstrap', 'exec'), {})
                 helper_calls = [argv for argv in commands if argv[0] == '/usr/bin/python3']

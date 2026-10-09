@@ -553,3 +553,21 @@ a mismatch).
    provide amd64 and arm64 builds; Linux on 32-bit ARM is not built.
 7. **Licence**: Elastic License 2.0 (SPDX `Elastic-2.0`, decided 6 Oct 2026). The formula and the
    image label carry it; the public repository has the text verbatim in `LICENSE`.
+
+### Private candidate image preparation
+
+A private release candidate can use a separate root-only registry preparation phase. The normal public image route retains its signature verification and pull. The private route is explicit Testnet only, and requires the release controller to independently verify the exact signed manifest and SLSA source before invoking it.
+
+Stage a canonical root-owned mode0700 directory containing only a mode0600 `config.json`: the sole permitted Docker field is `auths`, with only `ghcr.io` basic `auth`. Credential helpers, credential stores, other registries, linked files and shared writes are refused. The registry token is never a command argument or environment value.
+
+```sh
+sudo sh i --container --network testnet --prepare-image \
+  --registry-auth-dir /root/private-candidate-registry \
+  --source-commit VERIFIED_RELEASE_COMMIT
+```
+
+This phase reads no wallet key, verifies the OCI signature against the exact release tag, pulls the immutable signed image and records its local image ID and RepoDigest. It removes the admitted registry config and directory on success or artifact failure. Independently confirm that absence before retrieving any API-wallet frame. An authentication validation or scrub failure blocks wallet setup and requires inspection.
+
+A successful phase leaves `/etc/zunder-guard-container-image-prepared/receipt.json`, root-owned mode0600 in a mode0700 directory. It is a preparation receipt, not release acceptance evidence. The following protected setup adds `--prepared-image --source-commit VERIFIED_RELEASE_COMMIT` to its existing explicit Testnet/account/rules/cap/share/stdin options. Both the signed installer and installed supervisor require the same manifest, source, exact image digest and immutable local image ID. They reject cache changes and never fall back to ambient registry credentials. Runtime Docker configuration remains empty.
+
+Prepared receipts are retained for signed reinstalls/recovery of that exact candidate. A different source, manifest, image or pre-existing preparation requires separate inspection; no preparation receipt is silently replaced. The release controller disposes of its owned preparation receipt after native cleanup.
