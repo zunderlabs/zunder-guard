@@ -85,7 +85,7 @@ try {
   $R = Copy-Release 'no-archive'
   Remove-Item -LiteralPath (Join-Path $R $Zip)
   Expect-Refusal 'a missing archive' $R @{ InstallOnly = $true; InstallDir = (Join-Path $Work 't4') } ''
-  Expect-Refusal 'mainnet' $Release @{ Network = 'mainnet'; InstallDir = (Join-Path $Work 't5') } 'Mainnet refuses NonInteractive, InstallOnly, Force and alternate InstallDir.'
+  Expect-Refusal 'mainnet' $Release @{ Network = 'mainnet'; InstallDir = (Join-Path $Work 't5') } 'Mainnet refuses NonInteractive, KeyStdin, InstallOnly, Force and alternate InstallDir.'
   Expect-Refusal 'bad rules' $Release @{ Rules = 'nope'; InstallDir = (Join-Path $Work 't6') } 'zr1_'
 } finally {
   Remove-Item -LiteralPath $Work -Recurse -Force -ErrorAction SilentlyContinue
