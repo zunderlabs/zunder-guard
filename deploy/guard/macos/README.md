@@ -1,6 +1,6 @@
-# macOS managed mainnet service
+# macOS managed sending services
 
-This directory is the native mainnet service implementation. Publication is gated on the native security and lifecycle checks in the reviewed specification; the presence of these files alone does not make the route released.
+This directory implements native mainnet and explicitly selected testnet services. Publication is gated on the native security and lifecycle checks in the reviewed specification; the presence of these files alone does not make the route released.
 
 The authenticated macOS installer uses the signed `install-macos-service.sh` release asset internally. Never run a Homebrew Cellar executable under sudo to provision the service. Guard's privileged credential broker lives in a root-owned immutable release directory; the trading child runs as `_zunder_guard`. The System Keychain holds the API wallet credential, supplied on the child's anonymous stdin pipe at each start. No login-Keychain or interactive session is intended to be required after macOS boots and the disk is unlocked.
 
@@ -63,3 +63,53 @@ sudo "$GUARD_SERVICE_EXE" service remove-credential --binding '/Library/Applicat
 Old releases have separate items and require their own admitted versioned binding/executable to remove them. Keep configuration and journals for a future installation and records. Never delete them as a workaround for a journal or admission error.
 
 If configuration changed after an upgrade, the old binding may no longer match it. Credential removal then refuses. With Guard stopped, explicitly readmit that old binding against the current account before removing its item; retain the encrypted item if the old release cannot validate the current configuration. Never edit a binding fingerprint by hand or broaden a Keychain ACL.
+
+## Protected testnet installation
+
+The signed helper accepts explicit `testnet` from its authenticated installer,
+with hidden interactive input or paired `--non-interactive --key-stdin` input.
+This support requires a new signed release; it is
+not available in v1.0.1. Older helper invocations retain the mainnet route and its
+interactive confirmation.
+
+Testnet uses `_zunder_guard_testnet`, the `testnet-native` credential ID,
+`state-testnet` and `bindings-testnet` under the protected application directory,
+`com.zunderlabs.guard.testnet-native` as its launchd label, and the root-only log
+`/var/log/zunder-guard-testnet.log`. Its System Keychain service namespace is
+`com.zunderlabs.guard.testnet.v2`; mainnet's existing namespace and credential
+identifiers remain unchanged. Root-owned immutable release binaries are shared,
+not credentials or state.
+
+Interactive installation validates the key through Guard's hidden terminal prompt
+without saving it in a user credential store. Its separate provisioning prompt
+passes the key directly to the admitted System Keychain broker. An explicit equity
+cap is required; when absent, the helper asks for it before key validation.
+
+Unattended fresh installation requires explicit rules, account and cap. A licence
+is optional for Testnet. When supplied, Guard validates and preserves it; invalid
+keys fail setup. A staging-issued disposable key cannot activate official Guard.
+The
+provider supplies two newline-terminated key frames through a private anonymous
+stdin pipe. The unprivileged setup consumes the first frame only to validate and
+record the public API-wallet address, with `--service-key-check --non-interactive
+--no-key --key-stdin`. The admitted root-owned broker consumes the second frame
+and creates its System Keychain item. No plaintext wallet key is stored in the
+service state, shell variable, argument, environment or log. A regular input file
+or terminal is refused for the unattended input path; interactive setup requires
+an actual terminal. Paid activation is proved separately with a genuine entitlement.
+
+The service remains stopped after installation. A test controller may explicitly
+initialize a missing testnet journal and load the prepared launchd job. It must
+preserve an existing journal and halt. Testnet management uses `--confirm-account`
+with the bound account. It does not use or generate `ZUNDER_MAINNET_CONFIRM`.
+Pairing still requires stopped-service readmission, and licence changes retain
+the same fingerprint exclusions as mainnet.
+
+An existing testnet installation is reinstalled or upgraded without setup
+options. A same-release reinstall preserves its admitted binding and only checks
+the existing credential; an upgrade migrates the credential between the two
+admitted root-owned processes. Neither operation accepts another network's state
+or changes mainnet's service registration. Cleanup must unload the exact owned
+job before credential removal and must retain journals unless their disposal was
+separately authorized. Installation and offline fixture checks alone do not
+prove a real Keychain admission, native restart or host reboot.

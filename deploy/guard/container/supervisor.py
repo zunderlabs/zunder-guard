@@ -101,8 +101,17 @@ def docker_json(*args):
         raise Refused('Docker returned invalid metadata.') from error
 
 
+def sending_mode(config):
+    # Missing mode is the immutable legacy mainnet schema, never inferred Testnet.
+    mode = config.get('mode', 'mainnet')
+    require(mode in ('mainnet', 'testnet'), 'Sending network must be explicit and supported.')
+    return mode
+
+
 def validate(config):
-    require(set(config) == {'image', 'tag', 'volume', 'account', 'instance'}, 'Unexpected supervisor configuration.')
+    fields = {'image', 'tag', 'volume', 'account', 'instance'}
+    require(set(config) in (fields, fields | {'mode'}), 'Unexpected supervisor configuration.')
+    sending_mode(config)
     patterns = {'image': IMAGE_RE, 'tag': r'v[0-9]+\.[0-9]+\.[0-9]+',
                 'volume': VOLUME_RE, 'account': ACCOUNT_RE, 'instance': r'[a-f0-9]{32}'}
     for field, pattern in patterns.items():
@@ -182,6 +191,36 @@ def image_ready(config):
     require(obj.get('Config', {}).get('User') == '65532:65532', 'Signed image must use Guard nonroot UID.')
 
 
+PREPARED_IMAGE = Path('/etc/zunder-guard-container-image-prepared')
+
+
+def prepared_image(config, manifest, source):
+    """Root-prepared image cache; never an acceptance attestation."""
+    require(sending_mode(config) == 'testnet', 'Prepared private images are admitted on explicit Testnet only.')
+    require(re.fullmatch('[0-9a-f]{64}', manifest or '') and re.fullmatch('[0-9a-f]{40}', source or ''),
+            'Exact independently verified manifest/source binding required.')
+    for parent in PREPARED_IMAGE.parents:
+        trusted(parent, directory=True)
+    trusted(PREPARED_IMAGE, directory=True)
+    require(stat.S_IMODE(PREPARED_IMAGE.stat().st_mode) == 0o700
+            and {p.name for p in PREPARED_IMAGE.iterdir()} == {'receipt.json'}, 'Private prepared-image receipt required.')
+    receipt = PREPARED_IMAGE / 'receipt.json'
+    trusted(receipt)
+    info = receipt.stat()
+    require(stat.S_IMODE(info.st_mode) == 0o600 and info.st_nlink == 1 and info.st_size <= 65536,
+            'Bounded root-only prepared-image receipt required.')
+    value = json.loads(receipt.read_bytes())
+    require(set(value) == {'schema', 'tag', 'image', 'image_id', 'manifest_sha256', 'source_commit'}
+            and value['schema'] == 1 and value['tag'] == config['tag'] and value['image'] == config['image']
+            and value['manifest_sha256'] == manifest and value['source_commit'] == source,
+            'Prepared image does not bind this exact signed release/source.')
+    objects = docker_json('image', 'inspect', config['image'])
+    require(len(objects) == 1 and objects[0]['Id'] == value['image_id']
+            and config['image'] in objects[0].get('RepoDigests', []), 'Prepared immutable local image changed.')
+    image_ready(config)
+    return value
+
+
 def container_args(config, *, readonly_volume=False):
     mount = 'type=volume,source=' + config['volume'] + ',target=/data'
     if readonly_volume:
@@ -217,8 +256,8 @@ def check_config(config, *, transient=False):
                           current['image'], *command)
     mode = run_operation(config, ['config', 'get', 'mode']).decode().strip()
     account = run_operation(config, ['config', 'get', 'account']).decode().strip()
-    require(mode == 'mainnet' and account.lower() == config['account'].lower(),
-            'Existing mainnet config and exact account must match.')
+    require(mode == sending_mode(config) and account.lower() == config['account'].lower(),
+            'Existing sending network and exact account must match.')
     run_operation(config, ['check-config'])
 
 
@@ -245,8 +284,14 @@ def inactive():
 
 
 def install(args):
+    supplied = (getattr(args, 'manifest_sha256', ''), getattr(args, 'source_commit', ''))
+    require((getattr(args, 'prepared_image', False) and all(supplied))
+            or (not getattr(args, 'prepared_image', False) and not any(supplied)),
+            'Prepared image/source inputs require an explicit matching admission.')
     config = dict(image=args.image, tag=args.tag, volume=args.volume,
                   account=args.account, instance=uuid.uuid4().hex)
+    if getattr(args, 'network', 'mainnet') != 'mainnet':
+        config['mode'] = args.network
     validate(config)
     require(args.confirm_account == args.account, 'Repeat the exact account confirmation.')
     inactive()
@@ -254,17 +299,21 @@ def install(args):
             'Existing containers must be stopped and removed without removing the volume first.')
     if (BASE / 'config.json').exists():
         previous = load()
-        require(previous['volume'] == config['volume'] and previous['account'] == config['account'],
-                'Changing the supervisor account or volume requires a separate migration.')
+        require(sending_mode(previous) == sending_mode(config)
+                and previous['volume'] == config['volume'] and previous['account'] == config['account'],
+                'Changing the supervisor network, account or volume requires a separate migration.')
         config['instance'] = previous['instance']
-    execute([COSIGN, 'verify', config['image'], '--certificate-identity',
-             'https://github.com/zunderlabs/zunder-guard/.github/workflows/release.yml@refs/tags/' + config['tag'],
-             '--certificate-oidc-issuer', 'https://token.actions.githubusercontent.com'])
+    if getattr(args, 'prepared_image', False):
+        prepared_image(config, args.manifest_sha256, args.source_commit)
+    else:
+        execute([COSIGN, 'verify', config['image'], '--certificate-identity',
+                 'https://github.com/zunderlabs/zunder-guard/.github/workflows/release.yml@refs/tags/' + config['tag'],
+                 '--certificate-oidc-issuer', 'https://token.actions.githubusercontent.com'])
+        docker('pull', config['image'])
     volume_exists(config)
-    docker('pull', config['image'])
     check_config(config, transient=True)
     require(args.key_stdin or sys.stdin.isatty(), 'Use a terminal for the hidden prompt, or pass --key-stdin.')
-    key = sys.stdin.buffer.readline(257) if args.key_stdin else (getpass.getpass('API wallet key (hidden): ') + '\n').encode()
+    key = read_key_frame(sys.stdin.buffer) if args.key_stdin else (getpass.getpass('API wallet key (hidden): ') + '\n').encode()
     require(re.fullmatch(rb'(?:0x)?[a-fA-F0-9]{64}\r?\n?', key), 'Invalid API wallet key format.')
     try:
         # Existing initialized mainnet homes already have api_wallet. Read-only mount
@@ -284,7 +333,24 @@ def install(args):
     atomic(UNIT_PATH, UNIT_SOURCE.read_bytes())
     execute([SYSTEMCTL, 'daemon-reload'])
     execute([SYSTEMCTL, 'enable', UNIT])
-    print('Supervisor installed and enabled, but STOPPED. Review the mainnet journal and start explicitly.')
+    print('Supervisor installed and enabled, but STOPPED. Review the ' + sending_mode(config) + ' journal and start explicitly.')
+
+
+def read_key_frame(stream):
+    # Exactly one LF-terminated frame; bound malformed input without consuming another frame.
+    # A buffered readline may steal the next frame from a child inheriting fd 0.
+    source = getattr(stream, 'raw', stream)
+    key = bytearray()
+    while len(key) < 257:
+        value = source.read(1)
+        if not value:
+            break
+        key.extend(value)
+        if value == b'\n':
+            break
+    key = bytes(key)
+    require(re.fullmatch(rb'(?:0x)?[a-fA-F0-9]{64}\r?\n', key), 'Invalid private stdin key frame.')
+    return key
 
 
 def credential_stdin():
@@ -323,9 +389,11 @@ def runtime(config):
     argv = [DOCKER, '--config', str(BASE / 'docker-config'), '--host', 'unix:///var/run/docker.sock',
             'run', '-i', *container_args(config), '--name', NAME,
             '--label', LABEL + '=' + config['instance'], '--cidfile', str(RUNTIME / 'container.id'),
-            '--publish', '127.0.0.1:8547:8547', '--env', 'ZUNDER_GUARD_LISTEN=0.0.0.0:8547',
-            '--env', 'ZUNDER_MAINNET_CONFIRM=' + config['account'], config['image'],
-            'run', '--network', 'mainnet', '--key-stdin']
+            '--publish', '127.0.0.1:8547:8547', '--env', 'ZUNDER_GUARD_LISTEN=0.0.0.0:8547']
+    mode = sending_mode(config)
+    if mode == 'mainnet':
+        argv += ['--env', 'ZUNDER_MAINNET_CONFIRM=' + config['account']]
+    argv += [config['image'], 'run', '--network', mode, '--key-stdin']
     # systemd has now installed the credential namespace. Open it afresh on each
     # ExecStart, after non-secret preflight commands, and forward only descriptor 0.
     credential_stdin()
@@ -340,7 +408,11 @@ def main():
     setup = commands.add_parser('install')
     for flag in ('image', 'tag', 'volume', 'account', 'confirm-account'):
         setup.add_argument('--' + flag, required=True)
+    setup.add_argument('--prepared-image', action='store_true')
+    setup.add_argument('--manifest-sha256', default='')
+    setup.add_argument('--source-commit', default='')
     setup.add_argument('--key-stdin', action='store_true')
+    setup.add_argument('--network', choices=('mainnet', 'testnet'), default='mainnet')
     commands.add_parser('run')
     commands.add_parser('stop')
     args = parser.parse_args()

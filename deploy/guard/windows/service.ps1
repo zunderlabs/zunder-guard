@@ -1,4 +1,4 @@
-# Signed, versioned Windows mainnet lifecycle helper. Rust owns key prompts.
+# Signed, versioned Windows sending-service lifecycle helper. Rust owns key prompts.
 [CmdletBinding()]
 param(
   [Parameter(Mandatory)][ValidateSet('Prepare','Resume','JournalInit','Start','Stop','Status','Upgrade','Recover','Uninstall')][string]$Action,
@@ -6,6 +6,8 @@ param(
   [string]$ReleaseDir, [string]$Tag,
   [string]$Rules, [string]$Account, [string]$ConfirmAccount, [string]$EquityCap,
   [string]$Licence, [string]$Note,
+  [ValidateSet('mainnet','testnet')][string]$Network = 'mainnet',
+  [switch]$KeyStdin,
   [ValidateSet('','Manual','DelayedAuto')][string]$Startup = '',
   [ValidateSet('','RollbackImage')][string]$Recovery = ''
 )
@@ -159,6 +161,23 @@ function Assert-ZgHelperPolicy {
   }
 }
 
+function Get-ZgRecordNetwork($Record) {
+  # A missing field is the immutable legacy Mainnet transaction schema.
+  $mode = if ($null -ne $Record.PSObject.Properties['mode']) { $Record.mode } else { 'mainnet' }
+  if ($mode -cnotin @('mainnet','testnet')) { throw 'Unsupported owned sending network.' }
+  return $mode
+}
+function Get-ZgConfirmationFlag {
+  if ($Network -eq 'testnet') { return '--confirm-account' }
+  return '--confirm-mainnet'
+}
+function Get-ZgJournalPath {
+  $name = if ($Network -eq 'testnet') { 'risk.jsonl' } else { 'risk-mainnet.jsonl' }
+  return [IO.Path]::Combine($ZgHome,$name)
+}
+function Assert-ZgPrivateTestnetInput {
+  if ($Network -cne 'testnet' -or -not $KeyStdin -or -not [Console]::IsInputRedirected) { throw 'Protected Testnet key setup requires explicit private redirected stdin.' }
+}
 function Test-ZgSamePath([string]$Left,[string]$Right) {
   if ($Left.StartsWith('\\?\')) { $Left=$Left.Substring(4) }
   if ($Right.StartsWith('\\?\')) { $Right=$Right.Substring(4) }
@@ -237,6 +256,7 @@ function Read-ZgTransaction {
   $value = [IO.File]::ReadAllText($ZgTransactionPath) | Microsoft.PowerShell.Utility\ConvertFrom-Json
   $phases = @('install-planned','paths-created','image-admitted','service-created-disabled','config-preparing','config-prepared','binding-prepared','credential-provisioning','credential-present','admitted-disabled','journal-requested','journal-present','upgrade-planned','startup-disabled','quiesced','promoting-image','promoting-binding','activation-requested','activation-committed','stopped','uninstalled','rolled-back')
   if ($value.schema -ne 1 -or $value.id -cne $Id -or $value.service -cne $ZgServiceName -or $value.root -cne $ZgRoot -or $value.exe -cne $ZgExe -or $value.binding -cne $ZgBinding -or $value.phase -notin $phases -or $value.account -notmatch '^0x[0-9a-f]{40}$' -or $value.tag -notmatch '^v[0-9]+\.[0-9]+\.[0-9]+$') { throw 'Transaction identity or phase is ambiguous; refuse recovery.' }
+  if ((Get-ZgRecordNetwork $value) -cne $Network) { throw 'Transaction belongs to another sending network; adoption refused.' }
   if ($ConfirmAccount -and $ConfirmAccount.ToLowerInvariant() -cne $value.account) { throw 'Transaction account differs from explicit confirmation.' }
   return $value
 }
@@ -253,15 +273,15 @@ function Get-ZgPublic([string[]]$Words) {
   return ($text -join "`n")
 }
 function Get-ZgPreparedBinding {
-  $text = Get-ZgPublic @('service','prepare','--credential-id',$Id,'--confirm-mainnet',$ConfirmAccount,'--service-name',$ZgServiceName,'--service-sid',$ZgSid)
+  $text = Get-ZgPublic @('service','prepare','--credential-id',$Id,(Get-ZgConfirmationFlag),$ConfirmAccount,'--service-name',$ZgServiceName,'--service-sid',$ZgSid)
   $metadata = $text | Microsoft.PowerShell.Utility\ConvertFrom-Json
-  if ($metadata.account -cne $ZgTransaction.account -or $metadata.mode -ne 'mainnet' -or ( -not (Test-ZgSamePath $metadata.executable $ZgExe)) -or ( -not (Test-ZgSamePath $metadata.home $ZgHome)) -or ( -not (Test-ZgSamePath $metadata.config $ZgConfig)) -or $metadata.identity.service_name -cne $ZgServiceName -or $metadata.identity.service_sid -cne $ZgSid) { throw 'Prepared service metadata differs from transaction.' }
+  if ($metadata.account -cne $ZgTransaction.account -or $metadata.mode -cne $Network -or ( -not (Test-ZgSamePath $metadata.executable $ZgExe)) -or ( -not (Test-ZgSamePath $metadata.home $ZgHome)) -or ( -not (Test-ZgSamePath $metadata.config $ZgConfig)) -or $metadata.identity.service_name -cne $ZgServiceName -or $metadata.identity.service_sid -cne $ZgSid) { throw 'Prepared service metadata differs from transaction.' }
   return $metadata
 }
 function Get-ZgBinding {
   Assert-ZgPath $ZgBinding
   $metadata = [IO.File]::ReadAllText($ZgBinding) | Microsoft.PowerShell.Utility\ConvertFrom-Json
-  if ($metadata.account -cne $ZgTransaction.account -or $metadata.mode -ne 'mainnet' -or ( -not (Test-ZgSamePath $metadata.executable $ZgExe)) -or ( -not (Test-ZgSamePath $metadata.home $ZgHome)) -or ( -not (Test-ZgSamePath $metadata.config $ZgConfig)) -or $metadata.identity.service_name -cne $ZgServiceName -or $metadata.identity.service_sid -cne $ZgSid) { throw 'Binding differs from owned transaction.' }
+  if ($metadata.account -cne $ZgTransaction.account -or $metadata.mode -cne $Network -or ( -not (Test-ZgSamePath $metadata.executable $ZgExe)) -or ( -not (Test-ZgSamePath $metadata.home $ZgHome)) -or ( -not (Test-ZgSamePath $metadata.config $ZgConfig)) -or $metadata.identity.service_name -cne $ZgServiceName -or $metadata.identity.service_sid -cne $ZgSid) { throw 'Binding differs from owned transaction.' }
   if ((Get-ZgHash $ZgExe) -cne $metadata.executable_sha256) { throw 'Executable differs from admitted binding.' }
   return $metadata
 }
@@ -346,7 +366,9 @@ function Complete-ZgPrepare {
   if (-not [IO.File]::Exists($ZgConfig)) {
     if ([IO.File]::Exists($ZgConfig+'.new')) { throw 'Uncommitted config staging exists. Retained helper Status/Resume requires manual inspection; no init or deletion repeated.' }
     Save-ZgPhase 'config-preparing'
-    $words = @('init','--non-interactive','--service-setup',$Id,'--network','mainnet','--account',$ZgTransaction.account,'--confirm-mainnet',$ConfirmAccount,'--equity-cap',$ZgTransaction.cap)
+    $words = @('init','--non-interactive','--service-setup',$Id,'--network',$Network,'--account',$ZgTransaction.account,'--equity-cap',$ZgTransaction.cap)
+    if ($Network -eq 'mainnet') { $words += @('--confirm-mainnet',$ConfirmAccount) }
+    else { Assert-ZgPrivateTestnetInput; $words += '--key-stdin' }
     if ($ZgTransaction.rules) { $words += @('--rules',$ZgTransaction.rules) }
     Invoke-ZgGuard $words
   }
@@ -355,6 +377,11 @@ function Complete-ZgPrepare {
   if ($ZgTransaction.api_wallet -and $prepared.api_wallet -cne $ZgTransaction.api_wallet) { throw 'Recovered API wallet differs from transaction.' }
   $ZgTransaction.api_wallet = $prepared.api_wallet
   Set-ZgAcl $ZgConfig $ZgSid $true
+  if ($Network -eq 'testnet') {
+    $journal = Get-ZgJournalPath
+    if (-not [IO.File]::Exists($journal)) { throw 'Initialized Testnet risk journal is missing; no reset permitted.' }
+    Set-ZgAcl $journal $ZgSid $true
+  }
   Save-ZgPhase 'config-prepared'
   if (-not [IO.File]::Exists($ZgBinding)) { Write-ZgJson $ZgBinding $prepared; Set-ZgAcl $ZgBinding $ZgSid }
   $null = Get-ZgBinding
@@ -367,7 +394,9 @@ function Complete-ZgPrepare {
   Assert-ZgPath $credential
   if ([IO.FileInfo]::new($credential).Length -eq 0) {
     Save-ZgPhase 'credential-provisioning'
-    Invoke-ZgGuard @('service','provision','--binding',$ZgBinding,'--confirm-mainnet',$ConfirmAccount)
+    $words = @('service','provision','--binding',$ZgBinding,(Get-ZgConfirmationFlag),$ConfirmAccount)
+    if ($Network -eq 'testnet') { Assert-ZgPrivateTestnetInput; $words += '--key-stdin' }
+    Invoke-ZgGuard $words
   }
   # Presence only, never a claim of successful virtual-account decryption.
   Invoke-ZgGuard @('service','check','--binding',$ZgBinding)
@@ -385,7 +414,7 @@ function Get-ZgTextHash([string]$Text) {
   try { return ([BitConverter]::ToString($hash.ComputeHash([Text.Encoding]::UTF8.GetBytes($Text)))).Replace('-','').ToLowerInvariant() } finally { $hash.Dispose() }
 }
 function Get-ZgJournalHash {
-  $path = [IO.Path]::Combine($ZgHome,'risk-mainnet.jsonl')
+  $path = (Get-ZgJournalPath)
   if (-not [IO.File]::Exists($path)) { return '' }
   return Get-ZgHash $path
 }
@@ -440,6 +469,10 @@ function Read-ZgHttp([string]$Uri) {
   } finally { $response.Dispose() }
 }
 function Get-ZgFeeReadiness($Fee,[string]$LicenceState) {
+  if ($Network -eq 'testnet') {
+    if ($Fee.mode -ne 'off') { throw 'Testnet requires fee mode off.' }
+    return @{ mode='off'; approval='not_required'; trading_ready=$true }
+  }
   if ($Fee.mode -eq 'fee_free') {
     if ($LicenceState -ne 'active') { throw 'Fee-free status requires an active licence.' }
     return @{ mode='fee_free'; approval='not_required'; trading_ready=$true }
@@ -451,7 +484,7 @@ function Get-ZgFeeReadiness($Fee,[string]$LicenceState) {
   return @{ mode='builder'; approval=$Fee.approval.state; entries_blocked=$Fee.entries_blocked; trading_ready=($Fee.approval.state -eq 'approved' -and -not $Fee.entries_blocked -and $Fee.charged) }
 }
 function Write-ZgActivationOutcome($Readiness) {
-  if ($Readiness.trading_ready) { Microsoft.PowerShell.Utility\Write-Host 'Owned mainnet runtime is trading-ready for the admitted account, risk state and fee approval.' }
+  if ($Readiness.trading_ready) { Microsoft.PowerShell.Utility\Write-Host "Owned $Network runtime is trading-ready for the admitted account, risk state and fee policy." }
   else {
     Microsoft.PowerShell.Utility\Write-Host "Service is running; trading remains blocked (builder approval: $($Readiness.approval))."
     Microsoft.PowerShell.Utility\Write-Host 'Review Mainnet approval with your main wallet at https://zunderlabs.com/approve. Guard never approves on your behalf. If the venue refuses the builder itself, contact Zunder support.'
@@ -465,11 +498,11 @@ function Assert-ZgStatus($Status,[string]$Account,[string]$Cap,[bool]$Licensed,[
   if ($Status.risk.journal_ready -isnot [bool] -or $Status.journal_broken -isnot [bool]) { throw 'Runtime risk readiness requires boolean fields.' }
   if ($Status.started_at_ms -isnot [long] -and $Status.started_at_ms -isnot [int]) { throw 'Runtime start timestamp must be an integer.' }
   if ($Status.last_sync_ms -isnot [long] -and $Status.last_sync_ms -isnot [int]) { throw 'Runtime synchronization timestamp must be an integer.' }
-  if ($null -ne $Status.killed -or $Status.mode -ne 'mainnet' -or $Status.network -ne 'mainnet' -or $Status.account -cne $Account -or $Status.risk.state -ne 'active' -or $Status.risk.journal_ready -ne $true -or $null -ne $Status.last_error -or $Status.journal_broken -ne $false) { throw 'Runtime mainnet/account/risk admission not ready.' }
+  if ($null -ne $Status.killed -or $Status.mode -cne $Network -or $Status.network -cne $Network -or $Status.account -cne $Account -or $Status.risk.state -ne 'active' -or $Status.risk.journal_ready -ne $true -or $null -ne $Status.last_error -or $Status.journal_broken -ne $false) { throw 'Runtime mainnet/account/risk admission not ready.' }
   if ([string]$Status.equity_cap -cne $Cap -and [decimal]::Parse([string]$Status.equity_cap,[Globalization.CultureInfo]::InvariantCulture) -ne [decimal]::Parse($Cap,[Globalization.CultureInfo]::InvariantCulture)) { throw 'Runtime equity cap differs.' }
   $now = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
   if ($Status.started_at_ms -lt $StartedAt -or $Status.last_sync_ms -lt $Status.started_at_ms -or $Status.last_sync_ms -gt ($now+5000) -or ($now-$Status.last_sync_ms) -gt 90000) { throw 'Runtime has no fresh synchronization for this start.' }
-  if ($Licensed -and ($Status.licence.state -ne 'active' -or $Status.fee.mode -ne 'fee_free')) { throw 'Validated licence is not active/fee-free in this runtime.' }
+  if ($Licensed -and ($Status.licence.state -ne 'active' -or ($Network -eq 'mainnet' -and $Status.fee.mode -ne 'fee_free'))) { throw 'Validated licence is not active/fee-free in this runtime.' }
   $fee = Get-ZgFeeReadiness $Status.fee $Status.licence.state
   return @{ account=$Status.account; mode=$Status.mode; network=$Status.network; risk=$Status.risk.state; licence=$Status.licence.state; fee=$fee.mode; approval=$fee.approval; trading_ready=$fee.trading_ready; started_at_ms=$Status.started_at_ms; last_sync_ms=$Status.last_sync_ms }
 }
@@ -504,7 +537,7 @@ function Wait-ZgReady([long]$StartedAt) {
   throw 'Owned runtime did not meet mainnet/account/risk/licence readiness; service is being disabled.'
 }
 function New-ZgTransaction([string]$Operation) {
-  return [pscustomobject][ordered]@{
+  $value = [pscustomobject][ordered]@{
     schema=1; transaction=[Guid]::NewGuid().ToString('N'); operation=$Operation; id=$Id; service=$ZgServiceName;
     root=$ZgRoot; exe=$ZgExe; binding=$ZgBinding; account=$Account.ToLowerInvariant(); api_wallet='';
     tag=$Tag; release=$ReleaseDir; helper_hash=(Get-ZgHash ([IO.Path]::Combine($ReleaseDir,'install-windows-service.ps1')));
@@ -512,6 +545,8 @@ function New-ZgTransaction([string]$Operation) {
     original_startup=''; original_running=$false; config_hash=''; journal_hash=''; snapshot_captured=$false; runtime_attempted=$false;
     startup_choice=''; readiness=$null; old_release=''; old_tag=''; old_helper_hash=''
   }
+  if ($Network -eq 'testnet') { $value | Microsoft.PowerShell.Utility\Add-Member -NotePropertyName mode -NotePropertyValue 'testnet' }
+  return $value
 }
 function Start-ZgOwnedRuntime { Microsoft.PowerShell.Management\Start-Service -Name $ZgServiceName }
 function Complete-ZgStart {
@@ -519,7 +554,7 @@ function Complete-ZgStart {
   if ($Startup -notin @('Manual','DelayedAuto')) { throw 'Explicit Startup Manual or DelayedAuto is required; no default activation.' }
   Disable-ZgService; $null=Get-ZgBinding
   Invoke-ZgGuard @('service','check','--binding',$ZgBinding)
-  if (-not [IO.File]::Exists([IO.Path]::Combine($ZgHome,'risk-mainnet.jsonl'))) { throw 'Explicit scoped journal initialization is required.' }
+  if (-not [IO.File]::Exists((Get-ZgJournalPath))) { throw 'Explicit scoped journal initialization is required.' }
   $ZgTransaction.runtime_attempted=$true; $ZgTransaction.startup_choice=$Startup; Save-ZgPhase 'activation-requested'
   Invoke-ZgSc @('config',$ZgServiceName,'start=','demand')
   $startedAt=[DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()-1000
@@ -532,6 +567,8 @@ function Complete-ZgStart {
 function Invoke-ZgLifecycle {
   Initialize-ZgMachineContext -RuntimeModules
   if ($Id -notmatch '^[A-Za-z0-9-]{1,64}$') { throw 'Invalid instance ID.' }
+  if ($Network -eq 'testnet' -and -not $Id.StartsWith('testnet-',[StringComparison]::Ordinal)) { throw 'Testnet requires a separate testnet- instance identity.' }
+  if ($KeyStdin -and ($Network -ne 'testnet' -or $Action -notin @('Prepare','Resume'))) { throw 'Private unattended key input is Testnet Prepare/Resume only.' }
   $script:ZgServiceName = 'ZunderGuard-'+$Id
   $script:ZgManagement = [IO.Path]::Combine($ZgData,'management')
   $script:ZgTransactionPath = [IO.Path]::Combine($ZgManagement,($Id+'.json'))
@@ -583,7 +620,8 @@ function Invoke-ZgLifecycle {
         Disable-ZgService
         if ($phase -eq 'activation-requested') { throw 'Interrupted activation left disabled. Review Status and explicitly Start again.' }
         if ($phase -eq 'journal-requested') {
-          if (-not [IO.File]::Exists([IO.Path]::Combine($ZgHome,'risk-mainnet.jsonl'))) { throw 'Journal not committed; explicitly invoke JournalInit with a review note.' }
+          if ($Network -ne 'mainnet') { throw 'Testnet cannot adopt a Mainnet journal transaction.' }
+          if (-not [IO.File]::Exists((Get-ZgJournalPath))) { throw 'Journal not committed; explicitly invoke JournalInit with a review note.' }
           $old = $env:ZUNDER_MAINNET_CONFIRM
           try { $env:ZUNDER_MAINNET_CONFIRM=$ConfirmAccount; Invoke-ZgGuard @('journal-show','--mode','mainnet') } finally { $env:ZUNDER_MAINNET_CONFIRM=$old }
           Save-ZgPhase 'journal-present'
@@ -593,22 +631,23 @@ function Invoke-ZgLifecycle {
         else { throw 'Unknown transaction operation.' }
       }
       'JournalInit' {
+        if ($Network -ne 'mainnet') { throw 'Testnet journal is created only during fresh init; no reinitialization or automatic resume.' }
         Confirm-ZgConsent
         if ([string]::IsNullOrWhiteSpace($Note)) { throw 'Explicit human review note required.' }
-        if ([IO.File]::Exists([IO.Path]::Combine($ZgHome,'risk-mainnet.jsonl'))) { throw 'Existing journal is never initialized again or resumed automatically.' }
+        if ([IO.File]::Exists((Get-ZgJournalPath))) { throw 'Existing journal is never initialized again or resumed automatically.' }
         $null=Get-ZgService; $null=Get-ZgBinding
         $cleanupOwnedMutation = $true
         Disable-ZgService; Save-ZgPhase 'journal-requested'
         $old=$env:ZUNDER_MAINNET_CONFIRM
         try { $env:ZUNDER_MAINNET_CONFIRM=$ConfirmAccount; Invoke-ZgGuard @('journal-init','--mode','mainnet','--note',$Note) } finally { $env:ZUNDER_MAINNET_CONFIRM=$old }
-        Set-ZgAcl ([IO.Path]::Combine($ZgHome,'risk-mainnet.jsonl')) $ZgSid $true
+        Set-ZgAcl ((Get-ZgJournalPath)) $ZgSid $true
         Save-ZgPhase 'journal-present'
       }
       'Start' {
         Confirm-ZgConsent
         if ($Startup -notin @('Manual','DelayedAuto')) { throw 'Explicit Startup Manual or DelayedAuto is required; no default activation.' }
         $null=Get-ZgService; $null=Get-ZgBinding
-        if (-not [IO.File]::Exists([IO.Path]::Combine($ZgHome,'risk-mainnet.jsonl'))) { throw 'Explicit scoped journal initialization is required.' }
+        if (-not [IO.File]::Exists((Get-ZgJournalPath))) { throw 'Explicit scoped journal initialization is required.' }
         $cleanupOwnedMutation = $true
         Complete-ZgStart
       }
@@ -658,7 +697,11 @@ function Invoke-ZgLifecycle {
     if ($Action -in @('Prepare','Resume','Upgrade','JournalInit','Recover')) {
       $helper=[IO.Path]::Combine($ZgTransaction.release,'install-windows-service.ps1')
       Microsoft.PowerShell.Utility\Write-Host "Retained helper: $helper"
-      Microsoft.PowerShell.Utility\Write-Host "Service remains disabled. Next explicit choices: $(Get-ZgHelperInvocation $helper) -Action JournalInit -Id $Id -ConfirmAccount $($ZgTransaction.account) -Note '<review note>'; then $(Get-ZgHelperInvocation $helper) -Action Start -Id $Id -ConfirmAccount $($ZgTransaction.account) -Startup Manual or DelayedAuto."
+      if ($Network -eq 'testnet') {
+        Microsoft.PowerShell.Utility\Write-Host "Service remains disabled. Testnet journal is preserved. Start with: $(Get-ZgHelperInvocation $helper) -Action Start -Network testnet -Id $Id -ConfirmAccount $($ZgTransaction.account) -Startup Manual or DelayedAuto."
+      } else {
+        Microsoft.PowerShell.Utility\Write-Host "Service remains disabled. Next explicit choices: $(Get-ZgHelperInvocation $helper) -Action JournalInit -Network $Network -Id $Id -ConfirmAccount $($ZgTransaction.account) -Note '<review note>'; then $(Get-ZgHelperInvocation $helper) -Action Start -Network $Network -Id $Id -ConfirmAccount $($ZgTransaction.account) -Startup Manual or DelayedAuto."
+      }
     }
   } catch {
     if ($cleanupOwnedMutation) {
@@ -666,7 +709,7 @@ function Invoke-ZgLifecycle {
     }
     if ($cleanupOwnedMutation) {
       $recoveryHelper = [IO.Path]::Combine($ZgTransaction.release,'install-windows-service.ps1')
-      Microsoft.PowerShell.Utility\Write-Warning "Recovery: $(Get-ZgHelperInvocation $recoveryHelper) -Action Status -Id $Id; then the same helper -Action Resume -Id $Id -ConfirmAccount <your account>. State is retained."
+      Microsoft.PowerShell.Utility\Write-Warning "Recovery: $(Get-ZgHelperInvocation $recoveryHelper) -Action Status -Network $Network -Id $Id; then the same helper -Action Resume -Network $Network -Id $Id -ConfirmAccount <your account>. State is retained."
     } else { Microsoft.PowerShell.Utility\Write-Warning 'Action refused before owned service mutation; no stop or start was requested.' }
     throw
   } finally { $lock.Dispose() }

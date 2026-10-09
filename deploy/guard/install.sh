@@ -36,6 +36,9 @@ BASE_URL="${ZUNDER_GUARD_BASE_URL:-https://github.com/$REPO/releases/download/$V
 COSIGN_VERSION="v3.1.3"
 COSIGN_URL="https://github.com/sigstore/cosign/releases/download/$COSIGN_VERSION"
 
+SERVICE_USER=zunder-guard
+SERVICE_UNIT=zunder-guard
+SERVICE_CONFIG=/etc/zunder-guard
 SERVICE_HOME=/var/lib/zunder-guard
 CRED_NAME=hl-api-wallet-key
 CRED_ENCRYPTED=/etc/credstore.encrypted/zunder-guard.$CRED_NAME
@@ -57,6 +60,8 @@ Usage: sh install.sh [options]
   --network NAME        paper (default when asked), testnet or mainnet
   --account 0x…         Hyperliquid account address
   --key-file PATH       file holding the API wallet key (read by this script, never echoed)
+  --key-stdin           protected managed TESTNET only: private framed stdin, no prompts
+                        Linux needs systemd-creds; macOS/container use their secure broker
   --confirm-mainnet 0x… the account address again; required for mainnet without prompts
   --equity-cap USDC     mainnet: the most equity Guard sizes from (at most 2500); required for
                         mainnet without prompts
@@ -69,20 +74,27 @@ Usage: sh install.sh [options]
   --prefix DIR          binary directory (default /usr/local/bin as root, else ~/.local/bin);
                         notices go in ../share/licenses/zunder-guard for a bin directory,
                         otherwise DIR/share/licenses/zunder-guard
-  --container           guided Linux mainnet Docker service with encrypted credential
+  --container           protected Linux mainnet/testnet Docker service with encrypted credential
+  --prepare-image       container only: verify/pull private image before any wallet input
+  --registry-auth-dir D root-only isolated ghcr.io config; scrubbed by prepare-image
+  --prepared-image      use the exact source-bound image already prepared locally
+  --source-commit SHA   explicit independently verified source for prepared-image phases
   --volume NAME         explicit named volume for container setup (default zunder-guard-data)
   --install-only        verify and replace binary/notices only; no setup or service changes
                         stop Guard first; restart it yourself after checking the release
+  --service-instance N  fresh Linux testnet/mainnet service, isolated from the paper service;
+                        requires matching --network, rules, account, cap, loopback listen
+                        on a different port and --ip-share; refuses existing instance/--force
   --no-service          install and set up, but do not install the systemd unit
   --force               replace an existing configuration without asking (the journal is kept)
   --version             print the release this installer belongs to
 EOF
 }
 
-RULES="" NETWORK="" ACCOUNT="" KEY_FILE="" CONFIRM="" CAP="" PREFIX="" LISTEN="" SHARE="" LICENCE="" NONINTERACTIVE=0 NO_SERVICE=0 FORCE=0 INSTALL_ONLY=0 SETUP_OPTIONS=0 CONTAINER=0 VOLUME=""
+RULES="" NETWORK="" ACCOUNT="" KEY_FILE="" KEY_STDIN=0 CONFIRM="" CAP="" PREFIX="" LISTEN="" SHARE="" LICENCE="" NONINTERACTIVE=0 NO_SERVICE=0 FORCE=0 INSTALL_ONLY=0 SETUP_OPTIONS=0 CONTAINER=0 VOLUME="" SERVICE_INSTANCE="" PREPARE_IMAGE=0 PREPARED_IMAGE=0 REGISTRY_AUTH="" SOURCE_COMMIT=""
 while [ $# -gt 0 ]; do
   case "$1" in
-    --rules | --network | --account | --key-file | --confirm-mainnet | --equity-cap | --prefix | --listen | --ip-share | --licence | --volume)
+    --rules | --network | --account | --key-file | --confirm-mainnet | --equity-cap | --prefix | --listen | --ip-share | --licence | --volume | --service-instance | --registry-auth-dir | --source-commit)
       [ $# -ge 2 ] || die "$1 needs a value"
       [ "$1" = --prefix ] || SETUP_OPTIONS=1
       case "$1" in
@@ -97,9 +109,15 @@ while [ $# -gt 0 ]; do
         --ip-share) SHARE=$2 ;;
         --licence) LICENCE=$2 ;;
         --volume) VOLUME=$2 ;;
+        --service-instance) SERVICE_INSTANCE=$2 ;;
+        --registry-auth-dir) REGISTRY_AUTH=$2 ;;
+        --source-commit) SOURCE_COMMIT=$2 ;;
       esac
       shift 2
       ;;
+    --key-stdin) KEY_STDIN=1 && SETUP_OPTIONS=1 && shift ;;
+    --prepare-image) PREPARE_IMAGE=1 && SETUP_OPTIONS=1 && shift ;;
+    --prepared-image) PREPARED_IMAGE=1 && SETUP_OPTIONS=1 && shift ;;
     --container) CONTAINER=1 && SETUP_OPTIONS=1 && shift ;;
     --install-only) INSTALL_ONLY=1 && shift ;;
     --non-interactive) NONINTERACTIVE=1 && shift ;;
@@ -111,14 +129,75 @@ while [ $# -gt 0 ]; do
   esac
 done
 
+if [ "$PREPARE_IMAGE$PREPARED_IMAGE" != 00 ] || [ -n "$REGISTRY_AUTH$SOURCE_COMMIT" ]; then
+  if ! { [ "$CONTAINER" -eq 1 ] && [ "$NETWORK" = testnet ]; }; then
+    die "private image preparation requires explicit Linux container Testnet"
+  fi
+  printf '%s\n' "$SOURCE_COMMIT" | LC_ALL=C grep -Eq '^[0-9a-f]{40}$' || die "exact independently verified source commit required"
+  [ "$PREPARE_IMAGE$PREPARED_IMAGE" = 10 ] || [ "$PREPARE_IMAGE$PREPARED_IMAGE" = 01 ] || die "choose prepare-image or prepared-image"
+  if [ "$PREPARE_IMAGE" -eq 1 ]; then
+    [ -n "$REGISTRY_AUTH" ] || die "prepare-image requires isolated registry-auth-dir"
+    if ! { [ -z "$RULES$ACCOUNT$KEY_FILE$CONFIRM$CAP$PREFIX$LISTEN$SHARE$LICENCE$VOLUME$SERVICE_INSTANCE" ] \
+      && [ "$KEY_STDIN$NONINTERACTIVE$NO_SERVICE$FORCE$INSTALL_ONLY" = 00000 ]; }; then
+      die "prepare-image admits no wallet/setup options"
+    fi
+  else
+    [ -z "$REGISTRY_AUTH" ] || die "registry auth is admitted only during prepare-image"
+  fi
+fi
+
+# A named sending service is a fresh installation, never a migration of paper state.
+if [ -n "$SERVICE_INSTANCE" ]; then
+  case "$SERVICE_INSTANCE" in testnet | mainnet) ;; *) die "service instance is testnet or mainnet" ;; esac
+  [ "$NETWORK" = "$SERVICE_INSTANCE" ] || die "service instance needs matching explicit --network"
+  [ "$CONTAINER$NO_SERVICE$INSTALL_ONLY$FORCE" = 0000 ] || die "service instance requires fresh native managed setup; force is refused"
+  [ -z "$PREFIX" ] || die "service instance uses its own fixed binary prefix"
+  if ! { [ -n "$RULES" ] && [ -n "$ACCOUNT" ] && [ -n "$CAP" ] && [ -n "$SHARE" ]; }; then
+    die "service instance needs explicit rules, account, equity-cap and ip-share"
+  fi
+  case "$LISTEN" in 127.0.0.1:*) INSTANCE_PORT=${LISTEN#127.0.0.1:} ;; *) die "service instance listen must be 127.0.0.1:PORT" ;; esac
+  case "$INSTANCE_PORT" in "" | *[!0-9]* | 0*) die "service instance port must be a decimal from 1 to 65535" ;; esac
+  if ! { [ "${#INSTANCE_PORT}" -le 5 ] && [ "$INSTANCE_PORT" -ge 1 ] && [ "$INSTANCE_PORT" -le 65535 ] \
+    && [ "$INSTANCE_PORT" -ne 8547 ]; }; then
+    die "service instance needs a valid port distinct from paper port 8547"
+  fi
+  case "$SHARE" in *[!0-9.]* | "") die "service instance ip-share is a decimal in (0, 1]" ;; esac
+  printf '%s\n' "$SHARE" | awk '/^[0-9]+([.][0-9]+)?$/ && $0 + 0 > 0 && $0 + 0 <= 1 {good=1} END {exit !good}' \
+    || die "service instance ip-share is a decimal in (0, 1]"
+  SERVICE_USER=zunder-guard-$SERVICE_INSTANCE
+  SERVICE_UNIT=$SERVICE_USER
+  SERVICE_HOME=/var/lib/$SERVICE_USER
+  SERVICE_CONFIG=/etc/$SERVICE_USER
+  CRED_ENCRYPTED=/etc/credstore.encrypted/$SERVICE_USER.$CRED_NAME
+  CRED_PLAIN=$SERVICE_CONFIG/$CRED_NAME
+  MAINNET_ENV=$SERVICE_CONFIG/mainnet-confirm.env
+  PREFIX=/opt/$SERVICE_USER/bin
+fi
+
 if [ "$CONTAINER" -eq 1 ]; then
   PATH=/usr/sbin:/usr/bin:/sbin:/bin
   export PATH
-  [ "$NETWORK" = mainnet ] || die "--container requires --network mainnet"
-  [ "$INSTALL_ONLY$NONINTERACTIVE$NO_SERVICE$FORCE" = 0000 ] || die "container mode requires interactive managed setup"
+  case "$NETWORK" in mainnet | testnet) ;; *) die "--container requires --network mainnet or testnet" ;; esac
+  [ "$INSTALL_ONLY$NO_SERVICE$FORCE" = 000 ] || die "container mode requires managed setup"
+  if [ "$NETWORK" = mainnet ]; then
+    [ "$NONINTERACTIVE$KEY_STDIN" = 00 ] || die "mainnet container setup retains interactive confirmation and hidden input"
+  else
+    [ "$NONINTERACTIVE$KEY_STDIN" = 00 ] || [ "$NONINTERACTIVE$KEY_STDIN" = 11 ] \
+      || die "unattended testnet container setup requires --non-interactive --key-stdin"
+  fi
   [ -z "$KEY_FILE$CONFIRM$PREFIX$LISTEN" ] || die "container mode does not accept key-file, confirm-mainnet, prefix or listen"
 elif [ -n "$VOLUME" ]; then
   die "--volume requires --container"
+fi
+
+if [ "$KEY_STDIN" -eq 1 ]; then
+  if ! { [ "$NETWORK" = testnet ] && [ "$NONINTERACTIVE" -eq 1 ] && [ "$NO_SERVICE" -eq 0 ]; }; then
+    die "--key-stdin requires explicit testnet, non-interactive managed setup"
+  fi
+  [ -z "$KEY_FILE$CONFIRM" ] || die "testnet private stdin cannot be combined with a key file or mainnet consent"
+fi
+if [ "$NETWORK" = testnet ] && [ -n "$CONFIRM" ]; then
+  die "testnet setup accepts no mainnet confirmation"
 fi
 
 if [ "$INSTALL_ONLY" -eq 1 ] && [ "$SETUP_OPTIONS" -eq 1 ]; then
@@ -150,7 +229,9 @@ elif [ "$NONINTERACTIVE" -eq 1 ]; then
   [ -n "$NETWORK" ] || die "--non-interactive needs --network"
   if [ "$NETWORK" != paper ]; then
     [ -n "$ACCOUNT" ] || die "$NETWORK needs --account"
-    if [ -z "$KEY_FILE" ] || [ ! -r "$KEY_FILE" ]; then die "$NETWORK needs --key-file with a readable file"; fi
+    if [ "$KEY_STDIN" -eq 0 ] && { [ -z "$KEY_FILE" ] || [ ! -r "$KEY_FILE" ]; }; then
+      die "$NETWORK needs --key-file with a readable file (protected testnet also accepts --key-stdin)"
+    fi
   fi
   if [ "$NETWORK" = mainnet ] && [ "$CONFIRM" != "$ACCOUNT" ]; then
     die "mainnet needs --confirm-mainnet naming the same account"
@@ -169,6 +250,7 @@ case "$(uname -s)" in
   Darwin) OS=darwin ;;
   *) die "unsupported system $(uname -s); on Windows run Guard in Docker or in WSL (Linux)" ;;
 esac
+[ -z "$SERVICE_INSTANCE" ] || [ "$OS" = linux ] || die "service instance requires native Linux systemd"
 case "$(uname -m)" in
   x86_64 | amd64) ARCH=amd64 ;;
   aarch64 | arm64) ARCH=arm64 ;;
@@ -210,7 +292,7 @@ fetch() {
 
 # Container mode never installs/replaces a native Guard binary.
 if [ "$CONTAINER" -eq 1 ]; then
-  [ "$OS" = linux ] || die "--container mainnet requires Linux systemd and local Docker"
+  [ "$OS" = linux ] || die "--container requires Linux systemd and local Docker"
   [ -x /usr/bin/python3 ] || die "Python 3.11 or newer is required for container installation"
   /usr/bin/python3 -I -c 'import sys; sys.exit(sys.version_info < (3, 11))' || die "Python 3.11 or newer is required"
   for asset in SHA256SUMS SHA256SUMS.sigstore.json install-container.py container-supervisor.py container-operations.py zunder-guard-container.service zunder-guard-setup-guardian.service "zunder-guard-$VERSION.image.txt"; do
@@ -224,12 +306,11 @@ if [ "$CONTAINER" -eq 1 ]; then
     /usr/bin/sudo -v || die "administrator installation was not authorized"
     CONTAINER_SUDO=/usr/bin/sudo
   fi
-  $CONTAINER_SUDO /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME=/root LANG=C.UTF-8 \
-    /usr/bin/python3 -I - "$TMP" "$COSIGN_SHA256" "$VERSION" "$VOLUME" "$ACCOUNT" "$RULES" "$CAP" "$SHARE" "$LICENCE" <<'CONTAINER_BOOTSTRAP'
+  CONTAINER_BOOTSTRAP_CODE=$(cat <<'CONTAINER_BOOTSTRAP'
 import hashlib, os, pathlib, re, resource, shutil, stat, subprocess, sys, tempfile
 resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
 os.umask(0o077)
-source, pinned, version, volume, account, rules, cap, share, licence = sys.argv[1:]
+source, pinned, version, volume, account, rules, cap, share, licence, network, noninteractive, key_stdin, prepare_image, prepared_image, registry_auth, source_commit = sys.argv[1:]
 if not re.fullmatch(r'v[0-9]+\.[0-9]+\.[0-9]+', version):
     raise SystemExit('Invalid release version')
 env = {'PATH': '/usr/sbin:/usr/bin:/sbin:/bin', 'HOME': '/root', 'LANG': 'C.UTF-8'}
@@ -291,18 +372,36 @@ try:
             os.link(pending, destination)  # refuse a concurrent replacement
         finally:
             os.unlink(pending)
-    options = ['--version', version]
+    options = ['--version', version, '--network', network]
+    if prepare_image == '1':
+        options += ['--prepare-image', '--registry-auth-dir', registry_auth, '--source-commit', source_commit]
+    elif prepared_image == '1':
+        options += ['--prepared-image', '--source-commit', source_commit]
+    if noninteractive == '1':
+        if network != 'testnet' or key_stdin != '1':
+            raise SystemExit('Unattended container setup is protected testnet only')
+        options += ['--non-interactive', '--key-stdin']
     for name, value in [('volume', volume), ('account', account), ('rules', rules),
                         ('equity-cap', cap), ('ip-share', share), ('licence', licence)]:
         if value:
             options += ['--' + name, value]
-    with open('/dev/tty', 'rb') as terminal:
-        result = subprocess.run(['/usr/bin/python3', '-I', str(stage / 'install-container.py'), *options],
-                                stdin=terminal, env=env, check=False)
+    command = ['/usr/bin/python3', '-I', str(stage / 'install-container.py'), *options]
+    if prepare_image == '1':
+        result = subprocess.run(command, stdin=subprocess.DEVNULL, env=env, check=False)
+    elif key_stdin == '1':
+        result = subprocess.run(command, stdin=sys.stdin.buffer, env=env, check=False)
+    else:
+        with open('/dev/tty', 'rb') as terminal:
+            result = subprocess.run(command, stdin=terminal, env=env, check=False)
     raise SystemExit(result.returncode)
 finally:
     shutil.rmtree(stage)
 CONTAINER_BOOTSTRAP
+  )
+  # Code is public and signed; stdin remains the caller's private pipe across
+  # sudo. No credential is placed in argv/environment or an extra inherited FD.
+  $CONTAINER_SUDO /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME=/root LANG=C.UTF-8 \
+    /usr/bin/python3 -I -c "$CONTAINER_BOOTSTRAP_CODE" "$TMP" "$COSIGN_SHA256" "$VERSION" "$VOLUME" "$ACCOUNT" "$RULES" "$CAP" "$SHARE" "$LICENCE" "$NETWORK" "$NONINTERACTIVE" "$KEY_STDIN" "$PREPARE_IMAGE" "$PREPARED_IMAGE" "$REGISTRY_AUTH" "$SOURCE_COMMIT"
   exit $?
 fi
 
@@ -354,6 +453,26 @@ if [ "$(id -u)" -ne 0 ] && { [ "$SERVICE" -eq 1 ] || [ -z "$PREFIX" ]; }; then
     say "No root and no sudo: installing for this user only, without the systemd unit."
     SERVICE=0
   fi
+fi
+# Refuse before installing a binary or touching state, credentials or units.
+if [ -n "$SERVICE_INSTANCE" ]; then
+  [ "$SERVICE" -eq 1 ] || die "service instance needs root or sudo and native systemd"
+  if ! { command -v systemd-creds >/dev/null 2>&1 && systemd-creds --help 2>/dev/null | grep -q encrypt; }; then
+    die "service instance requires systemd-creds; plaintext fallback is refused"
+  fi
+  # Linux shells support the core-size resource; this branch is Linux-only.
+  # shellcheck disable=SC3045
+  ulimit -c 0 || die "service instance must disable core dumps before credential input"
+  for target in "$SERVICE_HOME" "$SERVICE_CONFIG" "${PREFIX%/bin}" "$CRED_ENCRYPTED" \
+    "/etc/systemd/system/$SERVICE_UNIT.service" "/etc/systemd/system/$SERVICE_UNIT.service.d"; do
+    if $SUDO test -e "$target" || $SUDO test -L "$target"; then
+      die "service instance already exists: $target; preserve it and inspect it separately"
+    fi
+  done
+  ! id "$SERVICE_USER" >/dev/null 2>&1 || die "service instance user already exists; no adoption"
+  command -v ss >/dev/null 2>&1 || die "service instance requires ss (iproute2) to check listener collisions"
+  INSTANCE_LISTENERS=$(ss -H -ltn "sport = :$INSTANCE_PORT") || die "cannot check listener collisions"
+  [ -z "$INSTANCE_LISTENERS" ] || die "service instance port is already listening"
 fi
 if [ -z "$PREFIX" ]; then
   if [ -n "$SUDO" ] || [ "$(id -u)" -eq 0 ]; then PREFIX=/usr/local/bin; else PREFIX=$HOME/.local/bin; fi
@@ -418,13 +537,18 @@ fi
 
 # macOS mainnet uses a protected launchd broker, never a user-writable binary.
 # This branch is deliberately AFTER the reviewed --install-only early return.
-if [ "$OS" = darwin ] && [ "$NETWORK" = mainnet ] && [ "$NO_SERVICE" -eq 0 ]; then
+if [ "$OS" = darwin ] && { [ "$NETWORK" = mainnet ] || [ "$NETWORK" = testnet ]; } && [ "$NO_SERVICE" -eq 0 ]; then
   PATH=/usr/bin:/bin:/usr/sbin:/sbin
   export PATH
   if ! { [ -z "$KEY_FILE$CONFIRM" ] && [ "$FORCE" -eq 0 ]; }; then
     die "macOS managed mainnet requires hidden key input and interactive account confirmation; key-file, confirm-mainnet and force are refused"
   fi
-  [ "$NONINTERACTIVE" -eq 0 ] || die "macOS mainnet provisioning needs an interactive terminal; nothing was started"
+  if [ "$NETWORK" = mainnet ]; then
+    [ "$NONINTERACTIVE$KEY_STDIN" = 00 ] || die "macOS mainnet provisioning needs an interactive terminal; nothing was started"
+  else
+    [ "$NONINTERACTIVE$KEY_STDIN" = 00 ] || [ "$NONINTERACTIVE$KEY_STDIN" = 11 ] \
+      || die "unattended macOS testnet setup requires --non-interactive --key-stdin"
+  fi
   if [ "$(/usr/bin/id -u)" -ne 0 ]; then
     [ -x /usr/bin/sudo ] || die "macOS mainnet needs administrator installation"
     /usr/bin/sudo -v || die "administrator installation was not authorized"
@@ -481,19 +605,23 @@ expected=$(awk '$2 == "install-macos-service.sh" || $2 == "*install-macos-servic
 [ "$(shasum -a 256 "$stage/install-macos-service.sh" | awk '{print $1}')" = "$expected" ] || exit 2
 ROOT_VERIFY
   # Helper is now a verified, root-owned signed asset in root-private staging.
-  $MAC_SUDO /bin/sh "$MAC_STAGE/install-macos-service.sh" "$MAC_STAGE" "$VERSION" "$RULES" "$ACCOUNT" "$CAP" "$LISTEN" "$SHARE" "$LICENCE"
+  $MAC_SUDO /bin/sh "$MAC_STAGE/install-macos-service.sh" "$MAC_STAGE" "$VERSION" "$RULES" "$ACCOUNT" "$CAP" "$LISTEN" "$SHARE" "$LICENCE" "$NETWORK" "$NONINTERACTIVE"
   $MAC_SUDO /bin/rm -rf "$MAC_STAGE"
   exit 0
+fi
+
+if [ "$KEY_STDIN" -eq 1 ] && [ "$SERVICE" -ne 1 ]; then
+  die "protected testnet stdin requires the managed systemd service on Linux"
 fi
 
 # ---------------------------------------------------------------- 5: set up
 if [ "$SERVICE" -eq 1 ]; then
   GUARD_HOME=$SERVICE_HOME
   RUN_AS=$SUDO
-  id zunder-guard >/dev/null 2>&1 \
-    || $SUDO useradd --system --home-dir "$SERVICE_HOME" --shell /usr/sbin/nologin zunder-guard
-  $SUDO install -d -m 0700 -o zunder-guard -g zunder-guard "$SERVICE_HOME"
-  $SUDO install -d -m 0755 /etc/zunder-guard
+  id "$SERVICE_USER" >/dev/null 2>&1 \
+    || $SUDO useradd --system --home-dir "$SERVICE_HOME" --shell /usr/sbin/nologin "$SERVICE_USER"
+  $SUDO install -d -m 0700 -o "$SERVICE_USER" -g "$SERVICE_USER" "$SERVICE_HOME"
+  $SUDO install -d -m 0755 "$SERVICE_CONFIG"
 else
   GUARD_HOME=${ZUNDER_GUARD_HOME:-$HOME/.zunder-guard}
   RUN_AS=""
@@ -511,6 +639,12 @@ if [ "$SERVICE" -eq 0 ]; then
   NO_MAINNET="mainnet is set up only as a systemd service on Linux (root or sudo), where the key reaches Guard from an encrypted credential; here, run it by hand with the key piped in: zunder-guard run --network mainnet --key-stdin"
 elif [ "$HAS_CREDS" -eq 0 ]; then
   NO_MAINNET="mainnet under systemd needs systemd-creds (systemd 250 or newer), so the key is never on disk in plain text; upgrade systemd, or run Guard by hand with the key piped in: zunder-guard run --network mainnet --key-stdin"
+fi
+if [ "$KEY_STDIN" -eq 1 ]; then
+  [ "$HAS_CREDS" -eq 1 ] || die "protected testnet stdin requires systemd-creds; plaintext fallback is refused"
+  if $SUDO test -e "$SERVICE_HOME/guard.toml"; then
+    [ "$(guard config get mode)" = testnet ] || die "testnet setup cannot adopt another network or paper state"
+  fi
 fi
 if [ "$NONINTERACTIVE" -eq 1 ] && [ "$NETWORK" = mainnet ] && [ -n "$NO_MAINNET" ]; then
   die "$NO_MAINNET. Nothing was set up."
@@ -549,7 +683,7 @@ ACCOUNT=$(guard config get account)
 
 # Pair before a service loads the config, so the displayed client key works immediately.
 guard pair
-[ "$SERVICE" -eq 1 ] && $SUDO chown -R zunder-guard:zunder-guard "$SERVICE_HOME"
+[ "$SERVICE" -eq 1 ] && $SUDO chown -R "$SERVICE_USER:$SERVICE_USER" "$SERVICE_HOME"
 
 if [ "$SERVICE" -eq 1 ]; then
   CREDENTIAL=""
@@ -563,7 +697,13 @@ if [ "$SERVICE" -eq 1 ]; then
     # never traced (set -x off from here on).
     { set +x; } 2>/dev/null
     if [ "$NONINTERACTIVE" -eq 1 ]; then
-      IFS= read -r KEY <"$KEY_FILE" || true
+      if [ "$KEY_STDIN" -eq 1 ]; then
+        IFS= read -r KEY || die "missing protected testnet key frame"
+        [ "${#KEY}" -eq 64 ] || die "protected testnet frame requires exactly 64 hex digits"
+        case "$KEY" in *[!0-9a-fA-F]*) die "invalid protected testnet key frame" ;; esac
+      else
+        IFS= read -r KEY <"$KEY_FILE" || true
+      fi
     else
       if [ "$NET" = mainnet ]; then
         say "Once more, for the encrypted credential the service reads it from (Guard checked it above and stored nothing):" >/dev/tty
@@ -584,7 +724,7 @@ if [ "$SERVICE" -eq 1 ]; then
       say "  key: encrypted with systemd-creds ($(systemd-creds has-tpm2 >/dev/null 2>&1 && echo 'TPM2 and host key' || echo 'host key')) in $CRED_ENCRYPTED"
     else
       printf '%s\n' "$KEY" | $SUDO sh -c "umask 077 && cat > '$CRED_PLAIN'"
-      $SUDO chown zunder-guard:zunder-guard "$CRED_PLAIN"
+      $SUDO chown "$SERVICE_USER:$SERVICE_USER" "$CRED_PLAIN"
       $SUDO chmod 0600 "$CRED_PLAIN"
       CREDENTIAL="LoadCredential=$CRED_NAME:$CRED_PLAIN"
       say "  WARNING: systemd-creds is not available (systemd 250 or newer has it). The key is in"
@@ -600,12 +740,20 @@ if [ "$SERVICE" -eq 1 ]; then
   else
     $SUDO rm -f "$MAINNET_ENV"
   fi
-  $SUDO chown -R zunder-guard:zunder-guard "$SERVICE_HOME"
-  $SUDO install -m 0644 "$TMP/x/zunder-guard.service" /etc/systemd/system/zunder-guard.service
-  $SUDO install -d -m 0755 /etc/systemd/system/zunder-guard.service.d
+  $SUDO chown -R "$SERVICE_USER:$SERVICE_USER" "$SERVICE_HOME"
+  $SUDO install -m 0644 "$TMP/x/zunder-guard.service" "/etc/systemd/system/$SERVICE_UNIT.service"
+  $SUDO install -d -m 0755 "/etc/systemd/system/$SERVICE_UNIT.service.d"
   {
     say "# Written by install.sh $VERSION. No secrets here: the key is a credential."
     say "[Service]"
+    if [ -n "$SERVICE_INSTANCE" ]; then
+      say "User=$SERVICE_USER"
+      say "Group=$SERVICE_USER"
+      say "StateDirectory="
+      say "StateDirectory=$SERVICE_USER"
+      say "WorkingDirectory=$SERVICE_HOME"
+      say "Environment=ZUNDER_GUARD_HOME=$SERVICE_HOME"
+    fi
     say "Environment=ZUNDER_GUARD_NETWORK=$NET"
     if [ -n "$CREDENTIAL" ]; then
       say "$CREDENTIAL"
@@ -615,20 +763,20 @@ if [ "$SERVICE" -eq 1 ]; then
       say "ExecStart="
       say "ExecStart=$BIN run --network $NET"
     fi
-    [ "$NET" = mainnet ] && say "EnvironmentFile=$MAINNET_ENV"
-  } | $SUDO sh -c "umask 022 && cat > /etc/systemd/system/zunder-guard.service.d/10-install.conf"
+    if [ "$NET" = mainnet ]; then say "EnvironmentFile=$MAINNET_ENV"; fi
+  } | $SUDO sh -c "umask 022 && cat > /etc/systemd/system/$SERVICE_UNIT.service.d/10-install.conf"
   $SUDO systemctl daemon-reload
-  $SUDO systemctl enable zunder-guard >/dev/null 2>&1
+  $SUDO systemctl enable "$SERVICE_UNIT" >/dev/null 2>&1
   if [ "$NET" = mainnet ] && ! $SUDO test -e "$SERVICE_HOME/risk-mainnet.jsonl"; then
     # The mainnet risk journal is started by a person at the account's equity then, and only
     # then does Guard start (docs/guard.md, "Mainnet").
-    $SUDO systemctl stop zunder-guard >/dev/null 2>&1 || true
+    $SUDO systemctl stop "$SERVICE_UNIT" >/dev/null 2>&1 || true
     say ""
     say "Mainnet is set up and NOT started. When you are ready to trade, start the risk journal and"
     say "then Guard, which reads the confirmation from $MAINNET_ENV at every start:"
-    say "  sudo -u zunder-guard env ZUNDER_GUARD_HOME=$SERVICE_HOME ZUNDER_MAINNET_CONFIRM=$ACCOUNT \\"
+    say "  sudo -u $SERVICE_USER env ZUNDER_GUARD_HOME=$SERVICE_HOME ZUNDER_MAINNET_CONFIRM=$ACCOUNT \\"
     say "    $BIN journal-init --mode mainnet --note \"your name, why, today's date\""
-    say "  sudo systemctl start zunder-guard"
+    say "  sudo systemctl start $SERVICE_UNIT"
     say "To stop mainnet for good, remove $MAINNET_ENV: Guard then refuses to start."
     if [ -n "$KEY_FILE" ]; then
       say "WARNING: $KEY_FILE still holds the API wallet key in plain text. Guard does not need it any"
@@ -636,18 +784,18 @@ if [ "$SERVICE" -eq 1 ]; then
     fi
     exit 0
   fi
-  $SUDO systemctl restart zunder-guard
+  $SUDO systemctl restart "$SERVICE_UNIT"
   i=0
   HEALTH_LISTEN=$(guard config get listen)
   until "$BIN" health --listen "$HEALTH_LISTEN" >/dev/null 2>&1; do
     i=$((i + 1))
     if [ "$i" -ge 20 ]; then
-      $SUDO journalctl -u zunder-guard -n 20 --no-pager >&2 || true
-      die "Guard did not become healthy; see the log above (journalctl -u zunder-guard)"
+      $SUDO journalctl -u "$SERVICE_UNIT" -n 20 --no-pager >&2 || true
+      die "Guard did not become healthy; see the log above (journalctl -u $SERVICE_UNIT)"
     fi
     sleep 1
   done
-  say "Guard is running ($NET) as the systemd service zunder-guard, on 127.0.0.1 only."
+  say "Guard is running ($NET) as the systemd service $SERVICE_UNIT, on 127.0.0.1 only."
 fi
 
 if [ -n "$KEY_FILE" ]; then
@@ -655,7 +803,7 @@ if [ -n "$KEY_FILE" ]; then
   say "more: delete it (shred -u \"$KEY_FILE\" where available)."
 fi
 if [ "$SERVICE" -eq 1 ]; then
-  say "Logs: journalctl -u zunder-guard -f    Stop: sudo systemctl stop zunder-guard"
+  say "Logs: journalctl -u $SERVICE_UNIT -f    Stop: sudo systemctl stop $SERVICE_UNIT"
 else
   say "Start Guard: ZUNDER_GUARD_HOME=$GUARD_HOME $BIN run --network $NET"
 fi

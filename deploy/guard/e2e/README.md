@@ -101,6 +101,14 @@ python3 deploy/guard/e2e/render.py \
 
 The renderer emits expected existing OIDC claims for readback, not a repository subject mutation request. Preserve existing repository OIDC settings and publishing-role trust.
 
+## Verified tool staging
+
+The pinned SLSA installer authenticates its verifier binary and then installs it at `$HOME/.slsa/bin/v2.7.1/slsa-verifier` with mode0100. The workflow requires that exact PATH lookup, runner-owned regular single-link file, expected original mode and non-writable parent directories. It adds only owner-read permission on that file, then stages identical bytes as a runner-owned0500 executable in the fresh0700 tool directory. Unexpected paths, ownership, permissions or existing destinations fail before AWS credentials or venue-key access. No sudo, replacement download or verification bypass is involved.
+
+The installer action remains pinned to `ea584f4502babc6f60d9bc799dbbb13c1caa9ee6`; its [installation source](https://github.com/slsa-framework/slsa-verifier/blob/ea584f4502babc6f60d9bc799dbbb13c1caa9ee6/actions/installer/src/index.ts) establishes the authenticated installation and execute-only mode. Twelve offline staging regressions exercise the actual workflow block without executing verifier binaries. They do not replace hosted verification.
+
+This workflow correction requires a new reviewed immutable reusable-workflow commit, followed by a separate literal caller update and corresponding evidence-consumer pin. The runtime policy commit still comes from authenticated OIDC claims. It changes no orchestrator, signed-release verifier, policy file hash, host controller, boot inhibition, SSM document, IAM trust or credential permission. Existing deployment receipts retain their historical commit bindings; they must not be relabeled as evidence of the new hosted execution.
+
 ## Authentic pre-release artifact transport
 
 The transport admits only the canonical repository IDs, completed successful `release.yml` push run, exact tag/source and selected run attempt. It requires one `dist` artifact and one exact-tag provenance artifact, their metadata and downloaded ZIP size/digest, and creation timestamps inside the corresponding successful `package` and `provenance / generator` job windows for that same attempt. It rechecks both the selected attempt and the current run after downloads, refusing a concurrent rerun.
@@ -126,6 +134,7 @@ python3 -B deploy/guard/e2e/test-journey.py
 python3 -B deploy/guard/e2e/test-orchestrator.py
 python3 -B deploy/guard/e2e/test-host-control.py
 python3 -B deploy/guard/e2e/test-actions-artifacts.py
+python3 -B deploy/guard/e2e/test-tool-staging.py
 ```
 
 The 125 harness checks, 18 orchestration checks, 12 host-controller checks and 12 artifact-transport checks cover offline accounting bounds, ownership/cleanup refusal, inventory integrity, trigger/ref/fork admission, injection refusal, configuration rendering, permission scope, canonical UTC producer-to-scanner-to-harness contracts, effective boot inhibition, delayed activation after start timeout, exact artifact attempt/job binding, unsafe archive refusal and unchanged cryptographic verifier core. They do not replace the actual signed-binary/venue execution or deployment readbacks.

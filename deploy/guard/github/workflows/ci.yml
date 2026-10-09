@@ -19,7 +19,7 @@ env:
   CARGO_TERM_COLOR: never
 
 jobs:
-  rust:
+  rust-main:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -28,14 +28,14 @@ jobs:
       - run: rustup toolchain install
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
-      - run: cargo test --workspace --locked
+      - run: cargo test --workspace --locked -- --exact --skip the_generator_reaches_every_path --skip the_implementation_is_the_reference --skip the_implementation_is_the_reference_when_told_in_time --skip the_order_of_the_reports_does_not_matter
         env:
           ZUNDER_FLOWS_CASES: "4000"
 
   # Windows: clippy and the tests natively (owner-only ACLs, the Credential Manager, Ctrl-C),
   # then the PowerShell installer against a release made from this build, under Windows
   # PowerShell 5.1 and PowerShell 7 (deploy/guard/test/installer-windows.ps1).
-  windows:
+  windows-main:
     runs-on: windows-2025
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -53,7 +53,7 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           $cargo = (Get-Command cargo -CommandType Application -ErrorAction Stop).Source
-          $arguments = @('test', '--no-fail-fast', '--locked', '-p', 'zunder-venue', '-p', 'zunder-guard-core', '-p', 'zunder-guard-mcp', '-p', 'zunder-guard-rules', '-p', 'zunder-guard')
+          $arguments = @('test', '--no-fail-fast', '--locked', '-p', 'zunder-venue', '-p', 'zunder-guard-core', '-p', 'zunder-guard-mcp', '-p', 'zunder-guard-rules', '-p', 'zunder-guard', '--', '--exact', '--skip', 'the_generator_reaches_every_path', '--skip', 'the_implementation_is_the_reference', '--skip', 'the_implementation_is_the_reference_when_told_in_time', '--skip', 'the_order_of_the_reports_does_not_matter')
           $tests = Start-Process -FilePath $cargo -ArgumentList $arguments -NoNewWindow -PassThru
           $finished = $false
           try {
@@ -169,6 +169,129 @@ jobs:
             Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue
             Remove-Item Env:ZUNDER_ACL_PATH -ErrorAction SilentlyContinue
           }
+
+  rust-flows:
+    name: rust flow (${{ matrix.test }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        test:
+          - the_generator_reaches_every_path
+          - the_implementation_is_the_reference
+          - the_implementation_is_the_reference_when_told_in_time
+          - the_order_of_the_reports_does_not_matter
+    env:
+      FLOW_TEST: ${{ matrix.test }}
+      ZUNDER_FLOWS_CASES: "4000"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install
+      - name: Require exactly one selected flow test
+        shell: bash
+        run: python deploy/guard/github/check-flow-selection.py "$FLOW_TEST"
+      - name: Run the selected flow property
+        shell: bash
+        run: cargo test --locked -p zunder-venue --test flows_model "$FLOW_TEST" -- --exact
+
+  rust:
+    name: rust
+    if: always()
+    needs: [rust-main, rust-flows]
+    runs-on: ubuntu-24.04
+    env:
+      REQUIRED_RESULTS: ${{ toJSON(needs) }}
+    steps:
+      - name: Require every main and flow matrix job to succeed
+        shell: python
+        run: |
+          import json, os
+          results = json.loads(os.environ['REQUIRED_RESULTS'])
+          assert set(results) == {'rust-main', 'rust-flows'}, 'Unexpected dependency set'
+          assert all(job['result'] == 'success' for job in results.values()), 'A required CI dependency did not succeed'
+
+  windows-flows:
+    name: windows flow (${{ matrix.test }})
+    runs-on: windows-2025
+    strategy:
+      fail-fast: false
+      matrix:
+        test:
+          - the_generator_reaches_every_path
+          - the_implementation_is_the_reference
+          - the_implementation_is_the_reference_when_told_in_time
+          - the_order_of_the_reports_does_not_matter
+    env:
+      FLOW_TEST: ${{ matrix.test }}
+      ZUNDER_FLOWS_CASES: "400"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install
+      - name: Require exactly one selected flow test
+        shell: bash
+        run: python deploy/guard/github/check-flow-selection.py "$FLOW_TEST"
+      - name: Native Windows flow property (400 histories)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $cargo = (Get-Command cargo -CommandType Application -ErrorAction Stop).Source
+          $arguments = @('test', '--no-fail-fast', '--locked', '-p', 'zunder-venue', '--test', 'flows_model', $env:FLOW_TEST, '--', '--exact')
+          $tests = Start-Process -FilePath $cargo -ArgumentList $arguments -NoNewWindow -PassThru
+          $finished = $false
+          try {
+            # Retain the process handle until its exit code has been collected.
+            $null = $tests.Handle
+            while (-not $tests.WaitForExit(30000)) {
+              Write-Host 'Native Windows tests are active; cumulative process counters:'
+              try {
+                Get-CimInstance -ClassName Win32_Process -OperationTimeoutSec 5 -Filter "Name = 'cargo.exe' OR Name LIKE 'flows_model%'" |
+                  Select-Object Name, ProcessId,
+                    @{Name='CpuSeconds';Expression={[math]::Round(([decimal]$_.KernelModeTime + [decimal]$_.UserModeTime) / 10000000, 1)}},
+                    ReadOperationCount, WriteOperationCount, WriteTransferCount |
+                  Format-Table -AutoSize
+              } catch {
+                Write-Warning 'Process counters are unavailable; the test exit code still determines this step.'
+              }
+            }
+            $tests.WaitForExit()
+            $testExit = $tests.ExitCode
+            $finished = $true
+          } finally {
+            try {
+              if (-not $finished -and -not $tests.HasExited) {
+                & "$env:SystemRoot\System32\taskkill.exe" /PID $tests.Id /T /F | Out-Host
+                if (-not $tests.WaitForExit(10000)) {
+                  Write-Warning 'The test child did not exit after termination; this step remains failed.'
+                }
+              }
+            } catch {
+              Write-Warning 'Test child cleanup failed; the original wrapper failure is retained.'
+            } finally {
+              $tests.Dispose()
+            }
+          }
+          if ($null -eq $testExit) { throw 'The test process supplied no exit code' }
+          exit $testExit
+
+  windows:
+    name: windows
+    if: always()
+    needs: [windows-main, windows-flows]
+    runs-on: ubuntu-24.04
+    env:
+      REQUIRED_RESULTS: ${{ toJSON(needs) }}
+    steps:
+      - name: Require every main and flow matrix job to succeed
+        shell: python
+        run: |
+          import json, os
+          results = json.loads(os.environ['REQUIRED_RESULTS'])
+          assert set(results) == {'windows-main', 'windows-flows'}, 'Unexpected dependency set'
+          assert all(job['result'] == 'success' for job in results.values()), 'A required CI dependency did not succeed'
 
   # Native proof runs on PR/main before any release tag. No secrets or publication.
   macos-service:
@@ -322,12 +445,16 @@ jobs:
           python3 deploy/guard/github/test_publish_aws_template.py
           python3 -m pip install PyYAML==6.0.3
           python3 deploy/guard/test/aws_template_test.py
+      - name: Flow shard selection and workflow contracts (no Cargo execution)
+        run: python3 -B deploy/guard/github/test_flow_shards.py
       - name: Container supervisor contract (synthetic only; no native restart claim)
         run: python3 -B deploy/guard/test/container-supervisor.py
       - name: Docker build context admission and exclusions
         run: python3 -B deploy/guard/test/distribution.py DockerBuildContext
       - name: Container installer transaction and ownership checks
         run: python3 -B deploy/guard/test/container-installer.py
+      - name: Protected testnet credential dispatch checks
+        run: python3 -B deploy/guard/test/protected-testnet-dispatch.py
       - name: Publication gate regressions (no network or signing)
         run: |
           python3 -B deploy/guard/test/release-policy.py

@@ -296,6 +296,54 @@ class SupervisorTests(unittest.TestCase):
         self.assertNotIn(KEY.decode().strip(), json.dumps(argv) + json.dumps(env))
         self.assertIn('type=volume,source=existing-data,target=/data', argv)
 
+    def test_testnet_runtime_uses_bound_network_without_mainnet_consent(self):
+        self.config['mode'] = 'testnet'
+        self.host.mode = 'testnet'
+        calls = []
+        with patch.object(supervisor.os, 'execve', lambda *args: calls.append(args)):
+            supervisor.runtime(self.config)
+        self.assertEqual(calls[0][1][-5:], [IMAGE, 'run', '--network', 'testnet', '--key-stdin'])
+        self.assertFalse(any('ZUNDER_MAINNET_CONFIRM' in value for value in calls[0][1]))
+        self.assertEqual(self.open_credential.call_count, 1)
+
+    def test_explicit_testnet_install_retains_only_encrypted_key(self):
+        self.args.network = 'testnet'
+        self.host.mode = 'testnet'
+        self.install()
+        self.assertEqual(json.loads((self.base / 'config.json').read_text())['mode'], 'testnet')
+        self.assertEqual(self.host.encrypted_inputs, [KEY])
+        self.assertNotIn(KEY.strip(), b''.join(p.read_bytes() for p in self.root.rglob('*') if p.is_file()))
+
+    def test_same_account_volume_cannot_cross_network_before_key_read(self):
+        self.install()
+        self.host.encrypted_inputs.clear()
+        self.args.network = 'testnet'
+        self.host.mode = 'testnet'
+        with self.assertRaises(supervisor.Refused):
+            self.install()
+        self.assertEqual(self.host.encrypted_inputs, [])
+        self.assertNotIn('mode', json.loads((self.base / 'config.json').read_text()))
+
+    def test_private_frame_requires_lf_and_does_not_steal_next_child_frame(self):
+        for invalid in (KEY.rstrip(), b'\n', b'x' * 258, KEY + b'x'):
+            if invalid == KEY + b'x':
+                continue  # A following frame belongs to the next credential consumer.
+            with self.assertRaises(supervisor.Refused):
+                supervisor.read_key_frame(io.BytesIO(invalid))
+        raw = io.BytesIO(KEY + KEY)
+        buffered = io.BufferedReader(raw)
+        self.assertEqual(supervisor.read_key_frame(buffered), KEY)
+        self.assertEqual(raw.read(), KEY)
+
+    def test_mode_schema_unknown_paper_or_extra_fields_refused(self):
+        supervisor.validate(self.config)  # Immutable legacy config remains Mainnet.
+        self.assertEqual(supervisor.sending_mode(self.config), 'mainnet')
+        for mode in ('paper', '', None, 'Testnet'):
+            with self.subTest(mode=mode), self.assertRaises(supervisor.Refused):
+                supervisor.validate(dict(self.config, mode=mode))
+        with self.assertRaises(supervisor.Refused):
+            supervisor.validate(dict(self.config, mode='testnet', unknown=True))
+
     def test_production_like_fixture_exits_zero_on_real_sigterm(self):
         fixture = Path(__file__).parent / 'container-native/fake_guard.py'
         # Execute the real fixture entrypoint with only its state/key/network

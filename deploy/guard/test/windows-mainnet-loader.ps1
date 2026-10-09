@@ -5,6 +5,7 @@ param([string]$SourceRoot = (Split-Path $PSScriptRoot -Parent))
 Set-StrictMode -Version Latest
 $ErrorActionPreference='Stop'
 $tests=0
+$Network='mainnet'; $KeyStdin=$false
 function Assert([bool]$Condition,[string]$Name) { if (-not $Condition) { throw "FAIL: $Name" }; $script:tests++ }
 function Refuses([scriptblock]$Code,[string]$Name) { $failed=$false; try { & $Code | Out-Null } catch { $failed=$true }; Assert $failed $Name }
 foreach ($relative in @('loader/i.ps1','windows/service.ps1')) {
@@ -51,7 +52,7 @@ function Write-ZgJson($Path,$Value) {
 }
 function Get-ZgPreparedBinding {
   if (-not [IO.File]::Exists($ZgConfig)) { throw 'missing config' }
-  return [pscustomobject]@{ version=1; account=$ZgTransaction.account; api_wallet='0x2222222222222222222222222222222222222222'; mode='mainnet'; executable=$ZgExe; executable_sha256=(Get-ZgHash $ZgExe); home=$ZgHome; config=$ZgConfig; identity=@{service_name=$ZgServiceName;service_sid=$ZgSid} }
+  return [pscustomobject]@{ version=1; account=$ZgTransaction.account; api_wallet='0x2222222222222222222222222222222222222222'; mode=$Network; executable=$ZgExe; executable_sha256=(Get-ZgHash $ZgExe); home=$ZgHome; config=$ZgConfig; identity=@{service_name=$ZgServiceName;service_sid=$ZgSid} }
 }
 function Get-ZgBinding {
   $value=[IO.File]::ReadAllText($ZgBinding) | ConvertFrom-Json
@@ -64,6 +65,7 @@ function Invoke-ZgGuard([string[]]$Words) {
     if ([IO.File]::Exists($ZgConfig)) { throw 'Repeated init would replace pairings' }
     $script:initCalls++; $script:pairingOutput++
     [IO.File]::WriteAllText($ZgConfig,"synthetic-config`nclient=preserved`nrenewal=preserved")
+    if ($Network -eq 'testnet') { [IO.File]::WriteAllText((Join-Path $ZgHome 'risk.jsonl'),'synthetic fresh testnet journal') }
   } elseif ($Words[0] -eq 'service' -and $Words[1] -eq 'provision') {
     $credential=Join-Path $ZgRoot 'credential.dpapi'
     if ([IO.FileInfo]::new($credential).Length -ne 0) { throw 'Repeated credential provisioning refused' }
@@ -83,6 +85,7 @@ function Invoke-ZgSc([string[]]$Words) {
 function Start-ZgOwnedRuntime { if ($startupMode -ne 'demand') { throw 'start before Demand' }; $script:startCalls++; $script:running=$true; $script:trace.Add('started') }
 function Wait-ZgReady($StartedAt) { if ($script:badReadiness) { throw 'synthetic unready runtime' }; return @{account=$ZgTransaction.account;mode='mainnet';risk='active';trading_ready=$true;approval='not_required'} }
 function New-Case {
+  $script:Network='mainnet'; $script:KeyStdin=$false
   $script:work=Join-Path ([IO.Path]::GetTempPath()) ('zg-lifecycle-model-'+[Guid]::NewGuid().ToString('N'))
   [IO.Directory]::CreateDirectory($work) | Out-Null
   $script:ZgData=Join-Path $work 'data'; $script:ZgBin=Join-Path $work 'bin'; $script:ZgManagement=Join-Path $work 'management'
@@ -341,4 +344,41 @@ try {
   Assert ($disableCalls -ge 2 -and -not $running -and $startupMode -eq 'Disabled') 'admitted mutation failure retains disabled cleanup'
 } finally { Remove-Case }
 
-Write-Host "Windows mainnet synthetic lifecycle: $tests assertions passed. Native ACL/signature/SCM/reboot proof remains separate."
+# Explicit protected Testnet reuses the real lifecycle and strict status code.
+# Only key-input/OS boundaries are synthetic here; native SCM/DPAPI remains a separate gate.
+New-Case
+try {
+  Assert ((Get-ZgRecordNetwork ([pscustomobject]@{})) -ceq 'mainnet') 'missing transaction mode remains legacy mainnet'
+  foreach ($mode in @('paper','', 'Testnet')) {
+    Refuses { Get-ZgRecordNetwork ([pscustomobject]@{mode=$mode}) } 'unknown transaction mode refused'
+  }
+  $script:Network='testnet'; $script:Id='testnet-fixture'; $script:KeyStdin=$true
+  $ZgTransaction | Add-Member -NotePropertyName mode -NotePropertyValue 'testnet'
+  Assert ((Get-ZgConfirmationFlag) -ceq '--confirm-account') 'testnet uses public account selection, never mainnet consent'
+  Assert ((Get-ZgJournalPath) -ceq (Join-Path $ZgHome 'risk.jsonl')) 'testnet journal is isolated from mainnet journal'
+  function Assert-ZgPrivateTestnetInput { if ($Network -cne 'testnet' -or -not $KeyStdin) { throw 'synthetic private stdin admission refused' } }
+  & $realPrepare
+  Assert ($initCalls -eq 1 -and $provisionCalls -eq 1 -and $startCalls -eq 0) 'testnet prepare initializes and provisions once, remains stopped'
+  $initTrace=@($trace | Where-Object { $_ -like 'guard-init *' })[0]
+  $provisionTrace=@($trace | Where-Object { $_ -like 'guard-service provision *' })[0]
+  Assert ($initTrace -like '*--network testnet*' -and $initTrace -like '*--key-stdin*' -and $initTrace -notlike '*--confirm-mainnet*') 'testnet init only framed private stdin'
+  Assert ($provisionTrace -like '*--confirm-account*' -and $provisionTrace -like '*--key-stdin*' -and $provisionTrace -notlike '*--confirm-mainnet*') 'testnet DPAPI provision receives private stdin with network-specific confirmation'
+  $journalHash=Get-ZgJournalHash
+  & $realPrepare
+  Assert ($initCalls -eq 1 -and $provisionCalls -eq 1 -and (Get-ZgJournalHash) -ceq $journalHash) 'testnet resume preserves pairing, credential and journal'
+  $now=[DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+  $status=[pscustomobject]@{schema=1;version='1.0.0';mode='testnet';network='testnet';account=$ConfirmAccount;killed=$null;risk=@{state='active';journal_ready=$true};equity_cap='100';last_sync_ms=$now;last_error=$null;started_at_ms=$now;licence=@{state='active'};fee=@{mode='off'};journal_broken=$false}
+  $ready=Assert-ZgStatus $status $ConfirmAccount '100' $true ($now-1000)
+  Assert ($ready.trading_ready -and $ready.fee -eq 'off') 'testnet readiness requires active risk and fees off'
+  foreach ($mode in @('builder','fee_free')) {
+    $status.fee=@{mode=$mode}
+    Refuses { Assert-ZgStatus $status $ConfirmAccount '100' $true ($now-1000) } 'testnet refuses mainnet fee modes'
+  }
+  $status.fee=@{mode='off'}; $status.network='mainnet'
+  Refuses { Assert-ZgStatus $status $ConfirmAccount '100' $true ($now-1000) } 'testnet refuses mainnet runtime network'
+  $script:Network='mainnet'
+  Assert ((Get-ZgConfirmationFlag) -ceq '--confirm-mainnet') 'mainnet confirmation remains unchanged'
+  Refuses { Get-ZgFeeReadiness ([pscustomobject]@{mode='off'}) 'active' } 'mainnet cannot claim readiness with testnet fee mode'
+} finally { Remove-Case }
+
+Write-Host "Windows sending-service synthetic lifecycle: $tests assertions passed. Native ACL/signature/SCM/reboot proof remains separate."

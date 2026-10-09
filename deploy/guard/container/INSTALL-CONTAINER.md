@@ -78,3 +78,36 @@ requires `fee.approval.state` to be `approved`. Otherwise the installer reports 
 running with entries blocked, and directs the owner to https://zunderlabs.com/approve with the
 main wallet on Hyperliquid Mainnet. Fee-free mode is reported only when Guard confirms it;
 an explicitly expected licence never silently falls back to builder fees.
+
+## Protected Testnet automation candidate
+
+The additive Testnet path requires a newly signed release containing these helpers. Signed
+v1.0.1 draft assets remain immutable. Offline tests below do not establish native release
+readiness; signed-image installation, restart, reboot and venue journey evidence remain gates.
+
+Download and verify the exact release loader as usual, then invoke the saved loader from an
+unattended controller with these public arguments:
+
+```sh
+sh i --container --network testnet --non-interactive --key-stdin \
+  --account 0xYOUR_TESTNET_ACCOUNT --rules zr1_YOUR_RULES --equity-cap 100
+```
+
+The controller supplies two LF-terminated API wallet key frames on a private stdin pipe for a
+fresh installation. The first validates the Testnet API-wallet role and records only its public
+address; the second provisions the encrypted systemd credential. No private key belongs in
+arguments, environment variables, files or logs. A reinstall consumes only the provisioning
+frame; inspect the owned transaction before choosing the frame count. Pairing output is private
+controller output and must not be uploaded as public CI logs.
+
+Testnet defaults to the distinct `zunder-guard-testnet-data` volume. The supervisor and managed
+installation receipts bind the sending network; a Mainnet installation, pending transaction or
+unowned existing volume cannot be adopted by this route. This host supervisor supports one
+managed network at a time. Mainnet retains its existing interactive confirmations.
+
+Fresh Testnet init creates its risk journal once. Unattended activation checks matching network,
+account, active risk, a ready journal, no kill state and fee mode `off`; an explicitly supplied
+licence must also be active. Reinstallation preserves configuration, pairings, journals and
+risk stops. Missing or halted state is refused; no automatic journal reset or risk resume exists.
+The same durable activation gate, encrypted credentials, root ownership checks and independent
+owned-container guardian apply to Testnet. Failure leaves activation inhibited.

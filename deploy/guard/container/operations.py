@@ -274,6 +274,11 @@ def wait_for(path, predicate, seconds=30):
 
 def run(config, command, *, data=None, interactive=False, readonly=True, public_env=(), read_config=False):
     """Secret input is only forwarded after independent owned-ID acknowledgement."""
+    mode = config.get('mode', 'mainnet')
+    require(mode in ('mainnet', 'testnet'), 'Unsupported sending network.')
+    require(mode == 'mainnet' or not public_env, 'Testnet refuses mainnet consent environment.')
+    for value in public_env:
+        require(value == 'ZUNDER_MAINNET_CONFIRM=' + config['account'], 'Operation confirmation account differs.')
     preflight()
     require(not pending(), 'An earlier setup operation needs guardian cleanup first.')
     operation = uuid.uuid4().hex

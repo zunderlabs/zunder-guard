@@ -78,6 +78,16 @@ guardian while an installation or cleanup operation remains unresolved.
 
 ## Development verification
 
+The guided protected installer accepts explicit Testnet as well as Mainnet.
+Interactive Testnet setup uses Guard's hidden key check with no user-store write;
+the service supervisor separately encrypts the credential with systemd-creds.
+An explicit equity cap is required and is prompted when absent. Unattended Testnet
+keeps the paired private stdin flags; Mainnet keeps interactive consent.
+Testnet needs no paid licence. An explicitly supplied licence is validated and
+preserved, and an invalid licence refuses setup. Disposable staging checkout keys
+cannot activate the official signed Guard; genuine paid activation has its own
+release evidence lane.
+
 ```sh
 python3 -B deploy/guard/test/container-installer.py
 python3 -B deploy/guard/test/container-supervisor.py

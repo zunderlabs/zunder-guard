@@ -1,10 +1,10 @@
 // Copyright 2026 Orcastrate UG (haftungsbeschränkt)
 // SPDX-License-Identifier: Elastic-2.0
-//! Admission shared by OS-supervised mainnet installations.
+//! Admission shared by protected OS-supervised sending installations.
 //!
 //! This module never initializes or resumes a journal and never sends an order.
 //! Platform admission precedes credential input. The runtime repeats its normal
-//! mainnet checks and accepts a key only through its owned standard-input pipe.
+//! network checks and accepts a key only through its owned standard-input pipe.
 
 use crate::config::{GuardConfig, GuardMode};
 use serde::{Deserialize, Serialize};
@@ -68,6 +68,32 @@ pub enum ServiceIdentity {
 }
 
 impl ServiceBinding {
+    /// The authenticated binding, rather than ambient flags, selects the network.
+    /// Testnet identities occupy a separate namespace; legacy mainnet IDs and
+    /// their serialized credential digests remain unchanged.
+    pub fn sending_mode(&self) -> Result<GuardMode> {
+        match self.mode.as_str() {
+            "mainnet" => Ok(GuardMode::Mainnet),
+            "testnet" if self.credential_id.starts_with("testnet-") => Ok(GuardMode::Testnet),
+            _ => Err(refused(
+                "unsupported service mode or testnet identity namespace",
+            )),
+        }
+    }
+
+    pub fn validate_confirmation(
+        &self,
+        confirm_mainnet: Option<&str>,
+        confirm_account: Option<&str>,
+    ) -> Result<()> {
+        validate_confirmation(
+            self.sending_mode()?,
+            &self.account,
+            confirm_mainnet,
+            confirm_account,
+        )
+    }
+
     pub fn validate(&self) -> Result<GuardConfig> {
         self.validate_shape()?;
         for path in [&self.home, &self.config, &self.executable] {
@@ -97,12 +123,17 @@ impl ServiceBinding {
         config
             .validate()
             .map_err(|_| refused("invalid runtime service config"))?;
-        if config.mode != GuardMode::Mainnet {
-            return Err(refused("service config is not mainnet"));
+        let mode = self.sending_mode()?;
+        if config.mode != mode {
+            return Err(refused(
+                "service config mode differs from its bound network",
+            ));
         }
-        config
-            .check_mainnet()
-            .map_err(|_| refused("mainnet config guards failed"))?;
+        if mode == GuardMode::Mainnet {
+            config
+                .check_mainnet()
+                .map_err(|_| refused("mainnet config guards failed"))?;
+        }
         if config.account().map_err(|_| refused("invalid account"))? != address(&self.account)? {
             return Err(refused("configured account differs from service consent"));
         }
@@ -125,7 +156,7 @@ impl ServiceBinding {
         let path = config.risk_journal(false);
         if !path.is_file() {
             return Err(refused(
-                "mainnet journal must be explicitly initialized before service start",
+                "sending journal must be explicitly initialized before service start",
             ));
         }
         zunder_venue::PersistentRisk::open_for(
@@ -133,18 +164,19 @@ impl ServiceBinding {
             &config.policy.risk_limits(),
             &config
                 .journal_scope(false)
-                .map_err(|_| refused("invalid mainnet journal scope"))?,
+                .map_err(|_| refused("invalid sending journal scope"))?,
         )
         .map_err(|_| {
-            refused("mainnet journal could not be admitted; no automatic reset or resume")
+            refused("sending journal could not be admitted; no automatic reset or resume")
         })?;
         Ok(())
     }
 
     pub fn validate_shape(&self) -> Result<()> {
-        if self.version != 1 || self.mode != "mainnet" {
-            return Err(refused("unsupported service binding version or mode"));
+        if self.version != 1 {
+            return Err(refused("unsupported service binding version"));
         }
+        self.sending_mode()?;
         if self.credential_id.is_empty()
             || self.credential_id.len() > 80
             || !self
@@ -239,15 +271,40 @@ impl ServiceBinding {
             .args([
                 "run",
                 "--network",
-                "mainnet",
+                &self.mode,
                 "--key-stdin",
                 "--supervised-stdin",
                 "--service-binding",
             ])
-            .arg(binding_path)
-            .env(zunder_venue::hyperliquid::CONFIRM_VAR, &self.account);
+            .arg(binding_path);
+        if self.mode == "mainnet" {
+            cmd.env(zunder_venue::hyperliquid::CONFIRM_VAR, &self.account);
+        }
         cmd
     }
+}
+
+/// Mainnet consent and testnet account selection are deliberately different
+/// flags. Neither can stand in for the other, including during migration.
+pub fn validate_confirmation(
+    mode: GuardMode,
+    account: &str,
+    confirm_mainnet: Option<&str>,
+    confirm_account: Option<&str>,
+) -> Result<()> {
+    let confirmation = match (mode, confirm_mainnet, confirm_account) {
+        (GuardMode::Mainnet, Some(value), None) => value,
+        (GuardMode::Testnet, None, Some(value)) => value,
+        _ => {
+            return Err(refused(
+                "explicit mode-specific account confirmation required",
+            ));
+        }
+    };
+    if address(confirmation)? != address(account)? {
+        return Err(refused("confirmation differs from the admitted account"));
+    }
+    Ok(())
 }
 
 /// Only these three fields may change under automatic licence delivery/renewal.
@@ -290,7 +347,7 @@ pub fn hash_file(path: &Path) -> Result<String> {
 
 /// One bounded frame. Consumes no byte after LF, so the same reader can
 /// watch parent liveness without losing buffered input. Default keyread is unchanged.
-pub fn read_key_frame(reader: &mut impl Read) -> Result<Zeroizing<Vec<u8>>> {
+pub fn read_key_frame<R: Read + ?Sized>(reader: &mut R) -> Result<Zeroizing<Vec<u8>>> {
     let mut bytes = Zeroizing::new(Vec::with_capacity(68));
     loop {
         let mut next = [0u8; 1];
@@ -392,11 +449,33 @@ pub fn enforce_no_core_dumps() -> Result<()> {
     {
         macos::enforce_no_core_dumps()
     }
-    #[cfg(not(any(windows, target_os = "macos")))]
+    #[cfg(target_os = "linux")]
+    {
+        use nix::sys::resource::{Resource, getrlimit, setrlimit};
+        disable_and_verify_linux_core_dumps(
+            || setrlimit(Resource::RLIMIT_CORE, 0, 0),
+            || getrlimit(Resource::RLIMIT_CORE),
+        )
+    }
+    #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
     {
         Err(refused(
-            "this service credential backend is supported on Windows and macOS only",
+            "core-dump protection is unsupported on this platform",
         ))
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn disable_and_verify_linux_core_dumps(
+    disable: impl FnOnce() -> nix::Result<()>,
+    read: impl FnOnce() -> nix::Result<(nix::sys::resource::rlim_t, nix::sys::resource::rlim_t)>,
+) -> Result<()> {
+    disable().map_err(|_| refused("could not disable service core dumps"))?;
+    match read() {
+        Ok((0, 0)) => Ok(()),
+        _ => Err(refused(
+            "service requires soft and hard core limits of zero",
+        )),
     }
 }
 
@@ -662,6 +741,120 @@ mod runtime_snapshot_tests {
         (binding, config)
     }
 
+    fn testnet_fixture(home: &Path) -> (ServiceBinding, GuardConfig) {
+        let (mut binding, mut config) = fixture(home);
+        config.mode = GuardMode::Testnet;
+        config.network = Some(GuardNetwork::Testnet);
+        config.allow_mainnet = false;
+        binding.mode = "testnet".into();
+        binding.credential_id = "testnet-ci-snapshot".into();
+        binding.identity = ServiceIdentity::Windows {
+            service_name: "ZunderGuard-testnet-ci-snapshot".into(),
+            service_sid: "S-1-5-80-1-2-3-4-5".into(),
+        };
+        binding.admission_config_sha256 = config_fingerprint(&config).unwrap();
+        (binding, config)
+    }
+
+    #[test]
+    fn protected_testnet_requires_exact_config_network_wallet_and_namespace() {
+        let directory = TestDir::new("service-testnet-admission");
+        let (binding, config) = testnet_fixture(directory.path());
+        assert!(binding.validate_runtime_config(&config).is_ok());
+        for field in 0..5 {
+            let mut changed = config.clone();
+            match field {
+                0 => changed.mode = GuardMode::Paper,
+                1 => changed.network = Some(GuardNetwork::Mainnet),
+                2 => changed.allow_mainnet = true,
+                3 => changed.api_wallet = Some("0x4444444444444444444444444444444444444444".into()),
+                _ => changed.account = Some("0x4444444444444444444444444444444444444444".into()),
+            }
+            assert!(binding.validate_runtime_config(&changed).is_err());
+        }
+        let mut shared_identity = binding.clone();
+        shared_identity.credential_id = "ci-snapshot".into();
+        assert!(shared_identity.validate_shape().is_err());
+    }
+
+    #[test]
+    fn testnet_child_has_no_mainnet_consent_environment() {
+        let directory = TestDir::new("service-testnet-command");
+        let (binding, _) = testnet_fixture(directory.path());
+        let command = binding.child_command(&directory.path().join("binding.json"));
+        let args: Vec<_> = command
+            .get_args()
+            .map(|value| value.to_string_lossy().into_owned())
+            .collect();
+        assert!(args.windows(2).any(|pair| pair == ["--network", "testnet"]));
+        assert!(command.get_envs().next().is_none());
+        assert!(!args.iter().any(|value| value == "mainnet"));
+    }
+
+    #[test]
+    fn mainnet_child_retains_exact_account_confirmation_environment() {
+        let directory = TestDir::new("service-mainnet-command");
+        let (binding, _) = fixture(directory.path());
+        let command = binding.child_command(&directory.path().join("binding.json"));
+        assert!(command.get_args().any(|value| value == "mainnet"));
+        assert_eq!(
+            command.get_envs().collect::<Vec<_>>(),
+            vec![(
+                std::ffi::OsStr::new(zunder_venue::hyperliquid::CONFIRM_VAR),
+                Some(std::ffi::OsStr::new(&binding.account))
+            )]
+        );
+    }
+
+    #[test]
+    fn network_specific_confirmation_cannot_authorize_the_other_mode() {
+        let account = "0x1111111111111111111111111111111111111111";
+        assert!(validate_confirmation(GuardMode::Mainnet, account, Some(account), None).is_ok());
+        assert!(validate_confirmation(GuardMode::Testnet, account, None, Some(account)).is_ok());
+        for mode in [GuardMode::Mainnet, GuardMode::Testnet, GuardMode::Paper] {
+            assert!(validate_confirmation(mode, account, None, None).is_err());
+            assert!(validate_confirmation(mode, account, Some(account), Some(account)).is_err());
+        }
+        assert!(validate_confirmation(GuardMode::Mainnet, account, None, Some(account)).is_err());
+        assert!(validate_confirmation(GuardMode::Testnet, account, Some(account), None).is_err());
+        assert!(
+            validate_confirmation(
+                GuardMode::Testnet,
+                account,
+                None,
+                Some("0x2222222222222222222222222222222222222222")
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn testnet_credentials_are_scoped_differently_without_changing_legacy_mainnet_digest() {
+        let directory = TestDir::new("service-network-digest");
+        let (mainnet, _) = fixture(directory.path());
+        let bytes = serde_json::to_vec(&(
+            mainnet.version,
+            &mainnet.credential_id,
+            &mainnet.mode,
+            &mainnet.account,
+            &mainnet.api_wallet,
+            &mainnet.home,
+            &mainnet.config,
+            &mainnet.executable,
+            &mainnet.identity,
+        ))
+        .unwrap();
+        assert_eq!(
+            mainnet.digest().unwrap(),
+            format!("{:x}", Sha256::digest(bytes))
+        );
+        let (testnet, _) = testnet_fixture(directory.path());
+        assert_ne!(mainnet.digest().unwrap(), testnet.digest().unwrap());
+        let mut paper = testnet.clone();
+        paper.mode = "paper".into();
+        assert!(paper.validate_shape().is_err());
+    }
+
     #[test]
     fn restoring_admitted_disk_config_does_not_admit_changed_first_snapshot() {
         let directory = TestDir::new("service-snapshot-race");
@@ -746,5 +939,34 @@ mod runtime_snapshot_tests {
             }
         }
         assert!(accepted > 0 && rejected > 0);
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod linux_core_dump_tests {
+    use super::*;
+    use nix::errno::Errno;
+
+    #[test]
+    fn failed_core_limit_set_refuses_without_readback() {
+        let read = std::cell::Cell::new(false);
+        let error = disable_and_verify_linux_core_dumps(
+            || Err(Errno::EPERM),
+            || {
+                read.set(true);
+                Ok((0, 0))
+            },
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("could not disable"));
+        assert!(!read.get());
+    }
+
+    #[test]
+    fn core_limit_readback_requires_both_zero_and_a_successful_read() {
+        assert!(disable_and_verify_linux_core_dumps(|| Ok(()), || Ok((0, 0))).is_ok());
+        for result in [Ok((0, 1)), Ok((1, 0)), Ok((1, 1)), Err(Errno::EPERM)] {
+            assert!(disable_and_verify_linux_core_dumps(|| Ok(()), || result).is_err());
+        }
     }
 }

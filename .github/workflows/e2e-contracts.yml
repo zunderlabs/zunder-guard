@@ -22,3 +22,4 @@ jobs:
           python3 -B deploy/guard/e2e/test-orchestrator.py
           python3 -B deploy/guard/e2e/test-host-control.py
           python3 -B deploy/guard/e2e/test-actions-artifacts.py
+          python3 -B deploy/guard/e2e/test-tool-staging.py

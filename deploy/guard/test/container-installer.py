@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Nontrading installer transaction/guardian regressions. Python stdlib only."""
 import hashlib
+import base64
 import contextlib
 import io
 import importlib.util
@@ -377,6 +378,117 @@ class BootTransactions(Stage):
             with self.assertRaises(self.ops.Refused): self.wrapper.verify_volume(self.config, 'd' * 32)
 
 
+class ProtectedTestnetTransactions(Stage):
+    def test_interactive_fresh_setup_checks_hidden_key_without_user_store(self):
+        import argparse
+        import ast
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+        text = (SOURCE / 'container/install-container.py').read_text()
+        function = next(node for node in ast.parse(text).body
+                        if isinstance(node, ast.FunctionDef) and node.name == 'main')
+        fresh = next(node for node in function.body if isinstance(node, ast.If)
+                     and isinstance(node.test, ast.Name) and node.test.id == 'fresh')
+        code = compile(ast.Module(body=[fresh], type_ignores=[]), 'production-fresh-init', 'exec')
+        for network, cap in [('testnet', '40'), ('testnet', ''), ('mainnet', '')]:
+            with self.subTest(network=network, cap=cap):
+                args = argparse.Namespace(network=network, account=ACCOUNT, non_interactive=False,
+                                          key_stdin=False, equity_cap=cap, rules='', ip_share='', licence='')
+                runner = Mock()
+                prompt = Mock(return_value='40')
+                frame = Mock(side_effect=AssertionError('Interactive setup must not read stdin key frames'))
+                namespace = {**vars(self.wrapper), 'fresh': True, 'args': args, 'account': ACCOUNT,
+                             'config': self.config, 'record': {}, 'create_volume': Mock(),
+                             'phase': Mock(), 'ops': SimpleNamespace(run=runner),
+                             'sup': SimpleNamespace(read_key_frame=frame), 'prompt': prompt}
+                exec(code, namespace)
+                command = runner.call_args.args[1]
+                self.assertIn('--interactive', command)
+                self.assertNotIn('--key-stdin', command)
+                self.assertNotIn('--non-interactive', command)
+                self.assertEqual(runner.call_args.kwargs, {'interactive': True, 'readonly': False})
+                frame.assert_not_called()
+                if network == 'testnet':
+                    self.assertIn('--no-key', command)
+                    self.assertIn('--service-key-check', command)
+                    self.assertEqual(command[command.index('--equity-cap') + 1], '40')
+                    if not cap:
+                        prompt.assert_called_once()
+                        self.assertIn('TESTNET USDC', prompt.call_args.args[0])
+                    else:
+                        prompt.assert_not_called()
+                else:
+                    self.assertNotIn('--service-key-check', command)
+                    prompt.assert_not_called()
+
+    calls = BootTransactions.calls
+    inhibit = BootTransactions.inhibit
+    def setUp(self):
+        super().setUp()
+        self.config['mode'] = 'testnet'
+
+    def test_gate_mode_binding_refuses_legacy_mainnet_same_account_volume(self):
+        record = self.inhibit()
+        self.assertEqual(record['mode'], 'testnet')
+        del record['mode']
+        self.ops.atomic(self.wrapper.GATE, record)
+        with self.calls(), self.assertRaises(self.ops.Refused):
+            self.wrapper.inhibit(self.config, False)
+
+    def test_fresh_testnet_activates_without_prompt_or_journal_reset(self):
+        record = self.inhibit('not-found')
+        with self.calls(True), patch.object(self.wrapper, 'prompt') as prompt, \
+             patch.object(self.ops, 'run') as guard, \
+             patch.object(self.wrapper, 'readiness', return_value={'fee': {'mode': 'off'}}):
+            self.wrapper.activate(self.config, record, True, False, unattended=True)
+        prompt.assert_not_called()
+        guard.assert_not_called()
+        self.assertFalse(self.wrapper.GATE.exists())
+        self.assertTrue(any('start' in args for args in self.commands))
+
+    def test_unattended_never_applies_to_mainnet_even_with_a_gate(self):
+        record = self.inhibit()
+        mainnet = dict(self.config)
+        del mainnet['mode']
+        with self.calls(True), patch.object(self.wrapper, 'prompt') as prompt:
+            with self.assertRaises(self.ops.Refused):
+                self.wrapper.activate(mainnet, record, False, False, unattended=True)
+        prompt.assert_not_called()
+        self.assertTrue(self.wrapper.GATE.exists())
+        self.assertFalse(any('start' in args for args in self.commands))
+
+    def test_testnet_refuses_mainnet_environment_before_registry_or_secret_delivery(self):
+        with patch.object(self.ops, 'preflight') as preflight:
+            with self.assertRaises(self.ops.Refused):
+                self.ops.run(self.config, ['check-config'], public_env=['ZUNDER_MAINNET_CONFIRM=' + ACCOUNT])
+        preflight.assert_not_called()
+        self.assertEqual(list(self.registry.iterdir()), [])
+
+    def test_unattended_input_contract_requires_explicit_testnet_account_and_both_flags(self):
+        import argparse
+        args = argparse.Namespace(network='testnet', account=ACCOUNT, non_interactive=True, key_stdin=True)
+        self.wrapper.validate_input(args, False)
+        with self.assertRaises(self.ops.Refused):
+            self.wrapper.validate_input(args, True)
+        for field, value in [('network', 'mainnet'), ('network', 'paper'), ('account', ''),
+                             ('non_interactive', False), ('key_stdin', False)]:
+            bad = argparse.Namespace(**vars(args))
+            setattr(bad, field, value)
+            with self.subTest(field=field), self.assertRaises(self.ops.Refused):
+                self.wrapper.validate_input(bad, False)
+        legacy = argparse.Namespace(network='mainnet', account='', non_interactive=False, key_stdin=False)
+        self.wrapper.validate_input(legacy, True)
+        with self.assertRaises(self.ops.Refused):
+            self.wrapper.validate_input(legacy, False)
+        interactive_testnet = argparse.Namespace(network='testnet', account='', non_interactive=False, key_stdin=False)
+        self.wrapper.validate_input(interactive_testnet, True)
+        with self.assertRaises(self.ops.Refused):
+            self.wrapper.validate_input(interactive_testnet, False)
+
+    # Inherited generic transactions execute in the immutable Mainnet suite above.
+    # Avoid inheriting Mainnet-only prompt/journal assumptions in this Testnet class.
+
+
 class ServiceOwnership(Stage):
     def view(self, unit, foreign=False):
         def run(*args):
@@ -391,6 +503,16 @@ class ServiceOwnership(Stage):
 
     def absent(self, *args):
         return 'not-found' if '--property=LoadState' in args else ''
+
+    def test_owned_receipt_network_cannot_be_adopted_before_loaded_service_mutation(self):
+        with patch.object(self.wrapper, 'run', side_effect=self.absent):
+            self.wrapper.prepare_receipt(self.config)
+        mainnet_receipt = (self.base / 'managed-install.json').read_bytes()
+        with patch.object(self.wrapper, 'run') as run:
+            with self.assertRaises(self.ops.Refused):
+                self.wrapper.admit_services(dict(self.config, mode='testnet'))
+        run.assert_not_called()
+        self.assertEqual((self.base / 'managed-install.json').read_bytes(), mainnet_receipt)
 
     def test_foreign_reserved_unit_or_guardian_remains_byte_identical(self):
         for unit in (self.wrapper.UNIT, self.wrapper.GUARDIAN):
@@ -473,7 +595,7 @@ class BuilderReadiness(Stage):
                 'risk': {'state': 'active', 'journal_ready': True},
                 'fee': {'mode': 'fee_free' if fee_free else 'builder', 'approval': {'state': state}}}
 
-    def read_status(self, status, expected=False):
+    def read_status(self, status, expected=False, configured_licence=None):
         class Response:
             def __init__(self, path): self.status = 200; self.path = path
             def read(self, *args): return json.dumps(status if self.path == '/guard/status' else {'status': 'healthy'}).encode()
@@ -485,7 +607,7 @@ class BuilderReadiness(Stage):
         with patch.object(self.wrapper.http.client, 'HTTPConnection', Connection), \
              patch.object(self.wrapper.time, 'monotonic', side_effect=[0, 1, 61]), \
              patch.object(self.wrapper.time, 'sleep'):
-            return self.wrapper.readiness(self.config, expected)
+            return self.wrapper.readiness(self.config, expected, configured_licence)
 
     def test_all_builder_approval_states_and_fee_free_have_honest_next_step(self):
         for state in ('approved', 'unchecked', 'not_approved', 'refused', 'refused_by_venue', 'refused_by_venue_builder', 'fee_free'):
@@ -526,6 +648,49 @@ class BuilderReadiness(Stage):
 
     def test_unknown_approval_state_is_not_trading_ready(self):
         with self.assertRaises(self.ops.Refused): self.read_status(self.status('unknown-new-state'))
+
+
+class ProtectedTestnetReadiness(Stage):
+    status = BuilderReadiness.status
+    read_status = BuilderReadiness.read_status
+    def setUp(self):
+        super().setUp()
+        self.config['mode'] = 'testnet'
+
+    def test_testnet_readiness_requires_off_and_matching_network(self):
+        good = self.status('approved')
+        good.update(mode='testnet', network='testnet', fee={'mode': 'off'}, licence={'state':'none'})
+        self.assertEqual(self.read_status(good)['fee']['mode'], 'off')
+        for changes in ({'mode': 'mainnet'}, {'network': 'mainnet'}, {'fee': {'mode': 'builder'}},
+                        {'fee': {'mode': 'fee_free'}}, {'risk': {'journal_ready': True, 'state': 'halted'}}):
+            with self.subTest(changes=changes), self.assertRaises(self.ops.Refused):
+                self.read_status(dict(good, **changes))
+        with self.assertRaises(self.ops.Refused):
+            self.read_status(good, expected=True)
+        good['licence'] = {'state': 'active'}
+        self.assertEqual(self.read_status(good, expected=True, configured_licence=self.key([]))['fee']['mode'], 'off')
+
+    @staticmethod
+    def key(features):
+        payload=json.dumps({'licensee':'public fixture','features':features,'accounts':[ACCOUNT],'expires_at_ms':1999999999999}).encode()
+        return 'zgl1_'+base64.urlsafe_b64encode(payload).rstrip(b'=').decode()+'.'+base64.urlsafe_b64encode(b'0'*64).rstrip(b'=').decode()
+
+    def test_exact_testnet_licence_feature_profiles_and_active_signature_state(self):
+        for features,fee in [(['fee_free'],'fee_free'),([],'off')]:
+            key=self.key(features)
+            good=self.status();good.update(mode='testnet',network='testnet',fee={'mode':fee},licence={'state':'active'})
+            self.assertEqual(self.read_status(good,expected=True,configured_licence=key)['fee']['mode'],fee)
+            # Reinstallation preserves the configured licence even without a new option.
+            self.assertEqual(self.read_status(good,configured_licence=key)['fee']['mode'],fee)
+            for changes in ({'fee':{'mode':'builder'}},{'fee':{'mode':'off'if fee=='fee_free'else'fee_free'}},
+                            {'licence':{'state':'none'}},{'licence':{'state':'not_used'}}):
+                with self.subTest(features=features,changes=changes),self.assertRaises(self.ops.Refused):
+                    self.read_status(dict(good,**changes),expected=True,configured_licence=key)
+
+    def test_invalid_configured_licence_is_not_discarded(self):
+        good=self.status();good.update(mode='testnet',network='testnet',fee={'mode':'off'},licence={'state':'active'})
+        for key in ('bad','zgl1_broken.signature',self.key(['unknown_feature'])):
+            with self.subTest(key=key),self.assertRaises(self.ops.Refused):self.read_status(good,expected=True,configured_licence=key)
 
 
 class Dispatch(unittest.TestCase):
@@ -571,7 +736,7 @@ class Bootstrap(unittest.TestCase):
     def test_signature_hash_and_manifest_fail_closed_before_helper(self):
         text = (SOURCE / 'install.sh').read_text()
         embedded = text.split("<<'CONTAINER_BOOTSTRAP'\n", 1)[1].split('\nCONTAINER_BOOTSTRAP', 1)[0]
-        for case in ('valid', 'signature', 'tamper', 'duplicate', 'missing', 'verifier'):
+        for case in ('valid', 'testnet', 'signature', 'tamper', 'duplicate', 'missing', 'verifier'):
             with self.subTest(case=case), tempfile.TemporaryDirectory() as folder:
                 base = Path(folder)
                 incoming = base / 'incoming'; incoming.mkdir()
@@ -600,16 +765,28 @@ class Bootstrap(unittest.TestCase):
                 terminal = base / 'terminal'; terminal.write_bytes(b'')
                 code = code.replace("open('/dev/tty', 'rb')", 'open(' + repr(str(terminal)) + ", 'rb')")
                 commands = []
+                synthetic = b'ab' * 32 + b'\n'
+                private_input = io.TextIOWrapper(io.BytesIO(synthetic + synthetic))
                 def fake_run(argv, **kwargs):
                     commands.append(argv)
+                    if case == 'testnet' and argv[0] == '/usr/bin/python3':
+                        self.assertIs(kwargs['stdin'], private_input.buffer)
+                        self.assertEqual(kwargs['stdin'].read(), synthetic + synthetic)
+                        self.assertIn('--network', argv)
+                        self.assertIn('testnet', argv)
+                        self.assertIn('--non-interactive', argv)
+                        self.assertIn('--key-stdin', argv)
+                        self.assertNotIn(synthetic.decode().strip(), repr(argv) + repr(kwargs['env']))
                     status = 1 if case == 'signature' and 'verify-blob' in argv else 0
                     return subprocess.CompletedProcess(argv, status)
-                args = ['bootstrap', str(incoming), pin, version, '', '', '', '', '', '']
-                with patch('sys.argv', args), patch('subprocess.run', side_effect=fake_run), patch('resource.setrlimit'):
+                args = ['bootstrap', str(incoming), pin, version, '', '', '', '', '', '', 'mainnet', '0', '0']
+                if case == 'testnet': args[-3:] = ['testnet', '1', '1']
+                args += ['0', '0', '', '']
+                with patch('sys.argv', args), patch('sys.stdin', private_input), patch('subprocess.run', side_effect=fake_run), patch('resource.setrlimit'):
                     with self.assertRaises(SystemExit) as result: exec(compile(code, 'real-bootstrap', 'exec'), {})
                 helper_calls = [argv for argv in commands if argv[0] == '/usr/bin/python3']
-                self.assertEqual(bool(helper_calls), case == 'valid')
-                if case == 'valid': self.assertEqual(result.exception.code, 0)
+                self.assertEqual(bool(helper_calls), case in ('valid', 'testnet'))
+                if case in ('valid', 'testnet'): self.assertEqual(result.exception.code, 0)
                 else: self.assertNotEqual(result.exception.code, 0)
                 if case != 'verifier':
                     verifier = commands[0]

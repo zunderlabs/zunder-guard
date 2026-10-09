@@ -1,6 +1,7 @@
 #!/usr/bin/python3
-"""Verified interactive Linux container setup. Mainnet is never started by default."""
+"""Verified Linux container setup. Unattended provisioning requires explicit Testnet."""
 import argparse
+import base64
 import fcntl
 import hashlib
 import http.client
@@ -84,8 +85,111 @@ def prompt(text):
     return answer.strip()
 
 
+def sending_mode(config):
+    mode = config.get('mode', 'mainnet')
+    require(mode in ('mainnet', 'testnet'), 'Unsupported sending network.')
+    return mode
+
+
+def validate_input(args, terminal):
+    require(args.network in ('mainnet', 'testnet'), 'Unsupported sending network.')
+    if args.non_interactive or args.key_stdin:
+        require(args.network == 'testnet' and args.non_interactive and args.key_stdin,
+                'Unattended private stdin provisioning requires explicit Testnet.')
+        require(not terminal, 'Testnet key input must be a private redirected pipe, never an echoing terminal.')
+        require(re.fullmatch('0x[a-fA-F0-9]{40}', args.account or ''), 'Explicit Testnet account required.')
+    else:
+        require(terminal, 'An interactive terminal is required.')
+
+
 def confirm(text, expected):
     require(prompt(text) == expected, 'Confirmation did not match; setup remains stopped.')
+
+
+def registry_auth(path):
+    """Explicit isolated basic GHCR auth only; no helpers or ambient fallback."""
+    require(path.is_absolute() and path.resolve() == path, 'Canonical isolated registry auth directory required.')
+    ops.parents(path); ops.trusted(path, True)
+    require(stat.S_IMODE(path.stat().st_mode) == 0o700 and {p.name for p in path.iterdir()} == {'config.json'},
+            'Isolated auth directory must contain only config.json, mode 0700.')
+    config = path / 'config.json'; ops.trusted(config)
+    info = config.stat()
+    require(stat.S_IMODE(info.st_mode) == 0o600 and info.st_nlink == 1 and 0 < info.st_size <= 4096,
+            'Root-only bounded auth file required.')
+    def pairs(items):
+        value = {}
+        for key, item in items:
+            require(key not in value, 'Duplicate registry auth field.'); value[key] = item
+        return value
+    try:
+        value = json.loads(config.read_bytes(), object_pairs_hook=pairs)
+        require(type(value) is dict and set(value) == {'auths'} and type(value['auths']) is dict
+                and set(value['auths']) == {'ghcr.io'} and type(value['auths']['ghcr.io']) is dict
+                and set(value['auths']['ghcr.io']) == {'auth'}, 'Only explicit ghcr.io basic auth is admitted.')
+        encoded = value['auths']['ghcr.io']['auth']
+        require(type(encoded) is str and len(encoded) <= 2048, 'Bounded basic auth required.')
+        secret = base64.b64decode(encoded, validate=True)
+        require(base64.b64encode(secret).decode() == encoded
+                and re.fullmatch(rb'[A-Za-z0-9_-]{1,64}:[A-Za-z0-9_]{1,512}', secret),
+                'Canonical GHCR basic authentication required.')
+    except (ValueError, UnicodeError, TypeError):
+        raise ops.Refused('Malformed isolated registry authentication.') from None
+    return (path.stat().st_dev, path.stat().st_ino, info.st_dev, info.st_ino)
+
+
+def scrub_registry_auth(path, identity):
+    config = path / 'config.json'
+    require((path.stat().st_dev, path.stat().st_ino, config.stat().st_dev, config.stat().st_ino) == identity
+            and {p.name for p in path.iterdir()} == {'config.json'}, 'Registry auth changed; refuse blind removal.')
+    ops.trusted(path, True); ops.trusted(config)
+    require(config.stat().st_nlink == 1, 'Linked auth is never scrubbed blindly.')
+    config.unlink(); path.rmdir()
+    require(not path.exists() and not config.exists(), 'Registry auth cleanup incomplete.')
+    descriptor = os.open(path.parent, os.O_RDONLY)
+    try: os.fsync(descriptor)
+    finally: os.close(descriptor)
+
+
+def prepare_image(args, sup):
+    require(args.network == 'testnet' and not any((args.rules, args.account, args.volume, args.equity_cap,
+            args.ip_share, args.licence, args.key_stdin, args.non_interactive, args.prepared_image)),
+            'Image preparation admits no wallet/setup options.')
+    require(re.fullmatch('[0-9a-f]{40}', args.source_commit or ''), 'Independently verified exact source required.')
+    auth = Path(args.registry_auth_dir); identity = registry_auth(auth)
+    try:
+        require(not sup.PREPARED_IMAGE.exists() and not sup.PREPARED_IMAGE.is_symlink(),
+                'Existing prepared image requires separate review; never replace silently.')
+        image = (STAGE / ('zunder-guard-' + args.version + '.image.txt')).read_text().strip()
+        require(re.fullmatch(r'ghcr\.io/zunderlabs/zunder-guard@sha256:[0-9a-f]{64}', image), 'Exact signed OCI descriptor required.')
+        env = dict(ENV, DOCKER_CONFIG=str(auth))  # Public path only, never a token value.
+        commands = [
+            [sup.COSIGN, 'verify', image, '--certificate-identity',
+             'https://github.com/zunderlabs/zunder-guard/.github/workflows/release.yml@refs/tags/' + args.version,
+             '--certificate-oidc-issuer', 'https://token.actions.githubusercontent.com'],
+            [sup.DOCKER, '--config', str(auth), '--host', 'unix:///var/run/docker.sock', 'pull', image],
+            [sup.DOCKER, '--config', str(auth), '--host', 'unix:///var/run/docker.sock', 'image', 'inspect', image]]
+        outputs = []
+        for command in commands:
+            result = subprocess.run(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, env=env, timeout=600, check=False)
+            require(result.returncode == 0 and len(result.stdout) <= 1024*1024 and len(result.stderr) <= 1024*1024,
+                    'Private artifact verification/pull failed; no wallet input is admitted.')
+            outputs.append(result.stdout)
+        objects = json.loads(outputs[-1])
+        require(len(objects) == 1 and re.fullmatch('sha256:[0-9a-f]{64}', objects[0]['Id'])
+                and image in objects[0].get('RepoDigests', []) and objects[0].get('Config', {}).get('User') == '65532:65532',
+                'Immutable signed image binding differs.')
+        manifest = hashlib.sha256((STAGE / 'SHA256SUMS').read_bytes()).hexdigest()
+        value = dict(schema=1, tag=args.version, image=image, image_id=objects[0]['Id'],
+                     manifest_sha256=manifest, source_commit=args.source_commit)
+    finally:
+        # Any failure after admission still scrubs only the exact owned auth input.
+        scrub_registry_auth(auth, identity)
+    sup.directory(sup.PREPARED_IMAGE)
+    fd = os.open(sup.PREPARED_IMAGE / 'receipt.json', os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, 'wb') as stream:
+        stream.write((json.dumps(value, sort_keys=True) + '\n').encode()); stream.flush(); os.fsync(stream.fileno())
+    print('Exact signed image prepared. Isolated registry auth was removed. No wallet was read or installed.')
 
 
 def enabled_state():
@@ -130,7 +234,8 @@ def inhibit(config, fresh):
             'Other supervisor drop-ins require separate review before managed upgrade.')
     if GATE.exists():
         record = ops.read(GATE)
-        require(record.get('account') == config['account'] and record.get('volume') == config['volume']
+        require(sending_mode(record) == sending_mode(config)
+                and record.get('account') == config['account'] and record.get('volume') == config['volume']
                 and record.get('original_enabled') in ('enabled', 'disabled', 'not-found')
                 and re.fullmatch('[a-f0-9]{32}', record.get('transaction', '')),
                 'Incomplete transaction does not match this installation.')
@@ -140,6 +245,8 @@ def inhibit(config, fresh):
         record = {'transaction': uuid.uuid4().hex, 'account': config['account'], 'volume': config['volume'],
                   'original_enabled': enabled_state(), 'original_active': active_state(),
                   'fresh': fresh, 'phase': 'inhibited'}
+        if sending_mode(config) == 'testnet':
+            record['mode'] = 'testnet'
         file_write(DROPIN, gate_text())
         ops.atomic(GATE, record)
     run(SYSTEMCTL, 'daemon-reload')
@@ -169,13 +276,15 @@ def ownership_receipt():
     ops.trusted(path)
     require(stat.S_IMODE(path.stat().st_mode) == 0o600, 'Managed receipt must be root-only.')
     receipt = ops.read(path)
-    require(set(receipt) == {'version', 'account', 'volume', 'allowed_files', 'config_refs'}
+    require(set(receipt) in ({'version', 'account', 'volume', 'allowed_files', 'config_refs'},
+                             {'version', 'account', 'volume', 'allowed_files', 'config_refs', 'mode'})
             and receipt['version'] == 1, 'Invalid managed-install receipt.')
     require(set(receipt['allowed_files']) == {str(path) for path in managed_assets()},
             'Unexpected managed-install file identities.')
     require(all(isinstance(values, list) and values and
                 all(isinstance(value, str) and re.fullmatch('[a-f0-9]{64}', value) for value in values)
                 for values in receipt['allowed_files'].values()), 'Invalid managed-install hashes.')
+    sending_mode(receipt)
     require(isinstance(receipt['config_refs'], list), 'Invalid managed configuration references.')
     return receipt
 
@@ -203,7 +312,8 @@ def admit_services(config):
     """Root-owned is not installer-owned: bind disk AND systemd's loaded fragment."""
     receipt = ownership_receipt()
     if receipt:
-        require(receipt['account'] == config['account'] and receipt['volume'] == config['volume'],
+        require(sending_mode(receipt) == sending_mode(config)
+                and receipt['account'] == config['account'] and receipt['volume'] == config['volume'],
                 'Managed receipt names another account or volume.')
     for target in managed_assets():
         if target.exists() or target.is_symlink():
@@ -216,7 +326,10 @@ def admit_services(config):
     if config_path.exists() or config_path.is_symlink():
         require(receipt is not None, 'Existing supervisor config has no managed-install receipt.')
         current = ops.read(config_path)
-        require(any(isinstance(ref, dict) and set(ref) == {'account', 'volume', 'tag', 'image'}
+        require(sending_mode(current) == sending_mode(config)
+                and any(isinstance(ref, dict) and set(ref) in ({'account', 'volume', 'tag', 'image'},
+                                                               {'account', 'volume', 'tag', 'image', 'mode'})
+                    and sending_mode(ref) == sending_mode(current)
                     and all(current.get(key) == value for key, value in ref.items())
                     for ref in receipt['config_refs']), 'Installed configuration identity differs from its receipt.')
     if DROPIN.exists() or DROPIN.is_symlink():
@@ -250,11 +363,15 @@ def prepare_receipt(config):
     receipt = ownership_receipt() or {
         'version': 1, 'account': config['account'], 'volume': config['volume'],
         'allowed_files': {str(path): [] for path in managed_assets()}, 'config_refs': []}
+    if sending_mode(config) == 'testnet':
+        receipt['mode'] = 'testnet'
     for target, source in managed_assets().items():
         digest = hashlib.sha256(source.read_bytes()).hexdigest()
         if digest not in receipt['allowed_files'][str(target)]:
             receipt['allowed_files'][str(target)].append(digest)
     reference = {key: config[key] for key in ('account', 'volume', 'tag', 'image')}
+    if sending_mode(config) == 'testnet':
+        reference['mode'] = 'testnet'
     if reference not in receipt['config_refs']:
         receipt['config_refs'].append(reference)
     ops.atomic(BASE / 'managed-install.json', receipt)
@@ -291,16 +408,42 @@ def verify_volume(config, owner=None):
     require(not ops.identifiers('volume=' + config['volume']), 'Another container uses this volume.')
 
 
-def create_volume(config, record):
+def create_volume(config, record, unattended=False):
     require(config['volume'] not in volume_names(), 'Volume name already exists; explicit adoption required.')
-    confirm('Type CREATE ' + config['volume'] + ' to create this NEW persistent volume:', 'CREATE ' + config['volume'])
+    require(not unattended or sending_mode(config) == 'testnet', 'Only Testnet can create unattended.')
+    if not unattended:
+        confirm('Type CREATE ' + config['volume'] + ' to create this NEW persistent volume:', 'CREATE ' + config['volume'])
     ops.docker('volume', 'create', '--driver', 'local', '--label',
                'com.zunderlabs.guard-install-volume=' + record['transaction'], config['volume'])
     verify_volume(config, record['transaction'])
     phase(record, 'volume-created')
 
 
-def readiness(config, expect_fee_free):
+def licence_fee_free(key):
+    """Decode expectations; runtime must validate signature/account/expiry."""
+    if not key:
+        return False
+    require(type(key) is str and len(key) <= 4096 and key.startswith('zgl1_'), 'Configured licence encoding differs.')
+    parts = key[5:].split('.')
+    require(len(parts) == 2 and all(re.fullmatch('[A-Za-z0-9_-]+', part) for part in parts),
+            'Configured licence encoding differs.')
+    try:
+        payload = base64.urlsafe_b64decode(parts[0] + '=' * ((4 - len(parts[0]) % 4) % 4))
+        require(base64.urlsafe_b64encode(payload).rstrip(b'=').decode() == parts[0], 'Configured licence payload differs.')
+        value = json.loads(payload)
+        features = value.get('features')
+        require(type(features) is list and all(type(item) is str and item == 'fee_free' for item in features),
+                'Configured licence feature profile differs.')
+    except (ValueError, UnicodeError, TypeError, AttributeError):
+        raise ops.Refused('Configured licence payload is malformed.') from None
+    return 'fee_free' in features
+
+
+def readiness(config, expect_fee_free, configured_licence=None):
+    expected_testnet_fee = None
+    if sending_mode(config) == 'testnet':
+        require(not expect_fee_free or configured_licence, 'Explicit Testnet licence expectation requires the configured signed key.')
+        expected_testnet_fee = 'fee_free' if licence_fee_free(configured_licence) else 'off'
     deadline = time.monotonic() + 60
     while time.monotonic() < deadline:
         try:
@@ -316,14 +459,19 @@ def readiness(config, expect_fee_free):
             require(response.status == 200, 'Guard status unavailable.')
             status = json.loads(response.read(1024 * 1024))
             connection.close()
-            require(status.get('mode') == 'mainnet' and status.get('network') == 'mainnet'
+            require(status.get('mode') == sending_mode(config) and status.get('network') == sending_mode(config)
                     and status.get('account', '').lower() == config['account'].lower(), 'Guard account/mode mismatch.')
             require(status.get('risk', {}).get('journal_ready') is True
                     and status.get('risk', {}).get('state') == 'active'
                     and 'killed' in status and status['killed'] is None,
                     'Guard risk state is not ready; no automatic resume is permitted.')
             fee = status.get('fee', {}).get('mode')
-            require(fee == 'fee_free' if expect_fee_free else fee in ('fee_free', 'builder'), 'Unexpected licence/fee state.')
+            if sending_mode(config) == 'testnet':
+                require(fee == expected_testnet_fee, 'Testnet fee differs from the exact configured licence features.')
+                require(status.get('licence', {}).get('state') == ('active' if configured_licence else 'none'),
+                        'Testnet configured licence did not validate, or absent licence state differs.')
+            else:
+                require(fee == 'fee_free' if expect_fee_free else fee in ('fee_free', 'builder'), 'Unexpected licence/fee state.')
             if fee == 'builder':
                 require(status['fee'].get('approval', {}).get('state') in
                         ('approved', 'unchecked', 'not_approved', 'refused',
@@ -335,13 +483,14 @@ def readiness(config, expect_fee_free):
     raise ops.Refused('Guard did not reach the expected healthy account/risk/licence state.')
 
 
-def activate(config, record, fresh, expect_fee_free):
+def activate(config, record, fresh, expect_fee_free, unattended=False, configured_licence=None):
+    require(not unattended or sending_mode(config) == 'testnet', 'Only Testnet can activate unattended.')
     verify_gate()
-    answer = prompt('Type START ' + config['account'] + ' to activate this mainnet Guard; anything else leaves it stopped:')
+    answer = ('START ' + config['account']) if unattended else prompt('Type START ' + config['account'] + ' to activate this ' + sending_mode(config) + ' Guard; anything else leaves it stopped:')
     if answer != 'START ' + config['account']:
         print('Installed and stopped. Boot activation remains inhibited; rerun this installer to continue.')
         return
-    if fresh:
+    if fresh and sending_mode(config) == 'mainnet':
         note = prompt('Who approved the first mainnet risk journal, and why?')
         require(3 <= len(note) <= 512 and '\x00' not in note, 'An attributable journal note is required.')
         ops.run(config, ['journal-init', '--mode', 'mainnet', '--note', note], readonly=False,
@@ -351,7 +500,8 @@ def activate(config, record, fresh, expect_fee_free):
     boot_enabled = record['original_enabled'] != 'disabled'
     print('Boot recovery will be ' + ('enabled.' if boot_enabled else 'disabled (preserving previous state).'))
     # This second choice also covers the enabled-state change on first installation.
-    confirm('Type ACTIVATE to commit that start/boot choice:', 'ACTIVATE')
+    if not unattended:
+        confirm('Type ACTIVATE to commit that start/boot choice:', 'ACTIVATE')
     run(SYSTEMCTL, 'enable' if boot_enabled else 'disable', UNIT)
     verify_gate()
     record['phase'] = 'ready-to-activate'
@@ -361,7 +511,7 @@ def activate(config, record, fresh, expect_fee_free):
     ops.sync_directory(BASE)
     try:
         run(SYSTEMCTL, 'start', UNIT)
-        status = readiness(config, expect_fee_free)
+        status = readiness(config, expect_fee_free, configured_licence)
     except BaseException:
         ops.atomic(GATE, record)
         run(SYSTEMCTL, 'stop', UNIT)
@@ -385,14 +535,28 @@ def main():
     parser.add_argument('--version', required=True)
     for flag in ('volume', 'account', 'rules', 'equity-cap', 'ip-share', 'licence'):
         parser.add_argument('--' + flag, default='')
+    parser.add_argument('--network', choices=('mainnet', 'testnet'), default='mainnet')
+    parser.add_argument('--non-interactive', action='store_true')
+    parser.add_argument('--prepare-image', action='store_true')
+    parser.add_argument('--prepared-image', action='store_true')
+    parser.add_argument('--registry-auth-dir', default='')
+    parser.add_argument('--source-commit', default='')
+    parser.add_argument('--key-stdin', action='store_true')
     args = parser.parse_args()
-    require(sys.platform == 'linux' and os.geteuid() == 0 and sys.stdin.isatty(), 'Linux root and a terminal are required.')
+    if not args.prepare_image:
+        require(not args.registry_auth_dir, 'Registry auth is only admitted during image preparation.')
+        require(args.prepared_image == bool(args.source_commit), 'Prepared image needs exact source; no ambiguous fallback.')
+        validate_input(args, sys.stdin.isatty())
+    require(sys.platform == 'linux' and os.geteuid() == 0, 'Linux root is required.')
     require(re.fullmatch('v[0-9]+\\.[0-9]+\\.[0-9]+', args.version), 'Invalid release version.')
     for tool in (SYSTEMCTL, '/usr/bin/docker', '/usr/bin/systemd-creds', '/usr/bin/python3', '/usr/local/bin/cosign'):
         ops.executable(tool)
+    sup = load_module('container_supervisor', STAGE / 'container-supervisor.py')
+    if args.prepare_image:
+        prepare_image(args, sup)
+        return
     mkdir(BASE)
     mkdir(BASE / 'docker-config')
-    sup = load_module('container_supervisor', STAGE / 'container-supervisor.py')
     sup.preflight(installing=True)
     require(not list((BASE / 'docker-config').iterdir()), 'Docker config directory must be empty.')
     lock = os.open(BASE / 'installer.lock', os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
@@ -401,28 +565,38 @@ def main():
     existing = sup.load() if (BASE / 'config.json').exists() else None
     pending_record = ops.read(GATE) if GATE.exists() else None
     account = args.account or (existing or pending_record or {}).get('account') or prompt('Hyperliquid account (public 0x address):')
-    volume = args.volume or (existing or pending_record or {}).get('volume') or 'zunder-guard-data'
+    volume = args.volume or (existing or pending_record or {}).get('volume') or (
+        'zunder-guard-testnet-data' if args.network == 'testnet' else 'zunder-guard-data')
     image = (STAGE / ('zunder-guard-' + args.version + '.image.txt')).read_text()
     image = image[:-1] if image.endswith('\n') else image
     config = {'image': image, 'tag': args.version, 'volume': volume, 'account': account, 'instance': uuid.uuid4().hex}
+    if args.network == 'testnet':
+        config['mode'] = 'testnet'
     sup.validate(config)
     if existing:
+        require(sending_mode(existing) == args.network, 'Existing supervisor belongs to another network.')
         require(existing['account'] == account and existing['volume'] == volume, 'Existing account/volume cannot change here.')
         require(not any((args.rules, args.equity_cap, args.ip_share, args.licence)),
                 'Existing setup options cannot be replaced by reinstall; use the documented configuration/licence command.')
     if pending_record:
+        require(sending_mode(pending_record) == args.network, 'Interrupted setup belongs to another network.')
         require(not any((args.rules, args.equity_cap, args.ip_share, args.licence)),
                 'Interrupted setup preserves existing choices; rerun without setup options.')
-    print('Verified release ' + args.version + '; mainnet account ' + account + '; persistent volume ' + volume + '.')
-    sup.execute([sup.COSIGN, 'verify', image, '--certificate-identity',
-                 'https://github.com/zunderlabs/zunder-guard/.github/workflows/release.yml@refs/tags/' + args.version,
-                 '--certificate-oidc-issuer', 'https://token.actions.githubusercontent.com'])
-    sup.docker('pull', image)
+    print('Verified release ' + args.version + '; ' + args.network + ' account ' + account + '; persistent volume ' + volume + '.')
+    manifest = hashlib.sha256((STAGE / 'SHA256SUMS').read_bytes()).hexdigest()
+    if args.prepared_image:
+        sup.prepared_image(config, manifest, args.source_commit)
+    else:
+        sup.execute([sup.COSIGN, 'verify', image, '--certificate-identity',
+                     'https://github.com/zunderlabs/zunder-guard/.github/workflows/release.yml@refs/tags/' + args.version,
+                     '--certificate-oidc-issuer', 'https://token.actions.githubusercontent.com'])
+        sup.docker('pull', image)
     sup.image_ready(config)
     fresh = not existing and not pending_record and volume not in volume_names()
     if not fresh and not existing and not pending_record:
-        confirm('Type ADOPT ' + volume + ' only for a complete existing mainnet home with no other restart owner:', 'ADOPT ' + volume)
-    if existing:
+        require(not args.non_interactive, 'Unattended setup cannot adopt an existing unowned volume.')
+        confirm('Type ADOPT ' + volume + ' only for a complete existing ' + args.network + ' home with no other restart owner:', 'ADOPT ' + volume)
+    if existing and not args.non_interactive:
         confirm('Stop your bot. Type STOP to stop Guard and prepare the verified upgrade:', 'STOP')
     prepare_receipt(config)
     record = inhibit(config, fresh)
@@ -435,13 +609,29 @@ def main():
     install_files(config)
     phase(record, 'helpers-installed')
     if fresh:
-        create_volume(config, record)
-        command = ['init', '--interactive', '--network', 'mainnet', '--account', account]
+        create_volume(config, record, args.non_interactive)
+        command = ['init', '--network', args.network, '--account', account]
+        command += (['--non-interactive', '--no-key', '--key-stdin', '--service-key-check']
+                    if args.key_stdin else ['--interactive'])
+        if args.network == 'testnet' and not args.key_stdin:
+            # Hidden input is checked by Guard; only the service supervisor
+            # persists the key through its protected encrypted credential path.
+            command += ['--no-key', '--service-key-check']
+            if not args.equity_cap:
+                args.equity_cap = prompt('The most equity Guard sizes from, in TESTNET USDC (at most 2500):')
+                require(bool(args.equity_cap), 'An explicit Testnet equity cap is required.')
         for name in ('rules', 'equity_cap', 'ip_share', 'licence'):
             value = getattr(args, name)
             if value:
                 command += ['--' + name.replace('_', '-'), value]
-        ops.run(config, command, interactive=True, readonly=False)
+        if args.key_stdin:
+            key = sup.read_key_frame(sys.stdin.buffer)
+            try:
+                ops.run(config, command, data=key, readonly=False)
+            finally:
+                del key  # Lifetime reduction; Python cannot promise memory zeroization.
+        else:
+            ops.run(config, command, interactive=True, readonly=False)
         phase(record, 'initialized')
     else:
         verify_volume(config)
@@ -451,19 +641,24 @@ def main():
     public_config = tomllib.loads(ops.run(config, ['check-config'], read_config=True).decode())
     cap = public_config.get('policy', {}).get('max_trading_equity_usd')
     require(isinstance(cap, str) and 0 < Decimal(cap) <= 2500, 'Configured equity cap is missing or invalid.')
-    print('Configured mainnet equity cap: ' + cap + '. Initial pairing is emitted by init; reinstall preserves clients.')
+    print('Configured ' + args.network + ' equity cap: ' + cap + '. Initial pairing is emitted by init; reinstall preserves clients.')
     admit_services(config)
-    repeated = prompt('Repeat the full account to authorize encrypted service provisioning:')
+    repeated = account if args.non_interactive else prompt('Repeat the full account to authorize encrypted service provisioning:')
     require(repeated == account, 'Account confirmation differs.')
     # A separate process retains supervisor locking/preflight and its hidden terminal prompt.
-    result = subprocess.run(['/usr/bin/python3', '-I', str(LIB / 'supervisor.py'), 'install',
-                             '--tag', args.version, '--image', image, '--volume', volume,
-                             '--account', account, '--confirm-account', repeated], env=ENV, check=False)
+    command = ['/usr/bin/python3', '-I', str(LIB / 'supervisor.py'), 'install',
+               '--tag', args.version, '--image', image, '--volume', volume,
+               '--account', account, '--confirm-account', repeated, '--network', args.network]
+    if args.prepared_image:
+        command += ['--prepared-image', '--manifest-sha256', manifest, '--source-commit', args.source_commit]
+    if args.key_stdin:
+        command.append('--key-stdin')
+    result = subprocess.run(command, stdin=sys.stdin.buffer if args.key_stdin else None, env=ENV, check=False)
     require(result.returncode == 0, 'Encrypted supervisor installation failed; activation remains inhibited.')
     verify_gate()
     phase(record, 'installed-stopped')
     # An interrupted/adopted home is never inferred fresh. Its missing journal needs explicit recovery.
-    activate(config, record, fresh, bool(args.licence))
+    activate(config, record, fresh, bool(args.licence), args.non_interactive, public_config.get('licence'))
     os.close(lock)
 
 

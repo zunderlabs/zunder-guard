@@ -97,7 +97,7 @@ sh i --rules zr1_…                       # run it
 Or skip the loader and verify by hand (needs cosign), which is what the loader does:
 
 ```sh
-V=v1.0.1; R=https://github.com/zunderlabs/zunder-guard/releases/download/$V
+V=v1.0.2; R=https://github.com/zunderlabs/zunder-guard/releases/download/$V
 curl -fsSLO "$R/install.sh" -O "$R/SHA256SUMS" -O "$R/SHA256SUMS.sigstore.json"
 cosign verify-blob --bundle SHA256SUMS.sigstore.json \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com \
@@ -130,10 +130,10 @@ sha256sum --ignore-missing -c SHA256SUMS && sh install.sh --rules zr1_…
 ### 2. Docker and Compose
 
 ```sh
-docker run -it --rm --log-driver=none -v zunder-guard:/data ghcr.io/zunderlabs/zunder-guard:v1.0.1 init --interactive --rules zr1_…
-docker run -it --rm --log-driver=none -v zunder-guard:/data ghcr.io/zunderlabs/zunder-guard:v1.0.1 pair
+docker run -it --rm --log-driver=none -v zunder-guard:/data ghcr.io/zunderlabs/zunder-guard:v1.0.2 init --interactive --rules zr1_…
+docker run -it --rm --log-driver=none -v zunder-guard:/data ghcr.io/zunderlabs/zunder-guard:v1.0.2 pair
 docker run -d --name zunder-guard --init --restart unless-stopped -v zunder-guard:/data \
-  -e ZUNDER_GUARD_LISTEN=0.0.0.0:8547 -p 127.0.0.1:8547:8547 ghcr.io/zunderlabs/zunder-guard:v1.0.1
+  -e ZUNDER_GUARD_LISTEN=0.0.0.0:8547 -p 127.0.0.1:8547:8547 ghcr.io/zunderlabs/zunder-guard:v1.0.2
 ```
 
 After a testnet `init`, add `-e ZUNDER_GUARD_NETWORK=testnet` to the last command: `run` sends
@@ -216,8 +216,11 @@ CloudFormation reports success only after installation, service and local health
 Optional public access is restricted to one valid IPv4 /32 address. Installer output is
 captured in a root-only temporary file, removed on success, so client keys and pairing codes
 never enter cloud-init logs. On failure the console reports only the diagnostic file path.
-Use `PairPaper` to pair the running paper setup. `NextStep` deliberately stops Guard and
-replaces bootstrap configuration/client pairings through guided installation; journals remain.
+Use `PairPaper` to pair the running paper setup. `NextStep` points to
+[separate native activation](systemd/ACTIVATION.md). Stop the paper service and its bot,
+then explicitly select Testnet or Mainnet in a fresh service instance. The paper binary,
+configuration, client identities and journals are preserved; the sending instance gets
+its own identity, state and encrypted credential. There is no automatic Mainnet activation.
 
 The encrypted, tagged state volume is retained when the instance terminates. Stack deletion
 therefore needs an explicit follow-up volume deletion after any required backup to stop all
@@ -330,23 +333,23 @@ What a user can check:
 ```sh
 # The release (as above)
 cosign verify-blob --bundle SHA256SUMS.sigstore.json --certificate-oidc-issuer https://token.actions.githubusercontent.com \
-  --certificate-identity https://github.com/zunderlabs/zunder-guard/.github/workflows/release.yml@refs/tags/v1.0.1 SHA256SUMS
+  --certificate-identity https://github.com/zunderlabs/zunder-guard/.github/workflows/release.yml@refs/tags/v1.0.2 SHA256SUMS
 # Provenance: built from this repository at this tag
-slsa-verifier verify-artifact zunder-guard-v1.0.1-linux-amd64.tar.gz \
-  --provenance-path zunder-guard-v1.0.1.intoto.jsonl --source-uri github.com/zunderlabs/zunder-guard --source-tag v1.0.1
+slsa-verifier verify-artifact zunder-guard-v1.0.2-linux-amd64.tar.gz \
+  --provenance-path zunder-guard-v1.0.2.intoto.jsonl --source-uri github.com/zunderlabs/zunder-guard --source-tag v1.0.2
 # The image
 cosign verify ghcr.io/zunderlabs/zunder-guard@sha256:<digest> --certificate-oidc-issuer https://token.actions.githubusercontent.com \
-  --certificate-identity https://github.com/zunderlabs/zunder-guard/.github/workflows/release.yml@refs/tags/v1.0.1
+  --certificate-identity https://github.com/zunderlabs/zunder-guard/.github/workflows/release.yml@refs/tags/v1.0.2
 slsa-verifier verify-image ghcr.io/zunderlabs/zunder-guard@sha256:<digest> \
-  --source-uri github.com/zunderlabs/zunder-guard --source-tag v1.0.1
+  --source-uri github.com/zunderlabs/zunder-guard --source-tag v1.0.2
 ```
 
 ### Reproducing a release
 
 ```sh
-git clone https://github.com/zunderlabs/zunder-guard && cd zunder-guard && git checkout v1.0.1
+git clone https://github.com/zunderlabs/zunder-guard && cd zunder-guard && git checkout v1.0.2
 docker buildx build -f deploy/guard/Dockerfile --target bin-build --platform linux/amd64 -o out .
-sha256sum out/zunder-guard     # equals zunder-guard inside zunder-guard-v1.0.1-linux-amd64.tar.gz
+sha256sum out/zunder-guard     # equals zunder-guard inside zunder-guard-v1.0.2-linux-amd64.tar.gz
 ```
 
 ## Network footprint
@@ -550,3 +553,21 @@ a mismatch).
    provide amd64 and arm64 builds; Linux on 32-bit ARM is not built.
 7. **Licence**: Elastic License 2.0 (SPDX `Elastic-2.0`, decided 6 Oct 2026). The formula and the
    image label carry it; the public repository has the text verbatim in `LICENSE`.
+
+### Private candidate image preparation
+
+A private release candidate can use a separate root-only registry preparation phase. The normal public image route retains its signature verification and pull. The private route is explicit Testnet only, and requires the release controller to independently verify the exact signed manifest and SLSA source before invoking it.
+
+Stage a canonical root-owned mode0700 directory containing only a mode0600 `config.json`: the sole permitted Docker field is `auths`, with only `ghcr.io` basic `auth`. Credential helpers, credential stores, other registries, linked files and shared writes are refused. The registry token is never a command argument or environment value.
+
+```sh
+sudo sh i --container --network testnet --prepare-image \
+  --registry-auth-dir /root/private-candidate-registry \
+  --source-commit VERIFIED_RELEASE_COMMIT
+```
+
+This phase reads no wallet key, verifies the OCI signature against the exact release tag, pulls the immutable signed image and records its local image ID and RepoDigest. It removes the admitted registry config and directory on success or artifact failure. Independently confirm that absence before retrieving any API-wallet frame. An authentication validation or scrub failure blocks wallet setup and requires inspection.
+
+A successful phase leaves `/etc/zunder-guard-container-image-prepared/receipt.json`, root-owned mode0600 in a mode0700 directory. It is a preparation receipt, not release acceptance evidence. The following protected setup adds `--prepared-image --source-commit VERIFIED_RELEASE_COMMIT` to its existing explicit Testnet/account/rules/cap/share/stdin options. Both the signed installer and installed supervisor require the same manifest, source, exact image digest and immutable local image ID. They reject cache changes and never fall back to ambient registry credentials. Runtime Docker configuration remains empty.
+
+Prepared receipts are retained for signed reinstalls/recovery of that exact candidate. A different source, manifest, image or pre-existing preparation requires separate inspection; no preparation receipt is silently replaced. The release controller disposes of its owned preparation receipt after native cleanup.

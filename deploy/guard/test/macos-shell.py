@@ -27,7 +27,7 @@ class MacShellTests(unittest.TestCase):
     def test_installer_renders_only_valid_plist_and_continues(self):
         block = fragment(INSTALL, 'cat >"$plist_next" <<PLIST', 'chown root:wheel "$plist_next"')
         with tempfile.TemporaryDirectory() as directory:
-            result = run('plist_next=service.plist; label=com.example.fixture; exe=/safe/broker; active=/safe/binding.json\n'
+            result = run('plist_next=service.plist; label=com.example.fixture; exe=/safe/broker; active=/safe/binding.json; log=/safe/fixture.log\n'
                          + block + '\nprintf reached > continued\n', directory)
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(result.stderr, '')  # bash -n alone misses unclosed heredocs.
@@ -46,6 +46,7 @@ class MacShellTests(unittest.TestCase):
             setup = '''plist_next=next.plist; plist=active.plist; label=com.example.fixture
 exe=/safe/broker; active_next=next.json; active=active.json
 service_user=_fixture; account=synthetic; home=/safe/home; same_release=SAME_RELEASE
+network=mainnet; log=/var/log/synthetic-fixture.log
 chown() { printf 'chown\\n' >> calls; }
 chmod() { printf 'chmod\\n' >> calls; }
 plutil() { printf 'plutil\\n' >> calls; return REJECT; }
@@ -85,11 +86,11 @@ fail() { exit 2; }
     def test_installer_tail_validation_failure_preserves_prior_binding(self):
         self.installer_tail(reject_plist=True)
 
-    def reinstall_admission(self, scenario):
+    def reinstall_admission(self, scenario, network="mainnet", non_interactive="1"):
         # Execute the actual installer admission branch. The broker and root
         # ownership/Keychain checks are conspicuous synthetic stubs; these tests
         # prove shell control flow and preservation, never native readiness.
-        block = fragment(INSTALL, 'next="$base/bindings/$sha.json"', '# Constant paths and hex release hash only:')
+        block = fragment(INSTALL, 'next="$base/$binding_name/$sha.json"', '# Constant paths and hex release hash only:')
         with tempfile.TemporaryDirectory() as directory:
             base = Path(directory)
             (base / 'bindings').mkdir()
@@ -130,7 +131,7 @@ case "$*" in *"service prepare"*) printf '{}\\n' ;; esac
             setup = '\n'.join([
                 'base=' + shlex.quote(str(base)), 'exe=' + shlex.quote(str(broker)),
                 'active=' + shlex.quote(str(active)), 'sha=' + sha,
-                'home=/synthetic/home; uid=450; gid=450; account=synthetic',
+                'home=/synthetic/home; uid=450; gid=450; account=synthetic; binding_name=bindings; credential_id=' + ('testnet-native' if network == 'testnet' else 'mainnet') + '; confirm_flag=' + ('--confirm-account' if network == 'testnet' else '--confirm-mainnet') + '; network=' + network + '; non_interactive=' + non_interactive,
                 'export FIXTURE_CALLS=' + shlex.quote(str(base / 'calls')),
                 'export CHECK_FAIL=' + ('1' if scenario == 'credential_refused' else '0'),
                 '''fail() { printf '%s\\n' "$*" >&2; exit 2; }
@@ -152,6 +153,14 @@ install() { printf 'pointer-copy\\n' >> "$FIXTURE_CALLS"; cp "$7" "$8"; }
                 self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
             for name, content in before.items():
                 self.assertEqual((base / 'bindings' / name).read_bytes(), content)
+            if scenario in ('first_install', 'different_release'):
+                self.assertIn('--confirm-account' if network == 'testnet' else '--confirm-mainnet', calls)
+                self.assertNotIn('--confirm-mainnet' if network == 'testnet' else '--confirm-account', calls)
+            if scenario == 'first_install' and network == 'testnet':
+                if non_interactive == '1':
+                    self.assertIn('--key-stdin', calls)
+                else:
+                    self.assertNotIn('--key-stdin', calls)
             if scenario == 'same_release':
                 self.assertIn('service check --binding ' + str(active), calls)
                 self.assertNotIn('service prepare', calls)
@@ -195,6 +204,148 @@ install() { printf 'pointer-copy\\n' >> "$FIXTURE_CALLS"; cp "$7" "$8"; }
     def test_first_install_still_prepares_provisions_and_checks_new_binding(self):
         self.reinstall_admission('first_install')
 
+    def test_testnet_reinstall_upgrade_and_fail_closed_admission(self):
+        for scenario in ('same_release', 'first_install', 'different_release', 'credential_refused',
+                         'wrong_executable_hash', 'symlink_active', 'orphan_versioned'):
+            with self.subTest(scenario=scenario):
+                self.reinstall_admission(scenario, 'testnet')
+
+    def test_interactive_testnet_provisions_through_hidden_broker_input(self):
+        self.reinstall_admission('first_install', 'testnet', '0')
+
+    def network_selection(self, arguments, piped=True):
+        block = fragment(INSTALL, 'stage=$1', 'case "$version" in')
+        import shlex
+        setup = 'fail() { printf "%s\\n" "$*" >&2; exit 2; }\nset -- ' + ' '.join(map(shlex.quote, arguments)) + '\n'
+        script = setup + block + '\nprintf "%s\\n" "$network|$credential_id|$service_user|$state_name|$identity_name|$binding_name|$log|$confirm_flag"\n'
+        return subprocess.run(['/bin/sh', '-c', 'set -eu\n' + script],
+                              input='SYNTHETIC-PIPE-FRAME\n' if piped else None,
+                              stdin=None if piped else subprocess.DEVNULL,
+                              capture_output=True, text=True, timeout=10)
+
+    def test_old_mac_helper_arguments_preserve_mainnet_identity_and_paths(self):
+        result = self.network_selection(['/synthetic/stage', 'v1.0.2'])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), 'mainnet|mainnet|_zunder_guard|state|service-identity|bindings|/var/log/zunder-guard.log|--confirm-mainnet')
+
+    def test_explicit_testnet_helper_has_separate_identity_state_and_binding(self):
+        result = self.network_selection(['/synthetic/stage', 'v1.0.2', '', '', '', '', '', '', 'testnet', '1'])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), 'testnet|testnet-native|_zunder_guard_testnet|state-testnet|service-identity-testnet|bindings-testnet|/var/log/zunder-guard-testnet.log|--confirm-account')
+        self.assertNotIn('SYNTHETIC-PIPE-FRAME', result.stdout + result.stderr)
+
+    def test_wrong_network_noninteractive_combinations_refuse(self):
+        for network, noninteractive in [('mainnet', '1'), ('paper', '1'), ('testnet', 'yes'), ('MAINNET', '0')]:
+            with self.subTest(network=network, noninteractive=noninteractive):
+                result = self.network_selection(['/stage', 'v1.0.2', '', '', '', '', '', '', network, noninteractive])
+                self.assertEqual(result.returncode, 2)
+                self.assertNotIn('SYNTHETIC-PIPE-FRAME', result.stdout + result.stderr)
+
+    def test_testnet_helper_refuses_regular_or_null_input(self):
+        result = self.network_selection(['/stage', 'v1.0.2', '', '', '', '', '', '', 'testnet', '1'], piped=False)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn('private stdin pipe', result.stderr)
+
+    def test_interactive_testnet_helper_requires_actual_terminal(self):
+        import pty
+        import shlex
+        arguments = ['/stage', 'v1.0.2', '', '', '', '', '', '', 'testnet', '0']
+        refused = self.network_selection(arguments)
+        self.assertEqual(refused.returncode, 2)
+        self.assertIn('requires a terminal', refused.stderr)
+        block = fragment(INSTALL, 'stage=$1', 'case "$version" in')
+        setup = 'fail() { exit 2; }\nset -- ' + ' '.join(map(shlex.quote, arguments)) + '\n'
+        master, slave = pty.openpty()
+        try:
+            result = subprocess.run(['/bin/sh', '-c', 'set -eu\n' + setup + block],
+                                    stdin=slave, capture_output=True, text=True, timeout=10)
+        finally:
+            os.close(master)
+            os.close(slave)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def init_selection(self, network, existing=False, options=True, non_interactive=True, licence=True):
+        import shlex
+        block = fragment(INSTALL, 'if [ ! -e "$home/guard.toml" ]; then', '# A reused service state')
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            home = root / 'home'
+            home.mkdir()
+            if existing:
+                (home / 'guard.toml').write_text('synthetic config')
+            exe = root / 'broker'
+            exe.write_text("""#!/bin/sh
+printf '%s\\n' "$*" >> "$FIXTURE_CALLS"
+case "$*" in *'--key-stdin'*) IFS= read -r frame; [ "$frame" = SYNTHETIC-FIRST-FRAME ] || exit 81 ;; esac
+""")
+            exe.chmod(0o755)
+            setup = '\n'.join([
+                'fail() { printf "%s\\n" "$*" >&2; exit 2; }',
+                'exe=' + shlex.quote(str(exe)), 'home=' + shlex.quote(str(home)),
+                'export FIXTURE_CALLS=' + shlex.quote(str(root / 'calls')),
+                'network=' + network,
+                'non_interactive=' + ('1' if non_interactive else '0'),
+                'service_user=_synthetic; listen=; share=',
+                'rules=zr1.synthetic; account=synthetic; cap=40; licence=synthetic-licence' if options else 'rules=; account=; cap=; licence=',
+                '' if licence else 'licence=',
+                'sudo() { shift 4; "$@"; }',
+            ])
+            after = '\n'
+            if network == 'testnet' and not existing and non_interactive:
+                after += 'IFS= read -r second; [ "$second" = SYNTHETIC-SECOND-FRAME ]; '
+            after += 'printf reached\n'
+            result = subprocess.run(['/bin/sh', '-c', 'set -eu\n' + setup + '\n' + block + after],
+                                    input='SYNTHETIC-FIRST-FRAME\nSYNTHETIC-SECOND-FRAME\n',
+                                    capture_output=True, text=True, timeout=10)
+            calls = (root / 'calls').read_text() if (root / 'calls').exists() else ''
+            return result, calls
+
+    def test_testnet_init_checks_private_key_without_persisting_and_preserves_provision_frame(self):
+        result, calls = self.init_selection('testnet')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, 'reached')
+        self.assertIn('init --network testnet --service-key-check --non-interactive --no-key --key-stdin', calls)
+        self.assertNotIn('--interactive', calls)
+        self.assertNotIn('FRAME', calls + result.stdout + result.stderr)
+
+    def test_testnet_init_missing_public_setup_refuses_before_key_read(self):
+        result, calls = self.init_selection('testnet', options=False)
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(calls, '')
+
+    def test_unattended_testnet_licence_is_optional_and_preserved_when_supplied(self):
+        for supplied in (False, True):
+            with self.subTest(supplied=supplied):
+                result, calls = self.init_selection('testnet', licence=supplied)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual('--licence synthetic-licence' in calls, supplied)
+                self.assertIn('--no-key --key-stdin', calls)
+
+    def test_mainnet_init_remains_interactive(self):
+        result, calls = self.init_selection('mainnet')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('init --network mainnet --interactive', calls)
+        self.assertNotIn('--key-stdin', calls)
+        self.assertNotIn('--no-key', calls)
+
+    def test_interactive_testnet_init_checks_hidden_input_without_user_store(self):
+        result, calls = self.init_selection('testnet', non_interactive=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('init --network testnet --interactive --no-key --service-key-check', calls)
+        self.assertIn('--equity-cap 40', calls)
+        self.assertNotIn('--key-stdin', calls)
+        self.assertNotIn('--non-interactive', calls)
+
+    def test_existing_testnet_config_is_preserved_without_consuming_key(self):
+        result, calls = self.init_selection('testnet', existing=True, options=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(calls, '')
+
+    def test_existing_testnet_config_rejects_setup_overwrite(self):
+        result, calls = self.init_selection('testnet', existing=True)
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(calls, '')
+
     def test_installer_conjunction_guards_reject_either_failed_condition(self):
         # Execute each real guard without privilege. Every acceptable combination
         # and each single-condition failure has a hand-written expected result.
@@ -202,14 +353,14 @@ install() { printf 'pointer-copy\\n' >> "$FIXTURE_CALLS"; cp "$7" "$8"; }
             ('core dump limits not disabled', 'ulimit() { if [[ $1 == -Sc ]]; then printf %s "$soft"; else printf %s "$hard"; fi; }\n',
              [('soft=0; hard=0', True), ('soft=1; hard=0', False), ('soft=0; hard=1', False), ('soft=1; hard=1', False)]),
             ('expected private release stage, version, optional public setup values', '',
-             [('set --', False), ('set -- a', False), ('set -- a b', True), ('set -- a b c d e f g h', True), ('set -- a b c d e f g h i', False)]),
+             [('set --', False), ('set -- a', False), ('set -- a b', True), ('set -- a b c d e f g h', True), ('set -- a b c d e f g h i', True), ('set -- a b c d e f g h i j', True), ('set -- a b c d e f g h i j k', False)]),
             ('service identity must not be root', '',
              [('uid=450; gid=450', True), ('uid=0; gid=450', False), ('uid=450; gid=0', False), ('uid=0; gid=0', False)]),
             ('unsafe service state directory', '',
              [('home=directory', True), ('home=link', False), ('home=file', False), ('home=absent', False)]),
             ('state ownership or permissions mismatch', 'home=directory; uid=450\nstat() { if [[ $2 == %u ]]; then printf %s "$owner"; else printf %s "$mode"; fi; }\n',
              [('owner=450; mode=700', True), ('owner=0; mode=700', False), ('owner=450; mode=755', False), ('owner=0; mode=755', False)]),
-            ('service log must be root-only', 'stat() { if [[ $2 == %u ]]; then printf %s "$owner"; else printf %s "$mode"; fi; }\n',
+            ('service log must be root-only', 'log=/synthetic/log\nstat() { if [[ $2 == %u ]]; then printf %s "$owner"; else printf %s "$mode"; fi; }\n',
              [('owner=0; mode=600', True), ('owner=450; mode=600', False), ('owner=0; mode=644', False), ('owner=450; mode=644', False)]),
         ]
         for message, stub, combinations in cases:

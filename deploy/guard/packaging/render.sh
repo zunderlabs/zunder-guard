@@ -100,10 +100,9 @@ text = replace_once(text,
     f'curl -fsSL --proto \'=https\' --retry 3 -o "$loader" \'{url}\'\n'
     f'            printf \'%s  %s\\n\' \'{sha}\' "$loader" | sha256sum -c -', path.name)
 text = replace_once(text,
-    "Download and verify this release's installer, then stop Guard and run guided setup with --force --rules '${Rules}' --account '${Account}'.",
-    f'In the session: download {url}, verify SHA-256 {sha},\n'
-    "      then run sudo systemctl stop zunder-guard && sudo sh i --force --rules '${Rules}' --account '${Account}'\n"
-    "      for guided setup. This replaces bootstrap configuration and client pairings; journals are preserved.", path.name)
+    "Follow deploy/guard/systemd/ACTIVATION.md at the source commit named in this release.",
+    f"Follow https://github.com/zunderlabs/zunder-guard/blob/{version}/deploy/guard/systemd/ACTIVATION.md "
+    "and verify that tag against the source commit in this release's provenance.", path.name)
 path.write_text(text)
 PY
 # The installer/guardian are release bytes, authenticated before privilege/key handling.

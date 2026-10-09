@@ -1,6 +1,6 @@
 # Windows mainnet installation candidate
 
-This verified machine-service path is prepared for the first signed v1.0.1 release. It is not yet a native-tested released installer. Do not replace already signed/versioned assets. Publication requires independent code review, Windows 5.1/7 tests, the native service checks and released-image install/upgrade proof. Pre-login reboot is a separate gate.
+This machine-service source includes an additive protected Testnet candidate for a future signed release; signed v1.0.1 draft assets remain immutable. It is not yet a native-tested released installer. Do not replace already signed/versioned assets. Publication requires independent code review, Windows 5.1/7 tests, the native service checks and released-image install/upgrade proof. Pre-login reboot is a separate gate.
 
 Open an elevated, trusted Windows PowerShell console explicitly, then run the verified published loader:
 
@@ -63,3 +63,45 @@ Stop disables boot startup before stopping. Uninstall unregisters only the exact
 ## Evidence boundaries
 
 `test/windows-mainnet-loader.ps1` runs real function state transitions with synthetic native boundaries and temporary files under Windows PowerShell 5.1/PowerShell 7. It distinguishes phase-interruption simulation from real power-loss/pre-login reboot evidence. Runtime SCM/DPAPI/Job/stop tests remain owned by the shared native service workflow. The Rust SVC-M1 configuration snapshot and SVC-M2 stop/recovery fixes are required dependencies. No test bypass, alternate verifier pin or plaintext credential route exists in the production entry point.
+
+## Protected Testnet automation candidate
+
+The additive Testnet SCM path requires a newly signed release and its native Windows gates.
+The ordinary per-user interactive Testnet installer remains available. To request the protected
+machine-service route, an elevated controller invokes the verified saved loader with explicit
+public arguments:
+
+```powershell
+& .\i.ps1 -Network testnet -ManagedService -NonInteractive -KeyStdin -Id testnet-journey `
+  -Account 0xYOUR_TESTNET_ACCOUNT -ConfirmAccount 0xYOUR_TESTNET_ACCOUNT `
+  -Rules zr1_YOUR_RULES -EquityCap 100
+```
+
+The controller must start PowerShell with redirected private stdin containing two LF-terminated
+API wallet key frames for fresh setup. Rust consumes the first to validate the Testnet wallet's
+role and records its public address without using a per-user key store. Rust consumes the second
+to provision the existing machine-bound DPAPI protection. PowerShell does not read either key.
+Private keys must never appear in command arguments, environment variables, files or logs.
+Initial pairing output must stay in private controller memory. Resume consumes only frames for
+steps not already committed; inspect the owned transaction before supplying them.
+
+Testnet requires a `testnet-` instance ID, producing distinct state, binary, binding, SCM virtual
+account and encrypted credential paths. Its binding and protected transaction identify Testnet;
+legacy records without a mode remain Mainnet and cannot be adopted. Mainnet retains its default
+ID, hidden interactive setup and explicit consent. Unattended flags never select Mainnet.
+
+Preparation remains stopped with startup Disabled. Fresh Testnet init creates `risk.jsonl` once;
+never run `JournalInit` for Testnet. The controller starts the exact retained helper explicitly:
+
+```powershell
+& $PowerShell -NoProfile -ExecutionPolicy Bypass -File $Helper -Action Start `
+  -Network testnet -Id testnet-journey -ConfirmAccount 0xYOUR_TESTNET_ACCOUNT -Startup DelayedAuto
+```
+
+Every subsequent helper action must name `-Network testnet` and the same instance. Upgrade,
+stop, recovery and uninstall preserve the existing protections and ownership checks. Readiness
+requires the exact owned SCM child and loopback listener, matching account/network/cap, fresh
+synchronization, active risk, a ready journal, no kill/error and Testnet fee mode `off`. An expected
+licence must be active. No key or Mainnet confirmation environment is forwarded on Testnet.
+Neither a halt nor a missing journal is repaired automatically. Use distinct loopback ports if
+running multiple instances; the default port can have only one owner.
