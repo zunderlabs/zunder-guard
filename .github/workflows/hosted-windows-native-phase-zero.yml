@@ -1,0 +1,36 @@
+name: hosted-windows-native-phase-zero
+
+on:
+  push:
+    branches: [codex/no-key-windows-native-phase-zero]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hosted-windows-native-phase-zero
+  cancel-in-progress: false
+
+jobs:
+  native-facts:
+    if: github.repository == 'zunderlabs/zunder-guard' && github.event.repository.private == false
+    runs-on: windows-2025
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Compile fixed OS getter and run no-key native facts probe
+        shell: pwsh
+        run: |
+          & 'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe' -NoProfile -NonInteractive -File deploy/guard/github/windows-native-phase-zero/probe.ps1
+          exit $LASTEXITCODE
+      - name: Retain closed no-key native report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: windows-native-phase-zero-report
+          path: ${{ runner.temp }}/windows-native-phase-zero-report.json
+          if-no-files-found: error
+          retention-days: 7
