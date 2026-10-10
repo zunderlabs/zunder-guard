@@ -132,3 +132,7 @@ and its parents are never modified.
 Actual run38024073354 passed signed paper install, explicit restart, owned crash recovery, reinstall/state preservation and acknowledged the single guest reboot. It failed while waiting for the new kernel hello; owned QEMU cleanup was confirmed. No full reboot acceptance is claimed.
 
 The observer had After=cloud-final.service while being WantedBy=multi-user.target. The canonical cloud-final service is ordered After=multi-user.target, creating an ordering cycle on normal subsequent boot. The original first boot started the observer from cloud-final runcmd after enable, which does not establish correct subsequent boot ordering. The observer is now enabled under cloud-init.target and remains after cloud-final.service. Guard's shipped service, actual changed-boot proof, same QEMU identity, original clocks and refusal/cleanup rules are unchanged. This is a source-based diagnosis awaiting actual hosted execution.
+
+## Current signed candidate
+
+This successor uses the actually independently verified v1.0.5 draft, product source0f64fa0f822fb2e9fffc414883ca843bd4e992a7 and successful signed build38022247487 attempt1. All27 exact asset lengths/hashes and the regular Linux AMD64 Guard archive member were read from verified bytes. Earlier v1.0.4 receipts and ordering diagnosis remain historical; none are promoted into v1.0.5 acceptance. Existing installer, signed-source predicates, complete provenance subjects, service/guest checks, single reboot, original clocks and cleanup remain unchanged.

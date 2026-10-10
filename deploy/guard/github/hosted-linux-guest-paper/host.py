@@ -221,7 +221,7 @@ def main():
     need(os.geteuid()==0 and platform.system()=='Linux'and platform.machine()=='x86_64','hosted-root-LinuxAMD-required')
     need(re.fullmatch('[a-f0-9]{40}',args.control_source)and re.fullmatch('[1-9][0-9]{0,19}',args.run_id)and re.fullmatch('[1-9][0-9]{0,3}',args.attempt),'original-GitHub-public-context-refused')
     resource.setrlimit(resource.RLIMIT_CORE,(0,0));os.umask(0o077);clock=Clock();source_raw,source=source_admission();candidate=json.loads(regular(HERE/'candidate.json'));pins=json.loads(regular(HERE/'image-pins.json'))
-    need(candidate['tag']=='v1.0.4'and candidate['source']=='ddb3ce0b86cdfd094cfffd60dd8ea8073f20d844','fixed-reviewed-candidate-required')
+    need(candidate['tag']=='v1.0.5'and candidate['source']=='0f64fa0f822fb2e9fffc414883ca843bd4e992a7','fixed-reviewed-candidate-required')
     for name,row in candidate['files'].items():
         raw=regular(args.assets/name);need(len(raw)==row['bytes']and sha(raw)==row['sha256'],'actual-signed-asset-pin-differs')
     tools={name:vendor_tool('/usr/bin/'+name)for name in('qemu-system-x86_64','qemu-img','cloud-localds','genisoimage','gpgv','systemd-run','systemctl')}

@@ -7,7 +7,7 @@ permissions:
   contents: read
   actions: read
 concurrency:
-  group: public-hosted-linux-guest-paper-v1.0.4
+  group: public-hosted-linux-guest-paper-v1.0.5
   cancel-in-progress: false
 jobs:
   linux-amd64-guest:
@@ -25,11 +25,11 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          gh api repos/zunderlabs/zunder-guard/actions/runs/38006057745 | python3 -c 'import json,sys; r=json.load(sys.stdin); assert r["head_sha"]=="ddb3ce0b86cdfd094cfffd60dd8ea8073f20d844" and r["run_attempt"]==1 and r["status"]=="completed" and r["conclusion"]=="success" and r["path"]==".github/workflows/release.yml"'
+          gh api repos/zunderlabs/zunder-guard/actions/runs/38022247487 | python3 -c 'import json,sys; r=json.load(sys.stdin); assert r["head_sha"]=="0f64fa0f822fb2e9fffc414883ca843bd4e992a7" and r["run_attempt"]==1 and r["status"]=="completed" and r["conclusion"]=="success" and r["path"]==".github/workflows/release.yml"'
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
-          artifact-ids: '11651844192,11651714491'
-          run-id: 38006057745
+          artifact-ids: '11659481192,11659731833'
+          run-id: 38022247487
           repository: zunderlabs/zunder-guard
           github-token: ${{ github.token }}
           merge-multiple: true
@@ -49,8 +49,8 @@ jobs:
           mapfile -t subjects < <(python3 -I -S -B deploy/guard/github/hosted-linux-guest-paper/acquire.py --subjects)
           test "${#subjects[@]}" -eq 24
           cd "$RUNNER_TEMP/public-linux-guest-assets"
-          cosign verify-blob --bundle SHA256SUMS.sigstore.json --certificate-identity https://github.com/zunderlabs/zunder-guard/.github/workflows/release.yml@refs/tags/v1.0.4 --certificate-oidc-issuer https://token.actions.githubusercontent.com SHA256SUMS >/dev/null
-          slsa-verifier verify-artifact "${subjects[@]}" --provenance-path zunder-guard-v1.0.4.intoto.jsonl --source-uri github.com/zunderlabs/zunder-guard --source-tag v1.0.4 --builder-id https://github.com/slsa-framework/slsa-github-generator/.github/workflows/generator_generic_slsa3.yml@refs/tags/v2.1.0 --print-provenance | jq -se --arg commit ddb3ce0b86cdfd094cfffd60dd8ea8073f20d844 'length > 0 and all(.predicate.invocation.configSource.digest.sha1 == $commit and .predicate.invocation.configSource.entryPoint == ".github/workflows/release.yml")' >/dev/null
+          cosign verify-blob --bundle SHA256SUMS.sigstore.json --certificate-identity https://github.com/zunderlabs/zunder-guard/.github/workflows/release.yml@refs/tags/v1.0.5 --certificate-oidc-issuer https://token.actions.githubusercontent.com SHA256SUMS >/dev/null
+          slsa-verifier verify-artifact "${subjects[@]}" --provenance-path zunder-guard-v1.0.5.intoto.jsonl --source-uri github.com/zunderlabs/zunder-guard --source-tag v1.0.5 --builder-id https://github.com/slsa-framework/slsa-github-generator/.github/workflows/generator_generic_slsa3.yml@refs/tags/v2.1.0 --print-provenance | jq -se --arg commit 0f64fa0f822fb2e9fffc414883ca843bd4e992a7 'length > 0 and all(.predicate.invocation.configSource.digest.sha1 == $commit and .predicate.invocation.configSource.entryPoint == ".github/workflows/release.yml")' >/dev/null
       - name: Prepare fixed authenticated public Ubuntu vendor tools
         shell: bash
         run: |

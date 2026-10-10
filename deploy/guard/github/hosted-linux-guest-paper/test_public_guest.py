@@ -269,5 +269,5 @@ class Fixtures(unittest.TestCase):
         self.assertEqual(tools.failure_reason(RuntimeError('private arbitrary input')),'RuntimeError')
         self.assertEqual(tools.failure_reason(OSError('private arbitrary input')),'OSError')
     def test_all_signed_subject_inventory_is_closed(self):
-        row=acquire.candidate();self.assertEqual(len(row['files']),27);self.assertEqual(len(row['provenance_subjects']),24);self.assertEqual(set(row['files'])-set(row['provenance_subjects']),{'SHA256SUMS','SHA256SUMS.sigstore.json','zunder-guard-v1.0.4.intoto.jsonl'})
+        row=acquire.candidate();self.assertEqual(len(row['files']),27);self.assertEqual(len(row['provenance_subjects']),24);self.assertEqual(set(row['files'])-set(row['provenance_subjects']),{'SHA256SUMS','SHA256SUMS.sigstore.json','zunder-guard-v1.0.5.intoto.jsonl'})
 if __name__=='__main__':unittest.main()

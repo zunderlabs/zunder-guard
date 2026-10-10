@@ -14,7 +14,7 @@ def regular(path,expected=None,limit=134217728):
     return raw
 def candidate():
     row=json.loads(regular(HERE/'candidate.json'))
-    need(row['tag']=='v1.0.4'and row['source']=='ddb3ce0b86cdfd094cfffd60dd8ea8073f20d844'and row['release_run']==38006057745 and row['manifest_sha256']=='59d94ded377d7834d7472c4ddede38154af8514a7cc76c27ac1c87db5305c09c','fixed candidate differs')
+    need(row['tag']=='v1.0.5'and row['source']=='0f64fa0f822fb2e9fffc414883ca843bd4e992a7'and row['release_run']==38022247487 and row['manifest_sha256']=='029c13981f216cf297f1c539e968c6e6dbe001d61ee4ee1f6496fea993ac06ad','fixed candidate differs')
     need(1<=len(row['files'])<=32 and all(re.fullmatch(r'[A-Za-z0-9_.-]+',name)and name not in('.','..')for name in row['files']),'subject names refused')
     return row
 def verify(directory):
