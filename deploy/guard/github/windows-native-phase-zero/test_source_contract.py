@@ -1,4 +1,5 @@
 """Inert ABI/report source checks; these never compile C# or execute native Windows APIs."""
+import hashlib
 import ctypes as c
 import json
 from pathlib import Path
@@ -31,6 +32,18 @@ def report_model(raw):
   if not 0<len(raw)<=16384 or not raw.isascii():return False
   r=json.loads(raw,object_pairs_hook=strict_pairs)
   baseline=json.loads(FIXTURES['cases'][0]['raw'])
+  if r.get('error_class') in ('clock_guard','clock_guard_suffix') or (r.get('error_class')=='clock' and r.get('boot',{}).get('state')=='UNKNOWN'):
+   # Independent inert model of the exact new refusal corpus, not native execution.
+   template=json.loads(next(x['raw']for x in FIXTURES['cases']if x['name']=='clock_guard_refusal_1'))
+   assert type(r.get('error_code'))is int and 0<=r['error_code']<=2**32-1
+   if r['error_class']=='clock_guard':assert 1<=r['error_code']<=11
+   else:assert r['error_class']=='clock'
+   normalized=dict(r);normalized['error_class']='clock_guard';normalized['error_code']=1
+   assert normalized==template
+   # JSON boolean/number equality alone is not a type check.
+   for key,value in template.items():
+    if type(value)is bool:assert type(normalized[key])is bool
+   return True
   def shape(value,template):
    if isinstance(template,dict):
     assert isinstance(value,dict) and set(value)==set(template)
@@ -131,7 +144,7 @@ class SourceContract(unittest.TestCase):
  def test_all_retained_report_cases_are_inert(self):
   self.assertEqual(FIXTURES['kind'],'INERT_REPORT_GATE_FIXTURES')
   self.assertFalse(FIXTURES['native_execution']);self.assertFalse(FIXTURES['source_runtime_admission'])
-  self.assertEqual(len(FIXTURES['cases']),32)
+  self.assertEqual(len(FIXTURES['cases']),61)
   for case in FIXTURES['cases']:
    with self.subTest(case=case['name']):self.assertEqual(report_model(case['raw']),case['accept'])
  def test_gate_source_duplicate_unknown_and_precision_guards(self):
@@ -198,5 +211,66 @@ class SourceContract(unittest.TestCase):
   self.assertIn('exe = null; else filesGone = false;',NATIVE)
   self.assertIn('new H[] { child, serviceProcess, marker, exe, root, parent, service, scm }',NATIVE)
   self.assertIn('executableDigest = digest',NATIVE)
+
+ def test_boot_clock_diagnostic_ids_match_exact_original_ordered_conjunction(self):
+  expected=['before <= after', 'qb >= 0', 'qa >= qb', 'freq > 0', 'boot.Id != Guid.Empty', 'tod.BootTime > 0', 'tod.CurrentTime > 0', 'unchecked((ulong)tod.BootTime) <= before', 'unchecked((ulong)tod.CurrentTime) >= before', 'unchecked((ulong)tod.CurrentTime) <= after', 'after - before <= 50000000']
+  boot=NATIVE[NATIVE.index('  static Dictionary<string, object> Boot()'):NATIVE.index('  static Dictionary<string, object> ProcessFacts')]
+  rows=re.findall(r'if \(!\(([^\n]+)\)\) throw new Refused\("clock_guard", ([0-9]+)\);',boot)
+  self.assertEqual([expr for expr,guard in rows],expected)
+  self.assertEqual([int(guard)for expr,guard in rows],list(range(1,12)))
+  self.assertEqual(boot.count('throw new Refused("clock_guard",'),11)
+  self.assertIn('N.QueryPerformanceCounter(out qb) && N.QueryPerformanceFrequency(out freq)',boot)
+  self.assertIn('Win(N.QueryPerformanceCounter(out qa), "clock")',boot)
+ def test_boot_clock_split_preserves_short_circuit_acceptance_and_fixed_first_failure(self):
+  import itertools
+  for outcomes in itertools.product((False,True),repeat=11):
+   original=all(outcomes);first=next((i for i,yes in enumerate(outcomes,1)if not yes),None)
+   self.assertEqual(original,first is None)
+  for i in range(11):
+   outcomes=[True]*11;outcomes[i]=False
+   self.assertEqual(next(k for k,yes in enumerate(outcomes,1)if not yes),i+1)
+
+
+ def test_historical_corpus_prefix_is_exact(self):
+  raw=json.dumps(FIXTURES['cases'][:32],sort_keys=True,separators=(',',':')).encode()
+  self.assertEqual(hashlib.sha256(raw).hexdigest(),'a742cb90acc901543b5efe686993c34a970ab4351d70a9086b5d407dbc13e324')
+  self.assertLessEqual(len(FIXTURES['cases']),64)
+ def test_closed_clock_guard_gate_context_and_old_success_predicates(self):
+  expected='if (Str(r["error_class"]) == "clock_guard") Need(Str(r["stage"]) == "preflight" && Str(r["outcome"]) == "REFUSED" && Str(b["state"]) == "UNKNOWN" && Num(r["error_code"]) >= 1 && Num(r["error_code"]) <= 11);'
+  self.assertEqual(GATE.count(expected),1)
+  self.assertIn('"clock", "clock_guard", "ownership"',GATE)
+  self.assertLess(GATE.index('Need(!Bool(r[f]))'),GATE.index(expected))
+  self.assertIn('@($fixtures.cases).Count -gt 64',WRAPPER)
+  self.assertIn('x.Length <= 16384',GATE)
+ def test_guard_and_native_error_nine_are_distinct_reports(self):
+  guard=json.loads(next(x['raw']for x in FIXTURES['cases']if x['name']=='clock_guard_refusal_9'))
+  win=json.loads(next(x['raw']for x in FIXTURES['cases']if x['name']=='native_win32_clock_nine_retains_distinct_namespace'))
+  self.assertEqual(guard['error_code'],win['error_code'])
+  self.assertEqual(guard['error_class'],'clock_guard');self.assertEqual(win['error_class'],'clock')
+  self.assertNotEqual(guard,win)
+  self.assertIn('Win(N.QueryPerformanceCounter(out qb) && N.QueryPerformanceFrequency(out freq), "clock")',NATIVE)
+  self.assertIn('throw new Refused(c, unchecked((uint)Marshal.GetLastWin32Error()))',NATIVE)
+ def test_all_eleven_guard_codes_and_context_mutants_are_retained(self):
+  cases={x['name']:x for x in FIXTURES['cases'][32:]}
+  for i in range(1,12):
+   case=cases['clock_guard_refusal_'+str(i)];self.assertTrue(case['accept']);self.assertTrue(report_model(case['raw']))
+  for name in ('code_zero','code_twelve','wrong_stage','unknown_outcome','observed_outcome','observed_boot','bool_code','string_code','fraction_code','unknown_class'):
+   case=cases['clock_guard_'+name];self.assertFalse(case['accept']);self.assertFalse(report_model(case['raw']))
+
+
+ def test_entire_native_normalization_restores_r4_bytes(self):
+  self.assertEqual(NATIVE.count('throw new Refused("clock_guard",'),11)
+  restored=NATIVE.replace('throw new Refused("clock_guard",','throw new Refused("clock",')
+  self.assertEqual(hashlib.sha256(restored.encode()).hexdigest(),'e79fb0bba017e7d9bba7156ef60177ba2c00887f5154e5c3463a1afd4afebe81')
+ def test_gate_exact_diagnostic_removal_restores_r4_bytes(self):
+  guard='      if (Str(r["error_class"]) == "clock_guard") Need(Str(r["stage"]) == "preflight" && Str(r["outcome"]) == "REFUSED" && Str(b["state"]) == "UNKNOWN" && Num(r["error_code"]) >= 1 && Num(r["error_code"]) <= 11);\n'
+  restored=GATE.replace('"clock", "clock_guard", "ownership"','"clock", "ownership"').replace(guard,'')
+  self.assertEqual(hashlib.sha256(restored.encode()).hexdigest(),'602af155a6188b805f2be61d57b7584201e0ba020df16b42086900b4907be0bc')
+  start=GATE.index('      if (Str(r["outcome"]) == "OBSERVED") {');end=GATE.index('      return raw.Trim();',start)
+  self.assertEqual(hashlib.sha256(GATE[start:end].encode()).hexdigest(),'d7fea10b23d253ac1b422638e80570430144280b8fc428c186097430709ceda8')
+ def test_wrapper_only_fixture_corpus_bound_changes(self):
+  self.assertEqual(WRAPPER.count('@($fixtures.cases).Count -gt 64'),1)
+  restored=WRAPPER.replace('@($fixtures.cases).Count -gt 64','@($fixtures.cases).Count -gt 32')
+  self.assertEqual(hashlib.sha256(restored.encode()).hexdigest(),'335b657000d22d0fd822a239dcdf7d427c2ab2abb9d77d17e05ac14fc09c2c90')
 
 if __name__=='__main__':unittest.main()

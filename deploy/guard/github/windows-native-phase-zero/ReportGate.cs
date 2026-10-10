@@ -53,7 +53,7 @@ public static class ReportGate {
         "same_host_reboot_proven", "all_owned_processes_gone", "self_exit", "vm_removal", "receipt_memory_absence", "boot", "processes", "files", "startup_status", "scm", "job", "listener", "cleanup");
       Need(Num(r["schema"]) == 2); Eq(r["kind"], "WINDOWS_NO_KEY_NATIVE_PHASE_ZERO"); Enum(r["outcome"], "OBSERVED", "UNKNOWN", "REFUSED");
       Enum(r["stage"], "preflight", "scm", "files", "startup", "job");
-      Enum(r["error_class"], "none", "handle", "security", "process", "abi", "boot_environment", "time_of_day", "clock", "ownership", "file", "scm", "listener", "startup", "job", "preexisting", "privilege", "cleanup", "unexpected", "report"); Num(r["error_code"]);
+      Enum(r["error_class"], "none", "handle", "security", "process", "abi", "boot_environment", "time_of_day", "clock", "clock_guard", "ownership", "file", "scm", "listener", "startup", "job", "preexisting", "privilege", "cleanup", "unexpected", "report"); Num(r["error_code"]);
       Need(Bool(r["actual_native_getter_executed"]));
       foreach (string f in new string[] { "source_admitted", "runtime_admitted", "release_ready", "production_windows_service_acceptance", "native_credential_retention_proven", "same_host_reboot_proven", "all_owned_processes_gone" }) Need(!Bool(r[f]));
       Eq(r["self_exit"], "UNKNOWN"); Eq(r["vm_removal"], "UNKNOWN"); Eq(r["receipt_memory_absence"], "NOT_EXERCISED");
@@ -65,6 +65,7 @@ public static class ReportGate {
         Need(Ticks(b["boot_filetime"]) > 0 && Ticks(b["boot_filetime"]) <= before && before <= current && current <= after && after - before <= 50000000);
         Need(Ticks(b["qpc_before"]) <= Ticks(b["qpc_after"]) && Ticks(b["qpc_frequency"]) > 0); Ticks(b["uptime_ms"]);
       } else foreach (var f in b) if (f.Key != "state") Need(f.Value == null);
+      if (Str(r["error_class"]) == "clock_guard") Need(Str(r["stage"]) == "preflight" && Str(r["outcome"]) == "REFUSED" && Str(b["state"]) == "UNKNOWN" && Num(r["error_code"]) >= 1 && Num(r["error_code"]) <= 11);
       var processes = ArrayOf(r["processes"], 2); var roles = new Dictionary<string, Dictionary<string, object>>();
       foreach (object x in processes) {
         var p = Obj(x, "role", "pid", "creation_filetime", "parent_pid", "image_sha256", "fixed_image_match", "virtual_sid_match", "observation_before_filetime", "observation_after_filetime");

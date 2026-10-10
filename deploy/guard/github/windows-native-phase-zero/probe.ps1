@@ -95,7 +95,7 @@ try {
   $type = $assembly.GetType('ReportGate', $true)
   $failure = 'REPORT_GATE'
   $fixtures = [IO.File]::ReadAllText($fixtureFile) | ConvertFrom-Json
-  if ($fixtures.schema -ne 1 -or $fixtures.kind -cne 'INERT_REPORT_GATE_FIXTURES' -or $fixtures.native_execution -ne $false -or @($fixtures.cases).Count -gt 32) { throw 'Inert gate fixtures refused.' }
+  if ($fixtures.schema -ne 1 -or $fixtures.kind -cne 'INERT_REPORT_GATE_FIXTURES' -or $fixtures.native_execution -ne $false -or @($fixtures.cases).Count -gt 64) { throw 'Inert gate fixtures refused.' }
   foreach ($case in $fixtures.cases) {
     $value = $type.GetMethod('Validate').Invoke($null, @([string]$case.raw))
     if (($null -ne $value) -ne [bool]$case.accept) { throw 'Pure report-gate fixture failed.' }
