@@ -33,6 +33,58 @@ BASE_ENV={'PATH':'/usr/bin:/bin','LANG':'C.UTF-8','PYTHONDONTWRITEBYTECODE':'1'}
 _STAGES={'arguments','public-source','reader','raw-source','rustup','preparation','metadata'}
 _STAGE='arguments'
 
+_PUBLIC_PREDICATE='none'
+_PUBLIC_PREDICATES=frozenset(('none','context-commit','context-environment','context-main-dispatch','context-reader-grants',
+    'context-no-credentials','source-arguments','source-workspace','source-clean-git','source-bootstrap-report',
+    'source-bootstrap-schema','source-bootstrap-binding','source-inventory-reference','source-inventory-path',
+    'source-inventory-read','source-inventory-hash','source-inventory-tree','source-admission-record',
+    'source-roster-record','source-reader-import','source-pin-validation','source-roster-validation',
+    'managed-root-interpreter','runtime-reference','runtime-inventory-read','runtime-inventory-hash',
+    'runtime-inventory-schema','runtime-tool-reference','runtime-tool-readback','runtime-vendor'))
+_PUBLIC_GUARD_REASONS={
+    'Preparation environment refused':'context-environment-refused',
+    'Public main dispatch refused':'context-main-refused',
+    'Reader grants absent':'reader-grants-absent',
+    'Public source refused':'git-refused',
+    'Admission ID refused':'admission-id-refused',
+    'Public workspace refused':'workspace-refused',
+    'Current clean public checkout required':'clean-checkout-refused',
+    'Original bootstrap refused':'bootstrap-refused',
+    'Fixed preparation input refused':'input-shape-refused',
+    'Original bootstrap source differs':'bootstrap-source-differs',
+    'Original source inventory path refused':'source-inventory-path-refused',
+    'Original source inventory differs':'source-inventory-differs',
+    'Original copied source changed':'copied-source-differs',
+    'Committed source admission absent or changed':'source-admission-differs',
+    'Committed source roster refused':'source-roster-refused',
+    'Managed root reader required':'managed-root-reader-refused',
+    'Managed root preparation required':'managed-root-preparation-refused',
+    'Bootstrap runtime path refused':'runtime-path-refused',
+    'Bootstrap runtime inventory differs':'runtime-inventory-differs',
+    'Managed fixed tool differs':'managed-tool-differs',
+    'Original fixed Node vendor differs':'node-vendor-differs',
+    'Canonical regular member required':'canonical-member-refused',
+    'Root-owned non-writable ancestor required':'root-ancestor-refused',
+    'Bounded regular single-link member required':'regular-member-refused',
+    'Protected member required':'protected-member-refused',
+    'Member read exceeded bound':'member-read-bound',
+    'Member changed while inventoried':'member-changed',
+    'Complete canonical tree required':'canonical-tree-refused',
+    'Tree links/devices refused':'tree-member-type-refused',
+    'Root protected tree required':'root-tree-refused',
+    'Complete tree member bound exceeded':'tree-member-bound',
+    'Nonempty complete source tree required':'empty-tree-refused',
+}
+
+
+def public_failure_diagnostic(error):
+    """Closed source-location observation only; no error rendering or new I/O."""
+    reason='unknown'
+    if type(error)is RuntimeError and len(error.args)==1 and type(error.args[0])is str:
+        reason=_PUBLIC_GUARD_REASONS.get(error.args[0],'unknown')
+    return {'predicate':_PUBLIC_PREDICATE if _PUBLIC_PREDICATE in _PUBLIC_PREDICATES else 'none','guardReason':reason}
+
+
 
 def exact(value,keys):
     need(type(value)is dict and set(value)==set(keys),'Fixed preparation input refused');return value
@@ -45,47 +97,69 @@ def git(workspace,args,maximum=268435456):
 
 
 def context(commit,env,*,reader=False):
+    global _PUBLIC_PREDICATE
+    _PUBLIC_PREDICATE='context-commit'
     sha(commit,40)
     allowed=set(BASE_ENV)|CONTEXT|({'PRIVATE_ARTIFACT_READ_TOKEN','GITHUB_TOKEN'}if reader else set())
+    _PUBLIC_PREDICATE='context-environment'
     need(set(env)<=allowed and all(env.get(k)==v for k,v in BASE_ENV.items()),'Preparation environment refused')
+    _PUBLIC_PREDICATE='context-main-dispatch'
     need(env.get('GITHUB_REPOSITORY')==REPOSITORY and env.get('GITHUB_REF')=='refs/heads/main'
         and env.get('GITHUB_REF_TYPE')=='branch'and env.get('GITHUB_EVENT_NAME')=='workflow_dispatch'
         and env.get('GITHUB_SHA')==commit,'Public main dispatch refused')
+    _PUBLIC_PREDICATE='context-reader-grants' if reader else 'context-no-credentials'
     if reader:need(all(type(env.get(k))is str and env[k]for k in('PRIVATE_ARTIFACT_READ_TOKEN','GITHUB_TOKEN')),'Reader grants absent')
     else:recipe.no_credentials(env)
 
 
 def public_source(workspace,commit,identifier):
+    global _PUBLIC_PREDICATE
+    _PUBLIC_PREDICATE='source-arguments'
     sha(commit,40);need(re.fullmatch('[a-z0-9][a-z0-9-]{0,63}',identifier or ''),'Admission ID refused')
     workspace=Path(workspace)
+    _PUBLIC_PREDICATE='source-workspace'
     need(workspace.is_absolute()and workspace.resolve(strict=True)==workspace,'Public workspace refused')
+    _PUBLIC_PREDICATE='source-clean-git'
     need(git(workspace,['rev-parse','HEAD'],128).decode().strip()==commit and git(workspace,['status','--porcelain'],1048576)==b'',
         'Current clean public checkout required')
+    _PUBLIC_PREDICATE='source-bootstrap-report'
     report=decode(read(PUBLIC/'reports/preparation.json'))
+    _PUBLIC_PREDICATE='source-bootstrap-schema'
     need(report.get('schema')==1 and type(report['schema'])is int and report.get('kind')=='actual-free-hosted-ordinary-preparation'
         and report.get('controlSource')==commit and all(report.get(k)is False for k in
         ('privateInput','providerRolesAssumed','venueOrders','nativeAcceptance','fullJourney','releaseReady')),'Original bootstrap refused')
+    _PUBLIC_PREDICATE='source-bootstrap-binding'
     src=exact(report['source'],{'commit','archiveSha256','controllerRoot','genuineCheckout','gitDatabaseInSourceInventory'})
     need(src['commit']==commit and src['controllerRoot']==str(SOURCE)and src['genuineCheckout']==str(CHECKOUT)
         and src['gitDatabaseInSourceInventory']is False and digest(git(workspace,['archive','--format=tar',commit]))==src['archiveSha256']
         and git(CHECKOUT,['rev-parse','HEAD'],128).decode().strip()==commit,'Original bootstrap source differs')
+    _PUBLIC_PREDICATE='source-inventory-reference'
     ref=exact(report['inventories']['source'],{'file','sha256'})
+    _PUBLIC_PREDICATE='source-inventory-path'
     need(ref['file']==str(PUBLIC/'reports/source-inventory.json'),'Original source inventory path refused')
-    raw=read(Path(ref['file']));need(digest(raw)==ref['sha256'],'Original source inventory differs')
+    _PUBLIC_PREDICATE='source-inventory-read'
+    raw=read(Path(ref['file']));
+    _PUBLIC_PREDICATE='source-inventory-hash'
+    need(digest(raw)==ref['sha256'],'Original source inventory differs')
+    _PUBLIC_PREDICATE='source-inventory-tree'
     source_map=decode(raw);need(source_map==tree(SOURCE),'Original copied source changed')
     # Root-maintained committed pin and source roster are independently joined
     # to the actual Git object and original bootstrap's protected source bytes.
     values=[]
     for suffix in('.json','.source.json'):
+        _PUBLIC_PREDICATE='source-admission-record' if suffix=='.json' else 'source-roster-record'
         name=RAW+identifier+suffix
         blob=git(workspace,['show',commit+':'+name],16*1024*1024)
         need(digest(blob)==source_map['files'].get(name)and read(SOURCE/name,16*1024*1024)==blob,'Committed source admission absent or changed')
         values.append((blob,decode(blob,16*1024*1024)))
     pin_raw,pin=values[0];_,roster=values[1]
+    _PUBLIC_PREDICATE='source-reader-import'
     reader_path=SOURCE/'deploy/guard/github/hosted-delivery/raw_build_reader.py'
     spec=importlib.util.spec_from_file_location('fixed_raw_build_reader',reader_path)
     module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
+    _PUBLIC_PREDICATE='source-pin-validation'
     module.load_pin(pin,identifier)
+    _PUBLIC_PREDICATE='source-roster-validation'
     validate_roster(pin_raw,pin,roster,identifier)
     return pin,roster,report,module
 
@@ -100,8 +174,9 @@ def validate_roster(pin_raw,pin,roster,identifier):
 
 
 def read_raw(workspace,commit,identifier,env):
-    global _STAGE
+    global _STAGE,_PUBLIC_PREDICATE
     _STAGE='public-source';context(commit,env,reader=True);pin,_,report,_=public_source(workspace,commit,identifier)
+    _PUBLIC_PREDICATE='managed-root-interpreter'
     need(os.geteuid()==0 and Path(sys.executable).resolve(strict=True)==PYTHON,'Managed root reader required')
     tools(report)
     _STAGE='reader'
@@ -175,15 +250,24 @@ def rustup():
 
 
 def tools(report):
+    global _PUBLIC_PREDICATE
+    _PUBLIC_PREDICATE='runtime-reference'
     ref=report['inventories']['runtime'];need(ref['file']==str(PUBLIC/'reports/runtime-inventory.json'),'Bootstrap runtime path refused')
-    raw=read(Path(ref['file']),16*1024*1024);need(digest(raw)==ref['sha256'],'Bootstrap runtime inventory differs')
+    _PUBLIC_PREDICATE='runtime-inventory-read'
+    raw=read(Path(ref['file']),16*1024*1024);
+    _PUBLIC_PREDICATE='runtime-inventory-hash'
+    need(digest(raw)==ref['sha256'],'Bootstrap runtime inventory differs')
+    _PUBLIC_PREDICATE='runtime-inventory-schema'
     runtime=decode(raw,16*1024*1024);result={}
     for path in(PYTHON,NODE,NPM):
+        _PUBLIC_PREDICATE='runtime-tool-reference'
         expected=runtime['files'].get(str(path));sha(expected)
+        _PUBLIC_PREDICATE='runtime-tool-readback'
         need(digest(read(path,128*1024*1024))==expected,'Managed fixed tool differs')
     for name,path in(('node',NODE),('npm',NPM)):
         expected=runtime['files'].get(str(path));sha(expected)
         result[name]={'file':str(path),'sha256':expected}
+    _PUBLIC_PREDICATE='runtime-vendor'
     need(report['node']['version']=='26.8.1'and report['node']['archiveSha256']=='3e301118d7df53d563b7e96c1617545f26e2f76f9724be668d6cab65c15dda5d',
         'Original fixed Node vendor differs')
     return result
@@ -207,8 +291,9 @@ def bounded_metadata(ref,identifier,commit):
 
 
 def invoke(workspace,commit,identifier,env):
-    global _STAGE
+    global _STAGE,_PUBLIC_PREDICATE
     _STAGE='public-source';context(commit,env)
+    _PUBLIC_PREDICATE='managed-root-interpreter'
     need(os.geteuid()==0 and Path(sys.executable).resolve(strict=True)==PYTHON,'Managed root preparation required')
     pin,roster,report,_=public_source(workspace,commit,identifier)
     _STAGE='raw-source';stage_ref=raw_source(pin,roster,identifier);refs=tools(report)
@@ -222,8 +307,8 @@ class FixedParser(argparse.ArgumentParser):
 
 
 def main():
-    global _STAGE
-    _STAGE='arguments'
+    global _STAGE,_PUBLIC_PREDICATE
+    _STAGE='arguments';_PUBLIC_PREDICATE='none'
     try:
         parser=FixedParser(add_help=False);parser.add_argument('--workspace',required=True);parser.add_argument('--control-source',required=True)
         parser.add_argument('--admission-id',required=True);parser.add_argument('--mode',choices=('validate','reader','prepare'),default='prepare');args=parser.parse_args()
@@ -239,10 +324,11 @@ def main():
             value={'schema':1,'status':'source-roster-validated','releaseReady':False}
         else:value=invoke(args.workspace,args.control_source,args.admission_id,env)
         raw=canonical(value);need(len(raw)<=4096,'Bounded preparation metadata required')
-    except BaseException:
+    except BaseException as error:
         value={'schema':1,'kind':'public-website-preparation-metadata','status':'held','stage':_STAGE if _STAGE in _STAGES else'arguments',
             'code':'fixed-stage-refused','runtimeAdmitted':False,'privateEpoch':False,'fullJourney':False,'releaseReady':False,
             'wholeHostCredentialAbsenceProven':False}
+        if _STAGE=='public-source':value['diagnostic']=public_failure_diagnostic(error)
         print(canonical(value).decode());return 1
     print(raw.decode());return 0
 
