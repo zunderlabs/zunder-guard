@@ -249,4 +249,28 @@ class Invoker(unittest.TestCase):
             if isinstance(node,ast.Call)and isinstance(node.func,ast.Name):self.assertIn(node.func.id,('type','len'))
         self.assertEqual(set(p.public_failure_diagnostic(RuntimeError('secret'))),{'predicate','guardReason'})
 
+    def test_exact_node_member_bound_and_other_tools_unchanged(self):
+        self.assertEqual(p.NODE_READ_BYTES,150425704)
+        rows={str(path):p.digest(str(path).encode())for path in(p.PYTHON,p.NODE,p.NPM)}
+        raw=p.canonical({'files':rows});seen=[]
+        report={'inventories':{'runtime':{'file':str(p.PUBLIC/'reports/runtime-inventory.json'),'sha256':p.digest(raw)}},'node':{'version':'26.8.1','archiveSha256':'3e301118d7df53d563b7e96c1617545f26e2f76f9724be668d6cab65c15dda5d'}}
+        def read(path,maximum):
+            seen.append((path,maximum));return raw if path.name=='runtime-inventory.json'else str(path).encode()
+        with patch.object(p,'read',side_effect=read):p.tools(report)
+        self.assertEqual(seen,[(p.PUBLIC/'reports/runtime-inventory.json',16*1024*1024),(p.PYTHON,128*1024*1024),(p.NODE,150425704),(p.NPM,128*1024*1024)])
+    def test_fixed_node_one_byte_oversize_is_refused_before_read(self):
+        import tempfile
+        from hosted_launch import inventory
+        with tempfile.TemporaryDirectory()as folder:
+            path=(Path(folder)/'inert-sparse-member').resolve();path.touch()
+            with path.open('r+b')as stream:stream.truncate(p.NODE_READ_BYTES+1)
+            with patch.object(inventory.os,'read')as read,self.assertRaises(RuntimeError):inventory.read(path,p.NODE_READ_BYTES,protected=False)
+            read.assert_not_called()
+    def test_exact_production_inverse_and_no_generic_bound_raise(self):
+        import inspect,hashlib
+        source=Path(p.__file__).read_text()
+        restored=source.replace('\nNODE_READ_BYTES=150425704','').replace('NODE_READ_BYTES if path==NODE else 128*1024*1024','128*1024*1024')
+        self.assertEqual(hashlib.sha256(restored.encode()).hexdigest(),'6aa5b1416c8d7ec0c540f9200f1ae20306dedd540b0167fcf4016a7b69b71946')
+        self.assertEqual(source.count('NODE_READ_BYTES'),2)
+
 if __name__=='__main__':unittest.main()

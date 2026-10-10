@@ -23,6 +23,7 @@ REPOSITORY='zunderlabs/zunder-guard'
 RAW='deploy/guard/github/hosted-delivery/raw-admissions/'
 PYTHON=ROOT/'runtime/python/bin/python3.12'
 NODE=ROOT/'runtime/node/bin/node'
+NODE_READ_BYTES=150425704
 NPM=ROOT/'runtime/node/lib/node_modules/npm/bin/npm-cli.js'
 RUSTUP=ROOT/'runtime/node/bin/rustup'
 RUSTUP_URL='https://static.rust-lang.org/rustup/archive/1.29.1/x86_64-unknown-linux-gnu/rustup-init'
@@ -263,7 +264,7 @@ def tools(report):
         _PUBLIC_PREDICATE='runtime-tool-reference'
         expected=runtime['files'].get(str(path));sha(expected)
         _PUBLIC_PREDICATE='runtime-tool-readback'
-        need(digest(read(path,128*1024*1024))==expected,'Managed fixed tool differs')
+        need(digest(read(path,NODE_READ_BYTES if path==NODE else 128*1024*1024))==expected,'Managed fixed tool differs')
     for name,path in(('node',NODE),('npm',NPM)):
         expected=runtime['files'].get(str(path));sha(expected)
         result[name]={'file':str(path),'sha256':expected}
