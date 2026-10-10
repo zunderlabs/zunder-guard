@@ -2,7 +2,7 @@ name: public-homebrew-candidate-paper
 on:
   workflow_dispatch:
   push:
-    branches: [codex/hosted-homebrew-candidate]
+    branches: [release/homebrew-rehearsal]
 permissions:
   contents: read
   actions: read
