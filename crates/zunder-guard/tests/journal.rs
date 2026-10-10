@@ -572,53 +572,114 @@ fn crashed_with(path: &Path, orders: u64) {
     }
 }
 
-/// Regression case: the bound holds against a slow venue
-/// (each `orderStatus` taking 2 s) and against actions that expire after
-/// it: recovery ends within it, what it could not read `unknown`.
+/// The venue-read budget and the journal's separate enqueue/sync waits
+/// are bounded; unread actions remain unknown and the conclusions reach disk.
 #[tokio::test(flavor = "multi_thread")]
 async fn recovery_ends_within_its_bound_on_a_slow_venue() {
+    const READ_BUDGET_MS: u64 = 2_500;
+    const STATUS_DELAY_MS: u64 = 2_000;
+    // recover_after first bounds reads, then gives all journal enqueues one
+    // ACK deadline; Durable::wait has its own ACK deadline after that.
+    // Match the journal's existing real-time tests' 1 s scheduler allowance.
+    let total_wait_bound =
+        Duration::from_millis(READ_BUDGET_MS + 2 * zunder_guard::journal::ACK_DEADLINE_MS + 1_000);
     let dir = TestDir::new("journal-j3-slow");
     let path = config(dir.path()).decision_journal(false);
     let guard = start(dir.path(), venue(), true).await;
     let venue = guard.upstream().fork();
     drop(guard);
     crashed_with(&path, 5);
-    venue.slow_order_status(2_000);
+    venue.slow_order_status(STATUS_DELAY_MS);
     let guard = start(dir.path(), venue, false).await;
     let pending = guard.pending_for_recovery().await;
     assert_eq!(pending.len(), 5);
-    // Expiry 60 s away: the bound (2.5 s) comes first.
+    let reads_before = guard.upstream().info_log().len();
+    let sends_before = guard.upstream().received().len();
+    // Expiry 60 s away: the read budget comes first, without any venue read.
     let started = std::time::Instant::now();
-    assert_eq!(guard.recover_after(pending, 60_000, 2_500).await, 5);
+    assert_eq!(
+        guard.recover_after(pending, 60_000, READ_BUDGET_MS).await,
+        5
+    );
     let took = started.elapsed();
-    assert!(took < Duration::from_millis(3_500), "{took:?}");
+    assert!(took < total_wait_bound, "{took:?}");
+    assert!(!guard.recovering());
+    assert_eq!(guard.upstream().info_log().len(), reads_before);
+    assert_eq!(guard.upstream().received().len(), sends_before);
+    let outcomes = recovered(&guard).await;
+    assert_eq!(outcomes.len(), 5);
+    assert!(
+        outcomes.iter().all(|event| {
+            event["outcome"] == "unknown" && event["evidence"]["why"] == "recovery ran out of time"
+        }),
+        "{outcomes:?}"
+    );
+    drop(guard);
+    let journal = DecisionJournal::open(&path).unwrap();
+    assert!(journal.pending().is_empty());
+    let durable: Vec<_> = journal
+        .since(0)
+        .into_iter()
+        .filter(|event| event["kind"] == "recovered")
+        .collect();
+    assert_eq!(durable, outcomes);
+    drop(journal);
+
+    // Expired at once. At most the first 2 s read can finish inside 2.5 s;
+    // a subsequent read is canceled and cannot appear in info_log, which
+    // records only AFTER the delay (it is not an attempted-read counter).
+    let dir = TestDir::new("journal-j3-slow2");
+    let path = config(dir.path()).decision_journal(false);
+    let guard = start(dir.path(), venue_with_slow_status(STATUS_DELAY_MS), true).await;
+    let venue = guard.upstream().fork();
+    drop(guard);
+    crashed_with(&path, 5);
+    let guard = start(dir.path(), venue, false).await;
+    let pending = guard.pending_for_recovery().await;
+    assert_eq!(pending.len(), 5);
+    let reads_before = guard.upstream().info_log().len();
+    let sends_before = guard.upstream().received().len();
+    let started = std::time::Instant::now();
+    assert_eq!(guard.recover_after(pending, 0, READ_BUDGET_MS).await, 5);
+    let took = started.elapsed();
+    assert!(took < total_wait_bound, "{took:?}");
+    assert!(!guard.recovering());
+    let reads = guard.upstream().info_log();
+    let completed = &reads[reads_before..];
+    assert!(completed.len() <= 1, "{completed:?}");
+    assert!(completed.iter().all(|read| read["type"] == "orderStatus"));
     let outcomes = recovered(&guard).await;
     assert_eq!(outcomes.len(), 5);
     assert!(
         outcomes.iter().all(|event| event["outcome"] == "unknown"),
         "{outcomes:?}"
     );
-    // Expired at once, but each read 2 s: the first answered in time but
-    // too late to read again, the second cut at the bound, the rest not
-    // read.
-    let dir = TestDir::new("journal-j3-slow2");
-    let path = config(dir.path()).decision_journal(false);
-    let guard = start(dir.path(), venue_with_slow_status(2_000), true).await;
-    let venue = guard.upstream().fork();
-    drop(guard);
-    crashed_with(&path, 5);
-    let guard = start(dir.path(), venue, false).await;
-    let pending = guard.pending_for_recovery().await;
-    let started = std::time::Instant::now();
-    assert_eq!(guard.recover_after(pending, 0, 2_500).await, 5);
-    let took = started.elapsed();
-    assert!(took < Duration::from_millis(3_500), "{took:?}");
     assert!(
-        recovered(&guard)
-            .await
+        outcomes
             .iter()
-            .all(|event| event["outcome"] == "unknown")
+            .filter(|event| { event["evidence"]["why"] == "recovery ran out of time" })
+            .count()
+            >= 4,
+        "{outcomes:?}"
     );
+    if let Some(read) = completed.first() {
+        assert_eq!(read["oid"], outcomes[0]["action"]["orders"][0]["c"]);
+    }
+    assert_eq!(guard.upstream().received().len(), sends_before);
+    // Waiting past a whole venue delay must not complete the canceled read
+    // or launch a late retry after recovery has returned.
+    tokio::time::sleep(Duration::from_millis(STATUS_DELAY_MS + 100)).await;
+    assert_eq!(guard.upstream().info_log(), reads);
+    assert_eq!(guard.upstream().received().len(), sends_before);
+    drop(guard);
+    let journal = DecisionJournal::open(&path).unwrap();
+    assert!(journal.pending().is_empty());
+    let durable: Vec<_> = journal
+        .since(0)
+        .into_iter()
+        .filter(|event| event["kind"] == "recovered")
+        .collect();
+    assert_eq!(durable, outcomes);
 }
 
 fn venue_with_slow_status(ms: u64) -> MemoryVenue {

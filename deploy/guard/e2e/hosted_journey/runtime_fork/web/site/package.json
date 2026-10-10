@@ -1,0 +1,43 @@
+{
+  "name": "zunderlabs-site",
+  "private": true,
+  "type": "module",
+  "license": "UNLICENSED",
+  "scripts": {
+    "fonts": "node scripts/copy-fonts.mjs",
+    "build": "node scripts/copy-fonts.mjs && node scripts/engine-defaults.mjs && node scripts/sample-snapshot.mjs && node scripts/sync-docs.mjs && node scripts/licenses.mjs --check && astro build && node scripts/after-paint.mjs && node scripts/approve-csp.mjs && node scripts/check-pages.mjs && node scripts/check-placeholders.mjs && node scripts/deployment-build.ts",
+    "preview": "astro preview --host 0.0.0.0",
+    "check": "astro check",
+    "test:e2e": "playwright test --project=fixture-* --project=wallet",
+    "test:staging": "playwright test --project=staging-*",
+    "test:purchase": "ZUNDER_REAL_PURCHASE=1 playwright test --project=real-purchase --workers=1 --retries=0 --reporter=line",
+    "test:typecheck": "tsc -p tests/tsconfig.json",
+    "test:testnet:policy": "playwright test --project=testnet-wallet-policy --reporter=line",
+    "test:testnet:approval": "playwright test --project=real-testnet-approval --workers=1 --retries=0 --reporter=line",
+    "test:testnet:payment-policy": "playwright test --project=testnet-payment-policy --reporter=line",
+    "test:testnet:purchase": "playwright test --project=real-testnet-purchase --workers=1 --retries=0 --reporter=line",
+    "build:staging": "node scripts/build-profile.ts staging",
+    "build:production": "node scripts/build-profile.ts production",
+    "test:profiles": "playwright test --project=profile-* --reporter=line"
+  },
+  "dependencies": {
+    "@astrojs/markdown-remark": "^7.3.1",
+    "@astrojs/starlight": "^0.42.5",
+    "@fontsource-variable/jetbrains-mono": "^5.3.0",
+    "@fontsource-variable/schibsted-grotesk": "^5.3.0",
+    "astro": "^7.3.5",
+    "js-yaml": "^4.3.2"
+  },
+  "devDependencies": {
+    "@astrojs/check": "^0.9.10",
+    "@playwright/test": "1.62.1",
+    "@types/node": "24.19.1",
+    "ethers": "6.17.0",
+    "postal-mime": "4.0.5",
+    "typescript": "^6.0.3"
+  },
+  "overrides": {
+    "sharp": "file:./stubs/sharp",
+    "lightningcss": "file:./stubs/lightningcss"
+  }
+}

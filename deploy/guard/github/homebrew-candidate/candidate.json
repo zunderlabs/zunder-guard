@@ -1,0 +1,50 @@
+{
+  "actual_hosted_execution": false,
+  "files": {
+    "SHA256SUMS": {
+      "bytes": 2233,
+      "sha256": "029c13981f216cf297f1c539e968c6e6dbe001d61ee4ee1f6496fea993ac06ad"
+    },
+    "SHA256SUMS.sigstore.json": {
+      "bytes": 10210,
+      "sha256": "5d78beafc41a6bd2620f68050a9a4fed65b0a5ed5e890f8d82f95790df14d244"
+    },
+    "zunder-guard-v1.0.5-darwin-amd64.tar.gz": {
+      "binary_sha256": "7a6208c967d0e392eb40cc7d8b9831efb1d42847a75f10d6b3b317ab77a98925",
+      "bytes": 3971090,
+      "sha256": "2e8d9947fa392a0fea55e28615172f367592e1ed20835996bc577a61efce901b"
+    },
+    "zunder-guard-v1.0.5-darwin-arm64.tar.gz": {
+      "binary_sha256": "bb0d4a995b239b50a598dfdd9456988b291d538fc002629fe17e9a8dd42483ee",
+      "bytes": 3662110,
+      "sha256": "224b1a95f07bdc0899b365ce2d2eeaf0f275db2e80465cdcb307bd4fd757e7d4"
+    },
+    "zunder-guard-v1.0.5-linux-amd64.tar.gz": {
+      "binary_sha256": "e47e478a885008c1aaa74cfebaa23528fed8e11aae4210ccb4520b48902d472f",
+      "bytes": 4121158,
+      "sha256": "055073b2c813deafec8120f899e87e70c6a6d016e3c26d0a33a0da568136b295"
+    },
+    "zunder-guard-v1.0.5-linux-arm64.tar.gz": {
+      "binary_sha256": "f699e58db96b3bf46b00d0803cac8eb14f2f08e1a119da5f85a1151493ecc29b",
+      "bytes": 3799761,
+      "sha256": "39f8581579a3dd58f1f8c6812e5ca3d49510a10026794bfb4394a37353b1c0da"
+    },
+    "zunder-guard-v1.0.5.intoto.jsonl": {
+      "bytes": 26459,
+      "sha256": "616b80c45e14d9b18eeaa015ebffde809760b57607f5c0ae2ec476de789de5e2"
+    },
+    "zunder-guard.rb": {
+      "bytes": 4205,
+      "sha256": "c5e78b003c1b042c81dc2694b804d34e75a42e95e391b22494e5933709f20563"
+    }
+  },
+  "formula_sha256": "c5e78b003c1b042c81dc2694b804d34e75a42e95e391b22494e5933709f20563",
+  "kind": "public-signed-homebrew-candidate",
+  "manifest_sha256": "029c13981f216cf297f1c539e968c6e6dbe001d61ee4ee1f6496fea993ac06ad",
+  "publication_verified": false,
+  "release_run": 38022247487,
+  "repository": "zunderlabs/zunder-guard",
+  "schema": 1,
+  "source": "0f64fa0f822fb2e9fffc414883ca843bd4e992a7",
+  "tag": "v1.0.5"
+}

@@ -1,0 +1,21 @@
+name: Hosted ordinary no-secret source denial checks
+on:
+  workflow_call:
+permissions:
+  contents: read
+jobs:
+  deny:
+    if: github.repository == 'zunderlabs/zunder-guard' && github.event.repository.private == false && github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+          fetch-depth: 1
+      - name: No-key contract rejection fixtures
+        shell: bash
+        env:
+          PYTHONDONTWRITEBYTECODE: '1'
+        run: python3 -I -B deploy/guard/e2e/hosted_launch/test_launch.py
