@@ -248,6 +248,17 @@ def python_failure_diagnostic(context, error):
             'memberSha256': digest(member.encode()), 'errorType': kind, 'reason': reason}
 
 
+
+def stdlib_alias_target(member, actual, original):
+    """Only the fixed Ubuntu AMD64 libpython alias may leave the stdlib."""
+    if actual.is_relative_to(original):
+        return str(actual.relative_to(original))
+    need(member == 'config-3.12-x86_64-linux-gnu/libpython3.12.so' and
+         actual == Path('/usr/lib/x86_64-linux-gnu/libpython3.12.so.1.0'),
+         'External stdlib alias refused')
+    return str(actual)
+
+
 def python_runtime():
     """Own a regular managed stdlib tree; no ambient Python import search."""
     global _PYTHON_CONTEXT
@@ -272,8 +283,9 @@ def python_runtime():
                 need(str(actual) == '/etc/python3.12/sitecustomize.py', 'Unexpected site customization alias refused')
                 aliases.append({'path': relative_name, 'omitted': 'ambient startup customization'})
                 continue
-            need(actual.is_relative_to(original) and actual.is_file(), 'External stdlib alias refused')
-            aliases.append({'path': relative_name, 'target': str(actual.relative_to(original))})
+            alias_target = stdlib_alias_target(relative_name, actual, original)
+            need(actual.is_file(), 'External stdlib alias refused')
+            aliases.append({'path': relative_name, 'target': alias_target})
             copy_regular(actual, target/'lib/python3.12'/relative_name)
         elif path.is_file(): copy_regular(path, target/'lib/python3.12'/relative_name)
         else: need(path.is_dir(), 'Stdlib device refused')

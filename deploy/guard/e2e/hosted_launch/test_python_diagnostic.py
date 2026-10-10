@@ -5,10 +5,23 @@ import sys
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from hosted_launch.bootstrap import python_failure_diagnostic as diagnostic
+from hosted_launch.bootstrap import python_failure_diagnostic as diagnostic, stdlib_alias_target
 
 
 class Diagnostic(unittest.TestCase):
+    def test_fixed_ubuntu_library_alias_is_the_only_external_exception(self):
+        original = Path('/usr/lib/python3.12')
+        member = 'config-3.12-x86_64-linux-gnu/libpython3.12.so'
+        target = Path('/usr/lib/x86_64-linux-gnu/libpython3.12.so.1.0')
+        self.assertEqual(stdlib_alias_target(member, target, original), str(target))
+        for name, actual in [(member, Path('/tmp/libpython3.12.so.1.0')),
+                             (member, Path('/usr/lib/x86_64-linux-gnu/libpython3.13.so.1.0')),
+                             ('unexpected.so', target),
+                             ('config-3.12-aarch64-linux-gnu/libpython3.12.so', target)]:
+            with self.subTest(name=name, actual=actual), self.assertRaises(RuntimeError):
+                stdlib_alias_target(name, actual, original)
+        self.assertEqual(stdlib_alias_target('internal.py', original/'internal.py', original), 'internal.py')
+
     def test_fixed_reason_and_relative_public_member(self):
         result = diagnostic(('copy-member', 'sitecustomize.py'), RuntimeError('Unexpected site customization alias refused'))
         self.assertEqual(result['reason'], 'startup-alias-refused')
