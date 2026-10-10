@@ -197,14 +197,20 @@ internal static class PhaseZero {
     Need(N.GetSecurityInfo(job.P, 6, 5, out owner, out group, out dacl, out sacl, out descriptor) == 0, "security");
     try {
       ushort control; uint revision; Win(N.GetSecurityDescriptorControl(descriptor, out control, out revision), "security");
-      Need(SID(owner) == sid && (control & 0x1000) != 0 && dacl != IntPtr.Zero, "ownership");
+      if (!(SID(owner) == sid)) throw new Refused("ownership", 0x4a4f4201);
+      if (!((control & 0x1000) != 0)) throw new Refused("ownership", 0x4a4f4202);
+      if (!(dacl != IntPtr.Zero)) throw new Refused("ownership", 0x4a4f4203);
       N.ACL_SIZE acl; Win(N.GetAclInformation(dacl, out acl, (uint)Marshal.SizeOf(typeof(N.ACL_SIZE)), 2), "security");
-      Need(acl.Count == 3, "ownership"); var seen = new Dictionary<string, bool>();
+      if (!(acl.Count == 3)) throw new Refused("ownership", 0x4a4f4204); var seen = new Dictionary<string, bool>();
       for (uint n = 0; n < 3; n++) {
         IntPtr ace; Win(N.GetAce(dacl, n, out ace), "security");
-        Need(Marshal.ReadByte(ace) == 0 && Marshal.ReadByte(ace, 1) == 0 && (ushort)Marshal.ReadInt16(ace, 2) >= 12, "ownership");
+        if (!(Marshal.ReadByte(ace) == 0)) throw new Refused("ownership", 0x4a4f4205);
+        if (!(Marshal.ReadByte(ace, 1) == 0)) throw new Refused("ownership", 0x4a4f4206);
+        if (!((ushort)Marshal.ReadInt16(ace, 2) >= 12)) throw new Refused("ownership", 0x4a4f4207);
         string a = SID(IntPtr.Add(ace, 8)); uint mask = unchecked((uint)Marshal.ReadInt32(ace, 4));
-        Need(!seen.ContainsKey(a) && mask == 0x1f003f && (a == sid || a == "S-1-5-18" || a == "S-1-5-32-544"), "ownership"); seen.Add(a, true);
+        if (!(!seen.ContainsKey(a))) throw new Refused("ownership", 0x4a4f4208);
+        if (!(mask == 0x1f003f)) throw new Refused("ownership", 0x4a4f4209);
+        if (!((a == sid || a == "S-1-5-18" || a == "S-1-5-32-544"))) throw new Refused("ownership", 0x4a4f420a); seen.Add(a, true);
       }
     } finally { N.LocalFree(descriptor); }
   }
@@ -376,11 +382,12 @@ internal static class PhaseZero {
       var processes = (List<object>)report["processes"]; processes.Add(serviceFacts); processes.Add(childFacts);
       stage = "job";
       using (var job = new H(N.OpenJobObjectW(0x20004, false, JobName), false)) {
-        JobSecurity(job, sid); bool member; Win(N.IsProcessInJob(child.P, job.P, out member), "job"); Need(member, "ownership");
+        JobSecurity(job, sid); bool member; Win(N.IsProcessInJob(child.P, job.P, out member), "job"); if (!(member)) throw new Refused("ownership", 0x4a4f420b);
         var limit = new N.JOB_LIMIT(); var accounting = new N.JOB_ACCOUNTING();
         Win(N.QueryJobLimit(job.P, 9, ref limit, (uint)Marshal.SizeOf(typeof(N.JOB_LIMIT)), IntPtr.Zero), "job");
         Win(N.QueryJobAccounting(job.P, 1, ref accounting, (uint)Marshal.SizeOf(typeof(N.JOB_ACCOUNTING)), IntPtr.Zero), "job");
-        Need((limit.Basic.Flags & 0x2000) != 0 && accounting.Active == 1, "ownership");
+        if (!((limit.Basic.Flags & 0x2000) != 0)) throw new Refused("ownership", 0x4a4f420c);
+        if (!(accounting.Active == 1)) throw new Refused("ownership", 0x4a4f420d);
         report["job"] = D("state", "OBSERVED", "kill_on_close", true, "child_member", true, "protected_dacl_match", true, "active_processes", accounting.Active);
       } // Do not retain a second Job handle across service stop/last-handle kill.
       report["listener"] = D("state", "OBSERVED", "family", "IPv4", "address_class", "LOOPBACK", "port", Port, "owned_pid", pids[0]);

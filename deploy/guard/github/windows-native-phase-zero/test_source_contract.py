@@ -97,6 +97,16 @@ def deletion_model(original,current,expected):
   if value.get('path')!='fixed-exe' or value.get('directory')is not False or value.get('reparse')is not False or value.get('links')!=1 or value.get('protected_dacl')is not True or value.get('owner')!='ADMINISTRATORS' or value.get('hash')!=expected:return False
  return all(original.get(k)==current.get(k)for k in ('volume','file_id'))
 
+def prior_job_source():
+ restored=NATIVE
+ restored=restored.replace('      if (!(SID(owner) == sid)) throw new Refused("ownership", 0x4a4f4201);\n      if (!((control & 0x1000) != 0)) throw new Refused("ownership", 0x4a4f4202);\n      if (!(dacl != IntPtr.Zero)) throw new Refused("ownership", 0x4a4f4203);','      Need(SID(owner) == sid && (control & 0x1000) != 0 && dacl != IntPtr.Zero, "ownership");',1)
+ restored=restored.replace('      if (!(acl.Count == 3)) throw new Refused("ownership", 0x4a4f4204); var seen = new Dictionary<string, bool>();','      Need(acl.Count == 3, "ownership"); var seen = new Dictionary<string, bool>();',1)
+ restored=restored.replace('        if (!(Marshal.ReadByte(ace) == 0)) throw new Refused("ownership", 0x4a4f4205);\n        if (!(Marshal.ReadByte(ace, 1) == 0)) throw new Refused("ownership", 0x4a4f4206);\n        if (!((ushort)Marshal.ReadInt16(ace, 2) >= 12)) throw new Refused("ownership", 0x4a4f4207);','        Need(Marshal.ReadByte(ace) == 0 && Marshal.ReadByte(ace, 1) == 0 && (ushort)Marshal.ReadInt16(ace, 2) >= 12, "ownership");',1)
+ restored=restored.replace('        if (!(!seen.ContainsKey(a))) throw new Refused("ownership", 0x4a4f4208);\n        if (!(mask == 0x1f003f)) throw new Refused("ownership", 0x4a4f4209);\n        if (!((a == sid || a == "S-1-5-18" || a == "S-1-5-32-544"))) throw new Refused("ownership", 0x4a4f420a); seen.Add(a, true);','        Need(!seen.ContainsKey(a) && mask == 0x1f003f && (a == sid || a == "S-1-5-18" || a == "S-1-5-32-544"), "ownership"); seen.Add(a, true);',1)
+ restored=restored.replace('JobSecurity(job, sid); bool member; Win(N.IsProcessInJob(child.P, job.P, out member), "job"); if (!(member)) throw new Refused("ownership", 0x4a4f420b);','JobSecurity(job, sid); bool member; Win(N.IsProcessInJob(child.P, job.P, out member), "job"); Need(member, "ownership");',1)
+ restored=restored.replace('        if (!((limit.Basic.Flags & 0x2000) != 0)) throw new Refused("ownership", 0x4a4f420c);\n        if (!(accounting.Active == 1)) throw new Refused("ownership", 0x4a4f420d);','        Need((limit.Basic.Flags & 0x2000) != 0 && accounting.Active == 1, "ownership");',1)
+ return restored
+
 class SourceContract(unittest.TestCase):
  def test_explicit_x64_layouts(self):
   self.assertEqual([c.sizeof(x) for x in [Boot,Time,Basic,JobBasic,Job,FileId]],[32,48,48,64,144,24])
@@ -260,7 +270,7 @@ class SourceContract(unittest.TestCase):
 
 
  def test_precise_delta_restores_exact_r5_and_prior_diagnostic_predecessor(self):
-  restored=NATIVE.replace('    // Current UTC is one documented precise sample, not the opaque TOD snapshot.\n    ulong current = Clock();\n','')
+  restored=prior_job_source().replace('    // Current UTC is one documented precise sample, not the opaque TOD snapshot.\n    ulong current = Clock();\n','')
   restored=restored.replace('if (!(tod.CurrentTime > 0 && tod.CurrentTime >= tod.BootTime))','if (!(tod.CurrentTime > 0))')
   restored=restored.replace('if (!(current >= before))','if (!(unchecked((ulong)tod.CurrentTime) >= before))')
   restored=restored.replace('if (!(current <= after))','if (!(unchecked((ulong)tod.CurrentTime) <= after))')
@@ -307,6 +317,34 @@ class SourceContract(unittest.TestCase):
   values[2]=150000001;self.assertFalse(accepts(*values))
  def test_precise_capture_changes_no_other_functions(self):
   start=NATIVE.index('  static Dictionary<string, object> ProcessFacts')
-  self.assertEqual(hashlib.sha256(NATIVE[start:].encode()).hexdigest(),RETAINED_FUNCTIONS_SHA)
+  self.assertEqual(hashlib.sha256(prior_job_source()[start:].encode()).hexdigest(),RETAINED_FUNCTIONS_SHA)
+
+
+ def test_job_diagnostics_exact_r6_reversal(self):
+  self.assertEqual(hashlib.sha256(prior_job_source().encode()).hexdigest(),'10083c12e04617404408d5fd31c51e09c0b21e9ccd8b5c474f790980a6bdd006')
+ def test_job_diagnostics_fixed_codes_and_no_win32_namespace_collision(self):
+  rows=re.findall(r'if \(!\(([^\n]+)\)\) throw new Refused\("ownership", 0x4a4f42([0-9a-f]{2})\);',NATIVE)
+  self.assertEqual([int(code,16)for expr,code in rows],list(range(1,14)))
+  expected=['SID(owner) == sid','(control & 0x1000) != 0','dacl != IntPtr.Zero','acl.Count == 3','Marshal.ReadByte(ace) == 0','Marshal.ReadByte(ace, 1) == 0','(ushort)Marshal.ReadInt16(ace, 2) >= 12','!seen.ContainsKey(a)','mask == 0x1f003f','(a == sid || a == "S-1-5-18" || a == "S-1-5-32-544")','member','(limit.Basic.Flags & 0x2000) != 0','accounting.Active == 1']
+  self.assertEqual([expr for expr,code in rows],expected)
+  self.assertNotRegex(NATIVE,r'Win\([^;\n]+, "ownership"\)')
+  other=[line for line in NATIVE.splitlines()if 'new Refused("ownership",'in line and '0x4a4f42'not in line]
+  self.assertEqual(other,[])
+ def test_job_diagnostic_short_circuit_acceptance_is_unchanged(self):
+  import itertools
+  for size in (2,3,13):
+   for outcomes in itertools.product((False,True),repeat=size):
+    first=next((i for i,yes in enumerate(outcomes,1)if not yes),None)
+    self.assertEqual(all(outcomes),first is None)
+  for code in range(1,14):self.assertLess(0x4a4f4200+code,2**32)
+
+
+ def test_job_source_codes_remain_failed_data_under_existing_gate(self):
+  for code in range(1,14):
+   value=json.loads(FIXTURES['cases'][0]['raw'])
+   value.update(outcome='UNKNOWN',stage='job',error_class='ownership',error_code=0x4a4f4200+code)
+   self.assertTrue(report_model(json.dumps(value,separators=(',',':'))))
+   value['outcome']='OBSERVED'
+   self.assertFalse(report_model(json.dumps(value,separators=(',',':'))))
 
 if __name__=='__main__':unittest.main()
