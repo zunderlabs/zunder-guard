@@ -33,17 +33,41 @@ def pairs(rows):
     return result
 
 
+def validate_ancestor(value):
+    if type(value)is not dict or set(value)!={'kind','target','ancestor','query','result','canonical','uid','mode','fileType'}:raise ValueError()
+    targets={'root':('rootfs','opt','prefix'),'source':('rootfs','opt','prefix','source'),
+             'material':('rootfs','opt','material'),'reports':('rootfs','run','reports'),'work':('rootfs','run','work')}
+    if value['kind']!='fixed-source-ancestor-observation' or type(value['target'])is not str or value['target'] not in targets:raise ValueError()
+    if value['ancestor'] not in targets[value['target']]:raise ValueError()
+    if value['query'] not in ('canonical','lstat') or value['result'] not in ('pending','observed','missing','facts-refused'):raise ValueError()
+    if value['canonical'] not in ('unknown','true','false'):raise ValueError()
+    if value['query']=='canonical':
+        if value['ancestor']!=('prefix' if value['target']=='root' else value['target']):raise ValueError()
+        if value['result'] not in ('pending','observed') or value['canonical'] not in (('unknown',)if value['result']=='pending'else ('true','false')):raise ValueError()
+    elif value['canonical']!='true':raise ValueError()
+    facts=value['query']=='lstat' and value['result']=='observed'
+    if facts:
+        if type(value['uid'])is not int or not 0<=value['uid']<=4294967295:raise ValueError()
+        if type(value['mode'])is not int or not 0<=value['mode']<=65535:raise ValueError()
+        kind={0o040000:'directory',0o100000:'regular',0o120000:'symlink'}.get(value['mode']&0o170000,'other')
+        if value['fileType']!=kind:raise ValueError()
+    elif value['uid']is not None or value['mode']is not None or value['fileType']!='unknown':raise ValueError()
+
+
 def validate_capture(raw):
     if type(raw)is not bytes or not 0<len(raw)<=MAX_CAPTURE or not raw.isascii():raise ValueError()
     value = json.loads(raw,object_pairs_hook=pairs)
     if type(value)is not dict:raise ValueError()
     required = {'schema','kind','stage','reason','privateInput','runtimeAdmitted','releaseReady'}
-    if set(value) not in (required,required|{'diagnostic'}):raise ValueError()
+    if set(value) not in (required,required|{'diagnostic'},required|{'ancestorObservation'}):raise ValueError()
     if type(value['schema'])is not int or value['schema']!=1:raise ValueError()
     if value['kind']!='linux-acquisition-preparation-incomplete':raise ValueError()
     if type(value['stage'])is not str or value['stage'] not in STAGES:raise ValueError()
     if type(value['reason'])is not str or value['reason'] not in ('guard-refused','operation-failed'):raise ValueError()
     if any(value[name]is not False for name in ('privateInput','runtimeAdmitted','releaseReady')):raise ValueError()
+    if 'ancestorObservation' in value:
+        if value['stage']!='source-ancestors':raise ValueError()
+        validate_ancestor(value['ancestorObservation'])
     if 'diagnostic' in value:
         diagnostic = value['diagnostic']
         if value['stage'] not in DIAGNOSTIC_STAGES or type(diagnostic)is not dict:raise ValueError()

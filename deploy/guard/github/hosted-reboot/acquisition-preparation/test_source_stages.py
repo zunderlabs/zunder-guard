@@ -70,6 +70,9 @@ class SourceStages(unittest.TestCase):
 
     def test_exact_full_source_inverse_and_ast(self):
         source=(HERE/'prepare_runtime.py').read_text()
+        inverse_spec=importlib.util.spec_from_file_location('ancestor_inverse',HERE/'test_source_ancestors.py')
+        inverse_module=importlib.util.module_from_spec(inverse_spec);inverse_spec.loader.exec_module(inverse_module)
+        source=inverse_module.normalize_source(source)
         self.assertEqual(source.count(ADDED_VOCAB),1)
         inverse=source.replace(ADDED_VOCAB,'')
         for label in LABELS:

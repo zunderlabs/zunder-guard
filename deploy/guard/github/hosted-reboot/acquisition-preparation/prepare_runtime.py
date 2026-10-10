@@ -72,13 +72,44 @@ def command(argv, *, env=None, maximum=65536, seconds=120):
     return result.stdout
 
 
+SOURCE_ANCESTOR_CONTEXT = None
+
+
+def ancestor_context(directory, path, query, result, canonical='unknown', observed=None):
+    """Only already captured fixed public ancestor facts; never path/error text."""
+    global SOURCE_ANCESTOR_CONTEXT
+    targets={ROOT:'root',SOURCE:'source',MATERIAL:'material',REPORTS:'reports',WORK:'work'}
+    ancestors={Path('/'):'rootfs',Path('/opt'):'opt',Path('/run'):'run',
+               ROOT:'prefix',SOURCE:'source',MATERIAL:'material',REPORTS:'reports',WORK:'work'}
+    if STAGE!='source-ancestors' or directory not in targets or path not in ancestors:
+        SOURCE_ANCESTOR_CONTEXT=None;return
+    value={'kind':'fixed-source-ancestor-observation','target':targets[directory],
+           'ancestor':ancestors[path],'query':query,'result':result,'canonical':canonical,
+           'uid':None,'mode':None,'fileType':'unknown'}
+    if observed is not None:
+        uid=observed.st_uid;mode=observed.st_mode
+        if type(uid)is not int or not 0<=uid<=4294967295 or type(mode)is not int or not 0<=mode<=65535:
+            value['result']='facts-refused'
+        else:
+            value['uid']=uid;value['mode']=mode
+            value['fileType']={stat.S_IFDIR:'directory',stat.S_IFREG:'regular',
+                               stat.S_IFLNK:'symlink'}.get(stat.S_IFMT(mode),'other')
+    SOURCE_ANCESTOR_CONTEXT=value
+
+
 def protected_ancestors(directory):
     directory=Path(directory)
-    need(directory.is_absolute() and directory.resolve(strict=False)==directory,
+    ancestor_context(directory,directory,'canonical','pending')
+    canonical_ok=directory.is_absolute() and directory.resolve(strict=False)==directory
+    ancestor_context(directory,directory,'canonical','observed','true' if canonical_ok else 'false')
+    need(canonical_ok,
          'Canonical fixed protected path required')
     for path in reversed((directory,*directory.parents)):
+        ancestor_context(directory,path,'lstat','pending','true')
         try:s=path.lstat()
-        except FileNotFoundError:break
+        except FileNotFoundError:
+            ancestor_context(directory,path,'lstat','missing','true');break
+        ancestor_context(directory,path,'lstat','observed','true',s)
         need(stat.S_ISDIR(s.st_mode) and s.st_uid==0 and not s.st_mode&0o022,
              'Protected fixed ancestor required')
 
@@ -376,6 +407,8 @@ def failure(error):
     reason='guard-refused' if isinstance(error,RuntimeError) else 'operation-failed'
     value={'schema':1,'kind':'linux-acquisition-preparation-incomplete','stage':STAGE if STAGE in STAGES else 'unknown',
            'reason':reason,'privateInput':False,'runtimeAdmitted':False,'releaseReady':False}
+    if STAGE=='source-ancestors' and SOURCE_ANCESTOR_CONTEXT is not None:
+        value['ancestorObservation']=SOURCE_ANCESTOR_CONTEXT.copy()
     maps=sys.modules.get('runtime_maps')
     if STAGE in ('runtime-inventory','system-config','mapped-inventory','trust-inventory','reports') and maps is not None and maps.CONTEXT is not None:
         value['diagnostic']=maps.CONTEXT.copy()
