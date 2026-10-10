@@ -39,6 +39,49 @@ TOOLS_PATHS = {'python': '/usr/bin/python3.12', 'systemd_run': '/usr/bin/systemd
     'certutil': '/usr/bin/certutil', 'bwrap': '/usr/bin/bwrap'}
 _STAGE = 'arguments'
 _PYTHON_CONTEXT = None
+_INVENTORY_CONTEXT = None
+_INVENTORY_OPERATIONS = frozenset(('source-tree', 'website-tree', 'runtime-python-tree',
+    'runtime-node-tree', 'runtime-packages-tree', 'checkout-tree', 'git-resolve', 'git-read',
+    'tool-resolve', 'tool-read', 'native-ldd', 'native-dependency-resolve',
+    'native-dependency-read', 'proc-maps-read', 'proc-map-member', 'python-packages-tree',
+    'inventory-report-write', 'preparation-report-write'))
+
+
+def inventory_context(operation=None, *, member=None, index=None, count=None):
+    """Local context only; never enumerate or inspect an inventory member here."""
+    global _INVENTORY_CONTEXT
+    if operation is None or _STAGE != 'inventories':
+        _INVENTORY_CONTEXT = None
+        return
+    need(operation in _INVENTORY_OPERATIONS, 'Closed inventory diagnostic operation required')
+    value = {'operation': operation}
+    if type(member) is str and 0 < len(member) <= 4096:
+        value['memberSha256'] = digest(member.encode('utf-8', 'surrogatepass'))
+    if type(index) is int and type(count) is int and 0 <= index < count <= 100000:
+        value.update(index=index, count=count)
+    _INVENTORY_CONTEXT = value
+
+
+def inventory_failure_diagnostic(context, error):
+    """Closed class/reason only. No paths, payloads, exception names or text."""
+    if context is None:
+        return None
+    need(type(context) is dict and set(context) <= {'operation', 'memberSha256', 'index', 'count'}
+         and context.get('operation') in _INVENTORY_OPERATIONS, 'Closed inventory diagnostic context required')
+    value = {'operation': context['operation']}
+    if 'memberSha256' in context:
+        sha(context['memberSha256']); value['memberSha256'] = context['memberSha256']
+    if 'index' in context or 'count' in context:
+        need(type(context.get('index')) is int and type(context.get('count')) is int and
+             0 <= context['index'] < context['count'] <= 100000, 'Bounded inventory diagnostic position required')
+        value.update(index=context['index'], count=context['count'])
+    kinds = ((FileNotFoundError, 'member-missing'), (PermissionError, 'permission-refused'),
+             (FileExistsError, 'already-exists'), (subprocess.TimeoutExpired, 'operation-timeout'),
+             (RuntimeError, 'guard-refused'), (OSError, 'os-operation-failed'))
+    kind, reason = next(((cls.__name__, reason) for cls, reason in kinds if isinstance(error, cls)),
+                        ('other', 'operation-failed'))
+    value.update(errorType=kind, reason=reason)
+    return value
 
 
 class NoRedirect(HTTPRedirectHandler):
@@ -177,22 +220,35 @@ def capabilities():
 def runtime_observation(node_path, packages):
     roots = {'python': str(ROOT/'runtime/python'), 'node': str(node_path), 'packages': str(packages)}
     files = {}
-    for root in roots.values():
+    for name, root in roots.items():
+        inventory_context('runtime-'+name+'-tree')
         observed = tree(root)
         files.update({str(Path(root)/name): expected for name, expected in observed['files'].items()})
+        inventory_context()
     # The actual immutable Git database is an explicitly inventoried runtime
     # input outside bounded controller SOURCE, never a hand-written HEAD.
+    inventory_context('checkout-tree')
     git_map = tree(CHECKOUT)
     files.update({str(CHECKOUT/name): expected for name, expected in git_map['files'].items()})
+    inventory_context()
+    inventory_context('git-resolve', member='/usr/bin/git')
     git_executable = Path('/usr/bin/git').resolve(strict=True)
+    inventory_context()
+    inventory_context('git-read', member=str(git_executable))
     files[str(git_executable)] = digest(read(git_executable))
+    inventory_context()
     tools = {}
     absent = []
-    for name, path in {**TOOLS_PATHS, 'python': str(ROOT/'runtime/python/bin/python3.12'),
-                       'node': str(node_path/'bin/node')}.items():
+    tool_paths = {**TOOLS_PATHS, 'python': str(ROOT/'runtime/python/bin/python3.12'),
+                  'node': str(node_path/'bin/node')}
+    for index, (name, path) in enumerate(tool_paths.items()):
+        inventory_context('tool-resolve', member=path, index=index, count=len(tool_paths))
         selected = Path(path).resolve(strict=True)
+        inventory_context()
+        inventory_context('tool-read', member=str(selected), index=index, count=len(tool_paths))
         tools[name] = {'file': str(selected), 'sha256': digest(read(selected))}
         files[str(selected)] = tools[name]['sha256']
+        inventory_context()
     # These official verifier/browser artifacts require a separately reviewed
     # vendor lock. Absence is data, never permission to install latest versions.
     for name in ('cosign', 'slsa-verifier', 'chromium'): absent.append(name)
@@ -200,19 +256,31 @@ def runtime_observation(node_path, packages):
     native = {ref['file'] for ref in tools.values()} | {str(git_executable)}
     for file in files:
         if file.endswith('.so') or '.so.' in Path(file).name: native.add(file)
-    for file in sorted(native):
+    for index, file in enumerate(sorted(native)):
+        inventory_context('native-ldd', member=file, index=index, count=len(native))
         result = subprocess.run(['/usr/bin/ldd', file], stdin=subprocess.DEVNULL,
                                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                                 env={'PATH': '/usr/bin:/bin', 'LANG': 'C'}, timeout=5, check=False)
         need(len(result.stdout) <= 65536 and result.returncode in (0, 1), 'Bounded native dependency observation failed')
+        inventory_context()
         for match in re.findall(rb'(?:=>\s*)?(/[A-Za-z0-9_./+-]+)', result.stdout):
+            inventory_context('native-dependency-resolve', member=match.decode())
             path = Path(match.decode()).resolve(strict=True)
+            inventory_context()
+            inventory_context('native-dependency-read', member=str(path))
             files[str(path)] = digest(read(path)); selected_native.add(str(path))
-    for line in Path('/proc/self/maps').read_text().splitlines():
+            inventory_context()
+    inventory_context('proc-maps-read')
+    mapped_lines = Path('/proc/self/maps').read_text().splitlines()
+    inventory_context()
+    for index, line in enumerate(mapped_lines):
         parts = line.split(maxsplit=5)
         if len(parts) == 6 and parts[5].startswith('/'):
-            path = parts[5]; need(not path.endswith(' (deleted)'), 'Deleted mapped native runtime refused')
+            path = parts[5]
+            inventory_context('proc-map-member', member=path, index=index, count=len(mapped_lines))
+            need(not path.endswith(' (deleted)'), 'Deleted mapped native runtime refused')
             files[path] = digest(read(path)); selected_native.add(path)
+            inventory_context()
     return {'schema': 1, 'files': dict(sorted(files.items())), 'roots': roots, 'tools': tools,
             'missingTools': absent, 'completePrivateRuntime': False,
             'observedNativeFiles': sorted(selected_native)}
@@ -295,6 +363,7 @@ def python_runtime():
 
 def prepare(workspace, commit):
     global _STAGE
+    inventory_context()
     need(os.geteuid() == 0 and not ROOT.exists() and not PUBLIC.exists(), 'Fresh fixed hosted preparation required')
     PUBLIC.mkdir(mode=0o700); ROOT.mkdir(mode=0o700)
     for name in ('home', 'npm-cache', 'reports'): (PUBLIC/name).mkdir(mode=0o700)
@@ -321,15 +390,20 @@ def prepare(workspace, commit):
              '-r', str(SOURCE/'deploy/guard/e2e/hosted_journey/consumer_fork/admission-requirements.txt')],
             maximum=1048576, seconds=300)
     _STAGE = 'protect'; protect(node_root); protect(ROOT/'runtime/python'); protect(selected); protect(SOURCE); protect(CHECKOUT)
-    _STAGE = 'inventories'; source_map = tree(SOURCE); website_map = tree(selected)
+    _STAGE = 'inventories'
+    inventory_context('source-tree'); source_map = tree(SOURCE); inventory_context()
+    inventory_context('website-tree'); website_map = tree(selected); inventory_context()
     runtime_map = runtime_observation(node_root, WEBSITE.parent)
     # Python packages belong to the same managed Python root; the website and
     # npm dependencies belong to the packages root, outside bounded SOURCE.
-    python_map = tree(py_packages)
+    inventory_context('python-packages-tree'); python_map = tree(py_packages); inventory_context()
     refs = {}
-    for name, value in [('source', source_map), ('website', website_map), ('runtime', runtime_map),
-                        ('python-packages', python_map)]:
+    reports = [('source', source_map), ('website', website_map), ('runtime', runtime_map),
+               ('python-packages', python_map)]
+    for index, (name, value) in enumerate(reports):
+        inventory_context('inventory-report-write', member=name, index=index, count=len(reports))
         refs[name] = write_new(PUBLIC/'reports'/(name+'-inventory.json'), value, 0o444)
+        inventory_context()
     result = {'schema': 1, 'kind': 'actual-free-hosted-ordinary-preparation',
         'controlSource': commit, 'startedAtNs': str(started), 'completedAtNs': str(time.time_ns()),
         'capabilities': cap, 'source': src, 'node': vendor, 'materialization': material,
@@ -343,7 +417,10 @@ def prepare(workspace, commit):
             'actual positive and negative zero-rights admission',
             'applied exact provider roles, custody table, inputs and fresh retained baseline',
             'actual private journey, final accounting and all required native evidence']}
-    return write_new(PUBLIC/'reports/preparation.json', result, 0o444)
+    inventory_context('preparation-report-write')
+    receipt = write_new(PUBLIC/'reports/preparation.json', result, 0o444)
+    inventory_context()
+    return receipt
 
 
 def main():
@@ -352,12 +429,16 @@ def main():
     try:
         prepare(args.workspace, args.control_source)
     except BaseException as error:
+        context = _INVENTORY_CONTEXT
+        inventory_context()
         reports = PUBLIC/'reports'
         if reports.is_dir() and not (reports/'failure.json').exists():
             failure = {'schema': 1, 'kind': 'hosted-preparation-incomplete',
                 'stage': _STAGE, 'privateInput': False, 'releaseReady': False}
             if _STAGE == 'python-runtime':
                 failure['diagnostic'] = python_failure_diagnostic(_PYTHON_CONTEXT, error)
+            elif _STAGE == 'inventories':
+                failure['diagnostic'] = inventory_failure_diagnostic(context, error)
             write_new(reports/'failure.json', failure, 0o444)
         raise SystemExit('No-secret hosted preparation incomplete; inspect the fixed stage receipt') from None
 

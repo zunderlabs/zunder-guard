@@ -1,0 +1,95 @@
+name: Public website runtime preparation
+on:
+  workflow_dispatch:
+    inputs:
+      admission_id:
+        description: Reviewed committed raw admission ID
+        required: true
+        type: string
+permissions:
+  contents: read
+  actions: read
+concurrency:
+  group: public-website-preparation
+  cancel-in-progress: false
+jobs:
+  preparation:
+    if: github.repository == 'zunderlabs/zunder-guard' && github.event.repository.private == false && github.ref == 'refs/heads/main' && github.ref_type == 'branch'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    environment: website-staging
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+          fetch-depth: 1
+      - name: Exact public source and inert invoker fixtures
+        env:
+          CONTROL_SOURCE: ${{ github.workflow_sha }}
+        run: |
+          set -euo pipefail
+          [[ "$CONTROL_SOURCE" =~ ^[0-9a-f]{40}$ ]]
+          test "$(git rev-parse HEAD)" = "$CONTROL_SOURCE"
+          test -z "$(git status --porcelain)"
+          python3 -B -m unittest discover -s deploy/guard/e2e/hosted_launch -t deploy/guard/e2e -p test_prepare_website_entry.py
+      - name: Public OS prerequisites before reader credentials
+        run: |
+          set -euo pipefail
+          sudo /usr/sbin/swapoff -a
+          test "$(wc -l < /proc/swaps)" -eq 1
+          sudo /usr/bin/apt-get update -qq > /dev/null
+          sudo /usr/bin/apt-get install --no-install-recommends -y -qq bubblewrap nftables libnss3-tools python3-pip > /dev/null
+      - name: Existing actual no-secret bootstrap
+        env:
+          CONTROL_SOURCE: ${{ github.workflow_sha }}
+        run: |
+          set -euo pipefail
+          sudo /usr/bin/env -i PATH=/usr/bin:/bin LANG=C.UTF-8 /usr/bin/python3.12 -I -B deploy/guard/e2e/hosted_launch/bootstrap.py --workspace "$GITHUB_WORKSPACE" --control-source "$CONTROL_SOURCE" > /dev/null 2>&1
+      - name: Validate committed source roster before reader token
+        env:
+          CONTROL_SOURCE: ${{ github.workflow_sha }}
+          ADMISSION_ID: ${{ inputs.admission_id }}
+        run: |
+          set -euo pipefail
+          sudo /usr/bin/env -i PATH=/usr/bin:/bin LANG=C.UTF-8 PYTHONDONTWRITEBYTECODE=1 GITHUB_REPOSITORY=zunderlabs/zunder-guard GITHUB_REF=refs/heads/main GITHUB_REF_TYPE=branch GITHUB_EVENT_NAME=workflow_dispatch GITHUB_SHA="$CONTROL_SOURCE" /opt/zunder-hosted-ordinary/runtime/python/bin/python3.12 -I -B /opt/zunder-hosted-ordinary/source/deploy/guard/e2e/hosted_launch/prepare_website_entry.py --mode validate --workspace "$GITHUB_WORKSPACE" --control-source "$CONTROL_SOURCE" --admission-id "$ADMISSION_ID"
+      - name: Mint only approved private repository read token
+        id: reader
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1
+        with:
+          client-id: ${{ vars.PRIVATE_ARTIFACT_READER_APP_CLIENT_ID }}
+          private-key: ${{ secrets.PRIVATE_ARTIFACT_READER_APP_PRIVATE_KEY }}
+          owner: zunderlabs
+          repositories: zunder
+          permission-actions: read
+          permission-contents: read
+          skip-token-revoke: false
+      - name: Authenticate inert source and require reader token DELETE204
+        env:
+          PRIVATE_ARTIFACT_READ_TOKEN: ${{ steps.reader.outputs.token }}
+          GITHUB_TOKEN: ${{ github.token }}
+          CONTROL_SOURCE: ${{ github.workflow_sha }}
+          ADMISSION_ID: ${{ inputs.admission_id }}
+        run: |
+          set -euo pipefail
+          export GITHUB_SHA="$CONTROL_SOURCE"
+          sudo --preserve-env=PRIVATE_ARTIFACT_READ_TOKEN,GITHUB_TOKEN,GITHUB_REPOSITORY,GITHUB_REF,GITHUB_REF_TYPE,GITHUB_EVENT_NAME,GITHUB_SHA /opt/zunder-hosted-ordinary/runtime/python/bin/python3.12 -I -B /opt/zunder-hosted-ordinary/source/deploy/guard/e2e/hosted_launch/prepare_website_entry.py --mode reader --workspace "$GITHUB_WORKSPACE" --control-source "$CONTROL_SOURCE" --admission-id "$ADMISSION_ID"
+      - name: Prepare admitted website source in explicit clean environment
+        env:
+          CONTROL_SOURCE: ${{ github.workflow_sha }}
+          ADMISSION_ID: ${{ inputs.admission_id }}
+        run: |
+          set -euo pipefail
+          # Only this bounded metadata stdout is public. No raw build files,
+          # inventories, source paths, caches or compiler output are uploaded.
+          umask 077
+          # Runner-owned file receives bounded metadata only.
+          # shellcheck disable=SC2024
+          sudo /usr/bin/env -i PATH=/usr/bin:/bin LANG=C.UTF-8 PYTHONDONTWRITEBYTECODE=1 GITHUB_REPOSITORY=zunderlabs/zunder-guard GITHUB_REF=refs/heads/main GITHUB_REF_TYPE=branch GITHUB_EVENT_NAME=workflow_dispatch GITHUB_SHA="$CONTROL_SOURCE" /opt/zunder-hosted-ordinary/runtime/python/bin/python3.12 -I -B /opt/zunder-hosted-ordinary/source/deploy/guard/e2e/hosted_launch/prepare_website_entry.py --workspace "$GITHUB_WORKSPACE" --control-source "$CONTROL_SOURCE" --admission-id "$ADMISSION_ID" > "$RUNNER_TEMP/website-preparation-metadata.json"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: always()
+        with:
+          name: website-preparation-metadata-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/website-preparation-metadata.json
+          if-no-files-found: ignore
+          retention-days: 7
