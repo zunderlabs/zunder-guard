@@ -46,7 +46,8 @@ class ZunderGuard < Formula
   service do
     run [opt_bin/"zunder-guard", "run", "--network", "paper"]
     environment_variables ZUNDER_GUARD_HOME: var/"zunder-guard"
-    keep_alive successful_exit: false
+    # launchd uses SuccessfulExit=false; systemd needs crashed=true for on-failure.
+    keep_alive successful_exit: false, crashed: true
     log_path var/"log/zunder-guard.log"
     error_log_path var/"log/zunder-guard.log"
   end
