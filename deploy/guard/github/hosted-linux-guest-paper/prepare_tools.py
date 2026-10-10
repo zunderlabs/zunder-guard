@@ -14,6 +14,10 @@ ARCHIVE_VENDOR={
     'primary_url':'https://packages.ubuntu.com/noble/all/ubuntu-keyring/download',
 }
 SOURCE_FILES={'host.py','guest.py','acquire.py','prepare_tools.py','candidate.json','image-pins.json','tool-source.json','README.md'}
+DIAGNOSTIC_REASONS=frozenset(('authenticated-snapshot-release-pin-differs', 'disposable-hosted-LinuxAMD-required', 'exact-three-signed-snapshot-pockets-required', 'fixed-official-package-policy-refused', 'fixed-source-manifest-required', 'fixed-vendor-package-step-refused', 'fixed-vendor-package-timeout', 'owned-keyring-copy-changed', 'owned-keyring-copy-race', 'owned-keyring-copy-refused', 'owned-keyring-stage-refused', 'owned-keyring-write-incomplete', 'public-package-metadata-changed', 'public-package-metadata-refused', 'public-source-pin-differs', 'public-tool-preparation-incomplete', 'tool-preparation-interrupted', 'tool-stage-ownership-differs', 'vendor-keyring-byte-pin-differs', 'vendor-keyring-copy-pin-differs', 'vendor-keyring-open-race', 'vendor-keyring-parent-refused', 'vendor-keyring-read-race', 'vendor-keyring-shape-refused'))
+def failure_reason(error):
+    message=str(error) if type(error)is RuntimeError else None
+    return message if message in DIAGNOSTIC_REASONS else type(error).__name__
 def need(ok,reason):
     if not ok:raise RuntimeError(reason)
 def sha(raw):return hashlib.sha256(raw).hexdigest()
@@ -109,7 +113,8 @@ def main():
         receipt['lastStage']='fixed-public-tool-install'
         run_fixed(['/usr/bin/apt-get',*fixed,'install','--yes','--no-install-recommends',*PACKAGES],300);verify_lists(stage,row)
         receipt['complete']=True;receipt['lastStage']='authenticated-tool-preparation-completed'
-    except BaseException:receipt['failure']='fixed-official-tool-preparation-refused'
+    except BaseException as error:
+        receipt['failure']='fixed-official-tool-preparation-refused';receipt['failureReason']=failure_reason(error)
     finally:
         try:
             if stage is not None:
