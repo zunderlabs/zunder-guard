@@ -6,7 +6,7 @@ import stat
 import struct
 import subprocess
 from hosted_launch.contracts import canonical, decode, digest, need
-from hosted_launch.inventory import read, tree
+from hosted_launch.inventory import read, tree, clear_read_diagnostic, read_diagnostic
 
 PREFIX = Path('/var/lib/zunder-public-reboot-acquisition')
 MAX_FILE = 160 * 1024 * 1024
@@ -19,12 +19,18 @@ CONTEXT = None
 
 def context(operation=None, path=None):
     global CONTEXT
+    clear_read_diagnostic()
     if operation is None:
         CONTEXT=None;return
     need(operation in ('protected-member','complete-tree'),'Closed inventory operation required')
     name=str(path)
     need(0<len(name)<=4096,'Bounded inventory diagnostic member required')
     CONTEXT={'operation':operation,'memberSha256':digest(name.encode())}
+
+
+def current_read_observation():
+    if CONTEXT is None or CONTEXT['operation']!='protected-member':return None
+    return read_diagnostic(CONTEXT['memberSha256'])
 
 
 FIELDS = ('st_dev', 'st_ino', 'st_uid', 'st_mode', 'st_nlink', 'st_size', 'st_mtime_ns', 'st_ctime_ns')

@@ -28,7 +28,7 @@ DEPENDENCIES = {
  'deploy/guard/e2e/hosted_launch/__init__.py':'86c4ddb768a0d25ee6c460351ced3c0d42e7145bbbc02aeab2a2ba34aa35e23c',
  'deploy/guard/e2e/hosted_launch/bootstrap.py':'0f8ce0bb4aea0708af0a2fafac27875b084d42b9485f98d428a0acdd47cc6dfc',
  'deploy/guard/e2e/hosted_launch/contracts.py':'243a91e7abaa84511a9fc087d9af2ef9ff74bea6f9c679d2b48b70c9be81dc6b',
- 'deploy/guard/e2e/hosted_launch/inventory.py':'97171bc3ccef3a64247d3e4a02ea4212c4c203fe6f8a5c2caa9f5c6502605898',
+ 'deploy/guard/e2e/hosted_launch/inventory.py':'b2ca993359b330d80c1e9c06734edb84c76a2d01ece3e96a1ae4465743250ee7',
  'deploy/guard/e2e/hosted_launch/materialize.py':'d7b7d819fb1aea413d65ed20d7f824a04a385d9b5b93c8feb8accb611d4530c4'}
 VERIFIERS = {
  'deploy/guard/e2e/verify-release-assets.sh':('verify-release-assets.sh','87b3cd3bf11e8f7be65b5ec7479a9436e827a9b25b01c53bc585e099e46f53b9'),
@@ -412,6 +412,8 @@ def failure(error):
     maps=sys.modules.get('runtime_maps')
     if STAGE in ('runtime-inventory','system-config','mapped-inventory','trust-inventory','reports') and maps is not None and maps.CONTEXT is not None:
         value['diagnostic']=maps.CONTEXT.copy()
+        read_observation=maps.current_read_observation()
+        if read_observation is not None:value['diagnostic']['readObservation']=read_observation
     if REPORTS.is_dir() and not (REPORTS/'failure.json').exists():
         exclusive(REPORTS/'failure.json',canonical(value),0o444)
     print(canonical(value).decode())

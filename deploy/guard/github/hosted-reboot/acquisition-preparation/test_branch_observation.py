@@ -75,7 +75,7 @@ class BranchObservationFixtures(unittest.TestCase):
         self.assertNotIn('linux-acquisition-runtime-inert-',text)
 
     def test_reviewed_getter_maps_tests_and_wrapper_are_byte_identical(self):
-        pins={'prepare_runtime.py':'7c886112cd7e9b210f7c026215ca921d63af70d5fa3fd53cfe991afa531416c2','runtime_maps.py':'f927a80d578238810de6c6e7bf8e9599003f14ef63ccf432fdc6db7e8cc9bda1','test_runtime_preparation.py':'b14f1257e8e103cb1f324552f0fb81462f9941f89b4826663bf4940d6187e906'}
+        pins={'prepare_runtime.py':'38c1236a6c5e19beb677fd84047a0ca0315d75135d681d842f42b1f92c0b9883','runtime_maps.py':'f6e6b899a957ccc81af91875e4c89140df0e335f435fc6c670d1df1f86c1e16a','test_runtime_preparation.py':'b14f1257e8e103cb1f324552f0fb81462f9941f89b4826663bf4940d6187e906'}
         for name,digest in pins.items():self.assertEqual(hashlib.sha256((HERE/name).read_bytes()).hexdigest(),digest)
         wrapper=REPO/'deploy/guard/github/hosted-reboot/fixed-acquisition-stage.py'
         self.assertEqual(hashlib.sha256(wrapper.read_bytes()).hexdigest(),'d726a4d7518b6d67e4326626c5bdb959bc682f3812f93be23308151326d13dc0')

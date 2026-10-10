@@ -162,8 +162,8 @@ class GetterStdoutTests(unittest.TestCase):
 
     def test_all_existing_getter_maps_support_and_tools_unchanged(self):
         pins={
-            HERE/'prepare_runtime.py':'7c886112cd7e9b210f7c026215ca921d63af70d5fa3fd53cfe991afa531416c2',
-            HERE/'runtime_maps.py':'f927a80d578238810de6c6e7bf8e9599003f14ef63ccf432fdc6db7e8cc9bda1',
+            HERE/'prepare_runtime.py':'38c1236a6c5e19beb677fd84047a0ca0315d75135d681d842f42b1f92c0b9883',
+            HERE/'runtime_maps.py':'f6e6b899a957ccc81af91875e4c89140df0e335f435fc6c670d1df1f86c1e16a',
             HERE/'test_runtime_preparation.py':'b14f1257e8e103cb1f324552f0fb81462f9941f89b4826663bf4940d6187e906',
             HERE/'branch_observation.py':'9a4a167dc081871cfcf5c02c8f8656c1f990cf9cc0907663425c1be6ee06074a',
             HERE.parent/'fixed-acquisition-stage.py':'d726a4d7518b6d67e4326626c5bdb959bc682f3812f93be23308151326d13dc0',

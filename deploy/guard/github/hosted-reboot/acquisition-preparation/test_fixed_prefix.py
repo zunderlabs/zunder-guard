@@ -16,6 +16,8 @@ e=importlib.util.module_from_spec(spec);spec.loader.exec_module(e)
 
 
 def normalize_migration(source):
+    source=source.replace('b2ca993359b330d80c1e9c06734edb84c76a2d01ece3e96a1ae4465743250ee7','97171bc3ccef3a64247d3e4a02ea4212c4c203fe6f8a5c2caa9f5c6502605898')
+    source=source.replace("        read_observation=maps.current_read_observation()\n        if read_observation is not None:value['diagnostic']['readObservation']=read_observation\n",'')
     if source.count(NEW)!=2 or source.count(NEW_WRAPPER)!=1:raise ValueError('Exact migration inverse required')
     source=source.replace(NEW,OLD).replace(NEW_WRAPPER,OLD_WRAPPER)
     new="Path('/'):'rootfs',Path('/var'):'var',Path('/var/lib'):'lib',Path('/run'):'run',"
@@ -35,6 +37,9 @@ class FixedPrefixFixtures(unittest.TestCase):
 
     def test_maps_and_wrapper_exact_path_inverse(self):
         source=(HERE/'runtime_maps.py').read_text();self.assertEqual(source.count(NEW),1)
+        source=source.replace('from hosted_launch.inventory import read, tree, clear_read_diagnostic, read_diagnostic','from hosted_launch.inventory import read, tree').replace('    clear_read_diagnostic()\n','')
+        bridge="def current_read_observation():\n    if CONTEXT is None or CONTEXT['operation']!='protected-member':return None\n    return read_diagnostic(CONTEXT['memberSha256'])\n\n\n"
+        self.assertEqual(source.count(bridge),1);source=source.replace(bridge,'')
         self.assertEqual(hashlib.sha256(source.replace(NEW,OLD).encode()).hexdigest(),'cce8160f30b2aa86cab06342e20bb222aa5f0a796e64b9cb811ea11da51d97f2')
         wrapper=REPO/'deploy/guard/github/hosted-reboot/fixed-acquisition-stage.py'
         source=wrapper.read_text();self.assertEqual(source.count(NEW),2);self.assertNotIn(OLD,source)

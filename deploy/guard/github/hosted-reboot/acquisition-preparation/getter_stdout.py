@@ -54,6 +54,25 @@ def validate_ancestor(value):
     elif value['uid']is not None or value['mode']is not None or value['fileType']!='unknown':raise ValueError()
 
 
+def validate_read_observation(value, member_sha256):
+    keys={'kind','memberSha256','phase','ancestorSha256','captured','uid','mode','nlink','bytes','fileType'}
+    fixed='5e57f0085d92e413d5fae0df92987f33f962d7f4d0a602ac58c593bf396bf495'
+    if type(value)is not dict or set(value)!=keys or member_sha256!=fixed or value['memberSha256']!=fixed:raise ValueError()
+    if value['kind']!='fixed-protected-member-read' or value['phase'] not in ('canonical','ancestor-query','ancestor-guard','open','member-query','member-bound','member-protected'):raise ValueError()
+    ancestor=value['phase'] in ('ancestor-query','ancestor-guard')
+    if ancestor:
+        if type(value['ancestorSha256'])is not str or not re.fullmatch('[a-f0-9]{64}',value['ancestorSha256']):raise ValueError()
+    elif value['ancestorSha256']is not None:raise ValueError()
+    if type(value['captured'])is not bool:raise ValueError()
+    fields=(value['uid'],value['mode'],value['nlink'],value['bytes'])
+    if value['captured']:
+        if value['phase'] not in ('ancestor-guard','member-bound','member-protected'):raise ValueError()
+        if not all(type(v)is int and 0<=v<=maximum for v,maximum in zip(fields,(4294967295,65535,9007199254740991,9007199254740991))):raise ValueError()
+        kind={0o040000:'directory',0o100000:'regular',0o120000:'symlink'}.get(value['mode']&0o170000,'other')
+        if value['fileType']!=kind:raise ValueError()
+    elif any(v is not None for v in fields) or value['fileType']!='unknown':raise ValueError()
+
+
 def validate_capture(raw):
     if type(raw)is not bytes or not 0<len(raw)<=MAX_CAPTURE or not raw.isascii():raise ValueError()
     value = json.loads(raw,object_pairs_hook=pairs)
@@ -71,9 +90,12 @@ def validate_capture(raw):
     if 'diagnostic' in value:
         diagnostic = value['diagnostic']
         if value['stage'] not in DIAGNOSTIC_STAGES or type(diagnostic)is not dict:raise ValueError()
-        if set(diagnostic)!={'operation','memberSha256'}:raise ValueError()
+        if set(diagnostic) not in ({'operation','memberSha256'},{'operation','memberSha256','readObservation'}):raise ValueError()
         if diagnostic['operation'] not in ('protected-member','complete-tree'):raise ValueError()
         if type(diagnostic['memberSha256'])is not str or not re.fullmatch('[0-9a-f]{64}',diagnostic['memberSha256']):raise ValueError()
+        if 'readObservation' in diagnostic:
+            if diagnostic['operation']!='protected-member':raise ValueError()
+            validate_read_observation(diagnostic['readObservation'],diagnostic['memberSha256'])
     if canonical(value)+b'\n'!=raw:raise ValueError()
     return value
 
