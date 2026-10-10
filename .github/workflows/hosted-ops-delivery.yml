@@ -1,0 +1,145 @@
+# Trusted PUBLIC protected-main controller; admitted private payloads are inert data.
+name: hosted-ops-delivery
+on:
+  workflow_dispatch:
+    inputs:
+      admission_id:
+        description: Existing reviewed public admission ID
+        required: true
+        type: string
+      target:
+        description: Exact target recorded by the public admission
+        required: true
+        type: choice
+        options: [website-preview, website-staging, website-production, customer-worker-production, licence-issuer-production]
+      mode:
+        description: Verify admitted bytes or publish to their fixed destination
+        required: true
+        type: choice
+        default: verify
+        options: [verify, publish]
+permissions: {}
+concurrency: {group: 'hosted-ops-${{ inputs.target }}', cancel-in-progress: false}
+jobs:
+  cloudflare:
+    if: github.repository == 'zunderlabs/zunder-guard' && github.ref == 'refs/heads/main' && github.ref_type == 'branch' && inputs.target != 'licence-issuer-production'
+    permissions: {contents: read, actions: read, packages: read}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    environment: ${{ inputs.target }}
+    steps:
+      - name: Require applied public authority configuration
+        env: {ENABLED: '${{ vars.HOSTED_OPS_ADMISSION_ENABLED }}'}
+        run: test "$ENABLED" = true
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: {ref: '${{ github.sha }}', persist-credentials: false}
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444
+        with: {node-version: '24'}
+      - name: Install only trusted public locked permissive tools before credentials
+        run: npm ci --ignore-scripts --no-audit --no-fund --prefix deploy/guard/github/hosted-delivery/tools
+      - name: Test trusted public controller and direct provider protocols
+        run: |
+          python3 -I -B deploy/guard/github/hosted-delivery/test_admit.py
+          python3 -I -B deploy/guard/github/hosted-delivery/test_cloud_delivery.py
+          python3 -I -B deploy/guard/github/hosted-delivery/test_delivery_cli.py
+          node --test deploy/guard/github/hosted-delivery/pages-upload.test.mjs
+      - uses: slsa-framework/slsa-verifier/actions/installer@ea584f4502babc6f60d9bc799dbbb13c1caa9ee6
+        if: startsWith(inputs.target, 'website-')
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6
+        if: startsWith(inputs.target, 'website-')
+        with: {cosign-release: v3.1.3}
+      - name: Mint private artifact reader installed only on private zunder
+        id: reader
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1
+        with:
+          client-id: ${{ vars.PRIVATE_ARTIFACT_READER_APP_CLIENT_ID }}
+          private-key: ${{ secrets.PRIVATE_ARTIFACT_READER_APP_PRIVATE_KEY }}
+          owner: zunderlabs
+          repositories: zunder
+          permission-actions: read
+          permission-contents: read
+          skip-token-revoke: false
+      - name: Verify exact payload and full current public release gate without publisher credentials
+        env:
+          PRIVATE_ARTIFACT_READ_TOKEN: ${{ steps.reader.outputs.token }}
+          GITHUB_TOKEN: ${{ github.token }}
+          ADMISSION_ID: ${{ inputs.admission_id }}
+          TARGET: ${{ inputs.target }}
+        run: python3 -I -B deploy/guard/github/hosted-delivery/delivery_cli.py "$ADMISSION_ID" "$TARGET"
+      - name: Readmit exact bytes and publish with applied-state smoke
+        if: inputs.mode == 'publish'
+        env:
+          PRIVATE_ARTIFACT_READ_TOKEN: ${{ steps.reader.outputs.token }}
+          GITHUB_TOKEN: ${{ github.token }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          ACCESS_CLIENT_ID: ${{ secrets.ACCESS_CLIENT_ID }}
+          ACCESS_CLIENT_SECRET: ${{ secrets.ACCESS_CLIENT_SECRET }}
+          ADMISSION_ID: ${{ inputs.admission_id }}
+          TARGET: ${{ inputs.target }}
+        run: python3 -I -B deploy/guard/github/hosted-delivery/delivery_cli.py "$ADMISSION_ID" "$TARGET" --publish
+  issuer:
+    if: github.repository == 'zunderlabs/zunder-guard' && github.ref == 'refs/heads/main' && github.ref_type == 'branch' && inputs.target == 'licence-issuer-production'
+    permissions: {contents: read, id-token: write}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    environment: ${{ inputs.target }}
+    steps:
+      - name: Require applied public authority configuration
+        env: {ENABLED: '${{ vars.HOSTED_OPS_ADMISSION_ENABLED }}'}
+        run: test "$ENABLED" = true
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: {ref: '${{ github.sha }}', persist-credentials: false}
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444
+        with: {node-version: '24'}
+      - name: Test trusted public admission and issuer orchestration before AWS credentials
+        run: |
+          python3 -I -B deploy/guard/github/hosted-delivery/test_admit.py
+          node --test deploy/guard/github/hosted-delivery/issuer*.test.ts
+      - name: Mint private artifact reader installed only on private zunder
+        id: reader
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1
+        with:
+          client-id: ${{ vars.PRIVATE_ARTIFACT_READER_APP_CLIENT_ID }}
+          private-key: ${{ secrets.PRIVATE_ARTIFACT_READER_APP_PRIVATE_KEY }}
+          owner: zunderlabs
+          repositories: zunder
+          permission-actions: read
+          permission-contents: read
+          skip-token-revoke: false
+      - name: Verify admitted private issuer ZIP without AWS credentials
+        env:
+          PRIVATE_ARTIFACT_READ_TOKEN: ${{ steps.reader.outputs.token }}
+          GITHUB_TOKEN: ${{ github.token }}
+          ADMISSION_ID: ${{ inputs.admission_id }}
+        run: python3 -I -B deploy/guard/github/hosted-delivery/admit.py "$ADMISSION_ID" licence-issuer-production --output "$RUNNER_TEMP/hosted-ops-private-verify"
+      - name: Obtain temporary issuer-only credentials
+        if: inputs.mode == 'publish'
+        uses: aws-actions/configure-aws-credentials@61815dcd50bd041e203e49132bacad1fd04d2708
+        with:
+          role-to-assume: ${{ vars.ISSUER_DEPLOY_ROLE_ARN }}
+          aws-region: eu-central-1
+          allowed-account-ids: '436632189317'
+          role-session-name: issuer-${{ github.run_id }}-${{ github.run_attempt }}
+          role-duration-seconds: 1800
+          unset-current-credentials: true
+          retry-max-attempts: 1
+      - name: Readmit current producer then deploy only the admitted ZIP as data
+        if: inputs.mode == 'publish'
+        env:
+          PRIVATE_ARTIFACT_READ_TOKEN: ${{ steps.reader.outputs.token }}
+          GITHUB_TOKEN: ${{ github.token }}
+          ADMISSION_ID: ${{ inputs.admission_id }}
+        run: python3 -I -B deploy/guard/github/hosted-delivery/admit.py "$ADMISSION_ID" licence-issuer-production --output "$RUNNER_TEMP/hosted-ops-private-apply"
+      - name: Deploy admitted data with AWS authority only
+        if: inputs.mode == 'publish'
+        env:
+          ADMISSION_ID: ${{ inputs.admission_id }}
+          HOSTED_DELIVERY_TARGET: licence-issuer-production
+          AWS_REGION: eu-central-1
+          ISSUER_EXPECTED_ACCOUNT: '436632189317'
+          ISSUER_RUNTIME_ROLE_ARN: ${{ vars.ISSUER_RUNTIME_ROLE_ARN }}
+          ISSUER_RESUME_PAUSED: 'false'
+        run: node deploy/guard/github/hosted-delivery/issuer-cli.ts "$ADMISSION_ID" "$RUNNER_TEMP/hosted-ops-private-apply"
+      - name: Remove private bytes even on failure; never upload an artifact or cache
+        if: always()
+        run: rm -rf -- "$RUNNER_TEMP/hosted-ops-private-verify" "$RUNNER_TEMP/hosted-ops-private-apply"
