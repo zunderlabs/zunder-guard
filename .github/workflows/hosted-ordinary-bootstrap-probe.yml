@@ -1,0 +1,69 @@
+name: Public no-key bootstrap diagnostic probe
+on:
+  push:
+    branches: [codex/no-key-hosted-preparation-probe]
+permissions:
+  contents: read
+concurrency:
+  group: public-no-key-bootstrap-probe
+  cancel-in-progress: false
+jobs:
+  probe:
+    if: github.repository == 'zunderlabs/zunder-guard' && github.event.repository.private == false && github.event_name == 'push' && github.ref == 'refs/heads/codex/no-key-hosted-preparation-probe'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          fetch-depth: 1
+      - name: Exact public source and inert exporter fixtures
+        shell: bash
+        env:
+          CONTROL_SOURCE: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          [[ "$CONTROL_SOURCE" =~ ^[0-9a-f]{40}$ ]]
+          test "$(/usr/bin/git rev-parse HEAD)" = "$CONTROL_SOURCE"
+          test -z "$(/usr/bin/git status --porcelain)"
+          /usr/bin/python3.12 -I -B deploy/guard/e2e/hosted_launch/test_export_bootstrap_probe.py
+      - name: Existing public OS prerequisites
+        shell: bash
+        run: |
+          set -euo pipefail
+          /usr/bin/sudo --non-interactive /usr/sbin/swapoff -a
+          test "$(/usr/bin/wc -l < /proc/swaps)" -eq 1
+          /usr/bin/sudo --non-interactive /usr/bin/apt-get update -qq > /dev/null 2>&1
+          /usr/bin/sudo --non-interactive /usr/bin/apt-get install --no-install-recommends -y -qq bubblewrap nftables libnss3-tools python3-pip > /dev/null 2>&1
+      - name: Existing no-key bootstrap with retained failure
+        id: bootstrap
+        shell: bash
+        env:
+          CONTROL_SOURCE: ${{ github.sha }}
+        run: |
+          set -uo pipefail
+          /usr/bin/sudo --non-interactive /usr/bin/env -i PATH=/usr/bin:/bin LANG=C.UTF-8 /usr/bin/python3.12 -I -B deploy/guard/e2e/hosted_launch/bootstrap.py --workspace "$GITHUB_WORKSPACE" --control-source "$CONTROL_SOURCE" > /dev/null 2>&1
+          result=$?
+          printf 'exit_code=%s\n' "$result" >> "$GITHUB_OUTPUT"
+          exit "$result"
+      - name: Export only closed diagnostic metadata
+        if: always()
+        shell: bash
+        env:
+          CONTROL_SOURCE: ${{ github.sha }}
+          BOOTSTRAP_EXIT: ${{ steps.bootstrap.outputs.exit_code }}
+        run: |
+          set -euo pipefail
+          umask 077
+          # stdout contains only one bounded canonical diagnostic; no raw reports.
+          # The redirect deliberately creates a runner-owned metadata file.
+          # shellcheck disable=SC2024
+          /usr/bin/sudo --non-interactive /usr/bin/env -i PATH=/usr/bin:/bin LANG=C.UTF-8 /usr/bin/python3.12 -I -B deploy/guard/e2e/hosted_launch/export_bootstrap_probe.py --control-source "$CONTROL_SOURCE" --bootstrap-exit "${BOOTSTRAP_EXIT:-unavailable}" > "$RUNNER_TEMP/hosted-bootstrap-probe.json"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: always()
+        with:
+          name: hosted-bootstrap-probe-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/hosted-bootstrap-probe.json
+          if-no-files-found: error
+          retention-days: 7
