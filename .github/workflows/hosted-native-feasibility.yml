@@ -1,0 +1,55 @@
+name: Public hosted native feasibility
+on:
+  push:
+    branches: [release/native-capabilities]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: hosted-native-feasibility-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  capabilities:
+    if: github.repository == 'zunderlabs/zunder-guard' && github.event.repository.private == false
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm, windows-2025, macos-15, macos-15-intel]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+          fetch-depth: 1
+      - name: Check exact immutable source
+        shell: bash
+        env:
+          CONTROL_SOURCE: ${{ github.workflow_sha }}
+        run: |
+          set -euo pipefail
+          [[ "$CONTROL_SOURCE" =~ ^[0-9a-f]{40}$ ]]
+          test "$(git rev-parse HEAD)" = "$CONTROL_SOURCE"
+          test -z "$(git status --porcelain)"
+      - name: Bounded public capability probe
+        shell: bash
+        env:
+          CONTROL_SOURCE: ${{ github.workflow_sha }}
+          PROBE_LABEL: ${{ matrix.runner }}
+          PYTHONDONTWRITEBYTECODE: '1'
+        run: |
+          set -euo pipefail
+          if command -v python3 >/dev/null; then
+            python3 -I -S -B deploy/guard/github/hosted-native-feasibility/probe.py --label "$PROBE_LABEL" --output "$RUNNER_TEMP/hosted-native-feasibility"
+          else
+            python -I -S -B deploy/guard/github/hosted-native-feasibility/probe.py --label "$PROBE_LABEL" --output "$RUNNER_TEMP/hosted-native-feasibility"
+          fi
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: always()
+        with:
+          name: hosted-native-feasibility-${{ matrix.runner }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/hosted-native-feasibility/capability.json
+          if-no-files-found: warn
+          retention-days: 7
