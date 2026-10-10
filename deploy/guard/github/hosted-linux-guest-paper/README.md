@@ -126,3 +126,9 @@ and `/` must remain root-owned directories without group/other write access. Onl
 is admitted. Owned staging remains root0700 with a create-only root0600 copy,
 and the signed snapshot and package chain remain mandatory. The shared input
 and its parents are never modified.
+
+## Postboot ordering correction
+
+Actual run38024073354 passed signed paper install, explicit restart, owned crash recovery, reinstall/state preservation and acknowledged the single guest reboot. It failed while waiting for the new kernel hello; owned QEMU cleanup was confirmed. No full reboot acceptance is claimed.
+
+The observer had After=cloud-final.service while being WantedBy=multi-user.target. The canonical cloud-final service is ordered After=multi-user.target, creating an ordering cycle on normal subsequent boot. The original first boot started the observer from cloud-final runcmd after enable, which does not establish correct subsequent boot ordering. The observer is now enabled under cloud-init.target and remains after cloud-final.service. Guard's shipped service, actual changed-boot proof, same QEMU identity, original clocks and refusal/cleanup rules are unchanged. This is a source-based diagnosis awaiting actual hosted execution.

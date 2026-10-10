@@ -52,7 +52,7 @@ class Fixtures(unittest.TestCase):
             with self.assertRaises(RuntimeError):clock.check()
     def test_cloud_has_no_package_or_ssh_key_generation(self):
         row=host.cloud_config({'challenge':'a'*64});self.assertEqual(row['packages'],[]);self.assertFalse(row['package_update']);self.assertFalse(row['package_upgrade']);self.assertEqual(row['ssh_genkeytypes'],[]);self.assertEqual(row['users'],[])
-        self.assertEqual(row['mounts'][0][3],'ro,nodev,nosuid,noexec');self.assertIn('After=cloud-final.service',row['write_files'][1]['content'])
+        self.assertEqual(row['mounts'][0][3],'ro,nodev,nosuid,noexec');self.assertIn('After=cloud-final.service',row['write_files'][1]['content']);self.assertIn('WantedBy=cloud-init.target',row['write_files'][1]['content']);self.assertNotIn('WantedBy=multi-user.target',row['write_files'][1]['content'])
         self.assertIn(['/usr/bin/systemctl','--no-block','start','zunder-public-guest-observer.service'],row['runcmd'])
     def test_qemu_has_actual_kvm_only_and_fixed_resource_bound(self):
         argv=host.qemu_argv(Path('/fixture'),{'kernel':{'name':'kernel'},'initrd':{'name':'initrd'}},{'qemu-system-x86_64':{'file':'/usr/bin/qemu-system-x86_64'}},'a'*64)

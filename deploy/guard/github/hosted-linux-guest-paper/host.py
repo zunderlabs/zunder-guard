@@ -98,7 +98,7 @@ TimeoutStopSec=10
 StandardOutput=null
 StandardError=null
 [Install]
-WantedBy=multi-user.target
+WantedBy=cloud-init.target
 '''
     return {'users':[],'disable_root':True,'ssh_pwauth':False,'ssh_genkeytypes':[],'package_update':False,'package_upgrade':False,'packages':[],
         'mounts':[['LABEL=ZUNDER_ASSETS','/mnt/zunder-public-assets','iso9660','ro,nodev,nosuid,noexec','0','0']],
