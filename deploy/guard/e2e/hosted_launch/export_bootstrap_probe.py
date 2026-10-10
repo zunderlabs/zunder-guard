@@ -57,9 +57,24 @@ REMAINING = ['independent exact runtime/source/vendor review and pins',
 FALSE_FLAGS = ('privateInput', 'sourceAdmitted', 'runtimeAdmitted', 'nativeAcceptance',
     'fullJourney', 'releaseReady', 'wholeHostAbsenceProven')
 
+VALIDATOR_STAGES = frozenset(('arguments', 'platform-context', 'report-directory',
+    'failure-report-read', 'preparation-report-read', 'report-directory-readback',
+    'diagnostic-context', 'report-conflict', 'failure-json', 'failure-schema',
+    'failure-diagnostic', 'preparation-json', 'preparation-schema', 'preparation-capabilities',
+    'preparation-source', 'preparation-node', 'preparation-materialization',
+    'preparation-inventories', 'npm-aliases', 'python-aliases'))
+VALIDATOR_GUARDS = frozenset(('guard-refused', 'node-alias-order-refused', 'report-mode-refused',
+    'missing-resource', 'permission-refused', 'os-operation-refused',
+    'metadata-decode-refused', 'metadata-shape-refused', 'other-refused'))
+_VALIDATOR_STAGE = 'arguments'
+
 
 class Refused(Exception):
     """An intentionally text-free exporter refusal."""
+
+    def __init__(self, guard='guard-refused'):
+        self.guard = guard if type(guard) is str and guard in VALIDATOR_GUARDS else 'guard-refused'
+        super().__init__()
 
 
 class ClosedParser(argparse.ArgumentParser):
@@ -67,9 +82,32 @@ class ClosedParser(argparse.ArgumentParser):
         raise Refused()
 
 
-def need(condition):
+def need(condition, guard='guard-refused'):
     if not condition:
-        raise Refused()
+        raise Refused(guard)
+
+
+def validator_stage(stage):
+    """Call-site enum only; no report values, paths or exception inspection."""
+    global _VALIDATOR_STAGE
+    need(type(stage) is str and stage in VALIDATOR_STAGES)
+    _VALIDATOR_STAGE = stage
+
+
+def refusal_diagnostic(error):
+    """Fixed codes only; exact exception types, no string/args/custom attribute access."""
+    stage = _VALIDATOR_STAGE if type(_VALIDATOR_STAGE) is str and _VALIDATOR_STAGE in VALIDATOR_STAGES else 'arguments'
+    guard = 'other-refused'
+    if type(error) is Refused:
+        value = error.guard
+        guard = value if type(value) is str and value in VALIDATOR_GUARDS else 'guard-refused'
+    else:
+        kinds = ((FileNotFoundError, 'missing-resource'), (PermissionError, 'permission-refused'),
+            (OSError, 'os-operation-refused'), (json.JSONDecodeError, 'metadata-decode-refused'),
+            (KeyError, 'metadata-shape-refused'), (TypeError, 'metadata-shape-refused'),
+            (ValueError, 'metadata-shape-refused'))
+        guard = next((code for cls, code in kinds if type(error) is cls), guard)
+    return {'stage': stage, 'guard': guard}
 
 
 def exact(value, keys):
@@ -105,6 +143,7 @@ def decode(raw):
 
 
 def failure(value):
+    validator_stage('failure-schema')
     keys = {'schema', 'kind', 'stage', 'privateInput', 'releaseReady'}
     need(type(value) is dict and set(value) in (keys, keys | {'diagnostic'}))
     need(type(value['schema']) is int and value['schema'] == 1 and
@@ -113,6 +152,7 @@ def failure(value):
     stage = value['stage']
     need(('diagnostic' in value) == (stage in ('python-runtime', 'inventories')))
     diagnostic = value.get('diagnostic')
+    validator_stage('failure-diagnostic')
     if diagnostic is None:
         return {'stage': stage, 'diagnostic': None}
     if stage == 'python-runtime':
@@ -145,6 +185,7 @@ def failure(value):
 
 
 def aliases(rows, python=False):
+    validator_stage('python-aliases' if python else 'npm-aliases')
     need(type(rows) is list and len(rows) <= 20000)
     seen = set()
     for row in rows:
@@ -164,6 +205,7 @@ def aliases(rows, python=False):
 
 
 def preparation(value, control_source):
+    validator_stage('preparation-schema')
     exact(value, ('schema', 'kind', 'controlSource', 'startedAtNs', 'completedAtNs', 'capabilities',
         'source', 'node', 'materialization', 'removedNpmAliases', 'regularizedPythonAliases',
         'inventories', 'privateInput', 'providerRolesAssumed', 'venueOrders', 'nativeAcceptance',
@@ -175,6 +217,7 @@ def preparation(value, control_source):
     for name in ('startedAtNs', 'completedAtNs'):
         need(type(value[name]) is str and re.fullmatch('[1-9][0-9]{0,19}', value[name]) is not None)
     need(int(value['completedAtNs']) >= int(value['startedAtNs']) and value['remaining'] == REMAINING)
+    validator_stage('preparation-capabilities')
     cap = value['capabilities']
     exact(cap, ('noSwap', 'coreLimits', 'systemd', 'unifiedCgroup', 'cgroupKill', 'memorySwapMax',
         'ownedProbeAbsent', 'bootId', 'machineIdSha256', 'heapLocking'))
@@ -184,18 +227,22 @@ def preparation(value, control_source):
          all(type(n) is int and n == 0 for n in cap['coreLimits']) and cap['heapLocking'] is False)
     need(type(cap['bootId']) is str and re.fullmatch('[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}', cap['bootId']) is not None)
     sha(cap['machineIdSha256'])
+    validator_stage('preparation-source')
     source = value['source']
     exact(source, ('commit', 'archiveSha256', 'controllerRoot', 'genuineCheckout', 'gitDatabaseInSourceInventory'))
     need(source['commit'] == control_source and source['controllerRoot'] == ROOT + '/source' and
          source['genuineCheckout'] == ROOT + '/checkout' and source['gitDatabaseInSourceInventory'] is False)
     sha(source['archiveSha256'])
+    validator_stage('preparation-node')
     node = value['node']
     exact(node, ('version', 'url', 'archiveSha256', 'archiveBytes', 'aliases', 'trust'))
+    need(node['aliases'] == ['bin/npx', 'bin/npm'], 'node-alias-order-refused')
     need(node['version'] == '26.8.1' and node['url'] == 'https://nodejs.org/dist/v26.8.1/node-v26.8.1-linux-x64.tar.xz' and
          node['archiveSha256'] == '3e301118d7df53d563b7e96c1617545f26e2f76f9724be668d6cab65c15dda5d' and
-         node['aliases'] == ['bin/npm', 'bin/npx'] and
+         node['aliases'] == ['bin/npx', 'bin/npm'] and
          node['trust'] == 'Previously verified official checksum signature; runtime still unadmitted')
     bounded_int(node['archiveBytes'], 1, 134217728)
+    validator_stage('preparation-materialization')
     material = value['materialization']
     exact(material, ('sourceLockSha256', 'focusedPackageSha256', 'focusedLockSha256',
         'omittedHistoricalGeneratedPrefix', 'omittedHistoricalReceipt', 'transformedFields'))
@@ -204,6 +251,7 @@ def preparation(value, control_source):
     need(material['omittedHistoricalGeneratedPrefix'] == 'artifacts/private-journey/' and
          material['omittedHistoricalReceipt'] == 'predecessor-manifest.json' and
          material['transformedFields'] == ['web/site/package.json', 'web/site/package-lock.json'])
+    validator_stage('preparation-inventories')
     exact(value['inventories'], INVENTORIES)
     digests = {}
     for name in INVENTORIES:
@@ -255,6 +303,7 @@ def read_report(fd, name):
         return None
     try:
         before = os.fstat(selected)
+        need(stat.S_IMODE(before.st_mode) == 0o444, 'report-mode-refused')
         need(stat.S_ISREG(before.st_mode) and before.st_uid == OWNER and before.st_nlink == 1 and
              stat.S_IMODE(before.st_mode) == 0o444 and 0 < before.st_size <= LIMIT)
         chunks = []
@@ -274,14 +323,18 @@ def read_report(fd, name):
 
 
 def reports():
+    validator_stage('report-directory')
     try:
         fd = open_reports()
     except FileNotFoundError:
         return None, None
     try:
         before = os.fstat(fd)
+        validator_stage('failure-report-read')
         failed = read_report(fd, 'failure.json')
+        validator_stage('preparation-report-read')
         prepared = read_report(fd, 'preparation.json')
+        validator_stage('report-directory-readback')
         fresh = open_reports()
         try:
             need(same(before, os.fstat(fd)) and same(before, os.fstat(fresh)))
@@ -293,6 +346,7 @@ def reports():
 
 
 def diagnostic(control_source, exit_code, failed, prepared):
+    validator_stage('diagnostic-context')
     sha(control_source, 40)
     need(exit_code is None or type(exit_code) is int and 0 <= exit_code <= 255)
     out = {'schema': 1, 'kind': 'public-no-key-bootstrap-probe', 'controlSource': control_source,
@@ -300,12 +354,15 @@ def diagnostic(control_source, exit_code, failed, prepared):
         'reportState': 'missing', 'reportSha256': None, 'stage': None, 'diagnostic': None,
         'inventoryDigests': {}, 'inventoryCount': 0, 'removedNpmAliasCount': 0, 'regularizedPythonAliasCount': 0,
         **{flag: False for flag in FALSE_FLAGS}}
+    validator_stage('report-conflict')
     need(failed is None or prepared is None)
     if failed is not None:
+        validator_stage('failure-json')
         out.update(failure(decode(failed)))
         out.update(reportState='failure' if exit_code not in (None, 0) else 'inconsistent',
                    reportSha256=hashlib.sha256(failed).hexdigest())
     elif prepared is not None:
+        validator_stage('preparation-json')
         out.update(preparation(decode(prepared), control_source))
         out.update(reportState='prepared' if exit_code == 0 else 'inconsistent',
                    reportSha256=hashlib.sha256(prepared).hexdigest())
@@ -313,6 +370,7 @@ def diagnostic(control_source, exit_code, failed, prepared):
 
 
 def main():
+    validator_stage('arguments')
     parser = ClosedParser(add_help=False)
     parser.add_argument('--control-source', required=True)
     parser.add_argument('--bootstrap-exit', required=True)
@@ -323,11 +381,13 @@ def main():
         need(args.bootstrap_exit == 'unavailable' or re.fullmatch('0|[1-9][0-9]{0,2}', args.bootstrap_exit) is not None)
         code = None if args.bootstrap_exit == 'unavailable' else int(args.bootstrap_exit)
         need(code is None or code <= 255)
+        validator_stage('platform-context')
         need(sys.platform == 'linux' and os.geteuid() == 0)
         out = diagnostic(args.control_source, code, *reports())
-    except Exception:
+    except Exception as error:
         out = {'schema': 1, 'kind': 'public-no-key-bootstrap-probe', 'reportState': 'refused',
                **{flag: False for flag in FALSE_FLAGS}}
+        out['validator'] = refusal_diagnostic(error)
     raw = json.dumps(out, sort_keys=True, separators=(',', ':'), ensure_ascii=True, allow_nan=False).encode()
     need(len(raw) <= 8192)
     sys.stdout.buffer.write(raw + b'\n')

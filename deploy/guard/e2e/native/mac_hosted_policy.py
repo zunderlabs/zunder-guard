@@ -131,24 +131,48 @@ def capability_diagnostic(text):
 
 
 def live_power_diagnostic(text):
-    """Required values only; unrelated override text is neither parsed nor exported."""
+    """One fixed Apple live section; closed shape counts never change admission."""
     required=('hibernatemode','standby','autopoweroff')
+    shape={'line_count':0,'system_header_count':0,'live_header_count':0,'unknown_header_count':0,
+           'prefix_line_count':0,'live_line_count':0,'required_duplicate_count':0,'required_multifield_count':0}
     def unknown(reason):
-        return {'observed':False,'reason':reason,'required':{key:{'presence':'unknown','zero':None}for key in required}}
+        return {'observed':False,'reason':reason,'shape':shape,
+                'required':{key:{'presence':'unknown','zero':None}for key in required}}
     if type(text)is not str or len(text)>65536:return unknown('input-refused')
     lines=text.splitlines()
-    if not 2<=len(lines)<=4096 or lines[0].strip()!='Currently in use:':return unknown('shape-refused')
+    if not 2<=len(lines)<=4096:return unknown('line-bound-refused')
+    shape['line_count']=len(lines)
+    system=[];live=[];nonblank=[]
+    for index,line in enumerate(lines):
+        word=line.strip()
+        if not word:continue
+        nonblank.append(index)
+        if word=='System-wide power settings:':system.append(index)
+        elif word=='Currently in use:':live.append(index)
+        elif word.endswith(':'):shape['unknown_header_count']+=1
+    shape['system_header_count']=len(system);shape['live_header_count']=len(live)
+    if shape['unknown_header_count']:return unknown('unknown-header-refused')
+    if len(live)!=1 or len(system)>1:return unknown('header-count-refused')
+    index=live[0]
+    if system:
+        if system[0]!=nonblank[0]or system[0]>=index:return unknown('header-order-refused')
+        shape['prefix_line_count']=sum(bool(line.strip())for line in lines[system[0]+1:index])
+    elif index!=nonblank[0]:return unknown('prefix-refused')
+    body=lines[index+1:];shape['live_line_count']=sum(bool(line.strip())for line in body)
+    if not shape['live_line_count']:return unknown('empty-live-section')
     values={};ambiguous=set();seen=set()
-    for line in lines[1:]:
+    for line in body:
         fields=line.split()
         if not fields:continue
         key=fields[0]
         if key not in required:continue
-        if key in seen:ambiguous.add(key)
+        if key in seen:ambiguous.add(key);shape['required_duplicate_count']+=1
         seen.add(key)
-        if len(fields)!=2 or re.fullmatch(r'[0-9]{1,10}',fields[1])is None:ambiguous.add(key)
+        if len(fields)!=2:
+            ambiguous.add(key);shape['required_multifield_count']+=1
+        elif re.fullmatch(r'[0-9]{1,10}',fields[1])is None:ambiguous.add(key)
         else:values[key]=fields[1]
-    return {'observed':True,'reason':'live-required-value-observation','required':{key:{
+    return {'observed':True,'reason':'live-required-value-observation','shape':shape,'required':{key:{
             'presence':'unknown'if key in ambiguous else'present'if key in values else'absent',
             'zero':None if key in ambiguous or key not in values else values[key]=='0'}for key in required}}
 
