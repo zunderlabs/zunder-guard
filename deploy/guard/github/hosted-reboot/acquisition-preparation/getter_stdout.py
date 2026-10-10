@@ -9,7 +9,10 @@ import sys
 MAX_CAPTURE = 4096
 CAPTURE = 'acquisition-preparation-summary.json'
 OUTPUT = 'getter-stdout.json'
-STAGES = frozenset(('arguments','source','node-vendor','python-runtime','system-tools',
+STAGES = frozenset(('arguments','source',
+ 'source-ancestors','source-checkout','source-head-clean','source-archive','source-fresh',
+ 'source-materialize','source-verify','source-manifest','source-protect','source-reexec',
+ 'node-vendor','python-runtime','system-tools',
     'verifier-vendors','trust-config','trust-tuf','managed-prefix','runtime-inventory',
     'system-config','mapped-inventory','trust-inventory','reports','unknown'))
 DIAGNOSTIC_STAGES = frozenset(('runtime-inventory','system-config','mapped-inventory',

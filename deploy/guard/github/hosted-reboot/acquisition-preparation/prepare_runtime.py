@@ -42,7 +42,10 @@ TOOLS = {'bash':'/usr/bin/bash','gh':'/usr/bin/gh','jq':'/usr/bin/jq',
          'sha256sum':'/usr/bin/sha256sum','awk':'/usr/bin/awk','cat':'/usr/bin/cat',
          'mkdir':'/usr/bin/mkdir','dirname':'/usr/bin/dirname'}
 STAGE = 'arguments'
-STAGES = frozenset(('arguments','source','node-vendor','python-runtime','system-tools','verifier-vendors',
+STAGES = frozenset(('arguments','source',
+ 'source-ancestors','source-checkout','source-head-clean','source-archive','source-fresh',
+ 'source-materialize','source-verify','source-manifest','source-protect','source-reexec',
+ 'node-vendor','python-runtime','system-tools','verifier-vendors',
  'trust-config','trust-tuf','managed-prefix','runtime-inventory','system-config','mapped-inventory','trust-inventory','reports'))
 
 
@@ -148,17 +151,24 @@ def protect_simple(root):
 def stage_source(workspace, commit):
     global STAGE
     STAGE='source'
+    STAGE='source-ancestors'
     guard_fixed_paths()
     workspace=Path(workspace)
+    STAGE='source-checkout'
     need(workspace.is_absolute() and workspace.resolve(strict=True)==workspace and
          re.fullmatch('[a-f0-9]{40}',commit),'Fixed actual public checkout required')
     git=['/usr/bin/git','-c','safe.directory='+str(workspace),'-C',str(workspace)]
+    STAGE='source-head-clean'
     need(command(git+['rev-parse','HEAD']).decode().strip()==commit and
          command(git+['status','--porcelain'])==b'','Exact clean workflow source required')
+    STAGE='source-archive'
     raw=command(git+['archive','--format=tar',commit],maximum=268435456)
+    STAGE='source-fresh'
     need(not ROOT.exists() and not MATERIAL.exists() and not REPORTS.exists() and not WORK.exists(),
          'Fresh fixed public preparation required')
+    STAGE='source-ancestors'
     guard_fixed_paths()
+    STAGE='source-materialize'
     ROOT.mkdir(mode=0o700);SOURCE.mkdir(mode=0o700);REPORTS.mkdir(mode=0o700)
     selected={};names=set();total=0
     with tarfile.open(fileobj=io.BytesIO(raw),mode='r:') as archive:
@@ -175,13 +185,17 @@ def stage_source(workspace, commit):
             need(expected is None or digest(data)==expected,'Reviewed source dependency changed')
             exclusive(target,data,0o700 if member.mode&0o111 else 0o600)
             selected[str(target.relative_to(SOURCE))]=digest(data)
+    STAGE='source-verify'
     required=set(DEPENDENCIES)|set(VERIFIERS)|{PUBLIC_ENTRY+'prepare_runtime.py',PUBLIC_ENTRY+'runtime_maps.py'}
     need(required<=names,'Fixed projected preparation/acquisition source missing')
     need(selected.get('preparation/prepare_runtime.py')==digest(Path(__file__).read_bytes()),
          'Initial getter differs from exact workflow archive')
+    STAGE='source-manifest'
     exclusive(SOURCE/'original-source.json',canonical({'schema':1,'commit':commit,
               'archiveSha256':digest(raw),'files':selected}),0o444)
+    STAGE='source-protect'
     protect_simple(SOURCE)
+    STAGE='source-reexec'
     checked_reexec('/usr/bin/python3.12',['/usr/bin/python3.12','-I','-B',
               str(SOURCE/'preparation/prepare_runtime.py'),'--phase','bootstrap','--control-source',commit],
               initial_environment(),selected['preparation/prepare_runtime.py'])
