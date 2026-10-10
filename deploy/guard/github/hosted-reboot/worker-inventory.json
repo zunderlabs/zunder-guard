@@ -1,0 +1,65 @@
+{
+  "actual_deployment_sha256": null,
+  "actual_provider_version": null,
+  "actual_source_inventory_only": true,
+  "allowed_bindings": {
+    "DB": {
+      "database_id": null,
+      "database_name": null,
+      "must_be_new_separate_receipt_database": true,
+      "type": "d1"
+    },
+    "PUBLIC_REBOOT_SCOPE": {
+      "type": "plain_text",
+      "value": null
+    }
+  },
+  "applied_schema_receipt": null,
+  "compatibility_date": null,
+  "d1_schema": {
+    "bytes": 580,
+    "path": "relay-schema.sql",
+    "sha256": "210902aed82ceb0a5213d628cd1d071a38cb147bbf6426ec1fdbfb8ed27ebce6"
+  },
+  "deployed": false,
+  "dispatch_runtime": {
+    "exact_node24_version": null,
+    "independent_vendor_review_receipt": null,
+    "status": "MISSING-NO-ADMITTED-NODE24-MAC-VENDOR-INVENTORY",
+    "vendor_archive_sha256": null,
+    "vendor_archive_url": null,
+    "vendor_binary_sha256": null
+  },
+  "enabled": false,
+  "entrypoint": "worker-entry.mjs",
+  "kind": "RECEIPT-WORKER-DEPLOYMENT-SOURCE-INVENTORY",
+  "module_format": "esm",
+  "modules": {
+    "github-enrollment.mjs": {
+      "bytes": 4607,
+      "sha256": "d7d8c7a7736ebca314234e6027fe9ec70b04e1c6835c08c4184038f0e5ec694c"
+    },
+    "protocol.mjs": {
+      "bytes": 8125,
+      "sha256": "c4127c2037fa653fee5e2cf387b8d98c23d12808e901c862cb7adf871e98573c"
+    },
+    "relay-schema.mjs": {
+      "bytes": 9166,
+      "sha256": "867366aadcf7d9e4698b1002cae53e8061f89c4d5859ee69d1babd6b28f47940"
+    },
+    "relay-worker.mjs": {
+      "bytes": 8657,
+      "sha256": "1395ac0a939954430086473b35a21728e10d1dfbe788ad48a2ae86cabee26c05"
+    },
+    "worker-entry.mjs": {
+      "bytes": 399,
+      "sha256": "ece0bd62a6daa4c430fffc553f07633a9ca69bcdbea7e1cb7d0273ab273cfbb2"
+    }
+  },
+  "provider_readback": null,
+  "schema": 1,
+  "source_commit": null,
+  "worker_id": null,
+  "worker_name": null,
+  "worker_url": null
+}

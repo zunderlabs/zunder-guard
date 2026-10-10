@@ -1,0 +1,34 @@
+name: hosted-delivery-contracts
+on:
+  pull_request:
+    paths:
+      - 'deploy/guard/github/hosted-delivery/**'
+      - '.github/workflows/hosted-delivery-contracts.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'deploy/guard/github/hosted-delivery/**'
+      - '.github/workflows/hosted-delivery-contracts.yml'
+permissions: {contents: read}
+concurrency:
+  group: hosted-delivery-contracts-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  contracts:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with: {persist-credentials: false}
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444
+        with: {node-version: '24'}
+      - name: Install locked permissive tools without package scripts
+        run: npm ci --ignore-scripts --no-audit --no-fund --prefix deploy/guard/github/hosted-delivery/tools
+      - name: Test admission, provider, delivery and repository contracts without credentials
+        run: |
+          python3 -I -B deploy/guard/github/hosted-delivery/test_admit.py
+          python3 -I -B deploy/guard/github/hosted-delivery/test_cloud_delivery.py
+          python3 -I -B deploy/guard/github/hosted-delivery/test_delivery_cli.py
+          python3 -I -B deploy/guard/github/hosted-delivery/repo-test.py
+          node --test deploy/guard/github/hosted-delivery/pages-upload.test.mjs
+          node --test deploy/guard/github/hosted-delivery/issuer.test.ts deploy/guard/github/hosted-delivery/issuer-control.test.ts

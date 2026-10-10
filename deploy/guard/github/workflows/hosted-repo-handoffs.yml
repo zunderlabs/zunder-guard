@@ -1,0 +1,94 @@
+# PUBLIC protected-main controller. No private checkout code or package hooks execute.
+name: hosted-repo-handoffs
+on:
+  workflow_dispatch:
+    inputs:
+      admission_id:
+        description: Existing reviewed public repository-handoff record ID
+        required: true
+        type: string
+      mode:
+        description: Exact mode bound by that record
+        required: true
+        type: choice
+        options: [source, site]
+      publish:
+        description: Open the admitted PR after verification
+        type: boolean
+        default: false
+permissions: {}
+concurrency: {group: 'hosted-repo-${{ inputs.mode }}', cancel-in-progress: false}
+jobs:
+  handoff:
+    if: github.repository == 'zunderlabs/zunder-guard' && github.ref == 'refs/heads/main' && github.ref_type == 'branch'
+    environment: ${{ inputs.mode == 'source' && 'guard-source-export' || 'guard-site-release-update' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions: {contents: read, actions: read, packages: read}
+    steps:
+      - name: Require applied public authority configuration
+        env: {ENABLED: '${{ vars.HOSTED_REPO_HANDOFFS_ENABLED }}'}
+        run: test "$ENABLED" = true
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with: {ref: '${{ github.sha }}', persist-credentials: false}
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444
+        with: {node-version: '24'}
+      - name: Check trusted public controller source only
+        run: python3 -I -B deploy/guard/github/hosted-delivery/repo-test.py
+      - uses: slsa-framework/slsa-verifier/actions/installer@ea584f4502babc6f60d9bc799dbbb13c1caa9ee6
+        if: inputs.mode == 'site'
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6
+        if: inputs.mode == 'site'
+        with: {cosign-release: v3.1.3}
+      - name: Mint private read-only artifact/source metadata token
+        id: reader
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1
+        with:
+          client-id: ${{ vars.PRIVATE_ARTIFACT_READER_APP_CLIENT_ID }}
+          private-key: ${{ secrets.PRIVATE_ARTIFACT_READER_APP_PRIVATE_KEY }}
+          owner: zunderlabs
+          repositories: zunder
+          permission-actions: read
+          permission-contents: read
+          skip-token-revoke: false
+      - name: Verify admitted source or complete accepted-release gate before destination credentials
+        env:
+          PRIVATE_ARTIFACT_READ_TOKEN: ${{ steps.reader.outputs.token }}
+          GITHUB_TOKEN: ${{ github.token }}
+          ADMISSION: ${{ inputs.admission_id }}
+          MODE: ${{ inputs.mode }}
+        run: python3 -I -B deploy/guard/github/hosted-delivery/repo-control.py "$ADMISSION" "$MODE"
+      - name: Mint only the public snapshot PR publisher
+        if: inputs.publish && inputs.mode == 'source'
+        id: source_writer
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1
+        with:
+          client-id: ${{ vars.GUARD_EXPORT_APP_CLIENT_ID }}
+          private-key: ${{ secrets.GUARD_EXPORT_APP_PRIVATE_KEY }}
+          owner: zunderlabs
+          repositories: zunder-guard
+          permission-contents: write
+          permission-pull-requests: write
+          permission-workflows: write
+          skip-token-revoke: false
+      - name: Mint only the private site manifest PR publisher
+        if: inputs.publish && inputs.mode == 'site'
+        id: site_writer
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1
+        with:
+          client-id: ${{ vars.GUARD_SITE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.GUARD_SITE_APP_PRIVATE_KEY }}
+          owner: zunderlabs
+          repositories: zunder
+          permission-contents: write
+          permission-pull-requests: write
+          skip-token-revoke: false
+      - name: Readmit exact candidate and open a PR without merge/tag/release or private code execution
+        if: inputs.publish
+        env:
+          PRIVATE_ARTIFACT_READ_TOKEN: ${{ steps.reader.outputs.token }}
+          GITHUB_TOKEN: ${{ github.token }}
+          REPO_PUBLISH_TOKEN: ${{ steps.source_writer.outputs.token || steps.site_writer.outputs.token }}
+          ADMISSION: ${{ inputs.admission_id }}
+          MODE: ${{ inputs.mode }}
+        run: python3 -I -B deploy/guard/github/hosted-delivery/repo-control.py "$ADMISSION" "$MODE" --publish

@@ -1,0 +1,41 @@
+name: Disposable public Mac target
+on:
+  workflow_call:
+permissions:
+  contents: read
+  actions: read
+  id-token: write
+jobs:
+  target-reboot:
+    name: target-reboot
+    runs-on: macos-15
+    environment: release-public-reboot
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444
+        with:
+          node-version: ${{ vars.PUBLIC_REBOOT_NODE_VERSION }}
+      - name: Pin original helper and clean runtime
+        env:
+          PUBLIC_REBOOT_EXPECTED_SCOPE: ${{ vars.PUBLIC_REBOOT_EXPECTED_SCOPE }}
+          PUBLIC_REBOOT_MAC_NODE_SHA256: ${{ vars.PUBLIC_REBOOT_MAC_NODE_SHA256 }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: node deploy/guard/github/hosted-reboot/runtime-cli.mjs prepare-target descriptor.json native-helper
+      - name: Publish original public build inventory
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: public-reboot-target-inventory
+          path: descriptor.json
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+      - name: Enroll and reboot this original target once
+        env:
+          PUBLIC_REBOOT_EXPECTED_SCOPE: ${{ vars.PUBLIC_REBOOT_EXPECTED_SCOPE }}
+          PUBLIC_REBOOT_MAC_NODE_SHA256: ${{ vars.PUBLIC_REBOOT_MAC_NODE_SHA256 }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: node deploy/guard/github/hosted-reboot/runtime-cli.mjs target descriptor.json native-helper
+      # Expected disconnect/failure does not substitute the controller's receipt.

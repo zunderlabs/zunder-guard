@@ -1,0 +1,12 @@
+{
+  "name": "zunder-public-hosted-delivery-tools",
+  "version": "1.0.0",
+  "private": true,
+  "license": "MIT",
+  "engines": {
+    "node": ">=24"
+  },
+  "dependencies": {
+    "@noble/hashes": "2.0.1"
+  }
+}

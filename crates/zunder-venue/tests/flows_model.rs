@@ -423,7 +423,8 @@ impl Model {
             snapshot.state = decision;
         } else if rank(snapshot.state) < 2
             && (unknown
-                || matches!(decision, RiskState::HaltedForDay { day } if day == snapshot.day))
+                || matches!(decision, RiskState::HaltedForDay { day } if day == snapshot.day)
+                || matches!(self.engine.state(), RiskState::HaltedForDay { day } if day == snapshot.day))
         {
             snapshot.state = RiskState::HaltedForDay { day: snapshot.day };
         }
@@ -2306,4 +2307,141 @@ fn case_stopped_zero_then_two_exact_deposits_across_midnight() {
         view,
     ];
     run(&build(&setup, &ops, false)).unwrap();
+}
+
+/// A deferred replay owns original money, but not permission to discard an
+/// already established halt of the current UTC day.
+#[test]
+fn deferred_model_keeps_the_current_days_halt() {
+    let limits = RiskLimits::default();
+    let at = ts(20_000 * DAY);
+    let mut model = Model::new(&limits, at, dec!(14_300), Vec::new());
+    model.pending_origin = Some(model.engine.clone());
+    let mut halted = model.engine.snapshot();
+    halted.state = RiskState::HaltedForDay { day: 20_000 };
+    model.engine = RiskEngine::restore(limits, halted).unwrap();
+    let deferred = model.defer(RiskState::Active, false, at).unwrap();
+    assert_eq!(deferred.state(), RiskState::HaltedForDay { day: 20_000 });
+    assert_eq!(deferred.snapshot().last, dec!(14_300));
+}
+
+/// Daily latches keep their date; yesterday's halt cannot contaminate a
+/// deferred replay rolled to today's immutable monetary checkpoint.
+#[test]
+fn deferred_model_does_not_keep_yesterdays_halt() {
+    let limits = RiskLimits::default();
+    let at = ts(20_000 * DAY);
+    let mut model = Model::new(&limits, at, dec!(14_300), Vec::new());
+    model.pending_origin = Some(model.engine.clone());
+    let mut halted = model.engine.snapshot();
+    halted.state = RiskState::HaltedForDay { day: 20_000 };
+    model.engine = RiskEngine::restore(limits, halted).unwrap();
+    let deferred = model
+        .defer(RiskState::Active, false, ts(20_001 * DAY))
+        .unwrap();
+    assert_eq!(deferred.state(), RiskState::Active);
+    assert_eq!(deferred.snapshot().day, 20_001);
+    assert_eq!(deferred.snapshot().last, dec!(14_300));
+}
+
+/// Actual PR16 run38025543985 job114135506019 saved after2,550 cases:
+/// cc aa2f82585b9a00486919fdc08edc85d4ce8cf9e77422525f10135fcec24fc721
+/// The delayed1,500 withdrawal causes a first-view daily halt. Its exact
+/// late report repairs monetary history, while a second zero view still
+/// defers cash placement and must preserve that already established halt.
+#[test]
+fn case_exact_zero_views_keep_the_day_halt_after_a_late_report() {
+    let setup = Setup {
+        start: 0,
+        main: 112,
+        second: 31,
+        cap: None,
+        values: 1,
+    };
+    let ops = [
+        Op::Withdraw {
+            second: true,
+            share: 39,
+            latency: Latency::Now,
+        },
+        Op::Withdraw {
+            second: true,
+            share: 78,
+            latency: Latency::After(5152),
+        },
+        Op::Withdraw {
+            second: false,
+            share: 100,
+            latency: Latency::Now,
+        },
+        Op::Pnl {
+            second: true,
+            units: -5,
+        },
+        Op::Pnl {
+            second: true,
+            units: 1,
+        },
+        Op::Pnl {
+            second: true,
+            units: 2,
+        },
+        Op::Withdraw {
+            second: true,
+            share: 67,
+            latency: Latency::Now,
+        },
+        Op::Wait(1995),
+        Op::View {
+            lag: 0,
+            second_after: 4,
+            second_lag: 0,
+            guard: 0,
+        },
+        Op::Wait(2561),
+        Op::View {
+            lag: 0,
+            second_after: 374,
+            second_lag: 0,
+            guard: 215,
+        },
+    ];
+    let timeline = build(&setup, &ops, true);
+    assert_eq!(timeline.equity, dec!(14_300));
+    assert_eq!(timeline.views.len(), 2);
+    assert!(timeline.views.iter().all(|view| view.equity.is_zero()));
+    assert_eq!(timeline.flows[1].amount, dec!(-1_500));
+    assert_eq!(
+        timeline.views[0].at.as_millis() - timeline.start.as_millis(),
+        5007
+    );
+    assert_eq!(
+        timeline.views[1].at.as_millis() - timeline.start.as_millis(),
+        8154
+    );
+    let (_, late) = run(&timeline).unwrap();
+    assert_eq!(late.state, RiskState::HaltedForDay { day: 20_000 });
+
+    // The existing order property compares monetary figures. Earlier
+    // reported cash avoids the conservative daily halt, as intended.
+    let mut prompt = timeline.clone();
+    for (at, event) in &mut prompt.events {
+        if let Event::Report(index) = event {
+            *at = prompt.flows[*index].time_ms;
+        }
+    }
+    prompt
+        .events
+        .sort_by_key(|(at, event)| (*at, !matches!(event, Event::Report(_))));
+    let (_, now) = run(&prompt).unwrap();
+    assert_eq!(now.state, RiskState::Active);
+    let figures = |snapshot: &RiskSnapshot| {
+        (
+            snapshot.day,
+            snapshot.peak,
+            snapshot.day_start,
+            snapshot.last,
+        )
+    };
+    assert_eq!(figures(&late), figures(&now));
 }
