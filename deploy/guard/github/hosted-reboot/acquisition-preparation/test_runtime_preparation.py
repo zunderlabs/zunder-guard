@@ -110,7 +110,7 @@ class InventoryFixtures(unittest.TestCase):
             self.assertEqual(maps.native_closure(o,['/usr/bin/fixed']),['/usr/bin/fixed'])
 
     def test_mapped_observation_refuses_deleted_unowned_and_omitted(self):
-        self.assertEqual(maps.mapped_paths('1-2 r-xp 0 00:00 1 /opt/zunder-public-reboot-acquisition/runtime/node'),['/opt/zunder-public-reboot-acquisition/runtime/node'])
+        self.assertEqual(maps.mapped_paths('1-2 r-xp 0 00:00 1 /var/lib/zunder-public-reboot-acquisition/runtime/node'),['/var/lib/zunder-public-reboot-acquisition/runtime/node'])
         for raw in ('1-2 r-xp 0 00:00 1 /usr/lib/libx.so (deleted)','1-2 r-xp 0 00:00 1 /opt/hostedtoolcache/node','', '1-2 r-xp 0 00:00 1 /tmp/key'):
             with self.assertRaises(RuntimeError):maps.mapped_paths(raw)
 
@@ -147,8 +147,8 @@ class InventoryFixtures(unittest.TestCase):
 class GetterFixtures(unittest.TestCase):
     def test_fixed_clean_environment_has_no_secret_proxy_or_factory(self):
         env=maps.clean_environment()
-        self.assertEqual(env['TUF_ROOT'],'/opt/zunder-public-reboot-acquisition/trust/cache/sigstore')
-        self.assertEqual(env['OPENSSL_CONF'],'/opt/zunder-public-reboot-acquisition/trust/openssl.cnf')
+        self.assertEqual(env['TUF_ROOT'],'/var/lib/zunder-public-reboot-acquisition/trust/cache/sigstore')
+        self.assertEqual(env['OPENSSL_CONF'],'/var/lib/zunder-public-reboot-acquisition/trust/openssl.cnf')
         for name in ('GH_TOKEN','GITHUB_TOKEN','ACTIONS_ID_TOKEN_REQUEST_TOKEN','AWS_PROFILE','AWS_ACCESS_KEY_ID','BASH_ENV','NODE_OPTIONS','PYTHONPATH','LD_PRELOAD','HTTPS_PROXY','TUF_MIRROR','TUF_ROOT_JSON'):
             self.assertNotIn(name,env);self.assertNotIn(name,getter.initial_environment())
 

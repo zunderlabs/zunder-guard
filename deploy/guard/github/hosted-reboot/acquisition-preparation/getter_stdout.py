@@ -35,8 +35,8 @@ def pairs(rows):
 
 def validate_ancestor(value):
     if type(value)is not dict or set(value)!={'kind','target','ancestor','query','result','canonical','uid','mode','fileType'}:raise ValueError()
-    targets={'root':('rootfs','opt','prefix'),'source':('rootfs','opt','prefix','source'),
-             'material':('rootfs','opt','material'),'reports':('rootfs','run','reports'),'work':('rootfs','run','work')}
+    targets={'root':('rootfs','opt','var','lib','prefix'),'source':('rootfs','opt','var','lib','prefix','source'),
+             'material':('rootfs','opt','var','lib','material'),'reports':('rootfs','run','reports'),'work':('rootfs','run','work')}
     if value['kind']!='fixed-source-ancestor-observation' or type(value['target'])is not str or value['target'] not in targets:raise ValueError()
     if value['ancestor'] not in targets[value['target']]:raise ValueError()
     if value['query'] not in ('canonical','lstat') or value['result'] not in ('pending','observed','missing','facts-refused'):raise ValueError()

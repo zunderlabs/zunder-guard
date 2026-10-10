@@ -18,9 +18,9 @@ import time
 from urllib.request import Request, build_opener, ProxyHandler, HTTPRedirectHandler
 from urllib.parse import urlsplit
 
-ROOT = Path('/opt/zunder-public-reboot-acquisition')
+ROOT = Path('/var/lib/zunder-public-reboot-acquisition')
 SOURCE = ROOT/'source'
-MATERIAL = Path('/opt/zunder-public-reboot-acquisition-material')
+MATERIAL = Path('/var/lib/zunder-public-reboot-acquisition-material')
 REPORTS = Path('/run/zunder-public-reboot-acquisition-preparation')
 WORK = Path('/run/zunder-public-reboot-acquisition')
 PUBLIC_ENTRY = 'deploy/guard/github/hosted-reboot/acquisition-preparation/'
@@ -34,7 +34,7 @@ VERIFIERS = {
  'deploy/guard/e2e/verify-release-assets.sh':('verify-release-assets.sh','87b3cd3bf11e8f7be65b5ec7479a9436e827a9b25b01c53bc585e099e46f53b9'),
  'deploy/guard/e2e/actions-artifacts.py':('actions-artifacts.py','69dc72eabaef3d7e39ac5762daa264693dc02d4d0f93b6c3215ee57cffbd774d'),
  'deploy/guard/e2e/staged-subjects.py':('staged-subjects.py','08cd01c76e9c67c7d753d93bed7b6c2b506dcce97e5b84291739363ae497b367'),
- 'deploy/guard/github/hosted-reboot/fixed-acquisition-stage.py':('fixed-acquisition-stage.py','539dbd0feaab3ad235a3fb5484b8f6f2ea1bf813cf5ed526868d94555523d421')}
+ 'deploy/guard/github/hosted-reboot/fixed-acquisition-stage.py':('fixed-acquisition-stage.py','d726a4d7518b6d67e4326626c5bdb959bc682f3812f93be23308151326d13dc0')}
 VENDORS = {
  'cosign':('https://github.com/sigstore/cosign/releases/download/v3.1.3/cosign-linux-amd64',141178250,'4629c757b7618056f8ddd7e2625ae9fdd94c0372a65049520bc7d9df9efc7f71'),
  'slsa-verifier':('https://github.com/slsa-framework/slsa-verifier/releases/download/v2.7.1/slsa-verifier-linux-amd64',33291668,'946dbec729094195e88ef78e1734324a27869f03e2c6bd2f61cbc06bd5350339')}
@@ -79,7 +79,7 @@ def ancestor_context(directory, path, query, result, canonical='unknown', observ
     """Only already captured fixed public ancestor facts; never path/error text."""
     global SOURCE_ANCESTOR_CONTEXT
     targets={ROOT:'root',SOURCE:'source',MATERIAL:'material',REPORTS:'reports',WORK:'work'}
-    ancestors={Path('/'):'rootfs',Path('/opt'):'opt',Path('/run'):'run',
+    ancestors={Path('/'):'rootfs',Path('/var'):'var',Path('/var/lib'):'lib',Path('/run'):'run',
                ROOT:'prefix',SOURCE:'source',MATERIAL:'material',REPORTS:'reports',WORK:'work'}
     if STAGE!='source-ancestors' or directory not in targets or path not in ancestors:
         SOURCE_ANCESTOR_CONTEXT=None;return

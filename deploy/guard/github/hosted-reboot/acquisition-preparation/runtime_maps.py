@@ -8,7 +8,7 @@ import subprocess
 from hosted_launch.contracts import canonical, decode, digest, need
 from hosted_launch.inventory import read, tree
 
-PREFIX = Path('/opt/zunder-public-reboot-acquisition')
+PREFIX = Path('/var/lib/zunder-public-reboot-acquisition')
 MAX_FILE = 160 * 1024 * 1024
 MAX_TOTAL = 2 * 1024 * 1024 * 1024
 SYSTEM_CONFIG = ('/etc/ld.so.cache', '/etc/nsswitch.conf', '/etc/hosts',

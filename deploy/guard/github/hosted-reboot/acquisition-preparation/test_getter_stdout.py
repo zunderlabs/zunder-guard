@@ -162,11 +162,11 @@ class GetterStdoutTests(unittest.TestCase):
 
     def test_all_existing_getter_maps_support_and_tools_unchanged(self):
         pins={
-            HERE/'prepare_runtime.py':'b08ce9be1df8d9c0f50bee5712bb7be0c17c0ec231a11a2b52bd6eefc349c5fa',
-            HERE/'runtime_maps.py':'cce8160f30b2aa86cab06342e20bb222aa5f0a796e64b9cb811ea11da51d97f2',
-            HERE/'test_runtime_preparation.py':'ff8af8b455dee74c1b353de94fdd4982c4f649171f102cfbd3546b86ede9aa62',
+            HERE/'prepare_runtime.py':'7c886112cd7e9b210f7c026215ca921d63af70d5fa3fd53cfe991afa531416c2',
+            HERE/'runtime_maps.py':'f927a80d578238810de6c6e7bf8e9599003f14ef63ccf432fdc6db7e8cc9bda1',
+            HERE/'test_runtime_preparation.py':'b14f1257e8e103cb1f324552f0fb81462f9941f89b4826663bf4940d6187e906',
             HERE/'branch_observation.py':'9a4a167dc081871cfcf5c02c8f8656c1f990cf9cc0907663425c1be6ee06074a',
-            HERE.parent/'fixed-acquisition-stage.py':'539dbd0feaab3ad235a3fb5484b8f6f2ea1bf813cf5ed526868d94555523d421',
+            HERE.parent/'fixed-acquisition-stage.py':'d726a4d7518b6d67e4326626c5bdb959bc682f3812f93be23308151326d13dc0',
             REPO/'.github/workflows/hosted-linux-acquisition-runtime-preparation.yml':'36f72e9f8f50f2af9658371313427b7dc3266df40194229ee80b4be4f0498bcb'}
         for path,expected in pins.items():self.assertEqual(hashlib.sha256(path.read_bytes()).hexdigest(),expected)
 

@@ -39,6 +39,9 @@ FAILURE_ADDITION="""    if STAGE=='source-ancestors' and SOURCE_ANCESTOR_CONTEXT
 
 
 def normalize_source(source):
+    migration_spec=importlib.util.spec_from_file_location('prefix_inverse',HERE/'test_fixed_prefix.py')
+    migration=importlib.util.module_from_spec(migration_spec);migration_spec.loader.exec_module(migration)
+    source=migration.normalize_migration(source)
     start=source.index('SOURCE_ANCESTOR_CONTEXT = None\n');end=source.index('def protected_ancestors(directory):',start)
     source=source[:start]+source[end:]
     for new,old in ((NEW_CANONICAL,OLD_CANONICAL),(NEW_STAT,OLD_STAT),(FAILURE_ADDITION,'')):
@@ -83,15 +86,15 @@ class AncestorFixtures(unittest.TestCase):
             def lstat(path):seen.append(str(path));return facts()if path==Path('/')else invalid
             with patch.object(Path,'resolve',lambda p,**k:p),patch.object(Path,'lstat',lstat):
                 with self.assertRaises(RuntimeError):g.protected_ancestors(g.ROOT)
-            self.assertEqual(seen,['/','/opt'])
+            self.assertEqual(seen,['/','/var'])
             raw,value=failure_record();observation=value['ancestorObservation']
-            self.assertEqual(observation['ancestor'],'opt');self.assertEqual(observation['uid'],invalid.st_uid)
+            self.assertEqual(observation['ancestor'],'var');self.assertEqual(observation['uid'],invalid.st_uid)
             self.assertEqual(observation['mode'],invalid.st_mode);self.assertEqual(observation['query'],'lstat')
             self.assertNotIn(b'/opt',raw);self.assertNotIn(b'secret-example',raw)
 
     def test_all_exact_fixed_targets_query_order_no_extra_stats(self):
-        targets={g.ROOT:['/','/opt',str(g.ROOT)],g.SOURCE:['/','/opt',str(g.ROOT),str(g.SOURCE)],
-                 g.MATERIAL:['/','/opt',str(g.MATERIAL)],g.REPORTS:['/','/run',str(g.REPORTS)],g.WORK:['/','/run',str(g.WORK)]}
+        targets={g.ROOT:['/','/var','/var/lib',str(g.ROOT)],g.SOURCE:['/','/var','/var/lib',str(g.ROOT),str(g.SOURCE)],
+                 g.MATERIAL:['/','/var','/var/lib',str(g.MATERIAL)],g.REPORTS:['/','/run',str(g.REPORTS)],g.WORK:['/','/run',str(g.WORK)]}
         for target,expected in targets.items():
             calls=[]
             def resolve(path,**kwargs):calls.append(('resolve',str(path)));return path
@@ -119,7 +122,7 @@ class AncestorFixtures(unittest.TestCase):
                     with self.assertRaises(OSError):g.protected_ancestors(g.ROOT)
                 self.assertEqual(query.call_count,2)
             current=g.SOURCE_ANCESTOR_CONTEXT
-            self.assertEqual(current['ancestor'],'opt');self.assertIsNone(current['uid']);self.assertIsNone(current['mode'])
+            self.assertEqual(current['ancestor'],'var');self.assertIsNone(current['uid']);self.assertIsNone(current['mode'])
             self.assertEqual(current['result'],'missing'if isinstance(error,FileNotFoundError)else 'pending');failure_record()
 
     def test_unknown_context_path_and_outside_phase_clear(self):
@@ -132,14 +135,14 @@ class AncestorFixtures(unittest.TestCase):
 
     def test_uid_mode_numeric_bounds_and_no_boolean_facts(self):
         for mode,uid in ((65536,0),(-1,0),(True,0),(0o40755,True),(0o40755,-1),(0o40755,4294967296)):
-            g.ancestor_context(g.ROOT,Path('/opt'),'lstat','observed','true',facts(mode,uid))
+            g.ancestor_context(g.ROOT,Path('/var'),'lstat','observed','true',facts(mode,uid))
             current=g.SOURCE_ANCESTOR_CONTEXT
             self.assertEqual(current['result'],'facts-refused');self.assertIsNone(current['uid']);self.assertIsNone(current['mode']);failure_record()
         for mode,uid in ((0,0),(65535,4294967295),(0o40755,0)):
-            g.ancestor_context(g.ROOT,Path('/opt'),'lstat','observed','true',facts(mode,uid));e.validate_ancestor(g.SOURCE_ANCESTOR_CONTEXT)
+            g.ancestor_context(g.ROOT,Path('/var'),'lstat','observed','true',facts(mode,uid));e.validate_ancestor(g.SOURCE_ANCESTOR_CONTEXT)
 
     def test_hostile_json_closed_grammar_and_same_mode_type(self):
-        g.ancestor_context(g.ROOT,Path('/opt'),'lstat','observed','true',facts())
+        g.ancestor_context(g.ROOT,Path('/var'),'lstat','observed','true',facts())
         valid=g.SOURCE_ANCESTOR_CONTEXT.copy()
         changes={'kind':'arbitrary','target':'/opt','ancestor':'secret-example','query':'readlink','result':'pass',
                  'canonical':True,'uid':True,'mode':-1,'fileType':'regular','path':'/private/path'}
