@@ -14,9 +14,10 @@
 //!
 //! - I1/I2: the figures (peak, day, day's start, last equity) are equal,
 //!   and the state is equal or stricter, stricter only after a view that
-//!   showed a flow not yet reported was taken; a restart is the run in
-//!   which the views the journal did not hold were never fed; every record
-//!   written is one the reader accepts.
+//!   showed a flow not yet reported was taken. A restart restores an
+//!   independently computed durable checkpoint: an absent view can have
+//!   contributed to its day's start without remaining a replay input.
+//!   Every record written is one the reader accepts.
 //! - I3: once everything is reported, the order and latency of the reports
 //!   do not matter.
 //! - I8: the reference model against a model that knows the true equity at
@@ -131,6 +132,24 @@ fn reference_rebase(
     (result > Decimal::ZERO).then_some(result)
 }
 
+/// Durable decisions and UTC chronology survive monetary replay. This is
+/// independent of the production settle function and never imports its state.
+fn reference_settle(model: &mut Model, before: &RiskSnapshot) {
+    let replayed = model.engine.snapshot();
+    if replayed.day < before.day {
+        model.engine.observe(ts(before.day * DAY), replayed.last);
+    }
+    let mut snapshot = model.engine.snapshot();
+    if matches!(before.state, RiskState::Stopped { .. })
+        || matches!(before.state, RiskState::HaltedForDay { day } if day == snapshot.day)
+            && !matches!(snapshot.state, RiskState::Stopped { .. })
+    {
+        snapshot.state = before.state;
+    }
+    model.engine = RiskEngine::restore(model.limits.clone(), snapshot)
+        .expect("independent settling preserves valid scalar figures");
+}
+
 /// Spec S6: the move of one flow of `amount` at pre-flow equity `before`,
 /// the engine having observed `before`.
 fn moved(
@@ -240,15 +259,6 @@ impl Model {
         }
     }
 
-    /// A view only its venue times are left of (a restart forgot it, but a
-    /// later record holds its times): it counts for which views go back.
-    fn ghost(&mut self, view: &SeenView) {
-        for (dex, time) in &view.times {
-            let latest = self.latest.entry(dex.clone()).or_insert(*time);
-            *latest = (*latest).max(*time);
-        }
-    }
-
     /// Feed a view: `None` when it goes back in venue time (S1), else
     /// whether it was taken.
     fn view(&mut self, view: &SeenView) -> Option<bool> {
@@ -279,7 +289,9 @@ impl Model {
             shown.sort_by_key(|i| (self.flows[*i].time_ms, self.flows[*i].id.clone()));
             match self.apply(&shown, view.equity, view.at) {
                 Some(Applied::Placed(engine)) => {
+                    let before = self.engine.snapshot();
                     self.engine = engine;
+                    reference_settle(self, &before);
                     self.pending_origin = None;
                     for i in &shown {
                         self.applied[*i] = true;
@@ -293,7 +305,9 @@ impl Model {
                     if self.pending_origin.is_none() {
                         self.pending_origin = Some(self.engine.clone());
                     }
+                    let before = self.engine.snapshot();
                     self.engine = engine;
+                    reference_settle(self, &before);
                     left = true;
                 }
                 None => left = true,
@@ -997,23 +1011,33 @@ fn journaled(records: &[JournalRecord]) -> BTreeSet<String> {
     out
 }
 
-/// What a run of the implementation saw, to build its reference with.
+/// An oracle checkpoint is constructed from generated inputs, independently
+/// checked, then retained when a record becomes durable. It never takes money
+/// or decisions from JournalRecord.state or PersistentRisk::snapshot.
+#[derive(Clone)]
+struct DurableCheckpoint {
+    model: Model,
+    /// Fed-view ordinal immediately after this record. Ordinals survive
+    /// restarts; unavailable views disappear only from retained replay inputs.
+    fed_len: usize,
+    /// Exact input occurrences retained by checked record metadata. Identical
+    /// views have distinct ordinals; serialized-set membership is insufficient.
+    durable_views: BTreeSet<usize>,
+}
+
+/// What one implementation run and its independent lifecycle oracle know.
 struct Run<'a> {
     timeline: &'a Timeline,
     dir: Dir,
     /// `None` only while it is reopened.
     risk: Option<PersistentRisk>,
-    /// The views fed and not ignored, by index into the timeline's, with
-    /// the journal's record count right after each; those a restart forgot
-    /// entirely (after the last record), and those it forgot but a later
-    /// record holds the times of.
-    fed: Vec<(usize, usize)>,
-    forgotten: BTreeSet<usize>,
-    ghosts: BTreeSet<usize>,
-    /// Decisions already checked against the oracle are durable human
-    /// knowledge. A later ledger report may omit their original view
-    /// during replay, but cannot revoke the decision without human review.
-    decisions: BTreeMap<usize, RiskState>,
+    /// Timeline view indices, with independent ordinals for replay inputs.
+    fed: Vec<usize>,
+    /// Views still available to replay, by their ordinal in fed.
+    retained: BTreeSet<usize>,
+    oracle: Model,
+    checkpoints: BTreeMap<u64, DurableCheckpoint>,
+    checked_records: usize,
     /// The flows reported so far, in order, and those the implementation
     /// skipped.
     reported: Vec<usize>,
@@ -1040,14 +1064,34 @@ impl<'a> Run<'a> {
         )
         .unwrap()
         .with_flows();
+        let oracle = Model::new(
+            &timeline.limits,
+            timeline.start,
+            timeline.equity,
+            Vec::new(),
+        );
+        let first = PersistentRisk::read(&dir.journal()).unwrap();
+        assert_eq!(first.len(), 1);
+        // Initial inputs, not journal money, define the first checkpoint.
+        assert_eq!(oracle.engine.snapshot(), first[0].state);
+        let checkpoints = [(
+            first[0].seq,
+            DurableCheckpoint {
+                model: oracle.clone(),
+                fed_len: 0,
+                durable_views: BTreeSet::new(),
+            },
+        )]
+        .into();
         Self {
             timeline,
             dir,
             risk: Some(risk),
             fed: Vec::new(),
-            forgotten: BTreeSet::new(),
-            ghosts: BTreeSet::new(),
-            decisions: BTreeMap::new(),
+            retained: BTreeSet::new(),
+            oracle,
+            checkpoints,
+            checked_records: 1,
             reported: Vec::new(),
             skipped: BTreeSet::new(),
             tainted: false,
@@ -1091,7 +1135,7 @@ impl<'a> Run<'a> {
                 // history fitted until this flow was known): stricter for
                 // a flow still unreported that one of them shows is D1's.
                 if rank(self.snapshot().state) > before {
-                    let shown_unreported = self.fed.iter().any(|(view, _)| {
+                    let shown_unreported = self.fed.iter().any(|view| {
                         let times = &self.timeline.views[*view].times;
                         self.timeline.flows.iter().enumerate().any(|(i, other)| {
                             i != *index
@@ -1134,10 +1178,13 @@ impl<'a> Run<'a> {
                     true,
                 );
                 prop_assert_eq!(&sync.journal_error, &None);
+                let independent = self.oracle.view(view);
+                prop_assert_eq!(sync.ignored, independent.is_none(), "stale-view decision");
                 if sync.ignored {
                     self.ignored += 1;
                     return self.check();
                 }
+                prop_assert_eq!(sync.taken, independent == Some(true), "view placement");
                 if sync.taken
                     && unreported
                         .iter()
@@ -1145,23 +1192,17 @@ impl<'a> Run<'a> {
                 {
                     self.tainted = true;
                 }
-                let count = self.records().len();
-                self.fed.push((*index, count));
+                self.retained.insert(self.fed.len());
+                self.fed.push(*index);
             }
             Event::Restart => {
                 let records = self.records();
-                let on_journal = journaled(&records);
-                for (index, count) in &self.fed {
-                    let key = serde_json::to_string(&self.timeline.views[*index]).unwrap();
-                    if on_journal.contains(&key) || self.forgotten.contains(index) {
-                        continue;
-                    }
-                    if *count == records.len() {
-                        self.forgotten.insert(*index);
-                    } else {
-                        self.ghosts.insert(*index);
-                    }
-                }
+                self.retained = self
+                    .checkpoints
+                    .get(&records.last().unwrap().seq)
+                    .expect("the durable input trail was independently checked")
+                    .durable_views
+                    .clone();
                 // Independently of the reference: a restart forgets at most a
                 // fall of the last equity within δ of the day's start (or
                 // the cap), nothing else.
@@ -1193,6 +1234,12 @@ impl<'a> Run<'a> {
                 // What the last record holds, exactly.
                 let last = records.last().unwrap();
                 prop_assert_eq!(&self.snapshot(), &last.state);
+                self.oracle = self
+                    .checkpoints
+                    .get(&last.seq)
+                    .expect("every durable record passed independent comparison")
+                    .model
+                    .clone();
                 // Guard reads the ledger again from the journal's horizon.
                 let from = self.risk().flows_from_ms();
                 for index in self.reported.clone() {
@@ -1214,45 +1261,149 @@ impl<'a> Run<'a> {
         self.check()
     }
 
-    /// The reference fed what the implementation knows.
-    fn reference(&self) -> Model {
-        let flows: Vec<Flow> = self
-            .reported
-            .iter()
-            .filter(|index| !self.skipped.contains(index))
-            .map(|index| self.timeline.flows[*index].clone())
-            .collect();
-        let mut model = Model::new(
-            &self.timeline.limits,
-            self.timeline.start,
-            self.timeline.equity,
-            flows,
-        );
-        for (index, _) in &self.fed {
-            if self.ghosts.contains(index) {
-                model.ghost(&self.timeline.views[*index]);
-            } else if !self.forgotten.contains(index) {
-                model.view(&self.timeline.views[*index]);
-            }
-            if let Some(decision) = self.decisions.get(index) {
-                let mut snapshot = model.engine.snapshot();
-                let applicable = match decision {
-                    RiskState::Stopped { .. } => true,
-                    RiskState::HaltedForDay { day } => *day == snapshot.day,
-                    RiskState::Active => false,
-                };
-                if applicable && rank(*decision) > rank(snapshot.state) {
-                    snapshot.state = *decision;
-                    model.engine = RiskEngine::restore(self.timeline.limits.clone(), snapshot)
-                        .expect("a validated decision preserves the oracle's valid figures");
+    /// Reconcile newly durable input records against independent checkpoints.
+    /// Journal money is only a comparison target. Inputs must be exactly the
+    /// complete generated/retained lists, not whatever a record elects to list.
+    fn durable_inputs(
+        &mut self,
+        records: &[JournalRecord],
+    ) -> Result<Vec<(u64, DurableCheckpoint)>, TestCaseError> {
+        let mut ready: Vec<(u64, DurableCheckpoint)> = Vec::new();
+        for record in &records[self.checked_records..] {
+            let previous = ready
+                .last()
+                .map(|(_, checkpoint)| checkpoint)
+                .or_else(|| self.checkpoints.get(&records[self.checked_records - 1].seq))
+                .expect("the preceding durable checkpoint was checked");
+            let prior = previous.model.engine.snapshot();
+            let mut durable_views = previous.durable_views.clone();
+            if let JournalEvent::Flowed { base, views, flows } = &record.event {
+                prop_assert!(*base < record.seq, "replay base must precede its record");
+                let checkpoint = ready
+                    .iter()
+                    .find(|(seq, _)| seq == base)
+                    .map(|(_, checkpoint)| checkpoint)
+                    .or_else(|| self.checkpoints.get(base))
+                    .ok_or_else(|| TestCaseError::fail("missing independent replay checkpoint"))?;
+                durable_views.retain(|ordinal| *ordinal < checkpoint.fed_len);
+                durable_views.extend(self.retained.range(checkpoint.fed_len..));
+                for index in &self.reported {
+                    let flow = &self.timeline.flows[*index];
+                    if !self.skipped.contains(index)
+                        && !checkpoint
+                            .model
+                            .flows
+                            .iter()
+                            .any(|known| known.id == flow.id)
+                    {
+                        let horizon = &checkpoint.model.latest;
+                        let before = flow.time_ms - MARGIN;
+                        prop_assert!(
+                            if horizon.is_empty() {
+                                self.timeline.start.as_millis() < before
+                            } else {
+                                horizon.values().all(|time| *time < before)
+                            },
+                            "new cash must lie after the replay prefix"
+                        );
+                    }
                 }
+                let expected_views: Vec<SeenView> = self
+                    .retained
+                    .range(checkpoint.fed_len..)
+                    .map(|ordinal| self.timeline.views[self.fed[*ordinal]].clone())
+                    .collect();
+                prop_assert_eq!(views, &expected_views, "complete retained replay views");
+                let prefix: BTreeSet<&str> = checkpoint
+                    .model
+                    .flows
+                    .iter()
+                    .zip(&checkpoint.model.applied)
+                    .filter(|(_, applied)| **applied)
+                    .map(|(flow, _)| flow.id.as_str())
+                    .collect();
+                let expected_flows: Vec<Flow> = self
+                    .reported
+                    .iter()
+                    .filter(|index| !self.skipped.contains(index))
+                    .map(|index| &self.timeline.flows[*index])
+                    .filter(|flow| !prefix.contains(flow.id.as_str()))
+                    .cloned()
+                    .collect();
+                prop_assert_eq!(flows, &expected_flows, "complete generated replay flows");
+                let mut replay = checkpoint.model.clone();
+                for flow in flows {
+                    if let Some(index) = replay.flows.iter().position(|old| old.id == flow.id) {
+                        prop_assert_eq!(&replay.flows[index], flow, "immutable known flow");
+                        prop_assert!(!replay.applied[index], "applied prefix cannot replay");
+                    } else {
+                        replay.flows.push(flow.clone());
+                        replay.applied.push(false);
+                    }
+                }
+                for view in views {
+                    prop_assert!(
+                        replay.view(view).is_some(),
+                        "replay contains no stale input"
+                    );
+                }
+                reference_settle(&mut replay, &prior);
+                // Durable horizon remembers even absent monetary views.
+                for (dex, time) in &self.oracle.latest {
+                    let latest = replay.latest.entry(dex.clone()).or_insert(*time);
+                    *latest = (*latest).max(*time);
+                }
+                self.oracle = replay;
+            } else {
+                prop_assert_eq!(
+                    &record.event,
+                    &JournalEvent::Updated,
+                    "only view updates here"
+                );
+                let index = *self.fed.last().expect("an updated record has a fed view");
+                prop_assert_eq!(record.view.as_ref(), Some(&self.timeline.views[index]));
+                durable_views.insert(self.fed.len() - 1);
             }
+            let expected = self.oracle.engine.snapshot();
+            let figures = |snapshot: &RiskSnapshot| {
+                (
+                    snapshot.day,
+                    snapshot.peak,
+                    snapshot.day_start,
+                    snapshot.last,
+                )
+            };
+            prop_assert_eq!(
+                figures(&record.state),
+                figures(&expected),
+                "durable figures"
+            );
+            prop_assert_eq!(record.state.state, expected.state, "durable decision");
+            prop_assert_eq!(
+                record.horizon.as_ref(),
+                Some(&self.oracle.latest),
+                "durable horizon"
+            );
+            ready.push((
+                record.seq,
+                DurableCheckpoint {
+                    model: self.oracle.clone(),
+                    fed_len: self.fed.len(),
+                    durable_views,
+                },
+            ));
         }
-        model
+        Ok(ready)
+    }
+
+    fn reference(&self) -> Model {
+        self.oracle.clone()
     }
 
     fn check(&mut self) -> Result<(), TestCaseError> {
         self.steps += 1;
+        let records = self.records();
+        let ready = self.durable_inputs(&records)?;
         let model = self.reference();
         let (got, want) = (self.snapshot(), model.engine.snapshot());
         let figures = |s: &RiskSnapshot| (s.day, s.peak, s.day_start, s.last);
@@ -1294,13 +1445,10 @@ impl<'a> Run<'a> {
                 Err(JournalError::PendingFlows | JournalError::NotObserved)
             ));
         }
-        // Record only after this step passed. Injecting the current result
-        // before comparison would conceal newly manufactured stops.
-        if let Some((index, _)) = self.fed.last()
-            && rank(got.state) > 0
-        {
-            self.decisions.insert(*index, got.state);
-        }
+        // Install independently calculated checkpoints only after all exact
+        // figure, decision and readiness comparisons for this step pass.
+        self.checkpoints.extend(ready);
+        self.checked_records = records.len();
         Ok(())
     }
 }
@@ -1409,6 +1557,397 @@ fn run_covered(timeline: &Timeline) -> Result<(usize, RiskSnapshot, Coverage), T
         midnight: usize::from(now.day > timeline.start.utc_day()),
     };
     Ok((run.steps, now, coverage))
+}
+
+/// Hand-computed lifecycle fixture. With a 100000 day base, a 100 fall
+/// is exactly the unwritten 0.1% allowance. Its next-day contribution is
+/// durable even though the falling view itself is absent after restart.
+fn durable_rollover_timeline(restart_before: bool) -> Timeline {
+    let t0 = 20_000 * DAY + DAY - 20_000;
+    let views: Vec<SeenView> = [
+        (t0 + 1_000, dec!(13600)),
+        (t0 + 7_000, dec!(13500)),
+        (t0 + 21_000, dec!(13800)),
+    ]
+    .into_iter()
+    .map(|(at, equity)| SeenView {
+        at: ts(at),
+        times: [(String::new(), at)].into(),
+        equity,
+    })
+    .collect();
+    let mut events = vec![(t0 + 1_000, Event::View(0)), (t0 + 7_000, Event::View(1))];
+    if restart_before {
+        events.push((t0 + 7_001, Event::Restart));
+    }
+    events.push((t0 + 21_000, Event::View(2)));
+    if !restart_before {
+        events.push((t0 + 21_001, Event::Restart));
+    }
+    Timeline {
+        limits: RiskLimits::default(),
+        start: ts(t0),
+        equity: dec!(100000),
+        states: views.iter().map(|view| view.times.clone()).collect(),
+        views,
+        flows: Vec::new(),
+        before: BTreeMap::new(),
+        pnl: Vec::new(),
+        events,
+    }
+}
+
+#[test]
+fn a_durable_rollover_retains_an_unwritten_falls_contribution() {
+    let timeline = durable_rollover_timeline(false);
+    let mut run = Run::new(&timeline);
+    for (at, event) in &timeline.events {
+        run.step(*at, event).unwrap();
+    }
+    let records = run.records();
+    assert!(!journaled(&records).contains(&serde_json::to_string(&timeline.views[1]).unwrap()));
+    let state = run.snapshot();
+    assert_eq!(
+        (state.day, state.peak, state.day_start, state.last),
+        (20001, dec!(100000), dec!(13500), dec!(13800))
+    );
+    assert_eq!(state.state, records[1].state.state);
+}
+
+#[test]
+fn restarting_before_rollover_forgets_only_the_uncommitted_fall() {
+    let timeline = durable_rollover_timeline(true);
+    let mut run = Run::new(&timeline);
+    for (at, event) in &timeline.events {
+        run.step(*at, event).unwrap();
+        if matches!(event, Event::Restart) {
+            assert_eq!(run.snapshot().last, dec!(13600));
+        }
+    }
+    let state = run.snapshot();
+    assert_eq!(
+        (state.day, state.peak, state.day_start, state.last),
+        (20001, dec!(100000), dec!(13600), dec!(13800))
+    );
+}
+
+#[test]
+fn delayed_cash_replay_uses_retained_views_after_a_durable_rollover() {
+    // Before and after the absent falling view: both exact cash anchors
+    // are 13500 before a 100 deposit, hence 13600 afterward. Replaying the
+    // retained day1 view starts its day at 13600, not at the absent 13500.
+    // Peak =100000*13600/13500; a proved original Stop never changes.
+    for offset in [3_500, 10_000] {
+        let mut timeline = durable_rollover_timeline(false);
+        let t0 = timeline.start.as_millis();
+        timeline.flows.push(Flow {
+            time_ms: t0 + offset,
+            amount: dec!(100),
+            id: "late cash".into(),
+            dex: String::new(),
+            between: false,
+            value: Some(ValueRange::cash_exact(dec!(13500))),
+        });
+        timeline.before.insert("late cash".into(), dec!(13500));
+        timeline.events.push((t0 + 23_000, Event::Report(0)));
+        timeline.events.push((t0 + 23_001, Event::Restart));
+        let mut run = Run::new(&timeline);
+        let mut original_stop = None;
+        for (at, event) in &timeline.events {
+            run.step(*at, event).unwrap();
+            original_stop.get_or_insert(run.snapshot().state);
+        }
+        let state = run.snapshot();
+        assert_eq!(
+            (state.day, state.peak, state.day_start, state.last),
+            (
+                20001,
+                dec!(100740.74074074074074074074074),
+                dec!(13600),
+                dec!(13800)
+            )
+        );
+        assert_eq!(Some(state.state), original_stop);
+        let outcome = run
+            .risk()
+            .apply_flow(ts(t0 + 23_002), &timeline.flows[0])
+            .unwrap();
+        assert_eq!(outcome, FlowOutcome::Duplicate);
+        assert_eq!(run.snapshot(), state);
+    }
+}
+
+#[test]
+fn a_second_restart_restores_the_committed_day_base_and_last() {
+    let mut timeline = durable_rollover_timeline(false);
+    let at = timeline.views[2].at.as_millis() + 100;
+    // Day1's allowance is 13.5; a one-dollar fall may remain unwritten.
+    timeline.views.push(SeenView {
+        at: ts(at),
+        times: [(String::new(), at)].into(),
+        equity: dec!(13799),
+    });
+    timeline.events.push((at, Event::View(3)));
+    timeline.events.push((at + 1, Event::Restart));
+    let (_, state) = run(&timeline).unwrap();
+    assert_eq!((state.day_start, state.last), (dec!(13500), dec!(13800)));
+}
+
+#[test]
+fn the_saved_restart_seed_preserves_rollover_then_delayed_cash_replay() {
+    let setup = Setup {
+        start: 86332406,
+        main: 60,
+        second: 0,
+        cap: None,
+        values: 1,
+    };
+    let ops = vec![
+        Op::Wait(1467),
+        Op::Pnl {
+            second: false,
+            units: -1,
+        },
+        Op::Pnl {
+            second: false,
+            units: 1,
+        },
+        Op::Wait(6668),
+        Op::Wait(2864),
+        Op::Pnl {
+            second: false,
+            units: 1,
+        },
+        Op::Pnl {
+            second: false,
+            units: -1,
+        },
+        Op::Wait(2901),
+        Op::Wait(2784),
+        Op::View {
+            lag: 0,
+            second_after: 0,
+            second_lag: 0,
+            guard: 0,
+        },
+        Op::View {
+            lag: 0,
+            second_after: 0,
+            second_lag: 0,
+            guard: 0,
+        },
+        Op::View {
+            lag: 0,
+            second_after: 0,
+            second_lag: 0,
+            guard: 0,
+        },
+        Op::Pnl {
+            second: false,
+            units: -1,
+        },
+        Op::Wait(2817),
+        Op::Wait(2918),
+        Op::Pnl {
+            second: false,
+            units: -1,
+        },
+        Op::Pnl {
+            second: false,
+            units: 1,
+        },
+        Op::Wait(200),
+        Op::Wait(407),
+        Op::Pnl {
+            second: false,
+            units: 1,
+        },
+        Op::Pnl {
+            second: false,
+            units: -1,
+        },
+        Op::Pnl {
+            second: false,
+            units: -1,
+        },
+        Op::View {
+            lag: 0,
+            second_after: 0,
+            second_lag: 0,
+            guard: 0,
+        },
+        Op::Pnl {
+            second: false,
+            units: -1,
+        },
+        Op::Pnl {
+            second: false,
+            units: 1,
+        },
+        Op::Pnl {
+            second: false,
+            units: -1,
+        },
+        Op::Pnl {
+            second: false,
+            units: 1,
+        },
+        Op::Wait(2821),
+        Op::Deposit {
+            second: false,
+            units: 104,
+            latency: Latency::Now,
+        },
+        Op::View {
+            lag: 0,
+            second_after: 0,
+            second_lag: 0,
+            guard: 0,
+        },
+        Op::Deposit {
+            second: false,
+            units: 74,
+            latency: Latency::Now,
+        },
+        Op::Deposit {
+            second: false,
+            units: 99,
+            latency: Latency::Now,
+        },
+        Op::Wait(1010),
+        Op::Wait(6613),
+        Op::View {
+            lag: 0,
+            second_after: 0,
+            second_lag: 0,
+            guard: 0,
+        },
+        Op::Pnl {
+            second: false,
+            units: 1,
+        },
+        Op::Wait(7569),
+        Op::Wait(894),
+        Op::Withdraw {
+            second: false,
+            share: 87,
+            latency: Latency::After(22740),
+        },
+        Op::Deposit {
+            second: false,
+            units: 93,
+            latency: Latency::Now,
+        },
+        Op::Pnl {
+            second: false,
+            units: -1,
+        },
+        Op::Pnl {
+            second: false,
+            units: -1,
+        },
+        Op::View {
+            lag: 0,
+            second_after: 0,
+            second_lag: 0,
+            guard: 0,
+        },
+        Op::View {
+            lag: 0,
+            second_after: 0,
+            second_lag: 0,
+            guard: 0,
+        },
+        Op::Pnl {
+            second: false,
+            units: 1,
+        },
+        Op::Pnl {
+            second: false,
+            units: 1,
+        },
+        Op::View {
+            lag: 0,
+            second_after: 0,
+            second_lag: 0,
+            guard: 0,
+        },
+        Op::Wait(6280),
+        Op::Wait(7271),
+        Op::Wait(3413),
+        Op::Pnl {
+            second: false,
+            units: -1,
+        },
+        Op::View {
+            lag: 2,
+            second_after: 0,
+            second_lag: 0,
+            guard: 0,
+        },
+        Op::Wait(4547),
+        Op::Pnl {
+            second: false,
+            units: 1,
+        },
+        Op::View {
+            lag: 2,
+            second_after: 0,
+            second_lag: 0,
+            guard: 0,
+        },
+        Op::Pnl {
+            second: false,
+            units: 1,
+        },
+        Op::Wait(869),
+        Op::Pnl {
+            second: false,
+            units: 1,
+        },
+        Op::View {
+            lag: 0,
+            second_after: 0,
+            second_lag: 0,
+            guard: 241,
+        },
+        Op::View {
+            lag: 0,
+            second_after: 0,
+            second_lag: 0,
+            guard: 241,
+        },
+        Op::Restart,
+        Op::Wait(200),
+    ];
+    let timeline = build(&setup, &ops, false);
+    let mut run = Run::new(&timeline);
+    let mut checked_restart = false;
+    let mut checked_late = false;
+    for (at, event) in &timeline.events {
+        run.step(*at, event).unwrap();
+        if matches!(event, Event::Restart) {
+            let state = run.snapshot();
+            assert_eq!(
+                (state.day, state.peak, state.day_start, state.last),
+                (
+                    20001,
+                    dec!(109607.05693664795509222133122),
+                    dec!(13500),
+                    dec!(13800)
+                )
+            );
+            checked_restart = true;
+        }
+        if let Event::Report(index) = event
+            && timeline.flows[*index].id == "w3"
+        {
+            assert!(checked_restart);
+            assert!(run.reference().applied.iter().all(|applied| *applied));
+            checked_late = true;
+        }
+    }
+    assert!(checked_restart && checked_late);
 }
 
 /// The generator reaches every path the invariants are about: a run of
