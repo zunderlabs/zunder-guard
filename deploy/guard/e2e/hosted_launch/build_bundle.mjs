@@ -10,7 +10,7 @@ const hash=(v)=>createHash('sha256').update(v).digest('hex');
 const relative=(v)=>typeof v==='string'&&v.length>0&&v.length<=1024&&/^[A-Za-z0-9_./+@-]+$/.test(v)&&!v.startsWith('/')&&v.split('/').every(p=>p!==''&&p!=='.'&&p!=='..');
 const canonical=(v)=>JSON.stringify(v,(_,x)=>x&&typeof x==='object'&&!Array.isArray(x)?Object.fromEntries(Object.entries(x).sort(([a],[b])=>a.localeCompare(b,'en'))):x);
 const root=process.argv[2];
-need(process.argv.length===3&&root==='/opt/zunder-hosted-ordinary/runtime/website/source'&&await fs.realpath(root)===root);
+need(process.argv.length===3&&root==='/var/lib/zunder-hosted-ordinary/runtime/website/source'&&await fs.realpath(root)===root);
 need(process.platform==='linux'&&process.arch==='x64'&&process.getuid()===0&&process.version==='v26.8.1');
 const esbuild=await import(pathToFileURL(path.join(root,'web/site/node_modules/esbuild/lib/main.js')).href);
 need(esbuild.version==='0.28.2');

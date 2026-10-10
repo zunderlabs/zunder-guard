@@ -10,7 +10,7 @@ import sys
 
 OWNER = 0
 REPORT_PARTS = ('run', 'zunder-hosted-ordinary', 'reports')
-ROOT = '/opt/zunder-hosted-ordinary'
+ROOT = '/var/lib/zunder-hosted-ordinary'
 PUBLIC = '/run/zunder-hosted-ordinary'
 LIMIT = 262144
 STAGES = frozenset(('arguments', 'capabilities', 'source', 'node', 'website', 'packages',

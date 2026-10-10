@@ -4,7 +4,7 @@ import json
 from pathlib import Path
 import re
 
-ROOT = Path('/opt/zunder-hosted-ordinary')
+ROOT = Path('/var/lib/zunder-hosted-ordinary')
 SOURCE = ROOT / 'source'
 CHECKOUT = ROOT / 'checkout'
 WEBSITE = ROOT / 'runtime/website/source'

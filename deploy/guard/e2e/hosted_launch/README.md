@@ -11,15 +11,15 @@ The source rejection fixture job is **not** the required live negative STS probe
 2. Observe no swap, zero core limits, systemd and unified cgroup kill/swap
    primitives; remove only its own empty capability probe group.
 3. Materialize the actual public source into a fresh root-owned
-   `/opt/zunder-hosted-ordinary/source`. Each controller file fits the existing
+   `/var/lib/zunder-hosted-ordinary/source`. Each controller file fits the existing
    two MiB read bound. Genuine Git objects and HEAD remain in a separate actual
-   root-owned `/opt/zunder-hosted-ordinary/checkout`; the private process must
+   root-owned `/var/lib/zunder-hosted-ordinary/checkout`; the private process must
    start there. Its database is inventoried separately as runtime input.
 4. Fetch Node 26.8.1 Linux x64 at the exact SHA256 from the previously verified
    official signed checksum. Reject redirects, oversized archives, unsafe
    members and unexpected aliases. This is not actual runtime admission.
 5. Place the current authored website fork in
-   `/opt/zunder-hosted-ordinary/runtime/website/source`, outside the bounded
+   `/var/lib/zunder-hosted-ordinary/runtime/website/source`, outside the bounded
    controller tree. Derive a focused npm
    lock from the existing lock's exact package records, versions, resolution
    URLs and integrity values. Select ethers 6.17.0, Playwright Core 1.62.1,

@@ -82,7 +82,7 @@ class Invoker(unittest.TestCase):
     def test_fixed_vendor_constants_and_no_redirect(self):
         self.assertEqual(p.RUSTUP_BYTES,21113232);self.assertEqual(p.RUSTUP_SHA,'dda7234360b7f578ca8b0ddcb80145646fa61a67c1720a5abc7051b35c9fcb71')
         self.assertIn('/1.29.1/x86_64-unknown-linux-gnu/',p.RUSTUP_URL)
-        self.assertEqual(str(p.RUSTUP),'/opt/zunder-hosted-ordinary/runtime/node/bin/rustup')
+        self.assertEqual(str(p.RUSTUP),'/var/lib/zunder-hosted-ordinary/runtime/node/bin/rustup')
         with self.assertRaises(RuntimeError):p.NoRedirect().redirect_request(None)
     def test_vendor_failure_never_creates_or_executes_file(self):
         # Context-manager fixture is a harmless response only, never a network.

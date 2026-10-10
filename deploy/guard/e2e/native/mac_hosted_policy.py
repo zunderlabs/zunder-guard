@@ -109,6 +109,63 @@ def power_format_diagnostic(text):
                 'ambiguous':key in ambiguous}for key in required}}
 
 
+
+def capability_diagnostic(text):
+    """Current-power-source feature API observation, never an admission override."""
+    required=('hibernatemode','standby','autopoweroff')
+    def unknown(reason):
+        return {'observed':False,'reason':reason,'power_source':'unknown',
+                'features':{key:'unknown'for key in required}}
+    if type(text)is not str or len(text)>65536:return unknown('input-refused')
+    lines=text.splitlines()
+    if not 2<=len(lines)<=65:return unknown('shape-refused')
+    header=re.fullmatch(r'Capabilities for (AC|Battery|UPS) Power:',lines[0].strip())
+    if header is None:return unknown('shape-refused')
+    seen=set()
+    for line in lines[1:]:
+        key=line.strip()
+        if re.fullmatch(r'[a-z][a-z0-9_]{0,63}',key)is None or key in seen:return unknown('shape-refused')
+        seen.add(key)
+    return {'observed':True,'reason':'current-source-positive-features-only','power_source':header[1].lower(),
+            'features':{key:'supported'if key in seen else'unknown'for key in required}}
+
+
+def live_power_diagnostic(text):
+    """Required values only; unrelated override text is neither parsed nor exported."""
+    required=('hibernatemode','standby','autopoweroff')
+    def unknown(reason):
+        return {'observed':False,'reason':reason,'required':{key:{'presence':'unknown','zero':None}for key in required}}
+    if type(text)is not str or len(text)>65536:return unknown('input-refused')
+    lines=text.splitlines()
+    if not 2<=len(lines)<=4096 or lines[0].strip()!='Currently in use:':return unknown('shape-refused')
+    values={};ambiguous=set();seen=set()
+    for line in lines[1:]:
+        fields=line.split()
+        if not fields:continue
+        key=fields[0]
+        if key not in required:continue
+        if key in seen:ambiguous.add(key)
+        seen.add(key)
+        if len(fields)!=2 or re.fullmatch(r'[0-9]{1,10}',fields[1])is None:ambiguous.add(key)
+        else:values[key]=fields[1]
+    return {'observed':True,'reason':'live-required-value-observation','required':{key:{
+            'presence':'unknown'if key in ambiguous else'present'if key in values else'absent',
+            'zero':None if key in ambiguous or key not in values else values[key]=='0'}for key in required}}
+
+
+def power_capability_probe(*,deadline):
+    """Two bounded no-key reads; results never feed the original policy predicate."""
+    result={'kind':'closed-power-capability-observation','interpretation':'current-source-feature-api-only',
+            'capabilities':capability_diagnostic(None),'live':live_power_diagnostic(None),
+            'universal_hibernation_absence_proven':False,'universal_crash_capture_prevention_proven':False}
+    for name,argv,parse in (
+        ('capabilities',['/usr/bin/pmset','-g','cap'],capability_diagnostic),
+        ('live',['/usr/bin/pmset','-g','live'],live_power_diagnostic)):
+        try:result[name]=parse(public(argv,deadline=deadline))
+        except BaseException:
+            result[name]=parse(None);result[name]['reason']='readback-unavailable'
+    return result
+
 def inspect_sleep_and_core(paths=(Path('/private/var/vm/sleepimage'),Path('/var/vm/sleepimage'),Path('/cores'))):
     for path in paths:
         if not os.path.lexists(path):continue
@@ -248,10 +305,12 @@ def probe(*,deadline=None):
                 need(time.monotonic()<original_deadline)
                 checks['owned_helper_cleanup']={'observed':True,'passed':True}
             except BaseException:checks['owned_helper_cleanup']={'observed':False,'passed':False,'reason':'owned-helper-remains-unknown'}
+    capability=power_capability_probe(deadline=original_deadline)
     return {'schema':1,'kind':'actual-hosted-mac-policy-capability','policy':HOSTED,'checks':checks,
         'eligible':checks.get('effective_policy',{}).get('passed')is True and checks.get('owned_helper_cleanup',{}).get('passed')is True,
         'coverage':{'filevault':False if values.get('vault')=='FileVault is Off.'else True if values.get('vault')=='FileVault is On.'else None,'filevault_coverage':'untested','no_swap':False,'heap_locking':False,
                     'strict_native_memory_satisfied':False},
+        'power_capability_observation':capability,
         'privateInput':False,'releaseReady':False,'source_or_custody_admission_proven':False,'host_policy_modified':False}
 
 

@@ -63,8 +63,8 @@ class RelativeAstroRoutes(unittest.TestCase):
             self.assertEqual(c.relative(value), value)
 
     def test_no_root_tool_or_runtime_cap_changes(self):
-        self.assertEqual(str(c.ROOT), '/opt/zunder-hosted-ordinary')
-        self.assertEqual(str(c.WEBSITE), '/opt/zunder-hosted-ordinary/runtime/website/source')
+        self.assertEqual(str(c.ROOT), '/var/lib/zunder-hosted-ordinary')
+        self.assertEqual(str(c.WEBSITE), '/var/lib/zunder-hosted-ordinary/runtime/website/source')
         self.assertFalse(c.WEBSITE.is_relative_to(c.SOURCE))
         # The existing full runtime schema's bounded cardinality remains active.
         files = {'/fixture/file-' + str(n): 'a' * 64 for n in range(19998)}

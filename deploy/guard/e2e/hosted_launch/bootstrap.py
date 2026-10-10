@@ -385,10 +385,22 @@ def python_runtime():
     return aliases
 
 
+def preparation_ancestors():
+    """Fixed existing parents only; never repair shared directory permissions."""
+    for directory in (ROOT, PUBLIC):
+        need(directory.is_absolute(), 'Fixed protected preparation ancestors required')
+        for parent in reversed(directory.parents):
+            info = parent.lstat()
+            need(stat.S_ISDIR(info.st_mode) and info.st_uid == 0 and not info.st_mode & 0o022
+                 and parent.resolve(strict=True) == parent,
+                 'Fixed protected preparation ancestors required')
+
+
 def prepare(workspace, commit):
     global _STAGE
     inventory_context()
     need(os.geteuid() == 0 and not ROOT.exists() and not PUBLIC.exists(), 'Fresh fixed hosted preparation required')
+    preparation_ancestors()
     PUBLIC.mkdir(mode=0o700); ROOT.mkdir(mode=0o700)
     for name in ('home', 'npm-cache', 'reports'): (PUBLIC/name).mkdir(mode=0o700)
     started = time.time_ns(); _STAGE = 'capabilities'; cap = capabilities()

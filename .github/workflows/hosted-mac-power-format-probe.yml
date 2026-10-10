@@ -6,6 +6,7 @@ on:
       - '.github/workflows/hosted-mac-power-format-probe.yml'
       - 'deploy/guard/e2e/native/mac_hosted_policy.py'
       - 'deploy/guard/e2e/native/test_mac_power_format_diagnostic.py'
+      - 'deploy/guard/e2e/native/test_mac_power_capability_diagnostic.py'
 permissions:
   contents: read
 concurrency:
@@ -31,6 +32,7 @@ jobs:
           test "$(git rev-parse HEAD)" = "$CONTROL_SOURCE"
           test -z "$(git status --porcelain)"
           python3 -I -B deploy/guard/e2e/native/test_mac_power_format_diagnostic.py
+          python3 -I -B deploy/guard/e2e/native/test_mac_power_capability_diagnostic.py
       - name: Existing root policy probe with closed shape detail
         run: |
           set -euo pipefail

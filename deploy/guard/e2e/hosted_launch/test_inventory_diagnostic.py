@@ -107,6 +107,7 @@ class InventoryDiagnostic(unittest.TestCase):
             root=Path(td)/'root';public=Path(td)/'public';selected=root/'runtime/website/source';writes=[];trees=[]
             for name,value in [('ROOT',root),('PUBLIC',public),('SOURCE',root/'source'),('CHECKOUT',root/'checkout'),('WEBSITE',selected)]:stack.enter_context(patch.object(p,name,value))
             stack.enter_context(patch.object(p.os,'geteuid',return_value=0));stack.enter_context(patch.object(p,'capabilities',return_value={}))
+            stack.enter_context(patch.object(p,'preparation_ancestors'))  # inert fixture paths, never host admission
             stack.enter_context(patch.object(p,'source',return_value={}))
             def node(): (root/'runtime/node').mkdir(parents=True);return {}
             stack.enter_context(patch.object(p,'node',side_effect=node));stack.enter_context(patch.object(p,'website',return_value={}))
@@ -203,6 +204,10 @@ class InventoryGuardReason(unittest.TestCase):
         self.assertEqual(len(set(p._INVENTORY_GUARD_REASONS.values())),16)
     def test_all_original_bootstrap_ast_is_unchanged_except_exact_optional_guard_block(self):
         tree=ast.parse(Path(p.__file__).read_text())
+        tree.body=[n for n in tree.body if not(isinstance(n,ast.FunctionDef)and n.name=='preparation_ancestors')]
+        prepare=next(n for n in tree.body if isinstance(n,ast.FunctionDef)and n.name=='prepare')
+        calls=[n for n in prepare.body if isinstance(n,ast.Expr)and isinstance(n.value,ast.Call)and isinstance(n.value.func,ast.Name)and n.value.func.id=='preparation_ancestors']
+        self.assertEqual(len(calls),1);prepare.body.remove(calls[0])
         tree.body=[n for n in tree.body if not(isinstance(n,ast.Assign)and len(n.targets)==1 and isinstance(n.targets[0],ast.Name)and n.targets[0].id=='_INVENTORY_GUARD_REASONS')]
         function=next(n for n in tree.body if isinstance(n,ast.FunctionDef)and n.name=='inventory_failure_diagnostic')
         candidates=[n for n in function.body if isinstance(n,ast.If)and ast.unparse(n.test)=='type(error) is RuntimeError']

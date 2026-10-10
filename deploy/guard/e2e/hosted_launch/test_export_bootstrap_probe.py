@@ -110,11 +110,23 @@ class Grammar(unittest.TestCase):
         self.assertEqual(out['regularizedPythonAliasCount'], 2)
         self.assertEqual(out['reportSha256'], hashlib.sha256(raw(prepared())).hexdigest())
         self.assertNotIn(b'/opt/', raw(out))
+        self.assertNotIn(b'/var/lib/', raw(out))
         self.assertNotIn(b'/run/', raw(out))
         self.assertNotIn(b'esbuild', raw(out))
         self.assertLess(len(raw(out)), 8192)
         for flag in p.FALSE_FLAGS:
             self.assertIs(out[flag], False)
+
+    def test_success_requires_only_new_fixed_root_and_original_run_report_paths(self):
+        self.assertEqual(p.ROOT, '/var/lib/zunder-hosted-ordinary')
+        self.assertEqual(p.PUBLIC, '/run/zunder-hosted-ordinary')
+        for root in ('/opt/zunder-hosted-ordinary', '/var/lib/foreign', '/var/lib/zunder-hosted-ordinary/..'):
+            for key, suffix in (('controllerRoot', '/source'), ('genuineCheckout', '/checkout')):
+                value=prepared();value['source'][key]=root+suffix
+                with self.subTest(root=root,key=key), self.assertRaises(p.Refused):
+                    p.preparation(value,SOURCE)
+        value=prepared();value['inventories']['source']['file']=p.ROOT+'/reports/source-inventory.json'
+        with self.assertRaises(p.Refused):p.preparation(value,SOURCE)
 
     def test_unknown_fields_at_every_nested_success_boundary_refuse(self):
         paths = [(), ('capabilities',), ('source',), ('node',), ('materialization',),
