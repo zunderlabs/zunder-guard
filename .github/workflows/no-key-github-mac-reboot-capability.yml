@@ -1,0 +1,61 @@
+name: No-key GitHub Mac reboot capability
+on:
+  push:
+    branches: [codex/no-key-github-mac-reboot-capability]
+permissions: {}
+concurrency:
+  group: no-key-github-mac-reboot-capability
+  cancel-in-progress: false
+jobs:
+  observer:
+    if: github.repository == 'zunderlabs/zunder-guard' && github.event.repository.private == false
+    name: original-linux-observer
+    runs-on: ubuntu-24.04
+    timeout-minutes: 16
+    permissions:
+      contents: read
+      checks: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Original bounded observation
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: node deploy/guard/github/no-key-reboot-capability/observer.mjs
+      - name: Retain closed observation
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: no-key-reboot-observer-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/reboot-capability-observer.json
+          if-no-files-found: warn
+          retention-days: 1
+          include-hidden-files: false
+  target:
+    if: github.repository == 'zunderlabs/zunder-guard' && github.event.repository.private == false
+    name: original-mac-arm-target
+    runs-on: macos-15
+    timeout-minutes: 16
+    permissions:
+      contents: read
+      checks: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Fixed hosted compilation and one no-key capability reboot
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: node deploy/guard/github/no-key-reboot-capability/target.mjs
+      - name: Retain closed target return
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: no-key-reboot-target-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/reboot-capability-target.json
+          if-no-files-found: warn
+          retention-days: 1
+          include-hidden-files: false
