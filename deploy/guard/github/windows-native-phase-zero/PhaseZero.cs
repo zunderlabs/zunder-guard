@@ -28,6 +28,7 @@ internal static class PhaseZero {
   static N.ServiceMain MainDelegate = ServiceMain;
   static N.Handler HandlerDelegate = ServiceControl;
   static IntPtr StatusHandle;
+  static uint ServiceCheckpoint = 1; // Finite self-reported diagnostics only, never ownership evidence.
   static string stage = "preflight";
   static Dictionary<string, object> report;
 
@@ -200,6 +201,12 @@ internal static class PhaseZero {
     IntPtr x = N.OpenServiceW(scm.P, ServiceName, 4); int e = Marshal.GetLastWin32Error();
     if (x != IntPtr.Zero) { N.CloseServiceHandle(x); return false; } return e == 1060;
   }
+  static void ObserveStartupStatus(H service) {
+    N.SERVICE_STATUS_PROCESS actual; uint bytes;
+    if (!N.QueryServiceStatusEx(service.P, 0, out actual, (uint)Marshal.SizeOf(typeof(N.SERVICE_STATUS_PROCESS)), out bytes) ||
+        bytes != Marshal.SizeOf(typeof(N.SERVICE_STATUS_PROCESS)) || actual.State < 1 || actual.State > 7) return;
+    report["startup_status"] = D("state", "OBSERVED", "service_state", actual.State, "win32_exit", actual.Win32Exit, "service_exit", actual.ServiceExit);
+  }
   static uint ServiceState(H service) {
     N.SERVICE_STATUS_PROCESS s; uint bytes;
     Win(N.QueryServiceStatusEx(service.P, 0, out s, (uint)Marshal.SizeOf(typeof(N.SERVICE_STATUS_PROCESS)), out bytes), "scm");
@@ -266,11 +273,12 @@ internal static class PhaseZero {
   static Dictionary<string, object> EmptyBoot() { return D("state", "UNKNOWN", "guid", null, "boot_filetime", null, "current_filetime", null,
     "observation_before_filetime", null, "observation_after_filetime", null, "qpc_before", null, "qpc_after", null, "qpc_frequency", null, "uptime_ms", null); }
   static int Probe() {
-    report = D("schema", 1, "kind", "WINDOWS_NO_KEY_NATIVE_PHASE_ZERO", "outcome", "UNKNOWN", "stage", "preflight", "error_class", "none", "error_code", 0,
+    report = D("schema", 2, "kind", "WINDOWS_NO_KEY_NATIVE_PHASE_ZERO", "outcome", "UNKNOWN", "stage", "preflight", "error_class", "none", "error_code", 0,
       "actual_native_getter_executed", true, "source_admitted", false, "runtime_admitted", false, "release_ready", false,
       "production_windows_service_acceptance", false, "native_credential_retention_proven", false, "same_host_reboot_proven", false,
       "all_owned_processes_gone", false, "self_exit", "UNKNOWN", "vm_removal", "UNKNOWN", "receipt_memory_absence", "NOT_EXERCISED",
       "boot", EmptyBoot(), "processes", new List<object>(), "files", new List<object>(),
+      "startup_status", D("state", "UNKNOWN", "service_state", null, "win32_exit", null, "service_exit", null),
       "scm", D("state", "UNKNOWN", "fixed_config_match", false, "sid_sha256", null, "pid", null),
       "job", D("state", "UNKNOWN", "kill_on_close", false, "child_member", false, "protected_dacl_match", false, "active_processes", null),
       "listener", D("state", "UNKNOWN", "family", "IPv4", "address_class", "LOOPBACK", "port", Port, "owned_pid", null),
@@ -308,8 +316,12 @@ internal static class PhaseZero {
       var ef = FileFacts(exe, false, sid); ef["role"] = "executable"; files.Add(ef);
       var mf = FileFacts(marker, false, sid); mf["role"] = "marker"; files.Add(mf);
       string digest = FileDigest(exe); ef["sha256"] = digest; mf["sha256"] = FileDigest(marker); rf["sha256"] = null;
-      stage = "startup"; startedService = true; cleanup["processes"] = "UNKNOWN"; cleanup["listener"] = "UNKNOWN"; Win(N.StartServiceW(service.P, 0, IntPtr.Zero), "scm");
-      Poll(delegate { return ServiceState(service) == 4; }, 20000, "startup"); ConfigMatch(service);
+      stage = "startup"; startedService = true; cleanup["processes"] = "UNKNOWN"; cleanup["listener"] = "UNKNOWN"; bool started = N.StartServiceW(service.P, 0, IntPtr.Zero);
+      uint startError = unchecked((uint)Marshal.GetLastWin32Error());
+      ObserveStartupStatus(service); // Preserve StartService error before this independent read.
+      if (!started) throw new Refused("scm", startError);
+      Poll(delegate { ObserveStartupStatus(service); return ServiceState(service) == 4; }, 20000, "startup");
+      ObserveStartupStatus(service); ConfigMatch(service);
       uint servicePid = ServicePid(service); serviceProcess = new H(N.OpenProcess(0x00101400, false, servicePid), false);
       var serviceFacts = ProcessFacts(serviceProcess, servicePid, sid, digest); serviceFacts["role"] = "service";
       report["scm"] = D("state", "OBSERVED", "fixed_config_match", true, "sid_sha256", Sha(Encoding.ASCII.GetBytes(sid)), "pid", servicePid);
@@ -369,7 +381,7 @@ internal static class PhaseZero {
   static uint ServiceControl(uint code, uint type, IntPtr data, IntPtr context) { if (code == 1 || code == 5) ServiceStop.Set(); return 0; }
   static void Status(uint state, bool bad) {
     var s = new N.SERVICE_STATUS { Type = 0x10, State = state, Accepted = state == 4 ? 5U : 0U,
-      Win32Exit = bad ? 1066U : 0U, ServiceExit = bad ? 1U : 0U, Checkpoint = state == 2 || state == 3 ? 1U : 0U,
+      Win32Exit = bad ? 1066U : 0U, ServiceExit = bad ? ServiceCheckpoint : 0U, Checkpoint = state == 2 || state == 3 ? 1U : 0U,
       WaitHint = state == 2 || state == 3 ? 30000U : 0U };
     Win(N.SetServiceStatus(StatusHandle, ref s), "scm");
   }
@@ -378,23 +390,24 @@ internal static class PhaseZero {
     H job = null, child = null, thread = null; bool bad = false;
     try {
       StatusHandle = N.RegisterServiceCtrlHandlerExW(ServiceName, HandlerDelegate, IntPtr.Zero); Win(StatusHandle != IntPtr.Zero, "scm"); Status(2, false);
-      Need(String.Equals(Assembly.GetExecutingAssembly().Location, Exe, StringComparison.OrdinalIgnoreCase), "ownership");
-      string sid = ServiceSID(); Need(TokenSID(N.GetCurrentProcess()) == sid, "ownership");
+      ServiceCheckpoint = 2; Need(String.Equals(Assembly.GetExecutingAssembly().Location, Exe, StringComparison.OrdinalIgnoreCase), "ownership");
+      ServiceCheckpoint = 3; string sid = ServiceSID(); Need(TokenSID(N.GetCurrentProcess()) == sid, "ownership");
+      ServiceCheckpoint = 4;
       using (var sd = new SD("O:" + sid + "D:P(A;;0x1f003f;;;BA)(A;;0x1f003f;;;SY)(A;;0x1f003f;;;" + sid + ")")) {
         N.SECURITY_ATTRIBUTES sa = sd.Attributes(); IntPtr raw = N.CreateJobObjectW(ref sa, JobName); int code = Marshal.GetLastWin32Error();
         job = new H(raw, false); Need(code != 183, "preexisting");
       }
-      Need(Marshal.SizeOf(typeof(N.JOB_LIMIT)) == 144, "abi"); var limits = new N.JOB_LIMIT(); limits.Basic.Flags = 0x2000;
+      ServiceCheckpoint = 5; Need(Marshal.SizeOf(typeof(N.JOB_LIMIT)) == 144, "abi"); var limits = new N.JOB_LIMIT(); limits.Basic.Flags = 0x2000;
       Win(N.SetInformationJobObject(job.P, 9, ref limits, 144), "job");
-      var start = new N.STARTUPINFO { Size = Marshal.SizeOf(typeof(N.STARTUPINFO)) }; var pi = new N.PROCESS_INFORMATION();
+      ServiceCheckpoint = 6; var start = new N.STARTUPINFO { Size = Marshal.SizeOf(typeof(N.STARTUPINFO)) }; var pi = new N.PROCESS_INFORMATION();
       IntPtr env = Marshal.StringToHGlobalUni("SystemRoot=C:\\Windows\0WINDIR=C:\\Windows\0PATH=C:\\Windows\\System32\0\0");
       try { Win(N.CreateProcessW(Exe, new StringBuilder("\"" + Exe + "\" --child"), IntPtr.Zero, IntPtr.Zero, false,
         CREATE_SUSPENDED | CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT, env, Root, ref start, out pi), "process"); }
       finally { Marshal.FreeHGlobal(env); }
       child = new H(pi.Process, false); thread = new H(pi.Thread, false);
-      if (!N.AssignProcessToJobObject(job.P, child.P)) { N.TerminateProcess(child.P, 1); N.WaitForSingleObject(child.P, 5000); throw new Refused("job", 0); }
-      Need(N.ResumeThread(thread.P) != uint.MaxValue, "process"); thread.Dispose(); thread = null; Status(4, false);
-      ServiceStop.WaitOne(LimitMs); Status(3, false);
+      ServiceCheckpoint = 7; if (!N.AssignProcessToJobObject(job.P, child.P)) { N.TerminateProcess(child.P, 1); N.WaitForSingleObject(child.P, 5000); throw new Refused("job", 0); }
+      ServiceCheckpoint = 8; Need(N.ResumeThread(thread.P) != uint.MaxValue, "process"); thread.Dispose(); thread = null; ServiceCheckpoint = 9; Status(4, false);
+      ServiceStop.WaitOne(LimitMs); ServiceCheckpoint = 10; Status(3, false);
     } catch { bad = true; }
     finally {
       if (thread != null) thread.Dispose(); if (job != null) job.Dispose();
@@ -421,8 +434,19 @@ internal static class PhaseZero {
       if (args[0] == "--probe") return Probe();
       if (args[0] == "--child") return Child();
       if (args[0] == "--service") {
-        var table = new N.SERVICE_TABLE[] { new N.SERVICE_TABLE { Name = ServiceName, Entry = MainDelegate }, new N.SERVICE_TABLE() };
-        Win(N.StartServiceCtrlDispatcherW(table), "scm"); return 0;
+        Need(IntPtr.Size == 8, "abi");
+        IntPtr name = IntPtr.Zero, table = IntPtr.Zero;
+        try {
+          name = Marshal.StringToHGlobalUni(ServiceName); table = Marshal.AllocHGlobal(32);
+          Marshal.WriteIntPtr(table, 0, name);
+          Marshal.WriteIntPtr(table, 8, Marshal.GetFunctionPointerForDelegate(MainDelegate));
+          Marshal.WriteIntPtr(table, 16, IntPtr.Zero); Marshal.WriteIntPtr(table, 24, IntPtr.Zero);
+          Win(N.StartServiceCtrlDispatcherW(table), "scm"); return 0;
+        } finally {
+          GC.KeepAlive(MainDelegate); GC.KeepAlive(HandlerDelegate);
+          if (table != IntPtr.Zero) Marshal.FreeHGlobal(table);
+          if (name != IntPtr.Zero) Marshal.FreeHGlobal(name);
+        }
       }
     } catch { return 1; } return 2;
   }
@@ -451,7 +475,6 @@ internal static class PhaseZero {
     [StructLayout(LayoutKind.Sequential)] internal struct PROCESS_INFORMATION { internal IntPtr Process, Thread; internal uint Pid, Tid; }
     [UnmanagedFunctionPointer(CallingConvention.Winapi)] internal delegate void ServiceMain(uint argc, IntPtr argv);
     [UnmanagedFunctionPointer(CallingConvention.Winapi)] internal delegate uint Handler(uint control, uint eventType, IntPtr eventData, IntPtr context);
-    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)] internal struct SERVICE_TABLE { [MarshalAs(UnmanagedType.LPWStr)] internal string Name; internal ServiceMain Entry; }
     [DllImport("ntdll.dll", EntryPoint = "NtQuerySystemInformation")] internal static extern int NtQueryBoot(int c, ref BOOT_ENV b, uint n, out uint returned);
     [DllImport("ntdll.dll", EntryPoint = "NtQuerySystemInformation")] internal static extern int NtQueryTime(int c, ref TIME_OF_DAY b, uint n, out uint returned);
     [DllImport("ntdll.dll")] internal static extern int NtQueryInformationProcess(IntPtr h, int c, ref BASIC_PROCESS b, uint n, out uint returned);
@@ -514,7 +537,7 @@ internal static class PhaseZero {
     [DllImport("advapi32.dll", SetLastError = true)] internal static extern bool DeleteService(IntPtr h);
     [DllImport("advapi32.dll", SetLastError = true)] internal static extern bool SetServiceStatus(IntPtr h, ref SERVICE_STATUS status);
     [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)] internal static extern IntPtr RegisterServiceCtrlHandlerExW(string name, Handler handler, IntPtr context);
-    [DllImport("advapi32.dll", SetLastError = true)] internal static extern bool StartServiceCtrlDispatcherW([In] SERVICE_TABLE[] table);
+    [DllImport("advapi32.dll", EntryPoint = "StartServiceCtrlDispatcherW", ExactSpelling = true, SetLastError = true)] internal static extern bool StartServiceCtrlDispatcherW(IntPtr table);
     [DllImport("iphlpapi.dll")] internal static extern uint GetExtendedTcpTable(IntPtr b, ref uint n, bool sorted, uint family, uint c, uint reserved);
     [DllImport("shell32.dll")] internal static extern bool IsUserAnAdmin();
   }

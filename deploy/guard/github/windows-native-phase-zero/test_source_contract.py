@@ -42,8 +42,13 @@ def report_model(raw):
    elif isinstance(template,int):assert type(value) is int and 0<=value<=2**32-1
    elif isinstance(template,str):assert isinstance(value,str) and len(value)<=128
    else:assert value is None
-  shape(r,baseline)
-  assert r['schema']==1 and r['kind']==baseline['kind'] and r['outcome']=='OBSERVED' and r['error_class']=='none' and r['error_code']==0
+  startup=r['startup_status'];assert set(startup)=={'state','service_state','win32_exit','service_exit'}
+  if startup['state']=='UNKNOWN':assert all(startup[k] is None for k in ['service_state','win32_exit','service_exit'])
+  else:
+   assert startup['state']=='OBSERVED' and type(startup['service_state']) is int and 1<=startup['service_state']<=7
+   assert all(type(startup[k]) is int and 0<=startup[k]<=2**32-1 for k in ['win32_exit','service_exit'])
+  shaped=dict(r);shaped['startup_status']=baseline['startup_status'];shape(shaped,baseline)
+  assert r['schema']==2 and r['kind']==baseline['kind'] and r['outcome'] in ['OBSERVED','UNKNOWN']
   for field in ['source_admitted','runtime_admitted','release_ready','production_windows_service_acceptance','native_credential_retention_proven','same_host_reboot_proven','all_owned_processes_gone']:assert r[field] is False
   assert r['actual_native_getter_executed'] is True and r['self_exit']=='UNKNOWN' and r['vm_removal']=='UNKNOWN' and r['receipt_memory_absence']=='NOT_EXERCISED'
   def tick(x):
@@ -52,6 +57,7 @@ def report_model(raw):
   b=r['boot'];assert b['state']=='OBSERVED' and re.fullmatch(r'[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}',b['guid'])
   assert tick(b['boot_filetime'])>0 and tick(b['boot_filetime'])<=tick(b['observation_before_filetime'])<=tick(b['current_filetime'])<=tick(b['observation_after_filetime'])
   assert tick(b['qpc_before'])<=tick(b['qpc_after']) and tick(b['qpc_frequency'])>0
+  if r['outcome']=='OBSERVED':assert startup==baseline['startup_status'] and r['error_class']=='none' and r['error_code']==0
   assert r['listener']==baseline['listener'] and r['job']==baseline['job'] and r['scm']==baseline['scm'] and r['cleanup']==baseline['cleanup']
   seen=set()
   for f in r['files']:
@@ -69,6 +75,15 @@ class SourceContract(unittest.TestCase):
  def test_explicit_x64_layouts(self):
   self.assertEqual([c.sizeof(x) for x in [Boot,Time,Basic,JobBasic,Job,FileId]],[32,48,48,64,144,24])
   self.assertEqual([Boot.flags.offset,Basic.pid.offset,Basic.parent.offset],[24,32,40])
+ def test_explicit_dispatcher_table_and_diagnostics(self):
+  self.assertNotIn('SERVICE_TABLE[]',NATIVE)
+  for text in ['Marshal.AllocHGlobal(32)','Marshal.WriteIntPtr(table, 0, name)','Marshal.WriteIntPtr(table, 8, Marshal.GetFunctionPointerForDelegate(MainDelegate))','Marshal.WriteIntPtr(table, 16, IntPtr.Zero)','Marshal.WriteIntPtr(table, 24, IntPtr.Zero)','GC.KeepAlive(MainDelegate)','GC.KeepAlive(HandlerDelegate)','StartServiceCtrlDispatcherW(IntPtr table)','ExactSpelling = true']:
+   self.assertIn(text,NATIVE)
+  self.assertLess(NATIVE.index('uint startError ='),NATIVE.index('ObserveStartupStatus(service); //'))
+  self.assertIn('if (!started) throw new Refused("scm", startError)',NATIVE)
+  self.assertEqual(set(re.findall(r'ServiceCheckpoint = (\d+)',NATIVE)),set(map(str,range(1,11))))
+  for text in ['"startup_status"','"service_state"','"win32_exit"','"service_exit"','Num(startup["service_state"]) <= 7','Num(startup["service_state"]) == 4']:
+   self.assertIn(text,GATE)
  def test_fixed_native_queries_no_boot_fallback(self):
   for text in ['N.NtQueryBoot(90, ref boot, 32','N.NtQueryTime(3, ref tod, 48','N.NtQueryInformationProcess(p.P, 0, ref basic, 48','N.GetSystemTimePreciseAsFileTime','N.QueryPerformanceCounter','N.GetProcessTimes','N.QueryFullProcessImageNameW','N.GetExtendedTcpTable']:
    self.assertIn(text,NATIVE)
@@ -104,7 +119,7 @@ class SourceContract(unittest.TestCase):
  def test_all_retained_report_cases_are_inert(self):
   self.assertEqual(FIXTURES['kind'],'INERT_REPORT_GATE_FIXTURES')
   self.assertFalse(FIXTURES['native_execution']);self.assertFalse(FIXTURES['source_runtime_admission'])
-  self.assertEqual(len(FIXTURES['cases']),26)
+  self.assertEqual(len(FIXTURES['cases']),32)
   for case in FIXTURES['cases']:
    with self.subTest(case=case['name']):self.assertEqual(report_model(case['raw']),case['accept'])
  def test_gate_source_duplicate_unknown_and_precision_guards(self):

@@ -50,8 +50,8 @@ public static class ReportGate {
     try {
       var r = Obj(new Parser(raw).Parse(), "schema", "kind", "outcome", "stage", "error_class", "error_code", "actual_native_getter_executed",
         "source_admitted", "runtime_admitted", "release_ready", "production_windows_service_acceptance", "native_credential_retention_proven",
-        "same_host_reboot_proven", "all_owned_processes_gone", "self_exit", "vm_removal", "receipt_memory_absence", "boot", "processes", "files", "scm", "job", "listener", "cleanup");
-      Need(Num(r["schema"]) == 1); Eq(r["kind"], "WINDOWS_NO_KEY_NATIVE_PHASE_ZERO"); Enum(r["outcome"], "OBSERVED", "UNKNOWN", "REFUSED");
+        "same_host_reboot_proven", "all_owned_processes_gone", "self_exit", "vm_removal", "receipt_memory_absence", "boot", "processes", "files", "startup_status", "scm", "job", "listener", "cleanup");
+      Need(Num(r["schema"]) == 2); Eq(r["kind"], "WINDOWS_NO_KEY_NATIVE_PHASE_ZERO"); Enum(r["outcome"], "OBSERVED", "UNKNOWN", "REFUSED");
       Enum(r["stage"], "preflight", "scm", "files", "startup", "job");
       Enum(r["error_class"], "none", "handle", "security", "process", "abi", "boot_environment", "time_of_day", "clock", "ownership", "file", "scm", "listener", "startup", "job", "preexisting", "privilege", "cleanup", "unexpected", "report"); Num(r["error_code"]);
       Need(Bool(r["actual_native_getter_executed"]));
@@ -79,6 +79,10 @@ public static class ReportGate {
         Hex(f["file_id"], 32); Ticks(f["volume_serial"]); Need(Num(f["links"]) > 0 && !Bool(f["reparse"]) && Bool(f["protected_dacl_match"])); Eq(f["owner_class"], "ADMINISTRATORS");
         if (Str(f["role"]) == "root") Need(f["sha256"] == null); else { Need(Num(f["links"]) == 1); if (f["sha256"] != null) Hex(f["sha256"], 64); else Need(Str(r["outcome"]) != "OBSERVED"); }
       }
+      var startup = Obj(r["startup_status"], "state", "service_state", "win32_exit", "service_exit");
+      Enum(startup["state"], "OBSERVED", "UNKNOWN");
+      if (Str(startup["state"]) == "OBSERVED") { Need(Num(startup["service_state"]) >= 1 && Num(startup["service_state"]) <= 7); Num(startup["win32_exit"]); Num(startup["service_exit"]); }
+      else Need(startup["service_state"] == null && startup["win32_exit"] == null && startup["service_exit"] == null);
       var scm = Obj(r["scm"], "state", "fixed_config_match", "sid_sha256", "pid"); Enum(scm["state"], "OBSERVED", "UNKNOWN");
       if (Str(scm["state"]) == "OBSERVED") { Need(Bool(scm["fixed_config_match"]) && Num(scm["pid"]) > 0); Hex(scm["sid_sha256"], 64); }
       else Need(!Bool(scm["fixed_config_match"]) && scm["sid_sha256"] == null && scm["pid"] == null);
@@ -92,6 +96,7 @@ public static class ReportGate {
       foreach (string f in new string[] { "scm", "listener", "files", "root" }) Enum(cleanup[f], "OBSERVED_ABSENT", "UNKNOWN", "NOT_CREATED");
       Enum(cleanup["processes"], "OBSERVED_TERMINAL", "UNKNOWN", "NOT_CREATED");
       if (Str(r["outcome"]) == "OBSERVED") {
+        Need(Str(startup["state"]) == "OBSERVED" && Num(startup["service_state"]) == 4 && Num(startup["win32_exit"]) == 0 && Num(startup["service_exit"]) == 0);
         Need(Str(r["error_class"]) == "none" && Num(r["error_code"]) == 0 && Str(b["state"]) == "OBSERVED" && processes.Count == 2 && files.Count == 3 &&
           Str(scm["state"]) == "OBSERVED" && Str(job["state"]) == "OBSERVED" && Str(listener["state"]) == "OBSERVED");
         Need(Num(roles["child"]["parent_pid"]) == Num(roles["service"]["pid"]) && Num(scm["pid"]) == Num(roles["service"]["pid"]) &&
