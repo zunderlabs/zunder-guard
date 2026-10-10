@@ -38,6 +38,7 @@ TOOLS_PATHS = {'python': '/usr/bin/python3.12', 'systemd_run': '/usr/bin/systemd
     'nft': '/usr/sbin/nft', 'sysctl': '/usr/sbin/sysctl', 'openssl': '/usr/bin/openssl',
     'certutil': '/usr/bin/certutil', 'bwrap': '/usr/bin/bwrap'}
 _STAGE = 'arguments'
+_PYTHON_CONTEXT = None
 
 
 class NoRedirect(HTTPRedirectHandler):
@@ -217,15 +218,51 @@ def runtime_observation(node_path, packages):
             'observedNativeFiles': sorted(selected_native)}
 
 
+
+def python_failure_diagnostic(context, error):
+    """Closed metadata for fixed public stdlib copying, never exception text."""
+    if context is None:
+        return None
+    operation, member = context
+    need(operation in ('check-root', 'create-root', 'copy-interpreter', 'enumerate', 'copy-member'),
+         'Fixed public Python diagnostic operation required')
+    need(type(member) is str and len(member) <= 1024,
+         'Bounded public Python diagnostic member required')
+    kinds = (FileNotFoundError, PermissionError, FileExistsError, RuntimeError, OSError)
+    kind = next((cls.__name__ for cls in kinds if isinstance(error, cls)), 'other')
+    reason_codes = {
+        'Actual Ubuntu Python 3.12 stdlib required': 'stdlib-root-refused',
+        'Unexpected site customization alias refused': 'startup-alias-refused',
+        'External stdlib alias refused': 'external-alias-refused',
+        'Stdlib device refused': 'stdlib-device-refused',
+        'Safe complete source member required': 'member-grammar-refused',
+        'Canonical regular member required': 'canonical-member-refused',
+        'Bounded regular single-link member required': 'regular-single-link-refused',
+        'Member changed while inventoried': 'member-changed',
+        'Member read exceeded bound': 'member-bound-refused',
+    }
+    # Exact fixed-message lookup is safe; arbitrary error text is never emitted.
+    reason = reason_codes.get(str(error), 'operation-failed') if type(error) is RuntimeError else 'operation-failed'
+    safe_member = member if re.fullmatch(r'[A-Za-z0-9_./+@-]{1,1024}', member) and not member.startswith('/') and all(p not in ('', '.', '..') for p in member.split('/')) else None
+    return {'operation': operation, 'member': safe_member,
+            'memberSha256': digest(member.encode()), 'errorType': kind, 'reason': reason}
+
+
 def python_runtime():
     """Own a regular managed stdlib tree; no ambient Python import search."""
+    global _PYTHON_CONTEXT
     original = Path('/usr/lib/python3.12'); target = ROOT/'runtime/python'
+    _PYTHON_CONTEXT = ('check-root', 'stdlib')
     need(original.is_dir() and original.resolve(strict=True) == original,
          'Actual Ubuntu Python 3.12 stdlib required')
+    _PYTHON_CONTEXT = ('create-root', 'stdlib')
     target.mkdir(mode=0o700)
+    _PYTHON_CONTEXT = ('copy-interpreter', 'python3.12')
     copy_regular(Path('/usr/bin/python3.12').resolve(strict=True), target/'bin/python3.12')
     aliases = []
+    _PYTHON_CONTEXT = ('enumerate', 'stdlib')
     for path in sorted(original.rglob('*')):
+        _PYTHON_CONTEXT = ('copy-member', str(path.relative_to(original)))
         relative_name = relative(str(path.relative_to(original)))
         if path.is_symlink():
             actual = path.resolve(strict=True)
@@ -240,6 +277,7 @@ def python_runtime():
             copy_regular(actual, target/'lib/python3.12'/relative_name)
         elif path.is_file(): copy_regular(path, target/'lib/python3.12'/relative_name)
         else: need(path.is_dir(), 'Stdlib device refused')
+    _PYTHON_CONTEXT = None
     return aliases
 
 
@@ -301,11 +339,14 @@ def main():
     parser.add_argument('--control-source', required=True); args = parser.parse_args()
     try:
         prepare(args.workspace, args.control_source)
-    except BaseException:
+    except BaseException as error:
         reports = PUBLIC/'reports'
         if reports.is_dir() and not (reports/'failure.json').exists():
-            write_new(reports/'failure.json', {'schema': 1, 'kind': 'hosted-preparation-incomplete',
-                'stage': _STAGE, 'privateInput': False, 'releaseReady': False}, 0o444)
+            failure = {'schema': 1, 'kind': 'hosted-preparation-incomplete',
+                'stage': _STAGE, 'privateInput': False, 'releaseReady': False}
+            if _STAGE == 'python-runtime':
+                failure['diagnostic'] = python_failure_diagnostic(_PYTHON_CONTEXT, error)
+            write_new(reports/'failure.json', failure, 0o444)
         raise SystemExit('No-secret hosted preparation incomplete; inspect the fixed stage receipt') from None
 
 
