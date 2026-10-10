@@ -182,4 +182,71 @@ class Invoker(unittest.TestCase):
         body=text[text.index('- name: Prepare admitted website'):];self.assertNotIn('PRIVATE_ARTIFACT_READ_TOKEN',body);self.assertNotIn('GITHUB_TOKEN',body)
         self.assertIn('website-preparation-metadata.json',body);self.assertNotIn('/*.json',body)
 
+    def test_public_diagnostic_strict_known_builtin_only(self):
+        p._PUBLIC_PREDICATE='runtime-inventory-read'
+        self.assertEqual(p.public_failure_diagnostic(RuntimeError('Root-owned non-writable ancestor required')),
+            {'predicate':'runtime-inventory-read','guardReason':'root-ancestor-refused'})
+        class Custom(RuntimeError):
+            def __str__(self):raise AssertionError('must never render')
+            @property
+            def args(self):raise AssertionError('must never inspect subclass args')
+        errors=(RuntimeError('/private/hidden-token'),RuntimeError('Root-owned non-writable ancestor required secret'),
+                RuntimeError('Root-owned non-writable ancestor required','secret'),RuntimeError(1),RuntimeError(),Custom('secret'),ValueError('secret'))
+        for error in errors:
+            with self.subTest(type=type(error)):
+                self.assertNotIn('secret',p.canonical(p.public_failure_diagnostic(error)).decode())
+            self.assertEqual(p.public_failure_diagnostic(error)['guardReason'],'unknown')
+        p._PUBLIC_PREDICATE='/private/secret'
+        self.assertEqual(p.public_failure_diagnostic(RuntimeError('secret')),{'predicate':'none','guardReason':'unknown'})
+    def test_public_diagnostic_main_closed_and_other_stage_unchanged(self):
+        argv=['entry','--workspace','/unused','--control-source','a'*40,'--admission-id','fixture']
+        def refusal(*_):
+            p._STAGE='public-source';p._PUBLIC_PREDICATE='managed-root-interpreter'
+            raise RuntimeError('Managed root reader required')
+        with patch.object(p.sys,'argv',argv),patch.object(p,'invoke',side_effect=refusal),patch('sys.stdout',new_callable=io.StringIO)as output:
+            self.assertEqual(p.main(),1)
+        value=json.loads(output.getvalue());self.assertEqual(value['stage'],'public-source');self.assertEqual(value['code'],'fixed-stage-refused')
+        self.assertEqual(value['diagnostic'],{'predicate':'managed-root-interpreter','guardReason':'managed-root-reader-refused'})
+        for key in ('runtimeAdmitted','privateEpoch','fullJourney','releaseReady','wholeHostCredentialAbsenceProven'):self.assertIs(value[key],False)
+        self.assertLess(len(output.getvalue()),4096)
+        with patch.object(p.sys,'argv',['entry','--unknown-private-secret']),patch('sys.stdout',new_callable=io.StringIO)as output:
+            self.assertEqual(p.main(),1)
+        self.assertNotIn('diagnostic',json.loads(output.getvalue()));self.assertEqual(p._PUBLIC_PREDICATE,'none')
+    def test_context_refusal_checkpoint_prevents_any_source_or_reader(self):
+        env={**self.env(),'PRIVATE_ARTIFACT_READ_TOKEN':'private-test-only','GITHUB_TOKEN':'public-test-only','GITHUB_SHA':'b'*40}
+        with patch.object(p,'public_source')as source,patch.object(p.subprocess,'run')as reader,self.assertRaises(RuntimeError)as failure:
+            p.read_raw('/unused','a'*40,'fixture',env)
+        source.assert_not_called();reader.assert_not_called()
+        self.assertEqual(p.public_failure_diagnostic(failure.exception),{'predicate':'context-main-dispatch','guardReason':'context-main-refused'})
+    def test_root_and_interpreter_checkpoint_prevents_reader(self):
+        env={**self.env(),'PRIVATE_ARTIFACT_READ_TOKEN':'private-test-only','GITHUB_TOKEN':'public-test-only'}
+        for uid,executable in ((1,p.PYTHON),(0,Path('/different-interpreter'))):
+            with self.subTest(uid=uid),patch.object(p,'public_source',return_value=({}, {}, {}, None)),patch.object(p.os,'geteuid',return_value=uid),                patch.object(Path,'resolve',return_value=executable),patch.object(p,'tools')as tools,patch.object(p.subprocess,'run')as reader,self.assertRaises(RuntimeError)as failure:
+                p.read_raw('/unused','a'*40,'fixture',env)
+            tools.assert_not_called();reader.assert_not_called()
+            self.assertEqual(p.public_failure_diagnostic(failure.exception),{'predicate':'managed-root-interpreter','guardReason':'managed-root-reader-refused'})
+    def test_runtime_guard_checkpoints_hash_path_vendor_and_open(self):
+        rows={str(path):p.digest(str(path).encode())for path in(p.PYTHON,p.NODE,p.NPM)}
+        raw=p.canonical({'files':rows})
+        report={'inventories':{'runtime':{'file':str(p.PUBLIC/'reports/runtime-inventory.json'),'sha256':p.digest(raw)}},
+            'node':{'version':'26.8.1','archiveSha256':'3e301118d7df53d563b7e96c1617545f26e2f76f9724be668d6cab65c15dda5d'}}
+        def read(path,*_):return raw if path.name=='runtime-inventory.json'else str(path).encode()
+        for name,mutation,predicate,reason in (
+            ('path',{'file':'/private/secret'},'runtime-reference','runtime-path-refused'),
+            ('hash',{'sha256':'0'*64},'runtime-inventory-hash','runtime-inventory-differs')):
+            with self.subTest(name=name),patch.dict(report['inventories']['runtime'],mutation),patch.object(p,'read',side_effect=read),self.assertRaises(RuntimeError)as failure:p.tools(report)
+            self.assertEqual(p.public_failure_diagnostic(failure.exception),{'predicate':predicate,'guardReason':reason})
+        with patch.object(p,'read',side_effect=RuntimeError('Root-owned non-writable ancestor required')),self.assertRaises(RuntimeError)as failure:p.tools(report)
+        self.assertEqual(p.public_failure_diagnostic(failure.exception),{'predicate':'runtime-inventory-read','guardReason':'root-ancestor-refused'})
+        with patch.object(p,'read',side_effect=lambda path,*_:b'changed'if path==p.NODE else read(path)),self.assertRaises(RuntimeError)as failure:p.tools(report)
+        self.assertEqual(p.public_failure_diagnostic(failure.exception),{'predicate':'runtime-tool-readback','guardReason':'managed-tool-differs'})
+        with patch.dict(report['node'],{'version':'wrong'}),patch.object(p,'read',side_effect=read),self.assertRaises(RuntimeError)as failure:p.tools(report)
+        self.assertEqual(p.public_failure_diagnostic(failure.exception),{'predicate':'runtime-vendor','guardReason':'node-vendor-differs'})
+    def test_no_diagnostic_io_or_error_rendering(self):
+        import inspect
+        body=inspect.getsource(p.public_failure_diagnostic);tree=ast.parse(body)
+        for node in ast.walk(tree):
+            if isinstance(node,ast.Call)and isinstance(node.func,ast.Name):self.assertIn(node.func.id,('type','len'))
+        self.assertEqual(set(p.public_failure_diagnostic(RuntimeError('secret'))),{'predicate','guardReason'})
+
 if __name__=='__main__':unittest.main()
