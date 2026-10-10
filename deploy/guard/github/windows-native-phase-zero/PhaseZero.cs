@@ -387,7 +387,7 @@ internal static class PhaseZero {
         Win(N.QueryJobLimit(job.P, 9, ref limit, (uint)Marshal.SizeOf(typeof(N.JOB_LIMIT)), IntPtr.Zero), "job");
         Win(N.QueryJobAccounting(job.P, 1, ref accounting, (uint)Marshal.SizeOf(typeof(N.JOB_ACCOUNTING)), IntPtr.Zero), "job");
         if (!((limit.Basic.Flags & 0x2000) != 0)) throw new Refused("ownership", 0x4a4f420c);
-        if (!(accounting.Active == 1)) throw new Refused("ownership", 0x4a4f420d);
+        if (!(accounting.Active == 1)) throw new Refused("ownership", accounting.Active <= 65535U ? 0x41430000U + accounting.Active : 0x4a4f420dU);
         report["job"] = D("state", "OBSERVED", "kill_on_close", true, "child_member", true, "protected_dacl_match", true, "active_processes", accounting.Active);
       } // Do not retain a second Job handle across service stop/last-handle kill.
       report["listener"] = D("state", "OBSERVED", "family", "IPv4", "address_class", "LOOPBACK", "port", Port, "owned_pid", pids[0]);

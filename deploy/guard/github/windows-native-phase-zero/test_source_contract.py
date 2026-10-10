@@ -97,8 +97,11 @@ def deletion_model(original,current,expected):
   if value.get('path')!='fixed-exe' or value.get('directory')is not False or value.get('reparse')is not False or value.get('links')!=1 or value.get('protected_dacl')is not True or value.get('owner')!='ADMINISTRATORS' or value.get('hash')!=expected:return False
  return all(original.get(k)==current.get(k)for k in ('volume','file_id'))
 
+def r7_source():
+ return NATIVE.replace('        if (!(accounting.Active == 1)) throw new Refused("ownership", accounting.Active <= 65535U ? 0x41430000U + accounting.Active : 0x4a4f420dU);','        if (!(accounting.Active == 1)) throw new Refused("ownership", 0x4a4f420d);',1)
+
 def prior_job_source():
- restored=NATIVE
+ restored=r7_source()
  restored=restored.replace('      if (!(SID(owner) == sid)) throw new Refused("ownership", 0x4a4f4201);\n      if (!((control & 0x1000) != 0)) throw new Refused("ownership", 0x4a4f4202);\n      if (!(dacl != IntPtr.Zero)) throw new Refused("ownership", 0x4a4f4203);','      Need(SID(owner) == sid && (control & 0x1000) != 0 && dacl != IntPtr.Zero, "ownership");',1)
  restored=restored.replace('      if (!(acl.Count == 3)) throw new Refused("ownership", 0x4a4f4204); var seen = new Dictionary<string, bool>();','      Need(acl.Count == 3, "ownership"); var seen = new Dictionary<string, bool>();',1)
  restored=restored.replace('        if (!(Marshal.ReadByte(ace) == 0)) throw new Refused("ownership", 0x4a4f4205);\n        if (!(Marshal.ReadByte(ace, 1) == 0)) throw new Refused("ownership", 0x4a4f4206);\n        if (!((ushort)Marshal.ReadInt16(ace, 2) >= 12)) throw new Refused("ownership", 0x4a4f4207);','        Need(Marshal.ReadByte(ace) == 0 && Marshal.ReadByte(ace, 1) == 0 && (ushort)Marshal.ReadInt16(ace, 2) >= 12, "ownership");',1)
@@ -323,7 +326,7 @@ class SourceContract(unittest.TestCase):
  def test_job_diagnostics_exact_r6_reversal(self):
   self.assertEqual(hashlib.sha256(prior_job_source().encode()).hexdigest(),'10083c12e04617404408d5fd31c51e09c0b21e9ccd8b5c474f790980a6bdd006')
  def test_job_diagnostics_fixed_codes_and_no_win32_namespace_collision(self):
-  rows=re.findall(r'if \(!\(([^\n]+)\)\) throw new Refused\("ownership", 0x4a4f42([0-9a-f]{2})\);',NATIVE)
+  rows=re.findall(r'if \(!\(([^\n]+)\)\) throw new Refused\("ownership", 0x4a4f42([0-9a-f]{2})\);',r7_source())
   self.assertEqual([int(code,16)for expr,code in rows],list(range(1,14)))
   expected=['SID(owner) == sid','(control & 0x1000) != 0','dacl != IntPtr.Zero','acl.Count == 3','Marshal.ReadByte(ace) == 0','Marshal.ReadByte(ace, 1) == 0','(ushort)Marshal.ReadInt16(ace, 2) >= 12','!seen.ContainsKey(a)','mask == 0x1f003f','(a == sid || a == "S-1-5-18" || a == "S-1-5-32-544")','member','(limit.Basic.Flags & 0x2000) != 0','accounting.Active == 1']
   self.assertEqual([expr for expr,code in rows],expected)
@@ -346,5 +349,26 @@ class SourceContract(unittest.TestCase):
    self.assertTrue(report_model(json.dumps(value,separators=(',',':'))))
    value['outcome']='OBSERVED'
    self.assertFalse(report_model(json.dumps(value,separators=(',',':'))))
+
+
+ def test_active_diagnostic_exact_r7_reversal(self):
+  self.assertEqual(hashlib.sha256(r7_source().encode()).hexdigest(),'87c3894bd46919dac6bb7da0fc262a0241f74c8ba41c86026dd56bc2f002d8f7')
+  self.assertEqual(NATIVE.count('accounting.Active <= 65535U ? 0x41430000U + accounting.Active : 0x4a4f420dU'),1)
+  self.assertIn('if (!(accounting.Active == 1)) throw new Refused',NATIVE)
+ def test_accounting_abi_exact(self):
+  class Accounting(c.Structure):_fields_=[('user',I64),('kernel',I64),('period_user',I64),('period_kernel',I64),('faults',U32),('total',U32),('active',U32),('terminated',U32)]
+  self.assertEqual((c.sizeof(Accounting),Accounting.active.offset),(48,40))
+  self.assertIn('internal long User, Kernel, PeriodUser, PeriodKernel; internal uint Faults, Total, Active, Terminated;',NATIVE)
+  self.assertIn('N.QueryJobAccounting(job.P, 1, ref accounting',NATIVE)
+ def test_count_diagnostic_bounds_are_failed_data(self):
+  for active in (0,1,2,65535,65536,2**32-1):
+   if active==1:continue
+   code=0x41430000+active if active<=65535 else 0x4a4f420d
+   self.assertLessEqual(code,2**32-1)
+   value=json.loads(FIXTURES['cases'][0]['raw']);value.update(outcome='UNKNOWN',stage='job',error_class='ownership',error_code=code)
+   self.assertTrue(report_model(json.dumps(value,separators=(',',':'))))
+   value['outcome']='OBSERVED';self.assertFalse(report_model(json.dumps(value,separators=(',',':'))))
+  for active in range(65536):
+   if active!=1:self.assertEqual((0x41430000+active)&0xffff,active)
 
 if __name__=='__main__':unittest.main()
