@@ -2,6 +2,8 @@
 
 Homebrew distributes the same signed-release binaries as the direct installer. It is not a separate build or signing pipeline. The tap is `zunderlabs/homebrew-tap`; its formula is `Formula/zunder-guard.rb`, copied **unchanged** from the verified release asset. `packaging/render.sh` renders the version, four archive URLs and SHA-256 values before signing.
 
+The paper service restarts after a crash: `SuccessfulExit=false` on launchd and `Restart=on-failure` on systemd. The formula names both `successful_exit: false` and `crashed: true` because Homebrew renders the two service managers differently. A deliberate service stop stays stopped. Verify the generated native definition and actual crash recovery for each candidate.
+
 This guide is a release procedure, not a record that publication or installation passed. Record actual evidence per platform below. A rendered formula, `ruby -c`, `brew audit` or a successful version command alone is not lifecycle proof.
 
 ## CI publication: signed release → verified formula → reviewed tap PR
