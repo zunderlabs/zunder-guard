@@ -1,0 +1,21 @@
+name: Public host reboot observation
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: public-host-reboot-observation
+  cancel-in-progress: false
+jobs:
+  controller:
+    uses: ./.github/workflows/public-reboot-controller.yml
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
+  target:
+    uses: ./.github/workflows/public-reboot-target.yml
+    permissions:
+      contents: read
+      actions: read
+      id-token: write

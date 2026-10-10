@@ -31,6 +31,10 @@ jobs:
       - run: cargo test --workspace --locked -- --exact --skip the_generator_reaches_every_path --skip the_implementation_is_the_reference --skip the_implementation_is_the_reference_when_told_in_time --skip the_order_of_the_reports_does_not_matter
         env:
           ZUNDER_FLOWS_CASES: "4000"
+      - name: Saved late-report daily-stop regression
+        run: cargo test --locked -p zunder-venue --test flows_model case_exact_zero_views_keep_the_day_halt_after_a_late_report -- --exact --nocapture
+        env:
+          ZUNDER_FLOWS_TRACE: "1"
 
   # Windows: clippy and the tests natively (owner-only ACLs, the Credential Manager, Ctrl-C),
   # then the PowerShell installer against a release made from this build, under Windows
@@ -449,8 +453,8 @@ jobs:
         run: python3 -B deploy/guard/github/test_flow_shards.py
       - name: Container supervisor contract (synthetic only; no native restart claim)
         run: python3 -B deploy/guard/test/container-supervisor.py
-      - name: Docker build context admission and exclusions
-        run: python3 -B deploy/guard/test/distribution.py DockerBuildContext
+      - name: Docker build context and Homebrew service policy
+        run: python3 -B deploy/guard/test/distribution.py DockerBuildContext HomebrewServicePolicy
       - name: Container installer transaction and ownership checks
         run: python3 -B deploy/guard/test/container-installer.py
       - name: Protected testnet credential dispatch checks
