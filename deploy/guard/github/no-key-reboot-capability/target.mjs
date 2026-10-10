@@ -11,7 +11,7 @@ try{
  let job;
  for(let n=0;n<12;n++){
   const timeout=Math.min(5000,clock.read().remaining);diagnostic='PUBLIC_JOBS_NONDELIVERY_UNKNOWN';requests++;
-  const response=await fetch(`https://api.github.com/repos/${REPO}/actions/runs/${run}/attempts/${attempt}/jobs?per_page=100`,{redirect:'error',headers:{Accept:'application/vnd.github+json','X-GitHub-Api-Version':'2022-11-28'},signal:AbortSignal.timeout(timeout)});
+  const response=await fetch(`https://api.github.com/repos/${REPO}/actions/runs/${run}/attempts/${attempt}/jobs?per_page=100`,{redirect:'error',headers:{Accept:'application/vnd.github+json','X-GitHub-Api-Version':'2022-11-28',Authorization:'Bearer '+token},signal:AbortSignal.timeout(timeout)});
   httpStatus=Number.isInteger(response.status)&&response.status>=100&&response.status<=599?response.status:null;
   rateRemaining=boundedHeader(response.headers,'x-ratelimit-remaining',1000000000);rateReset=boundedHeader(response.headers,'x-ratelimit-reset',9007199254740991);
   clock.read();diagnostic='PUBLIC_JOBS_HTTP_REFUSED';if(!response.ok)fail();
