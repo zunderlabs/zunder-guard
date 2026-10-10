@@ -44,7 +44,7 @@ def prepared():
             'genuineCheckout': p.ROOT + '/checkout', 'gitDatabaseInSourceInventory': False},
         'node': {'version': '26.8.1', 'url': 'https://nodejs.org/dist/v26.8.1/node-v26.8.1-linux-x64.tar.xz',
             'archiveSha256': '3e301118d7df53d563b7e96c1617545f26e2f76f9724be668d6cab65c15dda5d',
-            'archiveBytes': 100, 'aliases': ['bin/npm', 'bin/npx'],
+            'archiveBytes': 100, 'aliases': ['bin/npx', 'bin/npm'],
             'trust': 'Previously verified official checksum signature; runtime still unadmitted'},
         'materialization': {'sourceLockSha256': HASH, 'focusedPackageSha256': HASH, 'focusedLockSha256': HASH,
             'omittedHistoricalGeneratedPrefix': 'artifacts/private-journey/',
@@ -222,6 +222,17 @@ class Filesystem(unittest.TestCase):
             with self.assertRaises(p.Refused):
                 p.read_report(self.fd, name)
 
+    def test_source_producer_requested_0444_can_create_0400_under_restrictive_umask(self):
+        # Same exclusive mode call as the source producer, on inert temporary bytes only.
+        previous=os.umask(0o077)
+        try:
+            fd=os.open(self.root/'failure.json',os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o444)
+        finally:os.umask(previous)
+        with os.fdopen(fd,'wb')as output:output.write(raw(failed()))
+        self.assertEqual(stat.S_IMODE((self.root/'failure.json').stat().st_mode),0o400)
+        with self.assertRaises(p.Refused)as refusal:p.read_report(self.fd,'failure.json')
+        self.assertEqual(refusal.exception.guard,'report-mode-refused')
+
     def test_symlink_and_hardlink_are_refused(self):
         target = self.root / 'target'
         target.write_bytes(b'{}')
@@ -318,6 +329,138 @@ class GuardReasonAndShell(unittest.TestCase):
                 self.assertEqual(result.returncode,exit_code)
                 self.assertEqual(output.read_text(),'exit_code='+str(exit_code)+'\n')
                 self.assertEqual(result.stdout,b'');self.assertEqual(result.stderr,b'')
+
+
+class ValidatorRefusalDiagnostic(unittest.TestCase):
+    def setUp(self):
+        self.stage=p._VALIDATOR_STAGE
+        self.addCleanup(lambda:setattr(p,'_VALIDATOR_STAGE',self.stage))
+    def main(self,prepared_raw=None,failed_raw=None,*,error=None,stage=None,argv=None):
+        def reports():
+            if stage:p.validator_stage(stage)
+            if error is not None:raise error
+            return failed_raw,prepared_raw
+        output=SimpleNamespace(buffer=io.BytesIO())
+        with patch.object(p.sys,'argv',argv or ['probe','--control-source',SOURCE,'--bootstrap-exit','0']),\
+             patch.object(p.sys,'platform','linux'),patch.object(p.os,'geteuid',return_value=0),\
+             patch.object(p.sys,'stdout',output),patch.object(p,'reports',side_effect=reports):
+            code=p.main()
+        payload=output.buffer.getvalue();return code,json.loads(payload),payload
+    def test_closed_stage_and_guard_enums_only(self):
+        self.assertEqual(len(p.VALIDATOR_STAGES),20);self.assertEqual(len(p.VALIDATOR_GUARDS),9)
+        for stage in p.VALIDATOR_STAGES:
+            p.validator_stage(stage)
+            for guard in p.VALIDATOR_GUARDS:
+                self.assertEqual(p.refusal_diagnostic(p.Refused(guard)),{'stage':stage,'guard':guard})
+        for stage in ('private-path/payload',None,1,True,[],{}):
+            with self.assertRaises(p.Refused):p.validator_stage(stage)
+        for guard in ('private payload',None,1,True,[],{}):
+            self.assertEqual(p.refusal_diagnostic(p.Refused(guard))['guard'],'guard-refused')
+    def test_exact_pinned_vendor_alias_order_and_all_other_lists_refused(self):
+        value=prepared();p.preparation(value,SOURCE)
+        for aliases in (['bin/npm','bin/npx'],[],['bin/npm'],['bin/npm','bin/npm'],['bin/npm','bin/npx','private'],None,{},'private'):
+            value=prepared();value['node']['aliases']=aliases
+            with self.assertRaises(p.Refused)as failure:p.preparation(value,SOURCE)
+            self.assertEqual(p.refusal_diagnostic(failure.exception),{'stage':'preparation-node','guard':'node-alias-order-refused'})
+    def test_expected_order_is_exact_source_producer_and_observed_vendor_order(self):
+        # Parent read-only observation of SHA3e301118... official archive, not runtime proof.
+        observed=[('bin/npx','../lib/node_modules/npm/bin/npx-cli.js'),
+                  ('bin/npm','../lib/node_modules/npm/bin/npm-cli.js')]
+        self.assertEqual([name for name,_ in observed],prepared()['node']['aliases'])
+        source=ast.parse(Path(p.__file__).with_name('bootstrap.py').read_text())
+        node=next(n for n in source.body if isinstance(n,ast.FunctionDef)and n.name=='node')
+        expected=next(n.value for n in ast.walk(node)if isinstance(n,ast.Assign)and len(n.targets)==1 and isinstance(n.targets[0],ast.Name)and n.targets[0].id=='expected')
+        self.assertEqual(ast.literal_eval(expected),dict(observed))
+        result=node.body[-1];self.assertIsInstance(result,ast.Return)
+        value=next(value for key,value in zip(result.value.keys,result.value.values)if isinstance(key,ast.Constant)and key.value=='aliases')
+        self.assertEqual(ast.unparse(value),'[a for a, _ in aliases]')
+        self.assertNotIn('sorted(aliases)',ast.unparse(node))
+        text=ast.unparse(node)
+        self.assertIn('aliases.append((name,',text)
+        self.assertIn('expected.get(name) == member.linkname',text)
+
+    def test_real_exception_types_never_echo_text_and_subclasses_never_inspect_attributes(self):
+        class Hostile(p.Refused):
+            def __str__(self):raise AssertionError('No stringification')
+            def __repr__(self):raise AssertionError('No representation')
+            def __getattribute__(self,name):
+                if name in ('args','guard'):raise AssertionError('No custom attributes')
+                return super().__getattribute__(name)
+        p.validator_stage('report-directory')
+        pairs=[(FileNotFoundError('private'), 'missing-resource'),(PermissionError('private'),'permission-refused'),
+               (OSError('private'),'os-operation-refused'),(json.JSONDecodeError('private','private',0),'metadata-decode-refused'),
+               (KeyError('private'),'metadata-shape-refused'),(TypeError('private'),'metadata-shape-refused'),
+               (ValueError('private'),'metadata-shape-refused'),(Hostile(),'other-refused'),(RuntimeError('private'),'other-refused')]
+        for error,guard in pairs:
+            row=p.refusal_diagnostic(error);self.assertEqual(row,{'stage':'report-directory','guard':guard})
+            self.assertNotIn('private',json.dumps(row))
+    def test_context_and_guard_mutation_cannot_export_arbitrary_value_or_callbacks(self):
+        class Hostile(str):
+            def __hash__(self):raise AssertionError('No subclass hashing')
+            def __str__(self):raise AssertionError('No subclass string')
+        p._VALIDATOR_STAGE=Hostile('private')
+        error=p.Refused();error.guard=Hostile('private')
+        self.assertEqual(p.refusal_diagnostic(error),{'stage':'arguments','guard':'guard-refused'})
+    def test_bad_cli_resets_stage_and_never_reads_reports(self):
+        p.validator_stage('preparation-node');output=SimpleNamespace(buffer=io.BytesIO())
+        with patch.object(p.sys,'argv',['probe','--private=secret']),patch.object(p.sys,'stdout',output),patch.object(p,'reports')as reports:
+            self.assertEqual(p.main(),1)
+        reports.assert_not_called();row=json.loads(output.buffer.getvalue())
+        self.assertEqual(row['validator'],{'stage':'arguments','guard':'guard-refused'})
+        self.assertNotIn('secret',output.buffer.getvalue().decode())
+    def test_fixed_main_reports_read_error_stage_without_raw_data(self):
+        for stage in ('report-directory','failure-report-read','preparation-report-read','report-directory-readback'):
+            code,row,payload=self.main(error=PermissionError('/private/raw payload'),stage=stage)
+            self.assertEqual(code,1);self.assertEqual(row['reportState'],'refused')
+            self.assertEqual(row['validator'],{'stage':stage,'guard':'permission-refused'})
+            self.assertLess(len(payload),8192)
+            for flag in p.FALSE_FLAGS:self.assertIs(row[flag],False)
+            self.assertNotIn(b'private/raw',payload);self.assertNotIn(b'payload',payload)
+    def test_nested_validation_boundaries_have_fixed_stages_without_fields_or_payloads(self):
+        changes=[('preparation-schema',('extra',),'PRIVATE'),
+                 ('preparation-capabilities',('capabilities','machineIdSha256'),'PRIVATE'),
+                 ('preparation-source',('source','controllerRoot'),'/private/source'),
+                 ('preparation-node',('node','aliases'),['bin/npm','bin/npx']),
+                 ('preparation-materialization',('materialization','sourceLockSha256'),'PRIVATE'),
+                 ('preparation-inventories',('inventories','source','file'),'/private/inventory'),
+                 ('npm-aliases',('removedNpmAliases',),[{'path':'private unsafe','target':'x'}]),
+                 ('python-aliases',('regularizedPythonAliases',),[{'path':'x','target':'private unsafe'}])]
+        for stage,path,item in changes:
+            value=prepared();target=value
+            for name in path[:-1]:target=target[name]
+            target[path[-1]]=item
+            code,row,payload=self.main(raw(value));self.assertEqual(code,1)
+            self.assertEqual(row['validator']['stage'],stage)
+            self.assertNotIn(b'PRIVATE',payload);self.assertNotIn(b'/private',payload);self.assertNotIn(b'unsafe',payload)
+    def test_json_and_conflicting_report_boundaries_remain_refused(self):
+        for prepared_raw,failed_raw,stage,guard in ((b'{',None,'preparation-json','metadata-decode-refused'),
+                (b'{"schema":1,"schema":1}',None,'preparation-json','guard-refused'),
+                (None,b'{','failure-json','metadata-decode-refused'),
+                (raw(prepared()),raw(failed()),'report-conflict','guard-refused')):
+            code,row,_=self.main(prepared_raw,failed_raw)
+            self.assertEqual(code,1);self.assertEqual(row['validator'],{'stage':stage,'guard':guard})
+    def test_original_reports_adapter_selects_precise_read_boundary_and_closes_descriptors(self):
+        info=SimpleNamespace(st_dev=1,st_ino=2,st_uid=0,st_gid=0,st_mode=0o040700,st_nlink=1,st_size=1,st_mtime_ns=0,st_ctime_ns=0)
+        for selected,stage in (('failure.json','failure-report-read'),('preparation.json','preparation-report-read')):
+            def read(fd,name):
+                if name==selected:raise p.Refused('report-mode-refused')
+                return None
+            with patch.object(p,'open_reports',return_value=3),patch.object(p.os,'fstat',return_value=info),\
+                 patch.object(p,'read_report',side_effect=read),patch.object(p.os,'close')as close,self.assertRaises(p.Refused)as refusal:
+                p.reports()
+            self.assertEqual(p.refusal_diagnostic(refusal.exception),{'stage':stage,'guard':'report-mode-refused'})
+            close.assert_called_once_with(3)
+    def test_success_output_has_no_new_validator_or_authority_fields(self):
+        expected=p.diagnostic(SOURCE,0,None,raw(prepared()))
+        code,row,_=self.main(raw(prepared()))
+        self.assertEqual(code,0);self.assertEqual(row,expected);self.assertNotIn('validator',row)
+    def test_refusal_helpers_never_inspect_exception_text_or_add_report_reads(self):
+        tree=ast.parse(Path(p.__file__).read_text())
+        for name in ('validator_stage','refusal_diagnostic'):
+            function=next(n for n in tree.body if isinstance(n,ast.FunctionDef)and n.name==name)
+            calls={ast.unparse(n.func)for n in ast.walk(function)if isinstance(n,ast.Call)}
+            self.assertFalse(calls & {'str','repr','getattr','read_report','reports','open_reports','os.open','os.read','decode'})
+            self.assertFalse(any(isinstance(n,ast.Attribute)and n.attr=='args'for n in ast.walk(function)))
 
 
 if __name__ == '__main__':

@@ -72,6 +72,45 @@ class Capability(unittest.TestCase):
         with patch.object(policy,'public',side_effect=RuntimeError('SENSITIVE')):row=policy.power_capability_probe(deadline=0)
         self.assertEqual(row['capabilities']['reason'],'readback-unavailable');self.assertFalse(row['live']['observed'])
         self.assertNotIn('SENSITIVE',json.dumps(row))
+    def test_source_supported_optional_system_prefix(self):
+        row=policy.live_power_diagnostic('System-wide power settings:\n SleepDisabled 0\n'+LIVE)
+        self.assertTrue(row['observed']);self.assertTrue(row['required']['standby']['zero'])
+        self.assertEqual(row['shape'],{'line_count':6,'system_header_count':1,'live_header_count':1,
+            'unknown_header_count':0,'prefix_line_count':1,'live_line_count':3,
+            'required_duplicate_count':0,'required_multifield_count':0})
+    def test_system_values_never_adopted_into_live_section(self):
+        row=policy.live_power_diagnostic('System-wide power settings:\nhibernatemode 0\nautopoweroff 0\nCurrently in use:\nstandby 0\n')
+        self.assertTrue(row['observed'])
+        self.assertEqual(row['required']['hibernatemode'],{'presence':'absent','zero':None})
+        self.assertEqual(row['required']['autopoweroff'],{'presence':'absent','zero':None})
+    def test_duplicate_missing_reversed_headings_stay_unknown(self):
+        cases=[('System-wide power settings:\nstandby 0\n','header-count-refused'),
+            (LIVE+LIVE,'header-count-refused'),
+            ('System-wide power settings:\nSystem-wide power settings:\n'+LIVE,'header-count-refused'),
+            (LIVE+'System-wide power settings:\nSleepDisabled 0\n','header-order-refused')]
+        for text,reason in cases:
+            row=policy.live_power_diagnostic(text);self.assertFalse(row['observed']);self.assertEqual(row['reason'],reason)
+            self.assertTrue(all(v=={'presence':'unknown','zero':None}for v in row['required'].values()))
+    def test_unknown_prefix_or_heading_cannot_merge_sections(self):
+        for text in ('SENSITIVE 0\n'+LIVE,'AC Power:\n'+LIVE,LIVE+'SENSITIVE:\nstandby 0\n'):
+            row=policy.live_power_diagnostic(text);self.assertFalse(row['observed'])
+            self.assertNotIn('SENSITIVE',json.dumps(row));self.assertIsNone(row['required']['standby']['zero'])
+    def test_required_ambiguities_counted_inside_live_only(self):
+        row=policy.live_power_diagnostic('System-wide power settings:\nstandby 0 extra\n'+LIVE+'standby 0 extra\n')
+        self.assertEqual(row['shape']['required_duplicate_count'],1)
+        self.assertEqual(row['shape']['required_multifield_count'],1)
+        self.assertEqual(row['required']['standby'],{'presence':'unknown','zero':None})
+    def test_blank_lines_and_empty_live_section(self):
+        row=policy.live_power_diagnostic('\n\nSystem-wide power settings:\n\n'+LIVE)
+        self.assertTrue(row['observed']);self.assertEqual(row['shape']['prefix_line_count'],0)
+        row=policy.live_power_diagnostic('System-wide power settings:\nSleepDisabled 0\nCurrently in use:\n')
+        self.assertFalse(row['observed']);self.assertEqual(row['reason'],'empty-live-section')
+    def test_closed_shape_has_no_payload(self):
+        row=policy.live_power_diagnostic('System-wide power settings:\nSENSITIVE unknown /private/path\n'+LIVE+'sleep 1 (SENSITIVE)\n')
+        self.assertTrue(row['observed']);text=json.dumps(row)
+        for forbidden in ('SENSITIVE','/private/path','SleepDisabled','sleep 1'):
+            self.assertNotIn(forbidden,text)
+        self.assertFalse('eligible'in row);self.assertFalse('coverage'in row)
     def test_original_eligibility_stays_strict(self):
         self.assertEqual(len(policy.power_settings(CUSTOM)),1)
         self.assertTrue(policy.validate('0 (encrypted)','FileVault is Off.',CUSTOM,'1',(0,0))['hibernation_disabled'])
