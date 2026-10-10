@@ -71,6 +71,18 @@ def report_model(raw):
   return True
  except (AssertionError,ValueError,TypeError,KeyError):return False
 
+
+# Independent pure native-sharing model; no C#/Windows execution or authority.
+R,W,D=1,2,4
+def compatible(existing_access,existing_share,new_access,new_share):
+ return not (new_access & ~existing_share) and not (existing_access & ~new_share)
+
+def deletion_model(original,current,expected):
+ if type(expected)is not str or re.fullmatch('[0-9a-f]{64}',expected)is None:return False
+ for value in (original,current):
+  if value.get('path')!='fixed-exe' or value.get('directory')is not False or value.get('reparse')is not False or value.get('links')!=1 or value.get('protected_dacl')is not True or value.get('owner')!='ADMINISTRATORS' or value.get('hash')!=expected:return False
+ return all(original.get(k)==current.get(k)for k in ('volume','file_id'))
+
 class SourceContract(unittest.TestCase):
  def test_explicit_x64_layouts(self):
   self.assertEqual([c.sizeof(x) for x in [Boot,Time,Basic,JobBasic,Job,FileId]],[32,48,48,64,144,24])
@@ -145,5 +157,46 @@ class SourceContract(unittest.TestCase):
   self.assertIn('if: always()',workflow)
   for forbidden in ['pull_request:', 'workflow_dispatch:', 'id-token:', 'secrets.', 'environment:', 'self-hosted']:
    self.assertNotIn(forbidden,workflow)
+
+ def test_startup_sharing_old_delete_access_mutant_conflicts_with_clr_reader(self):
+  self.assertFalse(compatible(R|D,R,R,R))
+  self.assertTrue(compatible(R,R|D,R,R))
+  self.assertFalse(compatible(R,R|D,W,R|W|D))
+  self.assertTrue(compatible(R,R|D,R|D,R))
+  self.assertFalse(compatible(R,R,R|D,R)) # a still-open CLR reader can refuse deletion
+ def test_fixed_readonly_image_handle_and_exact_newfile_route(self):
+  body=NATIVE[NATIVE.index('  static H OpenExecutableRead'):NATIVE.index('  static void SameExecutable')]
+  self.assertIn('N.CreateFileW(Exe, 0x80020000U, 5, IntPtr.Zero, 3, 0x02200000',body)
+  self.assertNotIn('0x10000',body);self.assertNotIn('0xc0',body)
+  self.assertIn('path == Exe ? OpenExecutableRead() : OpenFile(path, false, true)',NATIVE)
+  creation=NATIVE[NATIVE.index('  static H NewFile'):NATIVE.index('  static bool MissingPath')]
+  self.assertLess(creation.index('h.Dispose();'),creation.index('OpenExecutableRead()'))
+  self.assertIn('captured.Volume == again.Volume && Hex(captured.Id) == Hex(again.Id)',creation)
+ def test_matching_substituted_and_changed_image_pure_deletion_fixtures(self):
+  original={'path':'fixed-exe','directory':False,'reparse':False,'links':1,'protected_dacl':True,'owner':'ADMINISTRATORS','volume':1,'file_id':'a'*32,'hash':'b'*64}
+  self.assertTrue(deletion_model(original,dict(original),'b'*64))
+  for key,value in [('path','foreign'),('volume',2),('file_id','c'*32),('hash','c'*64),('links',2),('reparse',True),('directory',True),('protected_dacl',False),('owner','FOREIGN')]:
+   with self.subTest(key=key):self.assertFalse(deletion_model(original,{**original,key:value},'b'*64))
+  for expected in (None,'', 'c'*64,'wildcard'):self.assertFalse(deletion_model(original,dict(original),expected))
+ def test_delete_handle_rejoins_before_disposition_while_original_retained(self):
+  body=NATIVE[NATIVE.index('  static bool DeleteExecutableHandle'):NATIVE.index('  static Dictionary<string, object> FileFacts')]
+  dispose=body.index('N.SetFileInformationByHandle(removal.P')
+  for required in ('expectedDigest != null','ExecutablePath(retained)','FileFacts(retained, false, sid)','OpenFile(Exe, false, true)','ExecutablePath(removal)','FileFacts(removal, false, sid)','SameExecutable(original, current)','FileDigest(retained) == expectedDigest','FileDigest(removal) == expectedDigest'):
+   self.assertLess(body.index(required),dispose)
+  self.assertGreater(body.index('retained.Dispose()'),dispose)
+  self.assertGreater(body.index('removal.Dispose()'),dispose)
+  self.assertGreater(body.index('MissingPath(Exe)'),body.index('removal.Dispose()'))
+  self.assertNotIn('DeleteFileW',body)
+  path=NATIVE[NATIVE.index('  static void ExecutablePath'):NATIVE.index('  static H OpenExecutableRead')]
+  self.assertIn('(info.Attributes & 0x410) == 0 && info.Links == 1',path)
+  self.assertIn('N.GetFinalPathNameByHandleW',path)
+  self.assertIn('StringComparison.OrdinalIgnoreCase',path)
+ def test_delete_join_follows_terminal_gate_and_failed_read_handle_survives_finally(self):
+  terminal=NATIVE.index('(child == null || N.WaitForSingleObject(child.P, 10000) == 0)')
+  deletion=NATIVE.index('if (DeleteExecutableHandle(exe, sid, executableDigest))')
+  self.assertLess(terminal,deletion)
+  self.assertIn('exe = null; else filesGone = false;',NATIVE)
+  self.assertIn('new H[] { child, serviceProcess, marker, exe, root, parent, service, scm }',NATIVE)
+  self.assertIn('executableDigest = digest',NATIVE)
 
 if __name__=='__main__':unittest.main()

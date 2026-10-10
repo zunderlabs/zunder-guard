@@ -125,6 +125,40 @@ internal static class PhaseZero {
       return h;
     } catch { h.Dispose(); throw; }
   }
+  static void ExecutablePath(H h) {
+    N.BY_HANDLE info; Win(N.GetFileInformationByHandle(h.P, out info), "file");
+    Need((info.Attributes & 0x410) == 0 && info.Links == 1, "ownership");
+    var final = new StringBuilder(1024); uint count = N.GetFinalPathNameByHandleW(h.P, final, (uint)final.Capacity, 0);
+    Need(count > 0 && count < final.Capacity && String.Equals(final.ToString(), @"\\?\" + Exe, StringComparison.OrdinalIgnoreCase), "ownership");
+  }
+  static H OpenExecutableRead() {
+    // Fixed image only: no requested DELETE/WRITE; permit a CLR READ-only opener.
+    // READ|DELETE sharing still denies writes. Later deletion must rejoin identity.
+    var h = new H(N.CreateFileW(Exe, 0x80020000U, 5, IntPtr.Zero, 3, 0x02200000, IntPtr.Zero), false);
+    try { ExecutablePath(h); return h; } catch { h.Dispose(); throw; }
+  }
+  static void SameExecutable(Dictionary<string, object> original, Dictionary<string, object> current) {
+    Need((string)original["file_id"] == (string)current["file_id"] &&
+      (string)original["volume_serial"] == (string)current["volume_serial"], "ownership");
+  }
+  static bool DeleteExecutableHandle(H retained, string sid, string expectedDigest) {
+    Need(expectedDigest != null && expectedDigest.Length == 64, "ownership");
+    ExecutablePath(retained); var original = FileFacts(retained, false, sid);
+    Need(FileDigest(retained) == expectedDigest, "ownership");
+    // Captured processes are terminal before this call. Keep original READ
+    // handle open while exact-path deletion handle is checked; never adopt it.
+    using (var removal = OpenFile(Exe, false, true)) {
+      ExecutablePath(removal); var current = FileFacts(removal, false, sid);
+      SameExecutable(original, current); Need(FileDigest(removal) == expectedDigest, "ownership");
+      ExecutablePath(retained); ExecutablePath(removal);
+      SameExecutable(original, FileFacts(retained, false, sid));
+      SameExecutable(original, FileFacts(removal, false, sid));
+      Need(FileDigest(retained) == expectedDigest && FileDigest(removal) == expectedDigest, "ownership");
+      var disposition = new N.DISPOSITION { Delete = 1 };
+      if (!N.SetFileInformationByHandle(removal.P, 4, ref disposition, 1)) return false;
+      retained.Dispose(); removal.Dispose(); return MissingPath(Exe);
+    }
+  }
   static Dictionary<string, object> FileFacts(H h, bool directory, string sid) {
     N.BY_HANDLE basic; var id = new N.FILE_ID_INFO { Id = new byte[16] };
     Win(N.GetFileInformationByHandle(h.P, out basic) && N.GetFileInformationByHandleEx(h.P, 18, ref id, 24), "file");
@@ -177,7 +211,7 @@ internal static class PhaseZero {
       var captured = new N.FILE_ID_INFO { Id = new byte[16] };
       Win(N.GetFileInformationByHandleEx(h.P, 18, ref captured, 24), "file");
       h.Dispose(); // An open write handle cannot be carried into image-section creation.
-      var read = OpenFile(path, false, true);
+      var read = path == Exe ? OpenExecutableRead() : OpenFile(path, false, true);
       try {
         var again = new N.FILE_ID_INFO { Id = new byte[16] };
         Win(N.GetFileInformationByHandleEx(read.P, 18, ref again, 24), "file");
@@ -284,7 +318,7 @@ internal static class PhaseZero {
       "listener", D("state", "UNKNOWN", "family", "IPv4", "address_class", "LOOPBACK", "port", Port, "owned_pid", null),
       "cleanup", D("scm", "NOT_CREATED", "processes", "NOT_CREATED", "listener", "NOT_CREATED", "files", "NOT_CREATED", "root", "NOT_CREATED"));
     H scm = null, service = null, parent = null, root = null, exe = null, marker = null, serviceProcess = null, child = null;
-    bool createdRoot = false, createdService = false, serviceConfigured = false, startedService = false, listenerObserved = false; string sid = null; bool complete = false;
+    bool createdRoot = false, createdService = false, serviceConfigured = false, startedService = false, listenerObserved = false; string sid = null, executableDigest = null; bool complete = false;
     var cleanup = (Dictionary<string, object>)report["cleanup"];
     try {
       Need(IntPtr.Size == 8 && N.IsUserAnAdmin(), "privilege"); report["boot"] = Boot();
@@ -315,7 +349,7 @@ internal static class PhaseZero {
       var rf = FileFacts(root, true, sid); rf["role"] = "root"; files.Add(rf);
       var ef = FileFacts(exe, false, sid); ef["role"] = "executable"; files.Add(ef);
       var mf = FileFacts(marker, false, sid); mf["role"] = "marker"; files.Add(mf);
-      string digest = FileDigest(exe); ef["sha256"] = digest; mf["sha256"] = FileDigest(marker); rf["sha256"] = null;
+      string digest = FileDigest(exe); executableDigest = digest; ef["sha256"] = digest; mf["sha256"] = FileDigest(marker); rf["sha256"] = null;
       stage = "startup"; startedService = true; cleanup["processes"] = "UNKNOWN"; cleanup["listener"] = "UNKNOWN"; bool started = N.StartServiceW(service.P, 0, IntPtr.Zero);
       uint startError = unchecked((uint)Marshal.GetLastWin32Error());
       ObserveStartupStatus(service); // Preserve StartService error before this independent read.
@@ -360,10 +394,10 @@ internal static class PhaseZero {
             Win(N.DeleteService(service.P), "cleanup"); service.Dispose(); service = null;
             Poll(delegate { return ServiceMissing(scm); }, 10000, "cleanup"); cleanup["scm"] = "OBSERVED_ABSENT";
             if (listenerObserved && ListenerPids().Count == 0 && RefusedConnect()) cleanup["listener"] = "OBSERVED_ABSENT";
-            // Same retained handles and positive file identities; never reopen a substituted path for deletion.
+            // Marker/root use original deletion handles; image joins a new handle to the retained READ identity/hash.
             bool filesGone = true;
             if (marker != null) { FileFacts(marker, false, sid); filesGone &= DeleteFileHandle(marker, Marker); marker = null; }
-            if (exe != null) { FileFacts(exe, false, sid); filesGone &= DeleteFileHandle(exe, Exe); exe = null; }
+            if (exe != null) { if (DeleteExecutableHandle(exe, sid, executableDigest)) exe = null; else filesGone = false; }
             if (createdRoot && filesGone && MissingPath(Exe) && MissingPath(Marker)) {
               cleanup["files"] = "OBSERVED_ABSENT"; FileFacts(root, true, sid);
               if (DeleteFileHandle(root, Root)) { root = null; cleanup["root"] = "OBSERVED_ABSENT"; }
