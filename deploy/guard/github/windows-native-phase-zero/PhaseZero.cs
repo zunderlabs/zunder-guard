@@ -78,6 +78,32 @@ internal static class PhaseZero {
   static ulong FT(N.FILETIME x) { return ((ulong)x.High << 32) | x.Low; }
   static ulong Clock() { N.FILETIME f; N.GetSystemTimePreciseAsFileTime(out f); return FT(f); }
   static string Tick(ulong x) { return x.ToString(System.Globalization.CultureInfo.InvariantCulture); }
+  static uint FailedJobMembers(H job, uint childPid, uint servicePid) {
+    IntPtr buffer = Marshal.AllocHGlobal(72);
+    try {
+      uint returned; Win(N.QueryJobProcessIds(job.P, 3, buffer, 72, out returned), "job");
+      uint assigned = unchecked((uint)Marshal.ReadInt32(buffer, 0)); uint count = unchecked((uint)Marshal.ReadInt32(buffer, 4));
+      Need(count >= 1 && count <= 8 && assigned == count && returned >= 8U + count * 8U && returned <= 72, "job");
+      var seen = new Dictionary<uint, bool>(); uint mask = 0;
+      for (uint i = 0; i < count; i++) {
+        ulong raw = unchecked((ulong)Marshal.ReadInt64(buffer, checked(8 + (int)i * 8)));
+        Need(raw > 0 && raw <= uint.MaxValue, "job"); uint pid = (uint)raw;
+        Need(!seen.ContainsKey(pid), "job"); seen.Add(pid, true);
+        if (pid == childPid) mask |= 1U;
+        else if (pid == servicePid) mask |= 2U;
+        else if (pid == N.GetCurrentProcessId()) mask |= 4U;
+        else {
+          using (var process = new H(N.OpenProcess(0x1000, false, pid), false)) {
+            var image = new StringBuilder(32768); uint size = 32768;
+            Win(N.QueryFullProcessImageNameW(process.P, 0, image, ref size), "job");
+            Need(size > 0 && size < 32768, "job");
+            mask |= String.Equals(image.ToString(), @"C:\Windows\System32\conhost.exe", StringComparison.OrdinalIgnoreCase) ? 8U : 16U;
+          }
+        }
+      }
+      return 0x4d420000U | mask;
+    } finally { Marshal.FreeHGlobal(buffer); }
+  }
   static Dictionary<string, object> Boot() {
     Need(Marshal.SizeOf(typeof(N.BOOT_ENV)) == 32 && Marshal.SizeOf(typeof(N.TIME_OF_DAY)) == 48 && Marshal.SizeOf(typeof(N.BASIC_PROCESS)) == 48, "abi");
     foreach (string dll in new string[] { "ntdll.dll", "kernel32.dll", "advapi32.dll", "iphlpapi.dll", "shell32.dll" }) {
@@ -387,7 +413,7 @@ internal static class PhaseZero {
         Win(N.QueryJobLimit(job.P, 9, ref limit, (uint)Marshal.SizeOf(typeof(N.JOB_LIMIT)), IntPtr.Zero), "job");
         Win(N.QueryJobAccounting(job.P, 1, ref accounting, (uint)Marshal.SizeOf(typeof(N.JOB_ACCOUNTING)), IntPtr.Zero), "job");
         if (!((limit.Basic.Flags & 0x2000) != 0)) throw new Refused("ownership", 0x4a4f420c);
-        if (!(accounting.Active == 1)) throw new Refused("ownership", accounting.Active <= 65535U ? 0x41430000U + accounting.Active : 0x4a4f420dU);
+        if (!(accounting.Active == 1)) throw new Refused("ownership", FailedJobMembers(job, pids[0], servicePid));
         report["job"] = D("state", "OBSERVED", "kill_on_close", true, "child_member", true, "protected_dacl_match", true, "active_processes", accounting.Active);
       } // Do not retain a second Job handle across service stop/last-handle kill.
       report["listener"] = D("state", "OBSERVED", "family", "IPv4", "address_class", "LOOPBACK", "port", Port, "owned_pid", pids[0]);
@@ -561,6 +587,7 @@ internal static class PhaseZero {
     [DllImport("kernel32.dll", SetLastError = true)] internal static extern bool SetInformationJobObject(IntPtr h, int c, ref JOB_LIMIT x, uint n);
     [DllImport("kernel32.dll", EntryPoint = "QueryInformationJobObject", SetLastError = true)] internal static extern bool QueryJobLimit(IntPtr h, int c, ref JOB_LIMIT x, uint n, IntPtr returned);
     [DllImport("kernel32.dll", EntryPoint = "QueryInformationJobObject", SetLastError = true)] internal static extern bool QueryJobAccounting(IntPtr h, int c, ref JOB_ACCOUNTING x, uint n, IntPtr returned);
+    [DllImport("kernel32.dll", EntryPoint = "QueryInformationJobObject", SetLastError = true)] internal static extern bool QueryJobProcessIds(IntPtr h, int c, IntPtr buffer, uint n, out uint returned);
     [DllImport("kernel32.dll", SetLastError = true)] internal static extern bool AssignProcessToJobObject(IntPtr job, IntPtr process);
     [DllImport("kernel32.dll", SetLastError = true)] internal static extern bool IsProcessInJob(IntPtr process, IntPtr job, out bool member);
     [DllImport("kernel32.dll")] internal static extern IntPtr LocalFree(IntPtr p);

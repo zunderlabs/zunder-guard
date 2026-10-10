@@ -97,8 +97,14 @@ def deletion_model(original,current,expected):
   if value.get('path')!='fixed-exe' or value.get('directory')is not False or value.get('reparse')is not False or value.get('links')!=1 or value.get('protected_dacl')is not True or value.get('owner')!='ADMINISTRATORS' or value.get('hash')!=expected:return False
  return all(original.get(k)==current.get(k)for k in ('volume','file_id'))
 
+R9_HELPER='  static uint FailedJobMembers(H job, uint childPid, uint servicePid) {\n    IntPtr buffer = Marshal.AllocHGlobal(72);\n    try {\n      uint returned; Win(N.QueryJobProcessIds(job.P, 3, buffer, 72, out returned), "job");\n      uint assigned = unchecked((uint)Marshal.ReadInt32(buffer, 0)); uint count = unchecked((uint)Marshal.ReadInt32(buffer, 4));\n      Need(count >= 1 && count <= 8 && assigned == count && returned >= 8U + count * 8U && returned <= 72, "job");\n      var seen = new Dictionary<uint, bool>(); uint mask = 0;\n      for (uint i = 0; i < count; i++) {\n        ulong raw = unchecked((ulong)Marshal.ReadInt64(buffer, checked(8 + (int)i * 8)));\n        Need(raw > 0 && raw <= uint.MaxValue, "job"); uint pid = (uint)raw;\n        Need(!seen.ContainsKey(pid), "job"); seen.Add(pid, true);\n        if (pid == childPid) mask |= 1U;\n        else if (pid == servicePid) mask |= 2U;\n        else if (pid == N.GetCurrentProcessId()) mask |= 4U;\n        else {\n          using (var process = new H(N.OpenProcess(0x1000, false, pid), false)) {\n            var image = new StringBuilder(32768); uint size = 32768;\n            Win(N.QueryFullProcessImageNameW(process.P, 0, image, ref size), "job");\n            Need(size > 0 && size < 32768, "job");\n            mask |= String.Equals(image.ToString(), @"C:\\Windows\\System32\\conhost.exe", StringComparison.OrdinalIgnoreCase) ? 8U : 16U;\n          }\n        }\n      }\n      return 0x4d420000U | mask;\n    } finally { Marshal.FreeHGlobal(buffer); }\n  }\n'
+R9_DLL='    [DllImport("kernel32.dll", EntryPoint = "QueryInformationJobObject", SetLastError = true)] internal static extern bool QueryJobProcessIds(IntPtr h, int c, IntPtr buffer, uint n, out uint returned);\n'
+
+def r8_source():
+ return NATIVE.replace(R9_HELPER,'',1).replace(R9_DLL,'',1).replace('FailedJobMembers(job, pids[0], servicePid)','accounting.Active <= 65535U ? 0x41430000U + accounting.Active : 0x4a4f420dU',1)
+
 def r7_source():
- return NATIVE.replace('        if (!(accounting.Active == 1)) throw new Refused("ownership", accounting.Active <= 65535U ? 0x41430000U + accounting.Active : 0x4a4f420dU);','        if (!(accounting.Active == 1)) throw new Refused("ownership", 0x4a4f420d);',1)
+ return r8_source().replace('        if (!(accounting.Active == 1)) throw new Refused("ownership", accounting.Active <= 65535U ? 0x41430000U + accounting.Active : 0x4a4f420dU);','        if (!(accounting.Active == 1)) throw new Refused("ownership", 0x4a4f420d);',1)
 
 def prior_job_source():
  restored=r7_source()
@@ -319,7 +325,7 @@ class SourceContract(unittest.TestCase):
   values=list(good);values[2]=150000000;self.assertTrue(accepts(*values))
   values[2]=150000001;self.assertFalse(accepts(*values))
  def test_precise_capture_changes_no_other_functions(self):
-  start=NATIVE.index('  static Dictionary<string, object> ProcessFacts')
+  start=prior_job_source().index('  static Dictionary<string, object> ProcessFacts')
   self.assertEqual(hashlib.sha256(prior_job_source()[start:].encode()).hexdigest(),RETAINED_FUNCTIONS_SHA)
 
 
@@ -331,7 +337,7 @@ class SourceContract(unittest.TestCase):
   expected=['SID(owner) == sid','(control & 0x1000) != 0','dacl != IntPtr.Zero','acl.Count == 3','Marshal.ReadByte(ace) == 0','Marshal.ReadByte(ace, 1) == 0','(ushort)Marshal.ReadInt16(ace, 2) >= 12','!seen.ContainsKey(a)','mask == 0x1f003f','(a == sid || a == "S-1-5-18" || a == "S-1-5-32-544")','member','(limit.Basic.Flags & 0x2000) != 0','accounting.Active == 1']
   self.assertEqual([expr for expr,code in rows],expected)
   self.assertNotRegex(NATIVE,r'Win\([^;\n]+, "ownership"\)')
-  other=[line for line in NATIVE.splitlines()if 'new Refused("ownership",'in line and '0x4a4f42'not in line]
+  other=[line for line in r7_source().splitlines()if 'new Refused("ownership",'in line and '0x4a4f42'not in line]
   self.assertEqual(other,[])
  def test_job_diagnostic_short_circuit_acceptance_is_unchanged(self):
   import itertools
@@ -353,7 +359,7 @@ class SourceContract(unittest.TestCase):
 
  def test_active_diagnostic_exact_r7_reversal(self):
   self.assertEqual(hashlib.sha256(r7_source().encode()).hexdigest(),'87c3894bd46919dac6bb7da0fc262a0241f74c8ba41c86026dd56bc2f002d8f7')
-  self.assertEqual(NATIVE.count('accounting.Active <= 65535U ? 0x41430000U + accounting.Active : 0x4a4f420dU'),1)
+  self.assertEqual(r8_source().count('accounting.Active <= 65535U ? 0x41430000U + accounting.Active : 0x4a4f420dU'),1)
   self.assertIn('if (!(accounting.Active == 1)) throw new Refused',NATIVE)
  def test_accounting_abi_exact(self):
   class Accounting(c.Structure):_fields_=[('user',I64),('kernel',I64),('period_user',I64),('period_kernel',I64),('faults',U32),('total',U32),('active',U32),('terminated',U32)]
@@ -370,5 +376,21 @@ class SourceContract(unittest.TestCase):
    value['outcome']='OBSERVED';self.assertFalse(report_model(json.dumps(value,separators=(',',':'))))
   for active in range(65536):
    if active!=1:self.assertEqual((0x41430000+active)&0xffff,active)
+
+
+ def test_failed_member_diagnostic_exact_r8_inverse(self):
+  self.assertEqual(hashlib.sha256(r8_source().encode()).hexdigest(),'1dc9c28f5a167e4f32de2aacf9370570ba14e5dd0a30aec1ece8746b39148ead')
+  self.assertIn('if (!(accounting.Active == 1)) throw new Refused("ownership", FailedJobMembers(job, pids[0], servicePid));',NATIVE)
+  self.assertEqual(NATIVE.count('FailedJobMembers('),2)
+ def test_failed_member_diagnostic_is_fixed_read_only_and_bounded(self):
+  for text in ['Marshal.AllocHGlobal(72)','N.QueryJobProcessIds(job.P, 3, buffer, 72, out returned)','count >= 1 && count <= 8 && assigned == count','returned >= 8U + count * 8U && returned <= 72','raw > 0 && raw <= uint.MaxValue','!seen.ContainsKey(pid)','N.OpenProcess(0x1000, false, pid)','new StringBuilder(32768)','size > 0 && size < 32768','finally { Marshal.FreeHGlobal(buffer); }','return 0x4d420000U | mask;']:self.assertIn(text,R9_HELPER)
+  for forbidden in ['Terminate','Assign','SetInformation','Thread.Sleep','while (','read','File','Token','Console','Json','ProcessFacts']:self.assertNotIn(forbidden,R9_HELPER)
+ def test_member_mask_diagnostics_never_allow_observed(self):
+  for mask in range(1,32):
+   value=json.loads(FIXTURES['cases'][0]['raw']);value.update(outcome='UNKNOWN',stage='job',error_class='ownership',error_code=0x4d420000|mask)
+   self.assertTrue(report_model(json.dumps(value,separators=(',',':'))));value['outcome']='OBSERVED';self.assertFalse(report_model(json.dumps(value,separators=(',',':'))))
+  for count in range(1,9):
+   self.assertLessEqual(8+count*8,72)
+  self.assertGreater(8+9*8,72)
 
 if __name__=='__main__':unittest.main()
