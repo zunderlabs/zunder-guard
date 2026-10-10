@@ -1,0 +1,34 @@
+name: Hosted Python copy probe
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/hosted-python-copy-probe.yml'
+      - 'deploy/guard/e2e/hosted_launch/bootstrap.py'
+      - 'deploy/guard/e2e/hosted_launch/diagnose_python.py'
+      - 'deploy/guard/e2e/hosted_launch/test_python_diagnostic.py'
+permissions:
+  contents: read
+jobs:
+  python-copy:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Closed diagnostic fixtures
+        run: python3 -I -B deploy/guard/e2e/hosted_launch/test_python_diagnostic.py
+      - name: Copy fixed public Ubuntu runtime without credentials
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Runner owns this public diagnostic output; only copy child runs as root.
+          # shellcheck disable=SC2024
+          sudo /usr/bin/env -i PATH=/usr/bin:/bin LANG=C.UTF-8 /usr/bin/python3.12 -I -B deploy/guard/e2e/hosted_launch/diagnose_python.py > "$RUNNER_TEMP/python-copy-probe.json"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: always()
+        with:
+          name: public-python-copy-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/python-copy-probe.json
+          if-no-files-found: error
+          retention-days: 7

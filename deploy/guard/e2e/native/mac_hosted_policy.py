@@ -56,10 +56,55 @@ def inspect_sleep_and_core(paths=(Path('/private/var/vm/sleepimage'),Path('/var/
 
 
 def validate_assertions(pid,assertions):
-    need(type(pid)is int and pid>1 and type(assertions)is str)
-    owned=[line for line in assertions.splitlines()if re.search(r'\bpid '+str(pid)+r'\(caffeinate\):',line)]
-    need(any('PreventUserIdleSystemSleep'in line for line in owned)and any('PreventSystemSleep'in line for line in owned))
+    result=assertion_status(pid,assertions)
+    need(all(result.values()))
     return True
+
+
+def assertion_status(pid,assertions):
+    """Only required assertions belonging to the exact owned PID; no raw export."""
+    need(type(pid)is int and pid>1 and type(assertions)is str)
+    need(len(assertions)<=65536)
+    owned=[line for line in assertions.splitlines()if re.search(r'\bpid '+str(pid)+r'\(caffeinate\):',line)]
+    return {'prevent_user_idle_system_sleep':any(re.search(r'\bPreventUserIdleSystemSleep\b',line)for line in owned),
+            'prevent_system_sleep':any(re.search(r'\bPreventSystemSleep\b',line)for line in owned)}
+
+
+def wait_owned_assertions(helper,proc,*,deadline,status):
+    """One bounded startup window; a changed birth never receives a new window."""
+    from mac_process_identity import birth,same
+    end=min(deadline,time.monotonic()+1)
+    identity=None;attempts=0
+    status.update(observed=False,passed=False,stage='owned-assertion-readiness',reason='owned-helper-identity-unavailable',
+                  required_assertions={'prevent_user_idle_system_sleep':False,'prevent_system_sleep':False})
+    def owned(row):
+        return row is not None and row.get('pid')==helper.pid and row.get('ppid')==os.getpid()and row.get('uid')==0 and row.get('path')=='/usr/bin/caffeinate'
+    while attempts<20 and time.monotonic()<end:
+        attempts+=1
+        row=proc.read(helper.pid)
+        if helper.poll()is not None:
+            status['reason']='owned-helper-exited';need(False)
+        if row is not None:
+            if not owned(row):
+                status['reason']='owned-helper-identity-changed';need(False)
+            if identity is None:identity=birth(row);status['identity']=identity
+            if not same(row,identity):status['reason']='owned-helper-identity-changed';need(False)
+            try:assertions=public(['/usr/bin/pmset','-g','assertions'],deadline=end)
+            except BaseException:status['reason']='assertion-readback-unavailable';raise
+            current=proc.read(helper.pid)
+            if helper.poll()is not None or not owned(current)or not same(current,identity):
+                status['reason']='owned-helper-identity-changed';need(False)
+            status.update(observed=True,required_assertions=assertion_status(helper.pid,assertions),
+                          reason='owned-required-assertions-missing')
+            if all(status['required_assertions'].values()):
+                need(time.monotonic()<end and time.monotonic()<deadline)
+                status.update(passed=True,reason='owned-required-assertions-observed')
+                return identity,assertions
+        remaining=end-time.monotonic()
+        if remaining<=0:break
+        time.sleep(min(.05,remaining))
+    if time.monotonic()>=deadline:status['reason']='original-probe-deadline-expired'
+    need(False)
 
 
 def validate(swap,vault,power,core,core_limits,*,prevent_sleep_pid=None,assertions=None):
@@ -88,9 +133,10 @@ def observe(*,prevent_sleep_pid=None,deadline=None):
     return result
 
 
-def probe():
+def probe(*,deadline=None):
     """No-secret capability measurement using the identical custody predicate."""
     resource.setrlimit(resource.RLIMIT_CORE,(0,0))
+    original_deadline=time.monotonic()+20 if deadline is None else min(deadline,time.monotonic()+20)
     checks={};values={};helper=None
     try:
         checks['platform']={'observed':True,'passed':platform.system()=='Darwin'and platform.machine()=='arm64'and os.geteuid()==0}
@@ -98,33 +144,25 @@ def probe():
         commands={'swap':['/usr/sbin/sysctl','-n','vm.swapusage'],'vault':['/usr/bin/fdesetup','status'],
                   'power':['/usr/bin/pmset','-g','custom'],'core':['/usr/sbin/sysctl','-n','kern.coredump']}
         for name,argv in commands.items():
-            try:values[name]=public(argv);checks[name]={'observed':True,'passed':None}
+            try:values[name]=public(argv,deadline=original_deadline);checks[name]={'observed':True,'passed':None}
             except BaseException:checks[name]={'observed':False,'passed':False,'reason':'readback-unavailable'}
         try:inspect_sleep_and_core();checks['sleep_image_and_core_inventory']={'observed':True,'passed':True}
         except BaseException:checks['sleep_image_and_core_inventory']={'observed':False,'passed':False,'reason':'inventory-refused-or-unavailable'}
         if all(row['observed']for row in checks.values())and checks['platform']['passed']:
             from mac_process_identity import DarwinProcesses,birth,same
             proc=DarwinProcesses()
+            need(time.monotonic()<original_deadline)
             helper=subprocess.Popen(['/usr/bin/caffeinate','-dimsu'],stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,env={'PATH':'/usr/bin:/bin','LANG':'C'})
-            import time
-            end=time.monotonic()+1;identity=None
-            while identity is None:
-                row=proc.read(helper.pid)
-                if row is not None:identity=birth(row)
-                need(time.monotonic()<end)
-            need(row['ppid']==os.getpid()and row['uid']==0 and row['path']=='/usr/bin/caffeinate')
-            assertions=public(['/usr/bin/pmset','-g','assertions'])
-            need(helper.poll()is None and same(proc.read(helper.pid),identity))
-            checks['owned_prevent_sleep']={'observed':True,'passed':False,'pid':helper.pid}
-            validate_assertions(helper.pid,assertions);checks['owned_prevent_sleep']['passed']=True
+            checks['owned_prevent_sleep']={'pid':helper.pid}
+            identity,assertions=wait_owned_assertions(helper,proc,deadline=original_deadline,status=checks['owned_prevent_sleep'])
             try:
                 result=validate(values['swap'],values['vault'],values['power'],values['core'],resource.getrlimit(resource.RLIMIT_CORE),
                     prevent_sleep_pid=helper.pid,assertions=assertions)
                 for name in commands:checks[name]['passed']=True
                 # The final eligibility decision invokes the exact bounded
                 # observation used for custody, not a duplicate policy path.
-                observe(prevent_sleep_pid=helper.pid)
+                observe(prevent_sleep_pid=helper.pid,deadline=original_deadline)
                 need(helper.poll()is None and same(proc.read(helper.pid),identity))
                 checks['effective_policy']={'observed':True,'passed':True}
             except BaseException:
@@ -139,7 +177,10 @@ def probe():
     finally:
         if helper is not None:
             if helper.poll()is None:helper.terminate()
-            try:helper.wait(timeout=5);checks['owned_helper_cleanup']={'observed':True,'passed':True}
+            try:
+                helper.wait(timeout=min(5,max(.01,original_deadline-time.monotonic())))
+                need(time.monotonic()<original_deadline)
+                checks['owned_helper_cleanup']={'observed':True,'passed':True}
             except BaseException:checks['owned_helper_cleanup']={'observed':False,'passed':False,'reason':'owned-helper-remains-unknown'}
     return {'schema':1,'kind':'actual-hosted-mac-policy-capability','policy':HOSTED,'checks':checks,
         'eligible':checks.get('effective_policy',{}).get('passed')is True and checks.get('owned_helper_cleanup',{}).get('passed')is True,

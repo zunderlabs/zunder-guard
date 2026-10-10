@@ -74,3 +74,61 @@ class Fixtures(unittest.TestCase):
                 self.assertFalse(result['privateInput']);self.assertFalse(result['releaseReady']);self.assertFalse(result['host_policy_modified'])
                 self.assertEqual(result['coverage']['filevault'],False)
                 spawn.assert_called_once();self.assertEqual(spawn.call_args.args[0],['/usr/bin/caffeinate','-dimsu'])
+
+    def readiness_fixture(self,assertions,*,deadline=20,rows=None):
+        from unittest.mock import Mock
+        helper=Mock();helper.pid=123;helper.poll.return_value=None
+        proc=Mock();owned={'pid':123,'start_sec':1,'start_usec':2,'uid':0,
+                          'ppid':policy.os.getpid(),'path':'/usr/bin/caffeinate'}
+        if rows is None:proc.read.return_value=owned
+        else:proc.read.side_effect=rows(owned)
+        tick=[10.0];status={}
+        def delay(seconds):tick[0]+=seconds
+        context=[patch.object(policy.time,'monotonic',side_effect=lambda:tick[0]),
+                 patch.object(policy.time,'sleep',side_effect=delay),
+                 patch.object(policy,'public',side_effect=assertions if type(assertions)is list else lambda *_a,**_k:assertions)]
+        return helper,proc,status,tick,context,deadline
+
+    def test_startup_wait_requires_both_owned_assertions_without_clock_reset(self):
+        helper,proc,status,tick,context,deadline=self.readiness_fixture(['',ASSERTIONS.splitlines()[0],ASSERTIONS])
+        with context[0],context[1],context[2]as read:
+            identity,_=policy.wait_owned_assertions(helper,proc,deadline=deadline,status=status)
+        self.assertEqual(read.call_count,3);self.assertEqual(identity,{'pid':123,'start_sec':1,'start_usec':2})
+        self.assertTrue(status['passed']);self.assertTrue(all(status['required_assertions'].values()))
+        self.assertLessEqual(tick[0]-10,1)
+        self.assertEqual({call.kwargs['deadline']for call in read.call_args_list},{11.0})
+        self.assertNotIn('assertions',status)
+
+    def test_missing_or_other_pid_assertions_remain_refused_with_fixed_diagnostics(self):
+        for assertions in ('',ASSERTIONS.replace('123','124'),ASSERTIONS.splitlines()[0],ASSERTIONS.replace('PreventSystemSleep','PreventSystemSleepFake')):
+            helper,proc,status,tick,context,deadline=self.readiness_fixture(assertions)
+            with context[0],context[1],context[2]as read,self.assertRaises(RuntimeError):
+                policy.wait_owned_assertions(helper,proc,deadline=deadline,status=status)
+            self.assertFalse(status['passed']);self.assertFalse(status['required_assertions']['prevent_system_sleep'])
+            self.assertEqual(status['stage'],'owned-assertion-readiness')
+            self.assertEqual(status['reason'],'owned-required-assertions-missing')
+            self.assertLessEqual(read.call_count,20);self.assertLessEqual(tick[0]-10,1.001)
+
+    def test_changed_birth_or_root_parent_executable_refuses_before_admission(self):
+        mutations=[{'start_usec':3},{'uid':501},{'ppid':99},{'path':'/tmp/caffeinate'}]
+        for change in mutations:
+            helper,proc,status,tick,context,deadline=self.readiness_fixture(ASSERTIONS,
+                rows=lambda owned:[owned,dict(owned,**change)])
+            with context[0],context[1],context[2]as read,self.assertRaises(RuntimeError):
+                policy.wait_owned_assertions(helper,proc,deadline=deadline,status=status)
+            self.assertEqual(status['reason'],'owned-helper-identity-changed');self.assertFalse(status['passed'])
+            self.assertEqual(read.call_count,1)
+
+    def test_original_probe_deadline_tightens_startup_wait(self):
+        helper,proc,status,tick,context,deadline=self.readiness_fixture('',deadline=10.02)
+        with context[0],context[1],context[2]as read,self.assertRaises(RuntimeError):
+            policy.wait_owned_assertions(helper,proc,deadline=deadline,status=status)
+        self.assertLessEqual(tick[0],10.02);self.assertEqual(read.call_args.kwargs['deadline'],10.02)
+        self.assertEqual(status['reason'],'original-probe-deadline-expired');self.assertFalse(status['passed'])
+
+    def test_readback_error_is_unknown_and_never_exports_raw_text(self):
+        helper,proc,status,tick,context,deadline=self.readiness_fixture('')
+        with context[0],context[1],patch.object(policy,'public',side_effect=RuntimeError('private raw output')),self.assertRaises(RuntimeError):
+            policy.wait_owned_assertions(helper,proc,deadline=deadline,status=status)
+        self.assertEqual(status['reason'],'assertion-readback-unavailable');self.assertFalse(status['observed'])
+        self.assertNotIn('private raw output',str(status))
