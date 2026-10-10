@@ -11,6 +11,7 @@ import re
 import resource
 import stat
 import subprocess
+import time
 
 HOSTED='hosted-mac-testnet-zero-orders-fv-off'
 STRICT='strict-native-memory'
@@ -20,10 +21,12 @@ def need(value):
     if not value:raise RuntimeError('Hosted Mac memory admission refused')
 
 
-def public(argv):
+def public(argv,*,deadline=None):
+    remaining=2 if deadline is None else min(2,deadline-time.monotonic())
+    need(remaining>0)
     row=subprocess.run(argv,stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,
-        timeout=2,env={'PATH':'/usr/sbin:/usr/bin:/sbin:/bin','LANG':'C','HOME':'/var/root'},close_fds=True)
-    need(row.returncode==0 and len(row.stdout)<=65536)
+        timeout=remaining,env={'PATH':'/usr/sbin:/usr/bin:/sbin:/bin','LANG':'C','HOME':'/var/root'},close_fds=True)
+    need((deadline is None or time.monotonic()<deadline)and row.returncode==0 and len(row.stdout)<=65536)
     return row.stdout.decode('ascii').strip()
 
 
@@ -71,14 +74,17 @@ def validate(swap,vault,power,core,core_limits,*,prevent_sleep_pid=None,assertio
         'prevent_sleep_process_observed':prevent_sleep_pid is not None}
 
 
-def observe(*,prevent_sleep_pid=None):
+def observe(*,prevent_sleep_pid=None,deadline=None):
     need(platform.system()=='Darwin'and platform.machine()=='arm64'and os.geteuid()==0)
     need(resource.getrlimit(resource.RLIMIT_CORE)==(0,0))
-    result=validate(public(['/usr/sbin/sysctl','-n','vm.swapusage']),public(['/usr/bin/fdesetup','status']),
-        public(['/usr/bin/pmset','-g','custom']),public(['/usr/sbin/sysctl','-n','kern.coredump']),
+    deadline=time.monotonic()+.75 if deadline is None else min(deadline,time.monotonic()+.75)
+    def sample(argv):
+        need(time.monotonic()<deadline);result=public(argv,deadline=deadline);need(time.monotonic()<deadline);return result
+    result=validate(sample(['/usr/sbin/sysctl','-n','vm.swapusage']),sample(['/usr/bin/fdesetup','status']),
+        sample(['/usr/bin/pmset','-g','custom']),sample(['/usr/sbin/sysctl','-n','kern.coredump']),
         resource.getrlimit(resource.RLIMIT_CORE),prevent_sleep_pid=prevent_sleep_pid,
-        assertions=public(['/usr/bin/pmset','-g','assertions'])if prevent_sleep_pid is not None else None)
-    inspect_sleep_and_core();result['sleep_images_absent']=True;result['core_directory_empty']=True
+        assertions=sample(['/usr/bin/pmset','-g','assertions'])if prevent_sleep_pid is not None else None)
+    inspect_sleep_and_core();need(time.monotonic()<deadline);result['sleep_images_absent']=True;result['core_directory_empty']=True
     return result
 
 
@@ -116,6 +122,10 @@ def probe():
                 result=validate(values['swap'],values['vault'],values['power'],values['core'],resource.getrlimit(resource.RLIMIT_CORE),
                     prevent_sleep_pid=helper.pid,assertions=assertions)
                 for name in commands:checks[name]['passed']=True
+                # The final eligibility decision invokes the exact bounded
+                # observation used for custody, not a duplicate policy path.
+                observe(prevent_sleep_pid=helper.pid)
+                need(helper.poll()is None and same(proc.read(helper.pid),identity))
                 checks['effective_policy']={'observed':True,'passed':True}
             except BaseException:
                 checks['swap']['passed']='(encrypted)'in values['swap'];checks['vault']['passed']=values['vault']=='FileVault is Off.'

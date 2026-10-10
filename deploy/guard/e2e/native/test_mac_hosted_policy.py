@@ -34,6 +34,23 @@ class Fixtures(unittest.TestCase):
             sleep=Path(tmp)/'sleepimage';sleep.touch()
             with patch.object(policy.os,'geteuid',return_value=0),patch.object(Path,'lstat',return_value=type('S',(),{'st_mode':0o100600,'st_uid':0})()):
                 with self.assertRaises(RuntimeError):policy.inspect_sleep_and_core([sleep])
+    def test_overall_sample_deadline_refuses_slow_success_before_remaining_probes(self):
+        tick=[10.0];calls=[]
+        def slow(argv,**kwargs):
+            calls.append((argv,kwargs['deadline']));tick[0]+=1.6;return '(encrypted)'
+        with patch.object(policy.platform,'system',return_value='Darwin'),patch.object(policy.platform,'machine',return_value='arm64'),\
+             patch.object(policy.os,'geteuid',return_value=0),patch.object(policy.resource,'getrlimit',return_value=(0,0)),\
+             patch.object(policy.time,'monotonic',side_effect=lambda:tick[0]),patch.object(policy,'public',side_effect=slow),\
+             patch.object(policy,'inspect_sleep_and_core')as inventory,self.assertRaises(RuntimeError):
+            policy.observe(prevent_sleep_pid=123)
+        self.assertEqual(len(calls),1);self.assertEqual(calls[0][1],10.75);inventory.assert_not_called()
+    def test_each_fixed_probe_uses_remaining_overall_deadline(self):
+        from types import SimpleNamespace
+        with patch.object(policy.time,'monotonic',side_effect=[10,10.1]),patch.object(policy.subprocess,'run',return_value=SimpleNamespace(returncode=0,stdout=b'1'))as run:
+            self.assertEqual(policy.public(['/usr/sbin/sysctl','-n','kern.coredump'],deadline=10.5),'1')
+        self.assertEqual(run.call_args.kwargs['timeout'],.5)
+        with patch.object(policy.time,'monotonic',side_effect=[10,10.6]),patch.object(policy.subprocess,'run',return_value=SimpleNamespace(returncode=0,stdout=b'1')),self.assertRaises(RuntimeError):
+            policy.public(['/usr/sbin/sysctl','-n','kern.coredump'],deadline=10.5)
     def test_no_policy_modifications_or_secret_input_exist(self):
         text=Path(policy.__file__).read_text()
         for forbidden in ('pmset -a','boot-args','csrutil','stdin.read','/exchange','key-stdin'):
@@ -50,7 +67,7 @@ class Fixtures(unittest.TestCase):
                  patch.object(policy.platform,'machine',return_value='arm64'),patch.object(policy.os,'geteuid',return_value=0),\
                  patch.object(policy.resource,'setrlimit'),patch.object(policy.resource,'getrlimit',return_value=(0,0)),\
                  patch.object(policy,'inspect_sleep_and_core',return_value=True),\
-                 patch.object(policy,'public',side_effect=['(encrypted)','FileVault is Off.',power,'1',ASSERTIONS]),\
+                 patch.object(policy,'public',side_effect=['(encrypted)','FileVault is Off.',power,'1',ASSERTIONS]*2),\
                  patch.object(mac_process_identity,'DarwinProcesses',return_value=proc),\
                  patch.object(policy.subprocess,'Popen',return_value=process)as spawn:
                 result=policy.probe();self.assertEqual(result['eligible'],eligible)
