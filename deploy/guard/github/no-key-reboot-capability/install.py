@@ -8,7 +8,7 @@ import subprocess
 import sys
 
 BASE = Path('/Library/ZunderGitHubRebootCapabilityBuild')
-PINS = {'native/broker.swift': 'fd77cc878dc42929950a4d0b9efd8b7cbecae1ef90c599f5af378e15f2a3bb3a', 'native/process.c': '392ede57c7b3669fcf6a982b6a9d3f5952db189b1f2cd590265a6d63968d84aa', 'native/process.h': '21bc2329d550e75af0a01876236e76e2a5092d741c9f9b741e2b813beff3f29c'}
+PINS = {'native/broker.swift': '361b4e0b3efb1bb56d6855c5523bc8042edcbe2528d89264f48b1eb96fc7e4be', 'native/process.c': '392ede57c7b3669fcf6a982b6a9d3f5952db189b1f2cd590265a6d63968d84aa', 'native/process.h': '21bc2329d550e75af0a01876236e76e2a5092d741c9f9b741e2b813beff3f29c'}
 NAMES = ('native/broker.swift', 'native/process.c', 'native/process.h')
 
 # R4 diagnostic begin

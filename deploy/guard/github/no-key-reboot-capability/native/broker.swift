@@ -177,7 +177,7 @@ func prepare() throws {
     // This probe has no observer ACK and grants no release authority.
     try fixedProcess("/sbin/shutdown",["-r","now"])
     // Keep the original target job alive if shutdown returns; never issue a second reboot.
-    while wall()>=originalWall && wall()<originalWall+890000 && (try mono())-originalMono<890000 {sleep(1)}
+    while try wall()>=originalWall && wall()<originalWall+890000 && (try mono())-originalMono<890000 {sleep(1)}
 }
 func watch(_ configHash:String) throws {
     try require(getuid()==0 && geteuid()==0 && capability_watch_image()==1 && matches(configHash,"^[0-9a-f]{64}$"))
