@@ -1,0 +1,103 @@
+name: public-homebrew-candidate-paper
+on:
+  workflow_dispatch:
+  push:
+    branches: [release/homebrew-rehearsal]
+permissions:
+  contents: read
+  actions: read
+concurrency:
+  group: public-homebrew-candidate-v1.0.5
+  cancel-in-progress: false
+jobs:
+  verified-candidate:
+    if: github.repository == 'zunderlabs/zunder-guard'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Admit exact successful signed build
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh api repos/zunderlabs/zunder-guard/actions/runs/38022247487 | python3 -c 'import json,sys; r=json.load(sys.stdin); assert r["head_sha"]=="0f64fa0f822fb2e9fffc414883ca843bd4e992a7" and r["run_attempt"]==1 and r["status"]=="completed" and r["conclusion"]=="success" and r["path"]==".github/workflows/release.yml"'
+      - name: Download exact signed dist and provenance artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          artifact-ids: '11659481192,11659731833'
+          run-id: 38022247487
+          repository: zunderlabs/zunder-guard
+          github-token: ${{ github.token }}
+          merge-multiple: true
+          digest-mismatch: error
+          path: ${{ runner.temp }}/public-homebrew-assets
+      - name: Verify all eight candidate subject byte identities
+        shell: bash
+        run: python3 -B deploy/guard/github/homebrew-candidate/acquire.py "$RUNNER_TEMP/public-homebrew-assets"
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6
+        with:
+          cosign-release: v3.1.3
+      - uses: slsa-framework/slsa-verifier/actions/installer@ea584f4502babc6f60d9bc799dbbb13c1caa9ee6
+      - name: Verify signature and source provenance before formula execution
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/public-homebrew-assets"
+          cosign verify-blob --bundle SHA256SUMS.sigstore.json --certificate-identity https://github.com/zunderlabs/zunder-guard/.github/workflows/release.yml@refs/tags/v1.0.5 --certificate-oidc-issuer https://token.actions.githubusercontent.com SHA256SUMS >/dev/null
+          slsa-verifier verify-artifact zunder-guard.rb zunder-guard-v1.0.5-*.tar.gz --provenance-path zunder-guard-v1.0.5.intoto.jsonl --source-uri github.com/zunderlabs/zunder-guard --source-tag v1.0.5 --builder-id https://github.com/slsa-framework/slsa-github-generator/.github/workflows/generator_generic_slsa3.yml@refs/tags/v2.1.0 --print-provenance | jq -se --arg commit 0f64fa0f822fb2e9fffc414883ca843bd4e992a7 'length > 0 and all(.predicate.invocation.configSource.digest.sha1 == $commit and .predicate.invocation.configSource.entryPoint == ".github/workflows/release.yml")' >/dev/null
+  paper-recipe:
+    needs: verified-candidate
+    if: github.repository == 'zunderlabs/zunder-guard'
+    timeout-minutes: 50
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, macos-15-intel, ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: Homebrew/actions/setup-homebrew@9ffcbcc2c89631400988e8d4b1e3ac17dbbe3fe9
+        with:
+          stable: true
+          token: ''
+          brew-gh-api-token: ''
+      - name: Admit exact successful signed build
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh api repos/zunderlabs/zunder-guard/actions/runs/38022247487 | python3 -c 'import json,sys; r=json.load(sys.stdin); assert r["head_sha"]=="0f64fa0f822fb2e9fffc414883ca843bd4e992a7" and r["run_attempt"]==1 and r["status"]=="completed" and r["conclusion"]=="success" and r["path"]==".github/workflows/release.yml"'
+      - name: Download exact signed dist and provenance artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          artifact-ids: '11659481192,11659731833'
+          run-id: 38022247487
+          repository: zunderlabs/zunder-guard
+          github-token: ${{ github.token }}
+          merge-multiple: true
+          digest-mismatch: error
+          path: ${{ runner.temp }}/public-homebrew-assets
+      - name: Verify all eight candidate subject byte identities
+        shell: bash
+        run: python3 -B deploy/guard/github/homebrew-candidate/acquire.py "$RUNNER_TEMP/public-homebrew-assets"
+      - name: Actual paper package and service lifecycle
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -B deploy/guard/github/homebrew-candidate/rehearse.py "$RUNNER_TEMP/public-homebrew-assets" "$RUNNER_TEMP/public-homebrew-receipt"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: always()
+        with:
+          name: public-homebrew-paper-${{ matrix.os }}
+          path: ${{ runner.temp }}/public-homebrew-receipt/receipt.json
+          if-no-files-found: error
+          retention-days: 7

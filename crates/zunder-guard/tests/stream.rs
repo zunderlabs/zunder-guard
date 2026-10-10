@@ -52,9 +52,9 @@ fn api_key() -> GuardKey {
     GuardKey::from_hex(&format!("0x{}", "42".repeat(32))).unwrap()
 }
 
-struct Running {
+struct Running<C = SystemClock> {
     url: String,
-    guard: Arc<Guard<MemoryVenue>>,
+    guard: Arc<Guard<MemoryVenue, C>>,
     ws: tokio::task::JoinHandle<()>,
     _dir: TestDir,
 }
@@ -89,6 +89,17 @@ async fn start_syncing(
     markets: &[&str],
     sync_seconds: Option<u64>,
 ) -> Running {
+    start_syncing_with_clock(name, paper, limits, markets, sync_seconds, SystemClock).await
+}
+
+async fn start_syncing_with_clock<C: Clock>(
+    name: &str,
+    paper: bool,
+    limits: Limits,
+    markets: &[&str],
+    sync_seconds: Option<u64>,
+    clock: C,
+) -> Running<C> {
     let dir = TestDir::new(name);
     let config = GuardConfig {
         network: Some(GuardNetwork::Testnet),
@@ -115,7 +126,7 @@ async fn start_syncing(
         &config.risk_journal(paper),
         config.policy.risk_limits(),
         &config.journal_scope(paper).unwrap(),
-        Timestamp::from_millis(SystemClock.now_ms() as i64),
+        Timestamp::from_millis(clock.now_ms() as i64),
         dec!(10000),
         "stream test",
     )
@@ -146,7 +157,7 @@ async fn start_syncing(
             limits,
         },
         venue,
-        SystemClock,
+        clock,
     )
     .unwrap();
     let ws = serve_ws(guard.clone(), 100).await;
@@ -1043,7 +1054,29 @@ async fn the_exit_allowances_count_weight() {
 /// allowance, then only those that reduce a position the last view shows.
 #[tokio::test]
 async fn exits_after_a_refused_read_go_within_their_allowance() {
-    let running = start_with("stream-exits-read", false, Limits::default()).await;
+    // Hold the budget clock fixed: signing, journal fsync and HTTP latency
+    // must not refill the allowance while this test spends its initial burst.
+    // Real HTTP and WebSocket transport still run normally.
+    let start = SystemClock.now_ms();
+    let clock = TestClock(Arc::new(AtomicU64::new(start)));
+    let running = start_syncing_with_clock(
+        "stream-exits-read",
+        false,
+        Limits::default(),
+        &["*", "xyz:*"],
+        None,
+        clock.clone(),
+    )
+    .await;
+    // Keep the original restart nonce floor (+5 s) and nonce windows.
+    let now = start + 5_100;
+    clock.0.store(now, Ordering::SeqCst);
+    let mut nonce = now;
+    let mut sign = |body: Value| {
+        nonce += 1;
+        let action = zunder_guard_core::action::decode_action_value(&body["action"]).unwrap();
+        signed_at(action.to_wire(), nonce)
+    };
     let venue = running.guard.upstream();
     venue.add_position("ETH", "5");
     running.guard.sync().await;
@@ -1052,7 +1085,7 @@ async fn exits_after_a_refused_read_go_within_their_allowance() {
     // stream unclean, so the next request needs a read.
     let mut spent = false;
     for _ in 0..100 {
-        if post(&running.url, &cancel(999_999))
+        if post(&running.url, &sign(cancel(999_999)))
             .await
             .to_string()
             .contains("rate_limited")
@@ -1062,11 +1095,13 @@ async fn exits_after_a_refused_read_go_within_their_allowance() {
         }
     }
     assert!(spent);
+    // More than one real refill interval passes, without budget time advancing.
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
     // A read needs 48, so up to 47 may be left: reduce-only BTC buys (no
     // BTC position) go on that, then on the allowance, then are refused.
     let mut refused = false;
     for _ in 0..80 {
-        let reply = post(&running.url, &reduce_only(0, true, "61000", "0.01")).await;
+        let reply = post(&running.url, &sign(reduce_only(0, true, "61000", "0.01"))).await;
         if reply.to_string().contains("rate_limited") {
             refused = true;
             break;
@@ -1077,8 +1112,13 @@ async fn exits_after_a_refused_read_go_within_their_allowance() {
         "a reduce-only order that reduces nothing is refused"
     );
     // An ETH sell, which reduces the long Guard saw, still goes.
-    let reply = post(&running.url, &reduce_only(1, false, "2900", "0.1")).await;
+    let reply = post(&running.url, &sign(reduce_only(1, false, "2900", "0.1"))).await;
     assert_eq!(reply["status"], "ok", "{reply}");
+    assert_eq!(
+        clock.now_ms(),
+        now,
+        "request latency cannot refill the budget"
+    );
 }
 
 /// A stop refused by HTTP status (the venue's 429) was not placed: Guard

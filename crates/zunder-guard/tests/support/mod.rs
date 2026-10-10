@@ -1295,8 +1295,8 @@ impl MemoryVenue {
 /// took since. Confirms every subscription and unsubscription, answers
 /// `ping`. The returned task serves every connection; aborting it closes
 /// them.
-pub async fn serve_ws(
-    guard: std::sync::Arc<zunder_guard::guard::Guard<MemoryVenue>>,
+pub async fn serve_ws<C: zunder_guard::guard::Clock>(
+    guard: std::sync::Arc<zunder_guard::guard::Guard<MemoryVenue, C>>,
     period_ms: u64,
 ) -> tokio::task::JoinHandle<()> {
     use futures_util::{SinkExt, StreamExt};
