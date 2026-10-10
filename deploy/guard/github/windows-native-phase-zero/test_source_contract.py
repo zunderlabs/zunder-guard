@@ -101,8 +101,11 @@ R9_HELPER='  static uint FailedJobMembers(H job, uint childPid, uint servicePid)
 R10_DLL='    [DllImport("kernel32.dll")] internal static extern uint GetCurrentProcessId();\n'
 R9_DLL='    [DllImport("kernel32.dll", EntryPoint = "QueryInformationJobObject", SetLastError = true)] internal static extern bool QueryJobProcessIds(IntPtr h, int c, IntPtr buffer, uint n, out uint returned);\n'
 
+def r10_source():
+ return NATIVE.replace('DETACHED_PROCESS = 8','CREATE_NO_WINDOW = 0x08000000',1).replace('CREATE_SUSPENDED | DETACHED_PROCESS | CREATE_UNICODE_ENVIRONMENT','CREATE_SUSPENDED | CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT',1)
+
 def r8_source():
- return NATIVE.replace(R10_DLL,'',1).replace(R9_HELPER,'',1).replace(R9_DLL,'',1).replace('FailedJobMembers(job, pids[0], servicePid)','accounting.Active <= 65535U ? 0x41430000U + accounting.Active : 0x4a4f420dU',1)
+ return r10_source().replace(R10_DLL,'',1).replace(R9_HELPER,'',1).replace(R9_DLL,'',1).replace('FailedJobMembers(job, pids[0], servicePid)','accounting.Active <= 65535U ? 0x41430000U + accounting.Active : 0x4a4f420dU',1)
 
 def r7_source():
  return r8_source().replace('        if (!(accounting.Active == 1)) throw new Refused("ownership", accounting.Active <= 65535U ? 0x41430000U + accounting.Active : 0x4a4f420dU);','        if (!(accounting.Active == 1)) throw new Refused("ownership", 0x4a4f420d);',1)
@@ -147,7 +150,7 @@ class SourceContract(unittest.TestCase):
   for fixed in ['C:\\ProgramData\\ZunderPublicWindowsPhaseZero','Global\\ZunderPublicWindowsPhaseZeroJob','const int Port = 18547','const int LimitMs = 120000','args.Length != 1']:
    self.assertIn(fixed,NATIVE)
   for role in ['--probe','--service','--child']:self.assertIn('args[0] == "'+role+'"',NATIVE)
-  self.assertIn('CREATE_SUSPENDED | CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT',NATIVE)
+  self.assertIn('CREATE_SUSPENDED | DETACHED_PROCESS | CREATE_UNICODE_ENVIRONMENT',NATIVE)
   self.assertLess(NATIVE.index('N.AssignProcessToJobObject'),NATIVE.index('N.ResumeThread'))
  def test_real_handle_identity_and_no_readiness_cleanup_prerequisite(self):
   for api in ['GetFileInformationByHandleEx','GetFinalPathNameByHandleW','GetSecurityInfo','SetFileInformationByHandle','WaitForSingleObject','ServiceMissing(scm)','RefusedConnect()','JobSecurity(job, sid)']:
@@ -402,6 +405,18 @@ class SourceContract(unittest.TestCase):
   self.assertEqual(refs-declarations,set())
   self.assertGreater(len(refs),60)
   self.assertEqual(NATIVE.count(R10_DLL),1)
-  self.assertEqual(hashlib.sha256(NATIVE.replace(R10_DLL,'',1).encode()).hexdigest(),'9d1ba908d9defb93a6f9758f77b81a6d9fcac60cfe17516a34b73bf2f2f8204f')
+  self.assertEqual(hashlib.sha256(r10_source().replace(R10_DLL,'',1).encode()).hexdigest(),'9d1ba908d9defb93a6f9758f77b81a6d9fcac60cfe17516a34b73bf2f2f8204f')
+
+
+ def test_detached_child_exact_r10_inverse_and_fixed_flags(self):
+  self.assertEqual(hashlib.sha256(r10_source().encode()).hexdigest(),'bad583c5411f75124d903e019a2bac1ef38f28595d698e35b58c13bf7e3ed2d2')
+  self.assertEqual(NATIVE.count('DETACHED_PROCESS'),2)
+  self.assertNotIn('CREATE_NO_WINDOW',NATIVE)
+  self.assertNotIn('CREATE_NEW_CONSOLE',NATIVE)
+  self.assertNotIn('CREATE_BREAKAWAY',NATIVE)
+  self.assertEqual(4|8|0x400,0x40c)
+  self.assertIn('false,\n        CREATE_SUSPENDED | DETACHED_PROCESS | CREATE_UNICODE_ENVIRONMENT, env, Root',NATIVE)
+  self.assertLess(NATIVE.index('N.AssignProcessToJobObject'),NATIVE.index('N.ResumeThread'))
+  self.assertIn('if (!(accounting.Active == 1)) throw new Refused',NATIVE)
 
 if __name__=='__main__':unittest.main()

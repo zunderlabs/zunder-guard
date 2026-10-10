@@ -22,7 +22,7 @@ internal static class PhaseZero {
   const int Port = 18547;
   const int LimitMs = 120000;
   const uint FileAll = 0x001f01ff, FileReadExecute = 0x001200a9;
-  const uint CREATE_SUSPENDED = 4, CREATE_NO_WINDOW = 0x08000000, CREATE_UNICODE_ENVIRONMENT = 0x400;
+  const uint CREATE_SUSPENDED = 4, DETACHED_PROCESS = 8, CREATE_UNICODE_ENVIRONMENT = 0x400;
   static readonly byte[] MarkerBytes = Encoding.ASCII.GetBytes("zunder-no-key-native-phase-zero-v1\n");
   static readonly ManualResetEvent ServiceStop = new ManualResetEvent(false);
   static N.ServiceMain MainDelegate = ServiceMain;
@@ -480,7 +480,7 @@ internal static class PhaseZero {
       ServiceCheckpoint = 6; var start = new N.STARTUPINFO { Size = Marshal.SizeOf(typeof(N.STARTUPINFO)) }; var pi = new N.PROCESS_INFORMATION();
       IntPtr env = Marshal.StringToHGlobalUni("SystemRoot=C:\\Windows\0WINDIR=C:\\Windows\0PATH=C:\\Windows\\System32\0\0");
       try { Win(N.CreateProcessW(Exe, new StringBuilder("\"" + Exe + "\" --child"), IntPtr.Zero, IntPtr.Zero, false,
-        CREATE_SUSPENDED | CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT, env, Root, ref start, out pi), "process"); }
+        CREATE_SUSPENDED | DETACHED_PROCESS | CREATE_UNICODE_ENVIRONMENT, env, Root, ref start, out pi), "process"); }
       finally { Marshal.FreeHGlobal(env); }
       child = new H(pi.Process, false); thread = new H(pi.Thread, false);
       ServiceCheckpoint = 7; if (!N.AssignProcessToJobObject(job.P, child.P)) { N.TerminateProcess(child.P, 1); N.WaitForSingleObject(child.P, 5000); throw new Refused("job", 0); }
