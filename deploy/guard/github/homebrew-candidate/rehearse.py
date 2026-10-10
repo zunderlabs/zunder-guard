@@ -46,6 +46,12 @@ PUBLIC_REASONS={
  'Owned launchd service remains loaded':'service-remains-loaded',
  'Owned systemd service remains active':'service-remains-active',
  'Actual paper status JSON object required':'paper-status-shape-refused',
+ 'Refused group signal has a live or unknown member':'owned-zombie-group-identity-refused',
+ 'Complete process group readback required':'owned-zombie-group-shape-refused',
+ 'Bounded process group readback required':'owned-zombie-group-output-bound',
+ 'Direct child status unknown':'owned-direct-child-state-refused',
+ 'Bounded direct child status required':'owned-direct-child-output-bound',
+ 'Owned group signal was refused':'owned-group-signal-refused',
 }
 def public_failure(error,step,command=None,exit_code=None):
  # No exception text, subprocess output, argv/path, logs or client fields leave memory.
@@ -148,13 +154,16 @@ class Rehearsal:
       # Darwin refuses signals to an all-zombie group. WNOWAIT retains our
       # original group leader, so its ID cannot be reused during this readback.
       need(platform.system()=='Darwin','Owned group signal was refused')
-      probe=subprocess.run(['/bin/ps','-axo','pid=,pgid=,uid=,stat='],stdin=subprocess.DEVNULL,
+      # Darwin ps is a vendor setuid program: uid is effective UID, while
+      # ruid retains the original launcher owner. Still require the unreaped
+      # leader, its pinned group, and every member to be an owned zombie.
+      probe=subprocess.run(['/bin/ps','-axo','pid=,pgid=,ruid=,stat='],stdin=subprocess.DEVNULL,
        stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,env=self.env,timeout=5,check=True)
       need(len(probe.stdout)<=1048576,'Bounded process group readback required')
       rows=[line.split()for line in probe.stdout.decode('ascii').splitlines()]
       need(all(len(row)==4 for row in rows),'Complete process group readback required')
       group=[row for row in rows if int(row[1])==child.pid]
-      need(any(int(row[0])==child.pid for row in group)and
+      need(sum(int(row[0])==child.pid for row in group)==1 and
        all(int(row[2])==os.getuid()and row[3].startswith('Z')for row in group),
        'Refused group signal has a live or unknown member')
     finally:
