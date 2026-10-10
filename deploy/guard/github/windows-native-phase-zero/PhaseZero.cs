@@ -344,7 +344,7 @@ internal static class PhaseZero {
       catch (SocketException e) {
         if (e.SocketErrorCode == SocketError.ConnectionRefused) return true;
         if (e.SocketErrorCode != SocketError.WouldBlock && e.SocketErrorCode != SocketError.InProgress) { failedCode = 0x4c430002; return false; }
-        if (!socket.Poll(1000000, SelectMode.SelectError)) { failedCode = 0x4c430003; return false; }
+        if (!socket.Poll(5000000, SelectMode.SelectError)) { failedCode = 0x4c430003; return false; }
         if ((int)socket.GetSocketOption(SocketOptionLevel.Socket, SocketOptionName.Error) == (int)SocketError.ConnectionRefused) return true;
         failedCode = 0x4c430004; return false;
       }

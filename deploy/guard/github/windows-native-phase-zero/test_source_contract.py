@@ -7,7 +7,8 @@ import re
 import unittest
 
 HERE=Path(__file__).parent
-ACTUAL_NATIVE=(HERE/'PhaseZero.cs').read_text()
+R14_NATIVE=(HERE/'PhaseZero.cs').read_text()
+ACTUAL_NATIVE=R14_NATIVE.replace('if (!socket.Poll(5000000, SelectMode.SelectError))','if (!socket.Poll(1000000, SelectMode.SelectError))',1)
 _R13_OLD_HELPER='  static bool RefusedConnect() {\n    using (var socket = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp)) {\n      socket.Blocking = false;\n      try { socket.Connect(IPAddress.Loopback, Port); return false; }\n      catch (SocketException e) {\n        if (e.SocketErrorCode == SocketError.ConnectionRefused) return true;\n        if (e.SocketErrorCode != SocketError.WouldBlock && e.SocketErrorCode != SocketError.InProgress) return false;\n        return socket.Poll(1000000, SelectMode.SelectError) && (int)socket.GetSocketOption(SocketOptionLevel.Socket, SocketOptionName.Error) == (int)SocketError.ConnectionRefused;\n      }\n    }\n  }\n'
 _R13_NEW_HELPER='  static bool RefusedConnect(out uint failedCode) {\n    failedCode = 0;\n    using (var socket = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp)) {\n      socket.Blocking = false;\n      try { socket.Connect(IPAddress.Loopback, Port); failedCode = 0x4c430001; return false; }\n      catch (SocketException e) {\n        if (e.SocketErrorCode == SocketError.ConnectionRefused) return true;\n        if (e.SocketErrorCode != SocketError.WouldBlock && e.SocketErrorCode != SocketError.InProgress) { failedCode = 0x4c430002; return false; }\n        if (!socket.Poll(1000000, SelectMode.SelectError)) { failedCode = 0x4c430003; return false; }\n        if ((int)socket.GetSocketOption(SocketOptionLevel.Socket, SocketOptionName.Error) == (int)SocketError.ConnectionRefused) return true;\n        failedCode = 0x4c430004; return false;\n      }\n    }\n  }\n'
 _R13_OLD_CLEANUP='            if (listenerObserved && ListenerPids().Count == 0 && RefusedConnect()) cleanup["listener"] = "OBSERVED_ABSENT";'
@@ -459,5 +460,20 @@ class SourceContract(unittest.TestCase):
    value['outcome']='OBSERVED';self.assertFalse(report_model(json.dumps(value,separators=(',',':'))))
   for forbidden in ('Thread.Sleep','while (','for (','Console','Json','QueryFull','File','Terminate'):
    self.assertNotIn(forbidden,_R13_NEW_HELPER)
+
+
+ def test_refusal_wait_exact_r13_inverse_and_one_bounded_query(self):
+  self.assertEqual(hashlib.sha256(ACTUAL_NATIVE.encode()).hexdigest(),'2594e28889fb3a146f24bc93f4fea6cf823a3ae1c3bc7942f64ceda40ff4bac6')
+  start=R14_NATIVE.index('  static bool RefusedConnect(')
+  block=R14_NATIVE[start:R14_NATIVE.index('  static Dictionary<string, object> EmptyBoot()',start)]
+  self.assertEqual(block.count('socket.Connect('),1)
+  self.assertEqual(block.count('socket.Poll('),1)
+  self.assertEqual(block.count('socket.GetSocketOption('),1)
+  self.assertIn('if (!socket.Poll(5000000, SelectMode.SelectError))',block)
+  self.assertIn('== (int)SocketError.ConnectionRefused',block)
+  self.assertIn('failedCode = 0x4c430003; return false;',block)
+  for forbidden in ('Thread.Sleep','while (','for (','SelectWrite','socket.ConnectAsync'):
+   self.assertNotIn(forbidden,block)
+  self.assertLess(5000000//1000,180000)
 
 if __name__=='__main__':unittest.main()
