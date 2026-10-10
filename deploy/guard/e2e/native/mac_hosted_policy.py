@@ -46,6 +46,29 @@ def power_settings(text):
     return sections
 
 
+def power_diagnostic(text):
+    """Bounded observation only; never exports provider text or changes admission."""
+    refused={'format_observed':False,'section_count':0,'required':{
+        key:{'present_in_all':False,'zero_in_all':False}
+        for key in('hibernatemode','standby','autopoweroff')}}
+    if type(text)is not str or len(text)>65536:return refused
+    sections=[];current=None
+    for line in text.splitlines():
+        if re.fullmatch(r'(?:Battery|AC|UPS) Power:',line.strip()):
+            current={};sections.append(current)
+            if len(sections)>3:return refused
+            continue
+        if not line.strip():continue
+        pair=line.split()
+        if current is None or len(pair)!=2 or pair[0]in current:return refused
+        current[pair[0]]=pair[1]
+    if not sections:return refused
+    return {'format_observed':True,'section_count':len(sections),'required':{
+        key:{'present_in_all':all(key in section for section in sections),
+             'zero_in_all':all(section.get(key)=='0'for section in sections)}
+        for key in('hibernatemode','standby','autopoweroff')}}
+
+
 def inspect_sleep_and_core(paths=(Path('/private/var/vm/sleepimage'),Path('/var/vm/sleepimage'),Path('/cores'))):
     for path in paths:
         if not os.path.lexists(path):continue
@@ -144,7 +167,9 @@ def probe(*,deadline=None):
         commands={'swap':['/usr/sbin/sysctl','-n','vm.swapusage'],'vault':['/usr/bin/fdesetup','status'],
                   'power':['/usr/bin/pmset','-g','custom'],'core':['/usr/sbin/sysctl','-n','kern.coredump']}
         for name,argv in commands.items():
-            try:values[name]=public(argv,deadline=original_deadline);checks[name]={'observed':True,'passed':None}
+            try:
+                values[name]=public(argv,deadline=original_deadline);checks[name]={'observed':True,'passed':None}
+                if name=='power':checks[name]['diagnostic']=power_diagnostic(values[name])
             except BaseException:checks[name]={'observed':False,'passed':False,'reason':'readback-unavailable'}
         try:inspect_sleep_and_core();checks['sleep_image_and_core_inventory']={'observed':True,'passed':True}
         except BaseException:checks['sleep_image_and_core_inventory']={'observed':False,'passed':False,'reason':'inventory-refused-or-unavailable'}

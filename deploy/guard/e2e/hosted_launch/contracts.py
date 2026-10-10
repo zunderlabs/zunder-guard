@@ -53,7 +53,7 @@ def sha(value, length=64):
 
 def relative(value):
     need(type(value) is str and 0 < len(value) <= 1024 and
-         re.fullmatch('[A-Za-z0-9_./+@-]+', value) and
+         re.fullmatch(r'[A-Za-z0-9_./+@$\[\]-]+', value) and
          not value.startswith('/') and all(p not in ('', '.', '..') for p in value.split('/')),
          'Safe complete source member required')
     return value
