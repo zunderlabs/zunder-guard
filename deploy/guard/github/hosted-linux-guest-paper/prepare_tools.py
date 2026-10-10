@@ -20,7 +20,7 @@ def policy():
         need('/'not in name and name not in('.','..')and sha(regular(HERE/name))==digest,'public-source-pin-differs')
     row=json.loads(regular(HERE/'tool-source.json'))
     need(set(row)=={'schema','snapshot','base_url','suites','components','architecture','keyring','packages','inrelease'}and type(row['schema'])is int and row['schema']==1 and row['snapshot']=='20260911T000000Z'and row['base_url']=='https://snapshot.ubuntu.com/ubuntu/20260911T000000Z/'and row['suites']==['noble','noble-updates','noble-security']and row['components']==['main','universe']and row['architecture']=='amd64'and row['keyring']=='/usr/share/keyrings/ubuntu-archive-keyring.gpg'and row['packages']==PACKAGES and set(row['inrelease'])==set(row['suites']),'fixed-official-package-policy-refused')
-    key=Path(row['keyring']);s=key.lstat();need(stat.S_ISREG(s.st_mode)and s.st_uid==0 and not s.st_mode&0o022,'vendor-archive-trust-anchor-refused')
+    key=Path(row['keyring']);s=key.lstat();need(stat.S_ISREG(s.st_mode)and s.st_uid==0 and not s.st_mode&0o022,'vendor-archive-trust-anchor-refused:mode='+oct(s.st_mode)+';uid='+str(s.st_uid))
     return row
 def options(stage):
     return ['-o','Dir::Etc::sourcelist='+str(stage/'sources.list'),'-o','Dir::Etc::sourceparts=-','-o','Dir::Etc::parts=-','-o','Dir::Etc::main=-',
