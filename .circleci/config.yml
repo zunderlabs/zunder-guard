@@ -1,0 +1,39 @@
+version: 2.1
+jobs:
+  no-key-mac-capability:
+    macos:
+      xcode: "26.4.1"
+    resource_class: m4pro.medium
+    steps:
+      - checkout
+      - run:
+          name: Fixed public observational context
+          command: |
+            set -eu
+            test "$CIRCLE_PROJECT_USERNAME" = zunderlabs
+            test "$CIRCLE_PROJECT_REPONAME" = zunder-guard
+            test "$CIRCLE_BRANCH" = codex/no-key-free-mac-capability
+            test -z "${CIRCLE_TAG:-}"
+            test -z "${CIRCLE_PULL_REQUEST:-}"
+            test "$CIRCLE_SHA1" = "$(git rev-parse HEAD)"
+            test -z "$(git status --porcelain)"
+            /usr/bin/python3 -I -B -m unittest discover -s deploy/guard/e2e/free_mac_probe -p 'test_*.py'
+      - run:
+          name: Twenty second read-only root probe
+          no_output_timeout: 1m
+          command: |
+            set -eu
+            umask 077
+            sudo -n /usr/bin/env -i PATH=/usr/bin:/bin LANG=C LC_ALL=C /usr/bin/python3 -I -B deploy/guard/e2e/free_mac_probe/probe.py --provider circleci --source-commit "$CIRCLE_SHA1" > capability-report.json 2>/dev/null
+      - store_artifacts:
+          path: capability-report.json
+          destination: capability-report.json
+workflows:
+  no-key-free-mac-capability:
+    jobs:
+      - no-key-mac-capability:
+          filters:
+            branches:
+              only: codex/no-key-free-mac-capability
+            tags:
+              ignore: /.*/

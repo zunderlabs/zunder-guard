@@ -1,0 +1,32 @@
+workflows:
+  no-key-free-mac-capability:
+    name: Fixed public no-key Mac observations
+    instance_type: mac_mini_m2
+    max_build_duration: 5
+    environment:
+      xcode: "26.4.1"
+    triggering:
+      events:
+        - push
+      branch_patterns:
+        - pattern: codex/no-key-free-mac-capability
+          include: true
+          source: true
+    scripts:
+      - name: Fixed public observational context
+        script: |
+          set -eu
+          test "$CM_REPO_SLUG" = zunderlabs/zunder-guard
+          test "$CM_BRANCH" = codex/no-key-free-mac-capability
+          test "$CM_PULL_REQUEST" = false
+          test -z "${CM_TAG:-}"
+          test "$CM_COMMIT" = "$(git rev-parse HEAD)"
+          test -z "$(git status --porcelain)"
+          /usr/bin/python3 -I -B -m unittest discover -s deploy/guard/e2e/free_mac_probe -p 'test_*.py'
+      - name: Twenty second read-only root probe
+        script: |
+          set -eu
+          umask 077
+          sudo -n /usr/bin/env -i PATH=/usr/bin:/bin LANG=C LC_ALL=C /usr/bin/python3 -I -B deploy/guard/e2e/free_mac_probe/probe.py --provider codemagic --source-commit "$CM_COMMIT" > capability-report.json 2>/dev/null
+    artifacts:
+      - capability-report.json
