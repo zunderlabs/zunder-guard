@@ -336,14 +336,17 @@ internal static class PhaseZero {
     ulong start = N.GetTickCount64(); do { if (predicate()) return; Thread.Sleep(50); } while (N.GetTickCount64() - start < (ulong)bound);
     throw new Refused(c, 0);
   }
-  static bool RefusedConnect() {
+  static bool RefusedConnect(out uint failedCode) {
+    failedCode = 0;
     using (var socket = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp)) {
       socket.Blocking = false;
-      try { socket.Connect(IPAddress.Loopback, Port); return false; }
+      try { socket.Connect(IPAddress.Loopback, Port); failedCode = 0x4c430001; return false; }
       catch (SocketException e) {
         if (e.SocketErrorCode == SocketError.ConnectionRefused) return true;
-        if (e.SocketErrorCode != SocketError.WouldBlock && e.SocketErrorCode != SocketError.InProgress) return false;
-        return socket.Poll(1000000, SelectMode.SelectError) && (int)socket.GetSocketOption(SocketOptionLevel.Socket, SocketOptionName.Error) == (int)SocketError.ConnectionRefused;
+        if (e.SocketErrorCode != SocketError.WouldBlock && e.SocketErrorCode != SocketError.InProgress) { failedCode = 0x4c430002; return false; }
+        if (!socket.Poll(1000000, SelectMode.SelectError)) { failedCode = 0x4c430003; return false; }
+        if ((int)socket.GetSocketOption(SocketOptionLevel.Socket, SocketOptionName.Error) == (int)SocketError.ConnectionRefused) return true;
+        failedCode = 0x4c430004; return false;
       }
     }
   }
@@ -437,7 +440,12 @@ internal static class PhaseZero {
             cleanup["processes"] = startedService ? (serviceProcess != null && child != null ? "OBSERVED_TERMINAL" : "UNKNOWN") : "NOT_CREATED";
             Win(N.DeleteService(service.P), "cleanup"); service.Dispose(); service = null;
             Poll(delegate { return ServiceMissing(scm); }, 10000, "cleanup"); cleanup["scm"] = "OBSERVED_ABSENT";
-            if (listenerObserved && ListenerPids().Count == 0 && RefusedConnect()) cleanup["listener"] = "OBSERVED_ABSENT";
+            if (listenerObserved) {
+              uint listenerCode = 0;
+              if (ListenerPids().Count != 0) listenerCode = 0x4c430005;
+              else if (RefusedConnect(out listenerCode)) cleanup["listener"] = "OBSERVED_ABSENT";
+              if (listenerCode != 0) { report["error_class"] = "cleanup"; report["error_code"] = listenerCode; }
+            }
             // Marker/root use original deletion handles; image joins a new handle to the retained READ identity/hash.
             bool filesGone = true;
             if (marker != null) { FileFacts(marker, false, sid); filesGone &= DeleteFileHandle(marker, Marker); marker = null; }

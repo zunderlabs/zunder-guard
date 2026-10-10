@@ -7,7 +7,12 @@ import re
 import unittest
 
 HERE=Path(__file__).parent
-CURRENT_NATIVE=(HERE/'PhaseZero.cs').read_text()
+ACTUAL_NATIVE=(HERE/'PhaseZero.cs').read_text()
+_R13_OLD_HELPER='  static bool RefusedConnect() {\n    using (var socket = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp)) {\n      socket.Blocking = false;\n      try { socket.Connect(IPAddress.Loopback, Port); return false; }\n      catch (SocketException e) {\n        if (e.SocketErrorCode == SocketError.ConnectionRefused) return true;\n        if (e.SocketErrorCode != SocketError.WouldBlock && e.SocketErrorCode != SocketError.InProgress) return false;\n        return socket.Poll(1000000, SelectMode.SelectError) && (int)socket.GetSocketOption(SocketOptionLevel.Socket, SocketOptionName.Error) == (int)SocketError.ConnectionRefused;\n      }\n    }\n  }\n'
+_R13_NEW_HELPER='  static bool RefusedConnect(out uint failedCode) {\n    failedCode = 0;\n    using (var socket = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp)) {\n      socket.Blocking = false;\n      try { socket.Connect(IPAddress.Loopback, Port); failedCode = 0x4c430001; return false; }\n      catch (SocketException e) {\n        if (e.SocketErrorCode == SocketError.ConnectionRefused) return true;\n        if (e.SocketErrorCode != SocketError.WouldBlock && e.SocketErrorCode != SocketError.InProgress) { failedCode = 0x4c430002; return false; }\n        if (!socket.Poll(1000000, SelectMode.SelectError)) { failedCode = 0x4c430003; return false; }\n        if ((int)socket.GetSocketOption(SocketOptionLevel.Socket, SocketOptionName.Error) == (int)SocketError.ConnectionRefused) return true;\n        failedCode = 0x4c430004; return false;\n      }\n    }\n  }\n'
+_R13_OLD_CLEANUP='            if (listenerObserved && ListenerPids().Count == 0 && RefusedConnect()) cleanup["listener"] = "OBSERVED_ABSENT";'
+_R13_NEW_CLEANUP='            if (listenerObserved) {\n              uint listenerCode = 0;\n              if (ListenerPids().Count != 0) listenerCode = 0x4c430005;\n              else if (RefusedConnect(out listenerCode)) cleanup["listener"] = "OBSERVED_ABSENT";\n              if (listenerCode != 0) { report["error_class"] = "cleanup"; report["error_code"] = listenerCode; }\n            }'
+CURRENT_NATIVE=ACTUAL_NATIVE.replace(_R13_NEW_HELPER,_R13_OLD_HELPER,1).replace(_R13_NEW_CLEANUP,_R13_OLD_CLEANUP,1)
 NATIVE=CURRENT_NATIVE.replace('return socket.Poll(1000000, SelectMode.SelectError) && (int)socket.GetSocketOption','return socket.Poll(1000000, SelectMode.SelectWrite) && (int)socket.GetSocketOption',1)
 GATE=(HERE/'ReportGate.cs').read_text()
 WRAPPER=(HERE/'probe.ps1').read_text()
@@ -437,5 +442,22 @@ class SourceContract(unittest.TestCase):
     if error!=10061:self.assertFalse(expected)
   self.assertIn('if (e.SocketErrorCode == SocketError.ConnectionRefused) return true;',block)
   self.assertIn('if (e.SocketErrorCode != SocketError.WouldBlock && e.SocketErrorCode != SocketError.InProgress) return false;',block)
+
+
+ def test_listener_diagnostic_exact_r12_inverse_and_closed_queries(self):
+  self.assertEqual(hashlib.sha256(CURRENT_NATIVE.encode()).hexdigest(),'b13e7778026955b95554d737aefb533353a10db17ef2d58cda518cf9a02f5a7f')
+  self.assertEqual(ACTUAL_NATIVE.count(_R13_NEW_HELPER),1)
+  self.assertEqual(ACTUAL_NATIVE.count(_R13_NEW_CLEANUP),1)
+  self.assertEqual(_R13_NEW_HELPER.count('socket.Poll('),1)
+  self.assertEqual(_R13_NEW_HELPER.count('socket.GetSocketOption('),1)
+  self.assertIn('socket.Poll(1000000, SelectMode.SelectError)',_R13_NEW_HELPER)
+  self.assertLess(_R13_NEW_HELPER.index('socket.Poll('),_R13_NEW_HELPER.index('socket.GetSocketOption('))
+  self.assertEqual(_R13_NEW_CLEANUP.count('ListenerPids()'),1)
+  for code in range(1,6):
+   value=json.loads(FIXTURES['cases'][0]['raw']);value.update(outcome='UNKNOWN',stage='job',error_class='cleanup',error_code=0x4c430000+code)
+   self.assertTrue(report_model(json.dumps(value,separators=(',',':'))))
+   value['outcome']='OBSERVED';self.assertFalse(report_model(json.dumps(value,separators=(',',':'))))
+  for forbidden in ('Thread.Sleep','while (','for (','Console','Json','QueryFull','File','Terminate'):
+   self.assertNotIn(forbidden,_R13_NEW_HELPER)
 
 if __name__=='__main__':unittest.main()
