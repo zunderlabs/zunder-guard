@@ -98,10 +98,11 @@ def deletion_model(original,current,expected):
  return all(original.get(k)==current.get(k)for k in ('volume','file_id'))
 
 R9_HELPER='  static uint FailedJobMembers(H job, uint childPid, uint servicePid) {\n    IntPtr buffer = Marshal.AllocHGlobal(72);\n    try {\n      uint returned; Win(N.QueryJobProcessIds(job.P, 3, buffer, 72, out returned), "job");\n      uint assigned = unchecked((uint)Marshal.ReadInt32(buffer, 0)); uint count = unchecked((uint)Marshal.ReadInt32(buffer, 4));\n      Need(count >= 1 && count <= 8 && assigned == count && returned >= 8U + count * 8U && returned <= 72, "job");\n      var seen = new Dictionary<uint, bool>(); uint mask = 0;\n      for (uint i = 0; i < count; i++) {\n        ulong raw = unchecked((ulong)Marshal.ReadInt64(buffer, checked(8 + (int)i * 8)));\n        Need(raw > 0 && raw <= uint.MaxValue, "job"); uint pid = (uint)raw;\n        Need(!seen.ContainsKey(pid), "job"); seen.Add(pid, true);\n        if (pid == childPid) mask |= 1U;\n        else if (pid == servicePid) mask |= 2U;\n        else if (pid == N.GetCurrentProcessId()) mask |= 4U;\n        else {\n          using (var process = new H(N.OpenProcess(0x1000, false, pid), false)) {\n            var image = new StringBuilder(32768); uint size = 32768;\n            Win(N.QueryFullProcessImageNameW(process.P, 0, image, ref size), "job");\n            Need(size > 0 && size < 32768, "job");\n            mask |= String.Equals(image.ToString(), @"C:\\Windows\\System32\\conhost.exe", StringComparison.OrdinalIgnoreCase) ? 8U : 16U;\n          }\n        }\n      }\n      return 0x4d420000U | mask;\n    } finally { Marshal.FreeHGlobal(buffer); }\n  }\n'
+R10_DLL='    [DllImport("kernel32.dll")] internal static extern uint GetCurrentProcessId();\n'
 R9_DLL='    [DllImport("kernel32.dll", EntryPoint = "QueryInformationJobObject", SetLastError = true)] internal static extern bool QueryJobProcessIds(IntPtr h, int c, IntPtr buffer, uint n, out uint returned);\n'
 
 def r8_source():
- return NATIVE.replace(R9_HELPER,'',1).replace(R9_DLL,'',1).replace('FailedJobMembers(job, pids[0], servicePid)','accounting.Active <= 65535U ? 0x41430000U + accounting.Active : 0x4a4f420dU',1)
+ return NATIVE.replace(R10_DLL,'',1).replace(R9_HELPER,'',1).replace(R9_DLL,'',1).replace('FailedJobMembers(job, pids[0], servicePid)','accounting.Active <= 65535U ? 0x41430000U + accounting.Active : 0x4a4f420dU',1)
 
 def r7_source():
  return r8_source().replace('        if (!(accounting.Active == 1)) throw new Refused("ownership", accounting.Active <= 65535U ? 0x41430000U + accounting.Active : 0x4a4f420dU);','        if (!(accounting.Active == 1)) throw new Refused("ownership", 0x4a4f420d);',1)
@@ -392,5 +393,15 @@ class SourceContract(unittest.TestCase):
   for count in range(1,9):
    self.assertLessEqual(8+count*8,72)
   self.assertGreater(8+9*8,72)
+
+
+ def test_native_references_have_fixed_declared_source_symbols(self):
+  native_class=NATIVE[NATIVE.index('  static class N {'):]
+  refs=set(re.findall(r'\bN\.([A-Za-z_]\w*)',NATIVE))
+  declarations=set(re.findall(r'internal (?:static extern [\w]+|struct|delegate [\w]+) ([A-Za-z_]\w*)',native_class))
+  self.assertEqual(refs-declarations,set())
+  self.assertGreater(len(refs),60)
+  self.assertEqual(NATIVE.count(R10_DLL),1)
+  self.assertEqual(hashlib.sha256(NATIVE.replace(R10_DLL,'',1).encode()).hexdigest(),'9d1ba908d9defb93a6f9758f77b81a6d9fcac60cfe17516a34b73bf2f2f8204f')
 
 if __name__=='__main__':unittest.main()

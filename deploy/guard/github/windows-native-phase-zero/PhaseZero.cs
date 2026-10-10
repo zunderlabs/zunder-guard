@@ -563,6 +563,7 @@ internal static class PhaseZero {
     [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)] internal static extern uint GetModuleFileNameW(IntPtr module, StringBuilder path, int size);
     [DllImport("kernel32.dll", SetLastError = true)] internal static extern IntPtr GetModuleHandleW([MarshalAs(UnmanagedType.LPWStr)] string name);
     [DllImport("kernel32.dll", SetLastError = true)] internal static extern IntPtr LoadLibraryExW([MarshalAs(UnmanagedType.LPWStr)] string name, IntPtr file, uint flags);
+    [DllImport("kernel32.dll")] internal static extern uint GetCurrentProcessId();
     [DllImport("kernel32.dll")] internal static extern IntPtr GetCurrentProcess();
     [DllImport("kernel32.dll", SetLastError = true)] internal static extern IntPtr OpenProcess(uint access, bool inherit, uint pid);
     [DllImport("kernel32.dll", SetLastError = true)] internal static extern bool GetProcessTimes(IntPtr h, out FILETIME created, out FILETIME exited, out FILETIME kernel, out FILETIME user);
