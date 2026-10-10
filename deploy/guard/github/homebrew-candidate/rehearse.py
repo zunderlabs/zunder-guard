@@ -13,14 +13,14 @@ def digest(path):return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 def formula_override(original,directory):
  text=original.decode('utf-8');changed=text
  for target in('darwin-amd64','darwin-arm64','linux-amd64','linux-arm64'):
-  name='zunder-guard-v1.0.4-'+target+'.tar.gz'
-  old='https://github.com/zunderlabs/zunder-guard/releases/download/v1.0.4/'+name
+  name='zunder-guard-v1.0.5-'+target+'.tar.gz'
+  old='https://github.com/zunderlabs/zunder-guard/releases/download/v1.0.5/'+name
   need(text.count(old)==1,'Exact signed formula archive URL required')
   changed=changed.replace(old,(directory/name).as_uri())
  reversed_text=changed
  for target in('darwin-amd64','darwin-arm64','linux-amd64','linux-arm64'):
-  name='zunder-guard-v1.0.4-'+target+'.tar.gz'
-  reversed_text=reversed_text.replace((directory/name).as_uri(),'https://github.com/zunderlabs/zunder-guard/releases/download/v1.0.4/'+name)
+  name='zunder-guard-v1.0.5-'+target+'.tar.gz'
+  reversed_text=reversed_text.replace((directory/name).as_uri(),'https://github.com/zunderlabs/zunder-guard/releases/download/v1.0.5/'+name)
  need(reversed_text==text,'Only candidate archive URLs may differ; service/caveats/checksums unchanged')
  return changed.encode('utf-8')
 
@@ -109,7 +109,7 @@ class Rehearsal:
   for key in('TMPDIR','XDG_RUNTIME_DIR','DBUS_SESSION_BUS_ADDRESS'):
    if key in os.environ:self.env[key]=os.environ[key]
   self.candidate=json.loads(Path(__file__).with_name('candidate.json').read_bytes())
-  self.selected='zunder-guard-v1.0.4-'+route()+'.tar.gz';verify(self.assets,self.candidate,self.selected)
+  self.selected='zunder-guard-v1.0.5-'+route()+'.tar.gz';verify(self.assets,self.candidate,self.selected)
   self.events=[];self.installed=False;self.tapped=False;self.owned_home=False;self.home=None;self.exe=None;self.stage='preflight';self.label=None;self.service_started=False;self.log=None;self.log_identity=None;self.manager_original=None;self.manager_prepared=False;self.failure=None;self.cleanup_failure=None;self.last_command=None;self.last_exit=None;self.service_step=None;self.readiness_failure=None;self.readiness_identity=None
  def live(self):need(time.monotonic()<self.end,'Original forty-minute public rehearsal ended')
  def run(self,argv,*,timeout=120,expected=0):
@@ -206,7 +206,7 @@ class Rehearsal:
     self.run([str(self.exe),'health'],timeout=10)
     row=json.loads(self.run([str(self.exe),'status','--json'],timeout=10))
     need(type(row)is dict,'Actual paper status JSON object required')
-    self.readiness_identity={'modeMatches':row.get('mode')=='paper','accountMatches':row.get('account')==PAPER_ACCOUNT,'versionMatches':row.get('version')=='1.0.4','twoClients':type(row.get('clients'))is list and len(row['clients'])==2}
+    self.readiness_identity={'modeMatches':row.get('mode')=='paper','accountMatches':row.get('account')==PAPER_ACCOUNT,'versionMatches':row.get('version')=='1.0.5','twoClients':type(row.get('clients'))is list and len(row['clients'])==2}
     need(all(self.readiness_identity.values()),'Actual paper candidate/account/pairing differs')
     actual=self.manager()
     if previous is not None:need((actual['pid'],actual['birth'])!=(previous['pid'],previous['birth']),'Service did not replace crashed/stopped process')

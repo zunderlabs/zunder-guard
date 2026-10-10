@@ -11,7 +11,7 @@ def route():
  return systems[platform.system()]+'-'+arches[platform.machine()]
 
 def verify(directory,candidate,selected):
- names=['SHA256SUMS','SHA256SUMS.sigstore.json','zunder-guard.rb','zunder-guard-v1.0.4.intoto.jsonl',selected]
+ names=['SHA256SUMS','SHA256SUMS.sigstore.json','zunder-guard.rb','zunder-guard-v1.0.5.intoto.jsonl',selected]
  for name in names:
   p=directory/name;s=p.lstat();row=candidate['files'][name]
   need(p.is_file()and not p.is_symlink()and s.st_nlink==1 and s.st_size==row['bytes']
@@ -21,10 +21,10 @@ def verify(directory,candidate,selected):
 def main():
  need(len(sys.argv)==2,'One exact public artifact output path required')
  candidate=json.loads(Path(__file__).with_name('candidate.json').read_bytes())
- need(candidate['tag']=='v1.0.4'and candidate['source']=='ddb3ce0b86cdfd094cfffd60dd8ea8073f20d844'
-      and candidate['manifest_sha256']=='59d94ded377d7834d7472c4ddede38154af8514a7cc76c27ac1c87db5305c09c','Fixed reviewed candidate required')
+ need(candidate['tag']=='v1.0.5'and candidate['source']=='0f64fa0f822fb2e9fffc414883ca843bd4e992a7'
+      and candidate['manifest_sha256']=='029c13981f216cf297f1c539e968c6e6dbe001d61ee4ee1f6496fea993ac06ad','Fixed reviewed candidate required')
  output=Path(sys.argv[1]);need(output.is_dir()and not output.is_symlink(),'Owned downloaded artifact directory required')
- selected='zunder-guard-v1.0.4-'+route()+'.tar.gz'
+ selected='zunder-guard-v1.0.5-'+route()+'.tar.gz'
  for name,row in candidate['files'].items():
   p=output/name;info=p.lstat()
   need(p.is_file()and not p.is_symlink()and info.st_uid==os.getuid()and info.st_nlink==1

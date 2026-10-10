@@ -9,29 +9,29 @@
 class ZunderGuard < Formula
   desc "Self-hosted risk firewall between trading bots or AI agents and Hyperliquid"
   homepage "https://zunderlabs.com"
-  version "1.0.4"
+  version "1.0.5"
   # Source-available, not open source: Elastic License 2.0.
   license "Elastic-2.0"
 
   on_macos do
     on_arm do
-      url "https://github.com/zunderlabs/zunder-guard/releases/download/v1.0.4/zunder-guard-v1.0.4-darwin-arm64.tar.gz"
-      sha256 "1b54077d94cb9945aa86aa83ad388b59eabb311089aeebc2f6c030986e031c9d"
+      url "https://github.com/zunderlabs/zunder-guard/releases/download/v1.0.5/zunder-guard-v1.0.5-darwin-arm64.tar.gz"
+      sha256 "224b1a95f07bdc0899b365ce2d2eeaf0f275db2e80465cdcb307bd4fd757e7d4"
     end
     on_intel do
-      url "https://github.com/zunderlabs/zunder-guard/releases/download/v1.0.4/zunder-guard-v1.0.4-darwin-amd64.tar.gz"
-      sha256 "15069f5e4ae18bc793f886188b48ecbb1222ede6750631a16e32ce552af6cee9"
+      url "https://github.com/zunderlabs/zunder-guard/releases/download/v1.0.5/zunder-guard-v1.0.5-darwin-amd64.tar.gz"
+      sha256 "2e8d9947fa392a0fea55e28615172f367592e1ed20835996bc577a61efce901b"
     end
   end
 
   on_linux do
     on_arm do
-      url "https://github.com/zunderlabs/zunder-guard/releases/download/v1.0.4/zunder-guard-v1.0.4-linux-arm64.tar.gz"
-      sha256 "0b9cc3e9869ed6f9b2e488c06207898b22c644f65ba0ba83d0ace21d8f586047"
+      url "https://github.com/zunderlabs/zunder-guard/releases/download/v1.0.5/zunder-guard-v1.0.5-linux-arm64.tar.gz"
+      sha256 "39f8581579a3dd58f1f8c6812e5ca3d49510a10026794bfb4394a37353b1c0da"
     end
     on_intel do
-      url "https://github.com/zunderlabs/zunder-guard/releases/download/v1.0.4/zunder-guard-v1.0.4-linux-amd64.tar.gz"
-      sha256 "28ffe6b20d61402fda00ab59b8bb86ae81d1a249117516e079f735b6fef61e6a"
+      url "https://github.com/zunderlabs/zunder-guard/releases/download/v1.0.5/zunder-guard-v1.0.5-linux-amd64.tar.gz"
+      sha256 "055073b2c813deafec8120f899e87e70c6a6d016e3c26d0a33a0da568136b295"
     end
   end
 
@@ -46,7 +46,8 @@ class ZunderGuard < Formula
   service do
     run [opt_bin/"zunder-guard", "run", "--network", "paper"]
     environment_variables ZUNDER_GUARD_HOME: var/"zunder-guard"
-    keep_alive successful_exit: false
+    # launchd uses SuccessfulExit=false; systemd needs crashed=true for on-failure.
+    keep_alive successful_exit: false, crashed: true
     log_path var/"log/zunder-guard.log"
     error_log_path var/"log/zunder-guard.log"
   end
