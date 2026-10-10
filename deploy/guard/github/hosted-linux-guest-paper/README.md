@@ -65,7 +65,14 @@ guest frames. QMP must report KVM present and enabled; TCG fallback is absent.
 The hosted image does not currently contain QEMU. A separate fixed preparation
 step uses only the official Ubuntu snapshot `20260911T000000Z`, exact three
 signed InRelease byte pins, Ubuntu archive keyring and isolated APT source/list/
-cache paths. APT authenticates Release → Packages → package bytes. The fixed six
+cache paths. The shared fixed archive keyring is read with O_NOFOLLOW, root
+ownership, one link, exact length and stable descriptor/path identity. Only the
+independently obtained 3,607-byte vendor SHA256 is admitted, even if the hosted
+file has writable mode bits. Verified bytes are copied once into the owned root
+0700 stage as a create-only 0600 file; Signed-By names only that copy. The shared
+file is never chmodded. A mismatch, race or short write refuses without fetching
+a replacement or retrying. Package provenance pins document the source of the
+public key bytes; package scripts are not used to obtain the key. APT authenticates Release → Packages → package bytes. The fixed six
 package names include QEMU, cloud-image-utils, genisoimage, gpgv and image keyring.
 Default repositories/config hooks, unsigned/insecure fallback, forced downgrade,
 guest apt, PPAs and unrelated daemons are absent. Packages and their OS dependency
@@ -102,6 +109,7 @@ are fixed and public; full guest logs and disks are deleted and never uploaded.
 ## Primary references
 
 - [Canonical image verification](https://ubuntu.com/docs/public-images/public-images-how-to/verify-image-checksum/)
+- [Ubuntu Noble archive keyring vendor package](https://packages.ubuntu.com/noble/all/ubuntu-keyring/download)
 - [Ubuntu snapshot service](https://ubuntu.com/server/docs/how-to/software/snapshot-service/)
 - [Ubuntu archive authentication](https://documentation.ubuntu.com/security/software-integrity/archive-verification/)
 - [QEMU character devices and options](https://www.qemu.org/docs/master/system/qemu-manpage.html)

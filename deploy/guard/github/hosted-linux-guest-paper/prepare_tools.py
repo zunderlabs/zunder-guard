@@ -4,6 +4,15 @@ from pathlib import Path
 HERE=Path(__file__).resolve().parent
 SAFE={'PATH':'/usr/sbin:/usr/bin:/sbin:/bin','HOME':'/root','LANG':'C.UTF-8','LC_ALL':'C.UTF-8','DEBIAN_FRONTEND':'noninteractive','APT_CONFIG':'/dev/null'}
 PACKAGES=['qemu-system-x86','qemu-utils','cloud-image-utils','genisoimage','gpgv','ubuntu-cloudimage-keyring']
+ARCHIVE_FILE=Path('/usr/share/keyrings/ubuntu-archive-keyring.gpg')
+ARCHIVE_VENDOR={
+    'anchor_bytes':3607,
+    'anchor_sha256':'80a36b0a6de2f69f49d2df75ef473ccde121e9e190b9ea01d20a4f63778d5c31',
+    'package_bytes':11124,
+    'package_sha256':'36de43b15853ccae0028e9a767613770c704833f82586f28eb262f0311adb8a8',
+    'package_url':'https://archive.ubuntu.com/ubuntu/pool/main/u/ubuntu-keyring/ubuntu-keyring_2023.11.28.1_all.deb',
+    'primary_url':'https://packages.ubuntu.com/noble/all/ubuntu-keyring/download',
+}
 SOURCE_FILES={'host.py','guest.py','acquire.py','prepare_tools.py','candidate.json','image-pins.json','tool-source.json','README.md'}
 def need(ok,reason):
     if not ok:raise RuntimeError(reason)
@@ -19,9 +28,46 @@ def policy():
     for name,digest in manifest['files'].items():
         need('/'not in name and name not in('.','..')and sha(regular(HERE/name))==digest,'public-source-pin-differs')
     row=json.loads(regular(HERE/'tool-source.json'))
-    need(set(row)=={'schema','snapshot','base_url','suites','components','architecture','keyring','packages','inrelease'}and type(row['schema'])is int and row['schema']==1 and row['snapshot']=='20260911T000000Z'and row['base_url']=='https://snapshot.ubuntu.com/ubuntu/20260911T000000Z/'and row['suites']==['noble','noble-updates','noble-security']and row['components']==['main','universe']and row['architecture']=='amd64'and row['keyring']=='/usr/share/keyrings/ubuntu-archive-keyring.gpg'and row['packages']==PACKAGES and set(row['inrelease'])==set(row['suites']),'fixed-official-package-policy-refused')
-    key=Path(row['keyring']);s=key.lstat();need(stat.S_ISREG(s.st_mode)and s.st_uid==0 and not s.st_mode&0o022,'vendor-archive-trust-anchor-refused:mode='+oct(s.st_mode)+';uid='+str(s.st_uid))
+    need(set(row)=={'schema','snapshot','base_url','suites','components','architecture','keyring','keyring_vendor','packages','inrelease'}and type(row['schema'])is int and row['schema']==1 and row['snapshot']=='20260911T000000Z'and row['base_url']=='https://snapshot.ubuntu.com/ubuntu/20260911T000000Z/'and row['suites']==['noble','noble-updates','noble-security']and row['components']==['main','universe']and row['architecture']=='amd64'and row['keyring']=='/usr/share/keyrings/ubuntu-archive-keyring.gpg'and row['keyring_vendor']==ARCHIVE_VENDOR and row['packages']==PACKAGES and set(row['inrelease'])==set(row['suites']),'fixed-official-package-policy-refused')
     return row
+def key_identity(s):
+    return(s.st_dev,s.st_ino,s.st_mode,s.st_uid,s.st_gid,s.st_nlink,s.st_size,s.st_mtime_ns,s.st_ctime_ns)
+def pinned_keyring():
+    # The shared hosted-image file is mutable. Never chmod it or trust its mode
+    # as authentication; use the independently obtained exact vendor byte pin.
+    for parent in(ARCHIVE_FILE.parent,ARCHIVE_FILE.parent.parent,Path('/usr'),Path('/')):
+        s=parent.lstat();need(stat.S_ISDIR(s.st_mode)and s.st_uid==0 and not s.st_mode&0o022,'vendor-keyring-parent-refused')
+    before=ARCHIVE_FILE.lstat()
+    need(stat.S_ISREG(before.st_mode)and before.st_uid==0 and before.st_nlink==1 and before.st_size==ARCHIVE_VENDOR['anchor_bytes'],'vendor-keyring-shape-refused')
+    fd=os.open(ARCHIVE_FILE,os.O_RDONLY|os.O_NOFOLLOW|os.O_CLOEXEC|os.O_NONBLOCK)
+    try:
+        opened=os.fstat(fd);need(key_identity(before)==key_identity(opened),'vendor-keyring-open-race')
+        raw=bytearray()
+        while len(raw)<=ARCHIVE_VENDOR['anchor_bytes']:
+            part=os.read(fd,ARCHIVE_VENDOR['anchor_bytes']+1-len(raw))
+            if not part:break
+            raw.extend(part)
+        need(key_identity(opened)==key_identity(os.fstat(fd))==key_identity(ARCHIVE_FILE.lstat()),'vendor-keyring-read-race')
+        need(len(raw)==ARCHIVE_VENDOR['anchor_bytes']and sha(raw)==ARCHIVE_VENDOR['anchor_sha256'],'vendor-keyring-byte-pin-differs')
+        return bytes(raw)
+    finally:os.close(fd)
+def stage_keyring(stage,raw):
+    s=stage.lstat();need(stat.S_ISDIR(s.st_mode)and s.st_uid==0 and stat.S_IMODE(s.st_mode)==0o700,'owned-keyring-stage-refused')
+    need(len(raw)==ARCHIVE_VENDOR['anchor_bytes']and sha(raw)==ARCHIVE_VENDOR['anchor_sha256'],'vendor-keyring-copy-pin-differs')
+    key=stage/'ubuntu-archive-keyring.gpg';fd=os.open(key,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW|os.O_CLOEXEC,0o600)
+    try:
+        # Unknown/short writes refuse; no retry or reopening/adoption.
+        need(os.write(fd,raw)==len(raw),'owned-keyring-write-incomplete');os.fsync(fd);written=os.fstat(fd)
+        need(stat.S_ISREG(written.st_mode)and written.st_uid==0 and stat.S_IMODE(written.st_mode)==0o600 and written.st_nlink==1 and written.st_size==len(raw),'owned-keyring-copy-refused')
+        need(key_identity(written)==key_identity(key.lstat()),'owned-keyring-copy-race')
+    finally:os.close(fd)
+    need(sha(regular(key))==ARCHIVE_VENDOR['anchor_sha256'],'owned-keyring-copy-changed')
+    return key
+def source_text(row,key):
+    return ''.join('deb [arch=amd64 signed-by='+str(key)+'] '+row['base_url']+' '+suite+' main universe\n'for suite in row['suites'])
+def cleanup_stage(stage,identity):
+    s=stage.lstat();need(stat.S_ISDIR(s.st_mode)and s.st_uid==0 and stat.S_IMODE(s.st_mode)==0o700 and(s.st_dev,s.st_ino)==identity,'tool-stage-ownership-differs')
+    shutil.rmtree(stage)
 def options(stage):
     return ['-o','Dir::Etc::sourcelist='+str(stage/'sources.list'),'-o','Dir::Etc::sourceparts=-','-o','Dir::Etc::parts=-','-o','Dir::Etc::main=-',
         '-o','Dir::State::lists='+str(stage/'lists'),'-o','Dir::Cache::archives='+str(stage/'archives'),'-o','Dir::Cache::pkgcache='+str(stage/'pkgcache.bin'),
@@ -46,14 +92,15 @@ def main():
     parser=argparse.ArgumentParser();parser.add_argument('--output',type=Path,required=True);args=parser.parse_args()
     need(os.geteuid()==0 and platform.system()=='Linux'and platform.machine()=='x86_64','disposable-hosted-LinuxAMD-required')
     resource.setrlimit(resource.RLIMIT_CORE,(0,0));os.umask(0o077);row=policy();args.output.mkdir(mode=0o700,parents=True,exist_ok=False)
-    receipt={'schema':1,'kind':'public-official-snapshot-tool-preparation','complete':False,'executionBound':False,'snapshot':row['snapshot'],'inrelease':row['inrelease'],'packages':PACKAGES,'serviceOrGuestStarted':False,'cleanupConfirmed':False}
+    receipt={'schema':1,'kind':'public-official-snapshot-tool-preparation','complete':False,'executionBound':False,'snapshot':row['snapshot'],'inrelease':row['inrelease'],'packages':PACKAGES,'keyringVendor':ARCHIVE_VENDOR,'keyringCopied':False,'serviceOrGuestStarted':False,'cleanupConfirmed':False}
     def interrupted(signum,frame):raise RuntimeError('tool-preparation-interrupted')
     for sig in(signal.SIGTERM,signal.SIGINT,signal.SIGHUP):signal.signal(sig,interrupted)
     stage=None;identity=None
     try:
         stage=Path(tempfile.mkdtemp(prefix='zunder-public-tool-source-',dir='/var/tmp'));s=stage.lstat();identity=(s.st_dev,s.st_ino)
+        key=stage_keyring(stage,pinned_keyring());receipt['keyringCopied']=True
         for name in('lists','archives'):(stage/name/'partial').mkdir(mode=0o700,parents=True)
-        text=''.join('deb [arch=amd64 signed-by='+row['keyring']+'] '+row['base_url']+' '+suite+' main universe\n'for suite in row['suites'])
+        text=source_text(row,key)
         (stage/'sources.list').write_text(text);(stage/'sources.list').chmod(0o600)
         receipt['lastStage']='authenticate-original-snapshot'
         fixed=options(stage);run_fixed(['/usr/bin/apt-get',*fixed,'update'],240);verify_lists(stage,row)
@@ -66,7 +113,7 @@ def main():
     finally:
         try:
             if stage is not None:
-                s=stage.lstat();need(stat.S_ISDIR(s.st_mode)and s.st_uid==0 and(s.st_dev,s.st_ino)==identity,'tool-stage-ownership-differs');shutil.rmtree(stage)
+                cleanup_stage(stage,identity)
             receipt['cleanupConfirmed']=True
         except BaseException:receipt['complete']=False
         (args.output/'receipt.json').write_bytes(canonical(receipt)+b'\n');(args.output/'receipt.json').chmod(0o644);args.output.chmod(0o755)

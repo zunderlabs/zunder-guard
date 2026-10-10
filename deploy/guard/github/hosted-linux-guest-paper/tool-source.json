@@ -1,1 +1,37 @@
-{"architecture":"amd64","base_url":"https://snapshot.ubuntu.com/ubuntu/20260911T000000Z/","components":["main","universe"],"inrelease":{"noble":"cdb2f31d809f589719a53c6ad15f255b27569c4059542ada282aaa21b8e164b0","noble-security":"1f35bbac35092dcc85517806c3fbecead38cc215cd985f89bea5abdcdab5798d","noble-updates":"2fb2c5418c54004245ca902a4446dee50c444c0d8afa2a1cac6550a770b003e4"},"keyring":"/usr/share/keyrings/ubuntu-archive-keyring.gpg","packages":["qemu-system-x86","qemu-utils","cloud-image-utils","genisoimage","gpgv","ubuntu-cloudimage-keyring"],"schema":1,"snapshot":"20260911T000000Z","suites":["noble","noble-updates","noble-security"]}
+{
+  "architecture": "amd64",
+  "base_url": "https://snapshot.ubuntu.com/ubuntu/20260911T000000Z/",
+  "components": [
+    "main",
+    "universe"
+  ],
+  "inrelease": {
+    "noble": "cdb2f31d809f589719a53c6ad15f255b27569c4059542ada282aaa21b8e164b0",
+    "noble-security": "1f35bbac35092dcc85517806c3fbecead38cc215cd985f89bea5abdcdab5798d",
+    "noble-updates": "2fb2c5418c54004245ca902a4446dee50c444c0d8afa2a1cac6550a770b003e4"
+  },
+  "keyring": "/usr/share/keyrings/ubuntu-archive-keyring.gpg",
+  "keyring_vendor": {
+    "anchor_bytes": 3607,
+    "anchor_sha256": "80a36b0a6de2f69f49d2df75ef473ccde121e9e190b9ea01d20a4f63778d5c31",
+    "package_bytes": 11124,
+    "package_sha256": "36de43b15853ccae0028e9a767613770c704833f82586f28eb262f0311adb8a8",
+    "package_url": "https://archive.ubuntu.com/ubuntu/pool/main/u/ubuntu-keyring/ubuntu-keyring_2023.11.28.1_all.deb",
+    "primary_url": "https://packages.ubuntu.com/noble/all/ubuntu-keyring/download"
+  },
+  "packages": [
+    "qemu-system-x86",
+    "qemu-utils",
+    "cloud-image-utils",
+    "genisoimage",
+    "gpgv",
+    "ubuntu-cloudimage-keyring"
+  ],
+  "schema": 1,
+  "snapshot": "20260911T000000Z",
+  "suites": [
+    "noble",
+    "noble-updates",
+    "noble-security"
+  ]
+}
