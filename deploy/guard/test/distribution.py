@@ -59,6 +59,21 @@ class DockerBuildContext(unittest.TestCase):
         self.assertEqual(patterns[final_allow + 1:], exclusions)
 
 
+class HomebrewServicePolicy(unittest.TestCase):
+    """Formula policy contract; native lifecycle remains a separate hosted check."""
+    def test_restart_policy_covers_systemd_and_preserves_launchd(self):
+        text = (GUARD / 'packaging/homebrew/zunder-guard.rb.in').read_text()
+        service = text.split('  service do\n', 1)[1].split('\n  end', 1)[0]
+        policy = [line.strip() for line in service.splitlines()
+                  if line.strip().startswith('keep_alive ')]
+        # Homebrew selects SuccessfulExit by key presence for launchd, but
+        # requires a truthy :crashed or :always value for systemd on-failure.
+        # successful_exit:false alone silently omits Linux's Restart directive.
+        self.assertEqual(policy, ['keep_alive successful_exit: false, crashed: true'])
+        self.assertIn('run [opt_bin/"zunder-guard", "run", "--network", "paper"]', service)
+        self.assertIn('environment_variables ZUNDER_GUARD_HOME: var/"zunder-guard"', service)
+
+
 class ReleaseRendering(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()

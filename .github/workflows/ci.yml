@@ -449,8 +449,8 @@ jobs:
         run: python3 -B deploy/guard/github/test_flow_shards.py
       - name: Container supervisor contract (synthetic only; no native restart claim)
         run: python3 -B deploy/guard/test/container-supervisor.py
-      - name: Docker build context admission and exclusions
-        run: python3 -B deploy/guard/test/distribution.py DockerBuildContext
+      - name: Docker build context and Homebrew service policy
+        run: python3 -B deploy/guard/test/distribution.py DockerBuildContext HomebrewServicePolicy
       - name: Container installer transaction and ownership checks
         run: python3 -B deploy/guard/test/container-installer.py
       - name: Protected testnet credential dispatch checks
