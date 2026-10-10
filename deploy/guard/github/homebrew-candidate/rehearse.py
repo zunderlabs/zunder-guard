@@ -24,6 +24,76 @@ def formula_override(original,directory):
  need(reversed_text==text,'Only candidate archive URLs may differ; service/caveats/checksums unchanged')
  return changed.encode('utf-8')
 
+PUBLIC_REASONS={
+ 'Generated systemd recipe differs':'systemd-recipe-mismatch',
+ 'Generated launchd recipe differs':'launchd-recipe-mismatch',
+ 'Foreign service definition refused':'service-recipe-ownership-refused',
+ 'One actual generated systemd definition required':'systemd-recipe-missing-or-ambiguous',
+ 'One actual generated launchd definition required':'launchd-recipe-missing-or-ambiguous',
+ 'Actual paper candidate/account/pairing differs':'paper-status-identity-mismatch',
+ 'Actual paper readiness unknown':'paper-readiness-timeout',
+ 'Actual paper service is not active':'service-not-active',
+ 'Actual systemd service PID required':'service-pid-missing',
+ 'Actual owned launchd PID required':'service-pid-missing',
+ 'Actual owned paper command differs':'service-command-mismatch',
+ 'Actual service birth required':'service-birth-missing',
+ 'Service did not replace crashed/stopped process':'service-process-not-replaced',
+ 'Fixed public rehearsal command failed':'fixed-command-failed',
+ 'Fixed public command timeout':'fixed-command-timeout',
+ 'Original forty-minute public rehearsal ended':'original-deadline-expired',
+ 'Public command output exceeded bound':'command-output-bound',
+ 'Paper listener remains after stop':'listener-remains-after-stop',
+ 'Owned launchd service remains loaded':'service-remains-loaded',
+ 'Owned systemd service remains active':'service-remains-active',
+ 'Actual paper status JSON object required':'paper-status-shape-refused',
+}
+def public_failure(error,step,command=None,exit_code=None):
+ # No exception text, subprocess output, argv/path, logs or client fields leave memory.
+ reason=PUBLIC_REASONS.get(str(error),'unclassified-check-refusal')if type(error)is RuntimeError else 'unexpected-error'
+ if isinstance(error,OSError):reason='local-io-error'
+ elif isinstance(error,(ValueError,TypeError)):reason='public-shape-or-decode-error'
+ elif isinstance(error,(KeyboardInterrupt,SystemExit)):reason='interrupted'
+ steps={'preflight','install','paper-init','service-start','owned-crash','reinstall','removal','complete','brew-start','recipe-admission','readiness','cleanup'}
+ commands={'brew','git','sudo','systemctl','loginctl','launchctl','ps','guard-init','guard-pair','guard-health','guard-status','other-fixed-command'}
+ return {'reason':reason,'step':step if step in steps else 'unknown',
+  'command':command if command in commands else None,
+  'exitCode':exit_code if type(exit_code)is int and -128<=exit_code<=255 else None}
+def owned_recipe(path):
+ before=path.lstat()
+ need(stat.S_ISREG(before.st_mode)and before.st_uid==os.getuid()and before.st_nlink==1
+      and not before.st_mode&0o022,'Foreign service definition refused')
+ fd=os.open(path,os.O_RDONLY|os.O_NONBLOCK|getattr(os,'O_NOFOLLOW',0)|getattr(os,'O_CLOEXEC',0))
+ try:
+  info=os.fstat(fd);raw=b''
+  need((info.st_dev,info.st_ino)==(before.st_dev,before.st_ino),'Foreign service definition refused')
+  while len(raw)<=131072:
+   part=os.read(fd,min(65536,131073-len(raw)))
+   if not part:break
+   raw+=part
+  after=os.fstat(fd);current=path.lstat()
+  identity=lambda v:(v.st_dev,v.st_ino,v.st_size,v.st_mtime_ns,v.st_ctime_ns,v.st_uid,v.st_mode,v.st_nlink)
+  need(len(raw)<=131072 and identity(before)==identity(after)==identity(current),'Foreign service definition refused')
+  return raw
+ finally:os.close(fd)
+def linux_recipe(raw,exe,home):
+ section=None;commands=[];environment=[];service_sections=0
+ for line in raw.decode('utf-8').splitlines():
+  line=line.strip()
+  if not line or line.startswith(('#',';')):continue
+  if line.startswith('[')and line.endswith(']'):
+   section=line[1:-1];service_sections+=section=='Service';continue
+  if section!='Service':continue
+  key,sep,value=line.partition('=')
+  if not sep:continue
+  if key=='ExecStart':commands.append(value)
+  if key=='Environment':environment.append(value)
+ try:
+  command=shlex.split(commands[0],posix=True)if len(commands)==1 else None
+  variables=[part for value in environment for part in shlex.split(value,posix=True)]
+ except ValueError:raise RuntimeError('Generated systemd recipe differs')from None
+ need(service_sections==1 and command==[str(exe),'run','--network','paper']
+      and variables==['ZUNDER_GUARD_HOME='+str(home)],'Generated systemd recipe differs')
+
 class Rehearsal:
  def __init__(self,assets,output):
   self.assets=assets.resolve();self.output=output.resolve();need(not self.output.exists(),'Fresh public receipt directory required')
@@ -34,10 +104,13 @@ class Rehearsal:
    if key in os.environ:self.env[key]=os.environ[key]
   self.candidate=json.loads(Path(__file__).with_name('candidate.json').read_bytes())
   self.selected='zunder-guard-v1.0.4-'+route()+'.tar.gz';verify(self.assets,self.candidate,self.selected)
-  self.events=[];self.installed=False;self.tapped=False;self.owned_home=False;self.home=None;self.exe=None;self.stage='preflight';self.label=None;self.service_started=False;self.log=None;self.log_identity=None;self.manager_original=None;self.manager_prepared=False
+  self.events=[];self.installed=False;self.tapped=False;self.owned_home=False;self.home=None;self.exe=None;self.stage='preflight';self.label=None;self.service_started=False;self.log=None;self.log_identity=None;self.manager_original=None;self.manager_prepared=False;self.failure=None;self.cleanup_failure=None;self.last_command=None;self.last_exit=None;self.service_step=None;self.readiness_failure=None;self.readiness_identity=None
  def live(self):need(time.monotonic()<self.end,'Original forty-minute public rehearsal ended')
  def run(self,argv,*,timeout=120,expected=0):
   self.live();child=None
+  name=Path(argv[0]).name
+  self.last_command=('guard-'+argv[1])if name=='zunder-guard'and len(argv)>1 and argv[1]in('init','pair','health','status')else name if name in('brew','git','sudo','systemctl','loginctl','launchctl','ps')else 'other-fixed-command'
+  self.last_exit=None
   try:
    child=subprocess.Popen(argv,env=self.env,stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,
           start_new_session=True,close_fds=True)
@@ -88,6 +161,7 @@ class Rehearsal:
      try:child.wait(timeout=5)
      finally:child.stdout.close()
   acceptable=expected if isinstance(expected,tuple)else(expected,)
+  self.last_exit=child.returncode
   need(child.returncode in acceptable,'Fixed public rehearsal command failed')
   self.live();return bytes(raw)
  def record(self,kind,**fields):self.events.append({'check':kind,'observedAt':time.time(),**fields})
@@ -107,17 +181,14 @@ class Rehearsal:
   if platform.system()=='Darwin':
    paths=[Path(self.env['HOME'])/'Library/LaunchAgents'/(label+'.plist')for label in MAC_LABELS]
    existing=[p for p in paths if p.exists()];need(len(existing)==1,'One actual generated launchd definition required');p=existing[0]
-   self.label=p.stem;value=plistlib.loads(p.read_bytes())
+   self.label=p.stem;raw=owned_recipe(p);value=plistlib.loads(raw)
    need(value['Label']==self.label and value['ProgramArguments']==[str(self.exe),'run','--network','paper']
         and value['EnvironmentVariables']['ZUNDER_GUARD_HOME']==str(self.home),'Generated launchd recipe differs')
   else:
    paths=[Path(self.env['HOME'])/'.config/systemd/user'/(label+'.service')for label in LINUX_LABELS]
    existing=[p for p in paths if p.exists()];need(len(existing)==1,'One actual generated systemd definition required');p=existing[0]
-   self.label=p.stem;raw=p.read_text()
-   need('ExecStart='+str(self.exe)+' run --network paper'in raw
-        and 'ZUNDER_GUARD_HOME='+str(self.home)in raw,'Generated systemd recipe differs')
-  need(not p.is_symlink()and p.stat().st_uid==os.getuid(),'Foreign service definition refused')
-  self.record('actual-paper-service-recipe',sha256=digest(p))
+   self.label=p.stem;raw=owned_recipe(p);linux_recipe(raw,self.exe,self.home)
+  self.record('actual-paper-service-recipe',sha256=hashlib.sha256(raw).hexdigest())
  def ready(self,previous=None):
   end=min(self.end,time.monotonic()+90)
   while time.monotonic()<end:
@@ -125,12 +196,14 @@ class Rehearsal:
    try:
     self.run([str(self.exe),'health'],timeout=10)
     row=json.loads(self.run([str(self.exe),'status','--json'],timeout=10))
-    need(row.get('mode')=='paper'and row.get('account')==PAPER_ACCOUNT and row.get('version')=='1.0.4'
-         and type(row.get('clients'))is list and len(row['clients'])==2,'Actual paper candidate/account/pairing differs')
+    need(type(row)is dict,'Actual paper status JSON object required')
+    self.readiness_identity={'modeMatches':row.get('mode')=='paper','accountMatches':row.get('account')==PAPER_ACCOUNT,'versionMatches':row.get('version')=='1.0.4','twoClients':type(row.get('clients'))is list and len(row['clients'])==2}
+    need(all(self.readiness_identity.values()),'Actual paper candidate/account/pairing differs')
     actual=self.manager()
     if previous is not None:need((actual['pid'],actual['birth'])!=(previous['pid'],previous['birth']),'Service did not replace crashed/stopped process')
     return actual
-   except RuntimeError:time.sleep(1)
+   except RuntimeError as error:
+    self.readiness_failure=public_failure(error,'readiness',self.last_command,self.last_exit);time.sleep(1)
   raise RuntimeError('Actual paper readiness unknown')
  def stop(self):
   self.run(['brew','services','stop',FORMULA],timeout=60)
@@ -193,7 +266,8 @@ class Rehearsal:
   self.run([str(self.exe),'pair'],timeout=30) # Disposable outputs remain memory-only and never enter logs/artifacts.
   config=self.home/'guard.toml';config_sha=digest(config)
   self.create_log()
-  self.stage='service-start';self.service_started=True;self.run(['brew','services','start',FORMULA]);self.service_recipe();first=self.ready()
+  self.stage='service-start';self.service_started=True;self.service_step='brew-start'
+  self.run(['brew','services','start',FORMULA]);self.service_step='recipe-admission';self.service_recipe();self.service_step='readiness';first=self.ready();self.service_step=None
   self.record('actual-paper-start-and-two-clients',**first)
   self.run(['brew','services','restart',FORMULA]);restarted=self.ready(first);self.record('actual-brew-restart',**restarted)
   self.stage='owned-crash'
@@ -267,15 +341,18 @@ class Rehearsal:
  def receipt(self,complete,cleanup):
   return {'schema':1,'kind':'prepublication-homebrew-paper-recipe-rehearsal','candidate':{k:self.candidate[k]for k in('tag','source','manifest_sha256')},
    'route':route(),'startedAt':self.start,'finishedAt':time.time(),'complete':complete,'cleanup':cleanup,'failedStage':None if complete else self.stage,'events':self.events,
+   'failure':None if complete else getattr(self,'failure',None),'cleanupFailure':getattr(self,'cleanup_failure',None),
+   'lastReadinessFailure':getattr(self,'readiness_failure',None),'readinessIdentity':getattr(self,'readiness_identity',None),
    'publicTapVerified':False,'customerDownloadUrlsVerified':False,'managedNativeLifecycleVerified':False,'rebootVerified':False,'licenceActivationVerified':False,'releaseReady':False}
 
 def main():
  need(len(sys.argv)==3,'Fixed public assets and fresh receipt directory required')
  r=Rehearsal(Path(sys.argv[1]),Path(sys.argv[2]));ok=False;cleanup='UNKNOWN'
  try:r.execute();ok=True;cleanup='CONFIRMED'
- except BaseException:
+ except BaseException as error:
+  r.failure=public_failure(error,r.service_step or r.stage,r.last_command,r.last_exit)
   try:r.cleanup();cleanup='FAILED_LANE_CONFIRMED'
-  except BaseException:pass
+  except BaseException as error:r.cleanup_failure=public_failure(error,'cleanup',r.last_command,r.last_exit)
  finally:(r.output/'receipt.json').write_text(json.dumps(r.receipt(ok,cleanup),sort_keys=True,separators=(',',':'))+'\n')
  need(ok,'Public Homebrew recipe rehearsal failed; inspect public receipt only')
 
