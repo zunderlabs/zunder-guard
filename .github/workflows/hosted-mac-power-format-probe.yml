@@ -1,0 +1,46 @@
+name: Public no-key Mac power format observation
+on:
+  push:
+    branches: [codex/no-key-hosted-preparation-probe]
+    paths:
+      - '.github/workflows/hosted-mac-power-format-probe.yml'
+      - 'deploy/guard/e2e/native/mac_hosted_policy.py'
+      - 'deploy/guard/e2e/native/test_mac_power_format_diagnostic.py'
+permissions:
+  contents: read
+concurrency:
+  group: public-no-key-mac-power-format-probe
+  cancel-in-progress: false
+jobs:
+  observe:
+    if: github.repository == 'zunderlabs/zunder-guard' && github.event.repository.private == false && github.event_name == 'push' && github.ref == 'refs/heads/codex/no-key-hosted-preparation-probe'
+    runs-on: macos-15
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          fetch-depth: 1
+      - name: Exact source and inert format fixtures
+        env:
+          CONTROL_SOURCE: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          [[ "$CONTROL_SOURCE" =~ ^[0-9a-f]{40}$ ]]
+          test "$(git rev-parse HEAD)" = "$CONTROL_SOURCE"
+          test -z "$(git status --porcelain)"
+          python3 -I -B deploy/guard/e2e/native/test_mac_power_format_diagnostic.py
+      - name: Existing root policy probe with closed shape detail
+        run: |
+          set -euo pipefail
+          umask 077
+          # Only bounded closed metadata is emitted; no provider text.
+          # shellcheck disable=SC2024
+          sudo --non-interactive /usr/bin/env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin LANG=C /usr/bin/python3 -S -B deploy/guard/e2e/native/mac_hosted_policy.py --probe > "$RUNNER_TEMP/mac-power-format.json"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: mac-power-format-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/mac-power-format.json
+          if-no-files-found: error
+          retention-days: 7

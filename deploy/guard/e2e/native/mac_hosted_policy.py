@@ -69,6 +69,46 @@ def power_diagnostic(text):
         for key in('hibernatemode','standby','autopoweroff')}}
 
 
+def power_format_diagnostic(text):
+    """Closed shape observation; partial settings never satisfy admission."""
+    required=('hibernatemode','standby','autopoweroff')
+    empty={key:{'present_in_all':False,'zero_in_all':False,'ambiguous':False}for key in required}
+    def refused(reason):
+        return {'kind':'closed-power-format-observation','reason':reason,'line_count':0,
+                'section_count':0,'headerless_count':0,'multifield_count':0,
+                'duplicate_count':0,'required':empty}
+    if type(text)is not str or len(text)>65536:return refused('input-refused')
+    lines=text.splitlines()
+    if len(lines)>4096:return refused('line-bound-refused')
+    sections=[];current=None;headerless=0;multifield=0;duplicates=0;ambiguous=set()
+    for line in lines:
+        if re.fullmatch(r'(?:Battery|AC|UPS) Power:',line.strip()):
+            current={'seen':set(),'values':{}};sections.append(current)
+            if len(sections)>3:return refused('section-bound-refused')
+            continue
+        if not line.strip():continue
+        fields=line.split()
+        if current is None:headerless+=1;continue
+        if len(fields)!=2:
+            multifield+=1
+            if fields[0]in required:ambiguous.add(fields[0])
+            continue
+        key,value=fields
+        if key in current['seen']:
+            duplicates+=1
+            if key in required:ambiguous.add(key)
+        current['seen'].add(key)
+        if key in required:current['values'][key]=value
+    reason=('no-sections'if not sections else'headerless-lines'if headerless else
+            'duplicate-fields'if duplicates else'multiple-fields'if multifield else'canonical-shape')
+    return {'kind':'closed-power-format-observation','reason':reason,'line_count':len(lines),
+            'section_count':len(sections),'headerless_count':headerless,'multifield_count':multifield,
+            'duplicate_count':duplicates,'required':{key:{
+                'present_in_all':bool(sections)and key not in ambiguous and all(key in row['values']for row in sections),
+                'zero_in_all':bool(sections)and key not in ambiguous and all(row['values'].get(key)=='0'for row in sections),
+                'ambiguous':key in ambiguous}for key in required}}
+
+
 def inspect_sleep_and_core(paths=(Path('/private/var/vm/sleepimage'),Path('/var/vm/sleepimage'),Path('/cores'))):
     for path in paths:
         if not os.path.lexists(path):continue
@@ -170,6 +210,7 @@ def probe(*,deadline=None):
             try:
                 values[name]=public(argv,deadline=original_deadline);checks[name]={'observed':True,'passed':None}
                 if name=='power':checks[name]['diagnostic']=power_diagnostic(values[name])
+                if name=='power':checks[name]['diagnostic']['format_detail']=power_format_diagnostic(values[name])
             except BaseException:checks[name]={'observed':False,'passed':False,'reason':'readback-unavailable'}
         try:inspect_sleep_and_core();checks['sleep_image_and_core_inventory']={'observed':True,'passed':True}
         except BaseException:checks['sleep_image_and_core_inventory']={'observed':False,'passed':False,'reason':'inventory-refused-or-unavailable'}

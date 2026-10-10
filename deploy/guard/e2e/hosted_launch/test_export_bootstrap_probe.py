@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Inert exporter fixtures; no bootstrap, package build or network."""
 import hashlib
+import ast
 import importlib.util
 import json
 import os
@@ -8,6 +9,7 @@ import io
 from pathlib import Path
 import stat
 import tempfile
+import subprocess
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
@@ -274,6 +276,36 @@ class Filesystem(unittest.TestCase):
         with patch.object(p, 'REPORT_PARTS', parts), patch.object(p, 'directory'), \
                 self.assertRaises(OSError):
             p.open_reports()
+
+
+class GuardReasonAndShell(unittest.TestCase):
+    def test_exact_closed_optional_inventory_guard_codes_only(self):
+        base={'operation':'source-tree','errorType':'RuntimeError','reason':'guard-refused'}
+        self.assertEqual(len(p.GUARD_REASONS),16)
+        producer=ast.parse(Path(p.__file__).with_name('bootstrap.py').read_text())
+        table=next(n.value for n in producer.body if isinstance(n,ast.Assign)and len(n.targets)==1 and isinstance(n.targets[0],ast.Name)and n.targets[0].id=='_INVENTORY_GUARD_REASONS')
+        self.assertEqual(p.GUARD_REASONS,frozenset(ast.literal_eval(table).values()))
+        for code in p.GUARD_REASONS:
+            context={**base,'guardReason':code}
+            self.assertEqual(p.diagnostic(SOURCE,1,raw(failed('inventories',context)),None)['diagnostic'],context)
+        for change in ({'guardReason':'private payload'},{'guardReason':'root-ancestor-refused suffix'},{'guardReason':True},{'guardReason':None},{'guardReason':['root-ancestor-refused']},{'guardReason':'root-ancestor-refused','errorType':'PermissionError','reason':'permission-refused'}):
+            with self.subTest(change=change),self.assertRaises(p.Refused):p.failure(failed('inventories',{**base,**change}))
+        self.assertEqual(p.failure(failed('inventories',base))['diagnostic'],base)
+    def test_actual_workflow_shell_retains_numeric_exit_under_inherited_errexit(self):
+        workflow=Path(__file__).resolve().parents[4]/'.github/workflows/hosted-ordinary-bootstrap-probe.yml'
+        stage=workflow.read_text().split('      - name: Existing no-key bootstrap with retained failure\n',1)[1].split('      - name: Export only closed diagnostic metadata',1)[0]
+        script=stage.split('        run: |\n',1)[1]
+        script='\n'.join(line[10:]for line in script.splitlines())+'\n'
+        command=next(line for line in script.splitlines()if line.startswith('if /usr/bin/sudo '))
+        self.assertTrue(command.endswith('; then'))
+        for exit_code in(0,1,23,137):
+            with tempfile.TemporaryDirectory()as directory:
+                output=Path(directory)/'output'
+                inert=script.replace(command,"if /bin/bash -c 'exit "+str(exit_code)+"'; then")
+                result=subprocess.run(['/bin/bash','--noprofile','--norc','-eo','pipefail','-c',inert],env={'PATH':'/usr/bin:/bin','GITHUB_OUTPUT':str(output)},stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.PIPE,check=False)
+                self.assertEqual(result.returncode,exit_code)
+                self.assertEqual(output.read_text(),'exit_code='+str(exit_code)+'\n')
+                self.assertEqual(result.stdout,b'');self.assertEqual(result.stderr,b'')
 
 
 if __name__ == '__main__':

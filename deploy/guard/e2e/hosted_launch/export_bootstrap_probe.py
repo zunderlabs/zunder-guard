@@ -23,6 +23,24 @@ OPERATIONS = frozenset(('source-tree', 'website-tree', 'runtime-python-tree',
 INVENTORY_ERRORS = {'FileNotFoundError': 'member-missing', 'PermissionError': 'permission-refused',
     'FileExistsError': 'already-exists', 'TimeoutExpired': 'operation-timeout',
     'RuntimeError': 'guard-refused', 'OSError': 'os-operation-failed', 'other': 'operation-failed'}
+GUARD_REASONS = frozenset((
+    'canonical-member-required',
+    'canonical-tree-required',
+    'mapped-runtime-omitted',
+    'member-changed',
+    'member-read-bound-refused',
+    'nonempty-tree-required',
+    'output-readback-differs',
+    'protected-member-refused',
+    'protected-tree-required',
+    'regular-member-bound-refused',
+    'root-ancestor-refused',
+    'runtime-member-differs',
+    'runtime-tree-differs',
+    'safe-member-refused',
+    'tree-kind-refused',
+    'tree-member-bound-refused',
+))
 PYTHON_ERRORS = frozenset(('FileNotFoundError', 'PermissionError', 'FileExistsError',
     'RuntimeError', 'OSError', 'other'))
 PYTHON_REASONS = frozenset(('operation-failed', 'stdlib-root-refused', 'startup-alias-refused',
@@ -111,9 +129,12 @@ def failure(value):
         safe = {key: diagnostic[key] for key in ('operation', 'memberSha256', 'errorType', 'reason')}
     else:
         need(type(diagnostic) is dict and {'operation', 'errorType', 'reason'} <= set(diagnostic) <=
-             {'operation', 'errorType', 'reason', 'memberSha256', 'index', 'count'})
+             {'operation', 'errorType', 'reason', 'memberSha256', 'index', 'count', 'guardReason'})
         need(diagnostic['operation'] in OPERATIONS and diagnostic['errorType'] in INVENTORY_ERRORS and
              diagnostic['reason'] == INVENTORY_ERRORS[diagnostic['errorType']])
+        if 'guardReason' in diagnostic:
+            need(diagnostic['errorType'] == 'RuntimeError' and type(diagnostic['guardReason']) is str and
+                 diagnostic['guardReason'] in GUARD_REASONS)
         if 'memberSha256' in diagnostic:
             sha(diagnostic['memberSha256'])
         if 'index' in diagnostic or 'count' in diagnostic:

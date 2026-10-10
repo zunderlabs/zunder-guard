@@ -40,6 +40,24 @@ TOOLS_PATHS = {'python': '/usr/bin/python3.12', 'systemd_run': '/usr/bin/systemd
 _STAGE = 'arguments'
 _PYTHON_CONTEXT = None
 _INVENTORY_CONTEXT = None
+_INVENTORY_GUARD_REASONS = {
+    'Actual mapped native runtime omitted': 'mapped-runtime-omitted',
+    'Actual original public output readback differs': 'output-readback-differs',
+    'Actual reviewed runtime member differs': 'runtime-member-differs',
+    'Bounded regular single-link member required': 'regular-member-bound-refused',
+    'Canonical regular member required': 'canonical-member-required',
+    'Complete canonical tree required': 'canonical-tree-required',
+    'Complete tree member bound exceeded': 'tree-member-bound-refused',
+    'Member changed while inventoried': 'member-changed',
+    'Member read exceeded bound': 'member-read-bound-refused',
+    'Nonempty complete source tree required': 'nonempty-tree-required',
+    'Protected member required': 'protected-member-refused',
+    'Root protected tree required': 'protected-tree-required',
+    'Root-owned non-writable ancestor required': 'root-ancestor-refused',
+    'Runtime tree omission or mutation refused': 'runtime-tree-differs',
+    'Safe complete source member required': 'safe-member-refused',
+    'Tree links/devices refused': 'tree-kind-refused',
+}
 _INVENTORY_OPERATIONS = frozenset(('source-tree', 'website-tree', 'runtime-python-tree',
     'runtime-node-tree', 'runtime-packages-tree', 'checkout-tree', 'git-resolve', 'git-read',
     'tool-resolve', 'tool-read', 'native-ldd', 'native-dependency-resolve',
@@ -81,6 +99,12 @@ def inventory_failure_diagnostic(context, error):
     kind, reason = next(((cls.__name__, reason) for cls, reason in kinds if isinstance(error, cls)),
                         ('other', 'operation-failed'))
     value.update(errorType=kind, reason=reason)
+    if type(error) is RuntimeError:
+        args = error.args
+        if type(args) is tuple and len(args) == 1 and type(args[0]) is str:
+            guard_reason = _INVENTORY_GUARD_REASONS.get(args[0])
+            if guard_reason is not None:
+                value['guardReason'] = guard_reason
     return value
 
 

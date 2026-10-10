@@ -43,8 +43,11 @@ jobs:
           CONTROL_SOURCE: ${{ github.sha }}
         run: |
           set -uo pipefail
-          /usr/bin/sudo --non-interactive /usr/bin/env -i PATH=/usr/bin:/bin LANG=C.UTF-8 /usr/bin/python3.12 -I -B deploy/guard/e2e/hosted_launch/bootstrap.py --workspace "$GITHUB_WORKSPACE" --control-source "$CONTROL_SOURCE" > /dev/null 2>&1
-          result=$?
+          if /usr/bin/sudo --non-interactive /usr/bin/env -i PATH=/usr/bin:/bin LANG=C.UTF-8 /usr/bin/python3.12 -I -B deploy/guard/e2e/hosted_launch/bootstrap.py --workspace "$GITHUB_WORKSPACE" --control-source "$CONTROL_SOURCE" > /dev/null 2>&1; then
+            result=0
+          else
+            result=$?
+          fi
           printf 'exit_code=%s\n' "$result" >> "$GITHUB_OUTPUT"
           exit "$result"
       - name: Export only closed diagnostic metadata
