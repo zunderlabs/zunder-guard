@@ -39,8 +39,12 @@ def key_identity(s):
 def pinned_keyring():
     # The shared hosted-image file is mutable. Never chmod it or trust its mode
     # as authentication; use the independently obtained exact vendor byte pin.
+    # Vendor-data directory writability is not authority for these public bytes.
+    # Executable/runtime ancestors /usr and / retain the original strict check.
+    # The stable no-follow descriptor and exact vendor digest authenticate them;
+    # all owned staging permissions remain strict.
     for parent in(ARCHIVE_FILE.parent,ARCHIVE_FILE.parent.parent,Path('/usr'),Path('/')):
-        s=parent.lstat();need(stat.S_ISDIR(s.st_mode)and s.st_uid==0 and not s.st_mode&0o022,'vendor-keyring-parent-refused')
+        s=parent.lstat();need(stat.S_ISDIR(s.st_mode)and s.st_uid==0 and(parent not in(Path('/usr'),Path('/'))or not s.st_mode&0o022),'vendor-keyring-parent-refused')
     before=ARCHIVE_FILE.lstat()
     need(stat.S_ISREG(before.st_mode)and before.st_uid==0 and before.st_nlink==1 and before.st_size==ARCHIVE_VENDOR['anchor_bytes'],'vendor-keyring-shape-refused')
     fd=os.open(ARCHIVE_FILE,os.O_RDONLY|os.O_NOFOLLOW|os.O_CLOEXEC|os.O_NONBLOCK)

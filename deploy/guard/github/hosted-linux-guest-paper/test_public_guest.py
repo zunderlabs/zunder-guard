@@ -192,11 +192,23 @@ class Fixtures(unittest.TestCase):
             current=Path.lstat
             with patch.object(Path,'lstat',lambda path:stat_copy(current(path),st_uid=1234)if path==key else current(path)),patch.object(tools.os,'open')as opened,self.assertRaises(RuntimeError):tools.pinned_keyring()
             opened.assert_not_called()
-    def test_shared_keyring_parent_writable_refuses(self):
+    def test_shared_keyring_writable_parent_requires_exact_vendor_bytes(self):
         with key_fixture()as(root,key,raw):
             root.chmod(0o777)
-            with patch.object(tools.os,'open')as opened,self.assertRaises(RuntimeError):tools.pinned_keyring()
+            self.assertEqual(tools.pinned_keyring(),raw)
+            key.write_bytes(b'x'+raw[1:])
+            with self.assertRaises(RuntimeError):tools.pinned_keyring()
+    def test_shared_keyring_nonroot_parent_refuses_before_open(self):
+        with key_fixture()as(root,key,raw):
+            current=Path.lstat
+            with patch.object(Path,'lstat',lambda path:stat_copy(current(path),st_uid=1234)if path==root else current(path)),patch.object(tools.os,'open')as opened,self.assertRaises(RuntimeError):tools.pinned_keyring()
             opened.assert_not_called()
+    def test_shared_keyring_executable_ancestors_writable_refuse(self):
+        for ancestor in(Path('/usr'),Path('/')):
+            with self.subTest(ancestor=str(ancestor)),key_fixture()as(root,key,raw):
+                current=Path.lstat
+                with patch.object(Path,'lstat',lambda path:stat_copy(current(path),st_mode=stat.S_IFDIR|0o777)if path==ancestor else current(path)),patch.object(tools.os,'open')as opened,self.assertRaises(RuntimeError):tools.pinned_keyring()
+                opened.assert_not_called()
     def test_shared_keyring_open_inode_race_refuses(self):
         with key_fixture()as(root,key,raw):
             current=tools.os.fstat

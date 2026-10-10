@@ -118,3 +118,11 @@ are fixed and public; full guest logs and disks are deleted and never uploaded.
 `test_public_guest.py` uses only temporary public files and mocked syscalls,
 processes and sockets. It never runs a candidate, package manager, service,
 virtualization helper, guest, elevated command, private protocol or provider.
+
+The shared vendor input is untrusted public data. Root-owned directory shape
+and a stable no-follow bounded descriptor are checked; vendor-data parent
+writability is not used as authentication. Executable/runtime ancestors `/usr`
+and `/` must remain root-owned directories without group/other write access. Only the exact independently pinned vendor digest
+is admitted. Owned staging remains root0700 with a create-only root0600 copy,
+and the signed snapshot and package chain remain mandatory. The shared input
+and its parents are never modified.
