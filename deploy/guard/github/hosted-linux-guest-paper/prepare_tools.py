@@ -73,4 +73,5 @@ def main():
     need(receipt['complete']and receipt['cleanupConfirmed'],'public-tool-preparation-incomplete')
 if __name__=='__main__':
     try:main()
-    except BaseException:raise SystemExit('Public vendor tool preparation refused; inspect public receipt.')
+    except RuntimeError as error:raise SystemExit('Public vendor tool preparation refused: '+str(error))
+    except BaseException as error:raise SystemExit('Public vendor tool preparation refused ('+type(error).__name__+').')
