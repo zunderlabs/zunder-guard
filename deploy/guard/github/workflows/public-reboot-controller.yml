@@ -1,0 +1,33 @@
+name: Original public reboot controller
+on:
+  workflow_call:
+permissions:
+  contents: read
+  actions: read
+  id-token: write
+jobs:
+  controller:
+    runs-on: ubuntu-24.04
+    environment: release-public-reboot
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444
+        with:
+          node-version: ${{ vars.PUBLIC_REBOOT_NODE_VERSION }}
+      - name: Observe original disposable target
+        env:
+          PUBLIC_REBOOT_EXPECTED_SCOPE: ${{ vars.PUBLIC_REBOOT_EXPECTED_SCOPE }}
+          PUBLIC_REBOOT_MAC_NODE_SHA256: ${{ vars.PUBLIC_REBOOT_MAC_NODE_SHA256 }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: node deploy/guard/github/hosted-reboot/runtime-cli.mjs controller public-reboot-controller.json
+      - name: Preserve public original result
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: public-reboot-controller
+          path: public-reboot-controller.json
+          if-no-files-found: error
+          retention-days: 7
