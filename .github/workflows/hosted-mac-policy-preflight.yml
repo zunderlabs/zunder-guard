@@ -1,0 +1,35 @@
+name: Hosted Mac policy preflight
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: hosted-mac-policy-preflight
+  cancel-in-progress: false
+jobs:
+  observe:
+    if: github.repository == 'zunderlabs/zunder-guard' && github.ref == 'refs/heads/main'
+    runs-on: macos-15
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+          fetch-depth: 1
+      - name: Observe the actual Testnet custody prerequisites without credentials
+        shell: bash
+        env:
+          CONTROL_SOURCE: ${{ github.workflow_sha }}
+        run: |
+          set -euo pipefail
+          [[ "$CONTROL_SOURCE" =~ ^[0-9a-f]{40}$ ]]
+          test "$(git rev-parse HEAD)" = "$CONTROL_SOURCE"
+          test -z "$(git status --porcelain)"
+          sudo --non-interactive /usr/bin/env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin LANG=C /usr/bin/python3 -S -B deploy/guard/e2e/native/mac_hosted_policy.py --probe > "$RUNNER_TEMP/mac-policy.json"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: hosted-mac-policy-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/mac-policy.json
+          if-no-files-found: error
+          retention-days: 7
