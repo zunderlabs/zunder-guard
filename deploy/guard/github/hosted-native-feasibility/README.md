@@ -30,3 +30,47 @@ Each job has a 12-minute hard limit; at most 2 run concurrently. Every child com
 ## What the green workflow means
 
 Only that the public probes completed and wrote observations. `release_ready`, `native_rehearsal`, `candidate_executed`, `guest_started`, `guest_rebooted` and `host_rebooted` stay false. Missing APIs/tools or refused context allocation remain reported as unavailable. A reported allocated context without confirmed closure fails the job after writing its public receipt. No native coverage waiver, risk change, mainnet permission or authenticity upgrade follows from these reports.
+
+
+## Ubuntu AMD64 permission-denied follow-up
+
+The first public hosted observation returned errno13 when the runner user opened
+`/dev/kvm`. That establishes a permissions boundary, not absence of KVM. Only
+`ubuntu-24.04` with actual x86_64 and unprivileged errno1/13 runs this follow-up.
+ARM absence and the original unprivileged observation remain separate facts.
+
+The fixed privileged path uses existing root-owned `/usr/bin` sudo, env, GNU
+timeout and Python tools, each read back and hashed before invocation. No tool
+or package is installed. Vendor image tools and Python standard library are
+the existing OS trust boundary; observed hashes are not invented upstream pins.
+`sudo -n` cannot prompt for credentials. Both launcher and helper disable cores.
+Pinned public helper bytes travel on anonymous stdin to Python `-I -S -B -`;
+a user-writable script pathname is not executed after its admission. Environment
+contains only fixed PATH/LANG/LC_ALL, no GitHub credentials or inherited values.
+
+The helper requires actual root/Linux/x86_64, a no-follow character device at
+`/dev/kvm` with major10/minor232, and matching lstat/fstat identity. It performs
+KVM_GET_API_VERSION and, only for API12, KVM_CREATE_VM with machine type0, then
+closes only its two descriptors. There is no fork/dup after device admission,
+vCPU, guest memory, device attachment, guest boot, reboot or host configuration.
+GNU timeout owns a separate root process group and sends SIGKILL after15seconds,
+including the fixed child; it remains independent of the unprivileged runner
+parent. The outer25second wait cannot claim it can kill a root process group.
+Any timeout, missing result, failed command, failed close or malformed result
+leaves cleanup unconfirmed and fails the lane. A timeout is never successful
+FD-close evidence, and permission/API errors never mean a guest is impossible.
+
+An accepted public result proves only creation and closure of one empty KVM
+context during this original source-bound hosted job. Signed candidate lifecycle,
+actual guest boot/reboot, native protected inputs and release proof remain
+separate. Mac/Windows probes and the workflow/candidate identity are unchanged.
+No privileged or hardware probe was executed during preparation; fixtures
+replace system calls and subprocesses. Root registers only reviewed source.
+
+Primary ABI/timeout references:
+- https://www.kernel.org/doc/html/latest/virt/kvm/api.html
+- https://github.com/torvalds/linux/blob/master/include/linux/miscdevice.h
+- https://github.com/coreutils/coreutils/blob/master/src/timeout.c
+- https://www.gnu.org/software/coreutils/manual/html_node/timeout-invocation.html
+
+No third-party implementation code was copied.
