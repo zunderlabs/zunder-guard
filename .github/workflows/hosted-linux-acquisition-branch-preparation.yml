@@ -1,0 +1,63 @@
+name: Public Linux acquisition branch observation
+on:
+  push:
+    branches: [codex/no-key-linux-acquisition-preparation]
+permissions:
+  contents: read
+concurrency:
+  group: public-linux-acquisition-branch-preparation
+  cancel-in-progress: false
+jobs:
+  preparation:
+    if: github.repository == 'zunderlabs/zunder-guard' && github.event.repository.private == false && github.event_name == 'push' && github.ref == 'refs/heads/codex/no-key-linux-acquisition-preparation' && github.ref_type == 'branch'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          fetch-depth: 1
+      - name: Fixed no-secret getter and inert complete-inventory fixtures
+        env:
+          CONTROL_SOURCE: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          [[ "$CONTROL_SOURCE" =~ ^[0-9a-f]{40}$ ]]
+          test "$(git rev-parse HEAD)" = "$CONTROL_SOURCE"
+          test -z "$(git status --porcelain)"
+          /usr/bin/python3.12 -I -B deploy/guard/github/hosted-reboot/acquisition-preparation/test_runtime_preparation.py
+          /usr/bin/python3.12 -I -B deploy/guard/github/hosted-reboot/acquisition-preparation/test_branch_observation.py
+      - name: Prepare fixed root-owned runtime and retained inert inventories
+        env:
+          CONTROL_SOURCE: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          umask 077
+          # The getter drops inherited credentials, runner toolcache and overrides.
+          # Only bounded public summary stdout is retained here.
+          sudo /usr/bin/env -i PATH=/usr/bin:/bin LANG=C.UTF-8 /usr/bin/python3.12 -I -B deploy/guard/github/hosted-reboot/acquisition-preparation/prepare_runtime.py --workspace "$GITHUB_WORKSPACE" --control-source "$CONTROL_SOURCE" > "$RUNNER_TEMP/acquisition-preparation-summary.json" 2>/dev/null
+      - name: Export only inert bounded inventory metadata
+        if: always()
+        env:
+          OBSERVED_SOURCE: ${{ github.sha }}
+          OBSERVED_RUN_ID: ${{ github.run_id }}
+          OBSERVED_ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          umask 077
+          mkdir -p "$RUNNER_TEMP/acquisition-preparation-inventories"
+          for name in summary failure runtime-closure trust-closure complete-trees bootstrap; do
+            fixed="/run/zunder-public-reboot-acquisition-preparation/$name.json"
+            if sudo test -f "$fixed"; then
+              sudo /usr/bin/cat "$fixed" > "$RUNNER_TEMP/acquisition-preparation-inventories/$name.json"
+            fi
+          done
+          /usr/bin/python3.12 -I -B deploy/guard/github/hosted-reboot/acquisition-preparation/branch_observation.py "$OBSERVED_SOURCE" "$OBSERVED_RUN_ID" "$OBSERVED_ATTEMPT" > "$RUNNER_TEMP/acquisition-preparation-inventories/observation-context.json"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: always()
+        with:
+          name: linux-acquisition-branch-inert-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/acquisition-preparation-inventories/*.json
+          if-no-files-found: ignore
+          retention-days: 7
