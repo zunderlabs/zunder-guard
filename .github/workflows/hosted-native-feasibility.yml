@@ -1,7 +1,7 @@
 name: Public hosted native feasibility
 on:
   push:
-    branches: [codex/hosted-native-feasibility]
+    branches: [release/native-capabilities]
   workflow_dispatch:
 permissions:
   contents: read
