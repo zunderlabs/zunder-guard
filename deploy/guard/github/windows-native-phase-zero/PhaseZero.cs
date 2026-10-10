@@ -91,6 +91,8 @@ internal static class PhaseZero {
     uint length; var boot = new N.BOOT_ENV(); var tod = new N.TIME_OF_DAY();
     int a = N.NtQueryBoot(90, ref boot, 32, out length); if (a != 0 || length != 32) throw new Refused("boot_environment", unchecked((uint)a));
     a = N.NtQueryTime(3, ref tod, 48, out length); if (a != 0 || length != 48) throw new Refused("time_of_day", unchecked((uint)a));
+    // Current UTC is one documented precise sample, not the opaque TOD snapshot.
+    ulong current = Clock();
     ulong uptime = N.GetTickCount64(); Win(N.QueryPerformanceCounter(out qa), "clock"); ulong after = Clock();
     // Fixed source-owned Boot guard IDs, not Win32 errors; original short-circuit order.
     if (!(before <= after)) throw new Refused("clock_guard", 1);
@@ -99,13 +101,13 @@ internal static class PhaseZero {
     if (!(freq > 0)) throw new Refused("clock_guard", 4);
     if (!(boot.Id != Guid.Empty)) throw new Refused("clock_guard", 5);
     if (!(tod.BootTime > 0)) throw new Refused("clock_guard", 6);
-    if (!(tod.CurrentTime > 0)) throw new Refused("clock_guard", 7);
+    if (!(tod.CurrentTime > 0 && tod.CurrentTime >= tod.BootTime)) throw new Refused("clock_guard", 7);
     if (!(unchecked((ulong)tod.BootTime) <= before)) throw new Refused("clock_guard", 8);
-    if (!(unchecked((ulong)tod.CurrentTime) >= before)) throw new Refused("clock_guard", 9);
-    if (!(unchecked((ulong)tod.CurrentTime) <= after)) throw new Refused("clock_guard", 10);
+    if (!(current >= before)) throw new Refused("clock_guard", 9);
+    if (!(current <= after)) throw new Refused("clock_guard", 10);
     if (!(after - before <= 50000000)) throw new Refused("clock_guard", 11);
     return D("state", "OBSERVED", "guid", boot.Id.ToString("D"), "boot_filetime", Tick(unchecked((ulong)tod.BootTime)),
-      "current_filetime", Tick(unchecked((ulong)tod.CurrentTime)), "observation_before_filetime", Tick(before),
+      "current_filetime", Tick(current), "observation_before_filetime", Tick(before),
       "observation_after_filetime", Tick(after), "qpc_before", Tick((ulong)qb), "qpc_after", Tick((ulong)qa),
       "qpc_frequency", Tick((ulong)freq), "uptime_ms", Tick(uptime));
   }

@@ -11,6 +11,7 @@ NATIVE=(HERE/'PhaseZero.cs').read_text()
 GATE=(HERE/'ReportGate.cs').read_text()
 WRAPPER=(HERE/'probe.ps1').read_text()
 FIXTURES=json.loads((HERE/'report-gate-fixtures.json').read_text())
+RETAINED_FUNCTIONS_SHA='df40ce4b975409b26a5d0521404752e52b3a1701abf57c306cfa5e31f353cda9'
 U32=c.c_uint32;U64=c.c_uint64;I64=c.c_int64
 class Boot(c.Structure):_fields_=[('guid',c.c_ubyte*16),('firmware',U32),('flags',U64)]
 class Time(c.Structure):_fields_=[('boot',I64),('current',I64),('bias',I64),('zone',U32),('reserved',U32),('bootbias',U64),('sleepbias',U64)]
@@ -212,8 +213,8 @@ class SourceContract(unittest.TestCase):
   self.assertIn('new H[] { child, serviceProcess, marker, exe, root, parent, service, scm }',NATIVE)
   self.assertIn('executableDigest = digest',NATIVE)
 
- def test_boot_clock_diagnostic_ids_match_exact_original_ordered_conjunction(self):
-  expected=['before <= after', 'qb >= 0', 'qa >= qb', 'freq > 0', 'boot.Id != Guid.Empty', 'tod.BootTime > 0', 'tod.CurrentTime > 0', 'unchecked((ulong)tod.BootTime) <= before', 'unchecked((ulong)tod.CurrentTime) >= before', 'unchecked((ulong)tod.CurrentTime) <= after', 'after - before <= 50000000']
+ def test_boot_clock_diagnostic_ids_match_exact_precise_capture_order(self):
+  expected=['before <= after', 'qb >= 0', 'qa >= qb', 'freq > 0', 'boot.Id != Guid.Empty', 'tod.BootTime > 0', 'tod.CurrentTime > 0 && tod.CurrentTime >= tod.BootTime', 'unchecked((ulong)tod.BootTime) <= before', 'current >= before', 'current <= after', 'after - before <= 50000000']
   boot=NATIVE[NATIVE.index('  static Dictionary<string, object> Boot()'):NATIVE.index('  static Dictionary<string, object> ProcessFacts')]
   rows=re.findall(r'if \(!\(([^\n]+)\)\) throw new Refused\("clock_guard", ([0-9]+)\);',boot)
   self.assertEqual([expr for expr,guard in rows],expected)
@@ -258,9 +259,15 @@ class SourceContract(unittest.TestCase):
    case=cases['clock_guard_'+name];self.assertFalse(case['accept']);self.assertFalse(report_model(case['raw']))
 
 
- def test_entire_native_normalization_restores_r4_bytes(self):
-  self.assertEqual(NATIVE.count('throw new Refused("clock_guard",'),11)
-  restored=NATIVE.replace('throw new Refused("clock_guard",','throw new Refused("clock",')
+ def test_precise_delta_restores_exact_r5_and_prior_diagnostic_predecessor(self):
+  restored=NATIVE.replace('    // Current UTC is one documented precise sample, not the opaque TOD snapshot.\n    ulong current = Clock();\n','')
+  restored=restored.replace('if (!(tod.CurrentTime > 0 && tod.CurrentTime >= tod.BootTime))','if (!(tod.CurrentTime > 0))')
+  restored=restored.replace('if (!(current >= before))','if (!(unchecked((ulong)tod.CurrentTime) >= before))')
+  restored=restored.replace('if (!(current <= after))','if (!(unchecked((ulong)tod.CurrentTime) <= after))')
+  restored=restored.replace('"current_filetime", Tick(current),','"current_filetime", Tick(unchecked((ulong)tod.CurrentTime)),')
+  self.assertEqual(hashlib.sha256(restored.encode()).hexdigest(),'9371a21f399eaa7c011c2a0ab7a94adc2d4fcedc3911aabafdb3efd3faa37e1e')
+  self.assertEqual(restored.count('throw new Refused("clock_guard",'),11)
+  restored=restored.replace('throw new Refused("clock_guard",','throw new Refused("clock",')
   self.assertEqual(hashlib.sha256(restored.encode()).hexdigest(),'e79fb0bba017e7d9bba7156ef60177ba2c00887f5154e5c3463a1afd4afebe81')
  def test_gate_exact_diagnostic_removal_restores_r4_bytes(self):
   guard='      if (Str(r["error_class"]) == "clock_guard") Need(Str(r["stage"]) == "preflight" && Str(r["outcome"]) == "REFUSED" && Str(b["state"]) == "UNKNOWN" && Num(r["error_code"]) >= 1 && Num(r["error_code"]) <= 11);\n'
@@ -272,5 +279,34 @@ class SourceContract(unittest.TestCase):
   self.assertEqual(WRAPPER.count('@($fixtures.cases).Count -gt 64'),1)
   restored=WRAPPER.replace('@($fixtures.cases).Count -gt 64','@($fixtures.cases).Count -gt 32')
   self.assertEqual(hashlib.sha256(restored.encode()).hexdigest(),'335b657000d22d0fd822a239dcdf7d427c2ab2abb9d77d17e05ac14fc09c2c90')
+
+
+ def test_precise_current_has_one_fixed_capture_and_returned_provenance(self):
+  boot=NATIVE[NATIVE.index('  static Dictionary<string, object> Boot()'):NATIVE.index('  static Dictionary<string, object> ProcessFacts')]
+  self.assertEqual(boot.count('ulong current = Clock();'),1)
+  self.assertLess(boot.index('a = N.NtQueryTime'),boot.index('ulong current = Clock();'))
+  self.assertLess(boot.index('ulong current = Clock();'),boot.index('ulong uptime ='))
+  self.assertLess(boot.index('ulong uptime ='),boot.index('ulong after = Clock();'))
+  self.assertIn('"current_filetime", Tick(current)',boot)
+  self.assertNotIn('Tick(unchecked((ulong)tod.CurrentTime))',boot)
+  for forbidden in ('Thread.Sleep','while (','for (int','before -','current +','current -'):
+   self.assertNotIn(forbidden,boot)
+ def test_hand_computed_precise_bracket_keeps_original_limits(self):
+  # FILETIME ticks are 100ns: 50,000,000 = exactly five seconds.
+  # Native TOD may lag precise before, but the returned precise sample must not.
+  def accepts(before,current,after,qb,qa,freq,boot,tod,guid):
+   return before<=after and qb>=0 and qa>=qb and freq>0 and guid and boot>0 and tod>0 and tod>=boot and boot<=before and current>=before and current<=after and after-before<=50000000
+  good=(100000000,100000002,100000004,10,11,1000000,1,99999999,True)
+  self.assertTrue(accepts(*good))
+  fields=[(0,100000005),(1,99999999),(1,100000005),(2,99999999),(3,-1),(4,9),(5,0),(6,0),(6,100000001),(7,0),(8,False)]
+  for index,value in fields:
+   values=list(good);values[index]=value
+   with self.subTest(index=index,value=value):self.assertFalse(accepts(*values))
+  values=list(good);values[6]=2;values[7]=1;self.assertFalse(accepts(*values))
+  values=list(good);values[2]=150000000;self.assertTrue(accepts(*values))
+  values[2]=150000001;self.assertFalse(accepts(*values))
+ def test_precise_capture_changes_no_other_functions(self):
+  start=NATIVE.index('  static Dictionary<string, object> ProcessFacts')
+  self.assertEqual(hashlib.sha256(NATIVE[start:].encode()).hexdigest(),RETAINED_FUNCTIONS_SHA)
 
 if __name__=='__main__':unittest.main()
