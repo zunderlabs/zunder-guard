@@ -52,7 +52,7 @@ jobs:
           ADMISSION_ID: ${{ inputs.admission_id }}
         run: |
           set -euo pipefail
-          sudo /usr/bin/env -i PATH=/usr/bin:/bin LANG=C.UTF-8 PYTHONDONTWRITEBYTECODE=1 GITHUB_REPOSITORY=zunderlabs/zunder-guard GITHUB_REF=refs/heads/main GITHUB_REF_TYPE=branch GITHUB_EVENT_NAME=workflow_dispatch GITHUB_SHA="$CONTROL_SOURCE" /opt/zunder-hosted-ordinary/runtime/python/bin/python3.12 -I -B /opt/zunder-hosted-ordinary/source/deploy/guard/e2e/hosted_launch/prepare_website_entry.py --mode validate --workspace "$GITHUB_WORKSPACE" --control-source "$CONTROL_SOURCE" --admission-id "$ADMISSION_ID"
+          sudo /usr/bin/env -i PATH=/usr/bin:/bin LANG=C.UTF-8 PYTHONDONTWRITEBYTECODE=1 GITHUB_REPOSITORY=zunderlabs/zunder-guard GITHUB_REF=refs/heads/main GITHUB_REF_TYPE=branch GITHUB_EVENT_NAME=workflow_dispatch GITHUB_SHA="$CONTROL_SOURCE" /var/lib/zunder-hosted-ordinary/runtime/python/bin/python3.12 -I -B /var/lib/zunder-hosted-ordinary/source/deploy/guard/e2e/hosted_launch/prepare_website_entry.py --mode validate --workspace "$GITHUB_WORKSPACE" --control-source "$CONTROL_SOURCE" --admission-id "$ADMISSION_ID"
       - name: Mint only approved private repository read token
         id: reader
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1
@@ -73,7 +73,7 @@ jobs:
         run: |
           set -euo pipefail
           export GITHUB_SHA="$CONTROL_SOURCE"
-          sudo --preserve-env=PRIVATE_ARTIFACT_READ_TOKEN,GITHUB_TOKEN,GITHUB_REPOSITORY,GITHUB_REF,GITHUB_REF_TYPE,GITHUB_EVENT_NAME,GITHUB_SHA /opt/zunder-hosted-ordinary/runtime/python/bin/python3.12 -I -B /opt/zunder-hosted-ordinary/source/deploy/guard/e2e/hosted_launch/prepare_website_entry.py --mode reader --workspace "$GITHUB_WORKSPACE" --control-source "$CONTROL_SOURCE" --admission-id "$ADMISSION_ID"
+          sudo --preserve-env=PRIVATE_ARTIFACT_READ_TOKEN,GITHUB_TOKEN,GITHUB_REPOSITORY,GITHUB_REF,GITHUB_REF_TYPE,GITHUB_EVENT_NAME,GITHUB_SHA /var/lib/zunder-hosted-ordinary/runtime/python/bin/python3.12 -I -B /var/lib/zunder-hosted-ordinary/source/deploy/guard/e2e/hosted_launch/prepare_website_entry.py --mode reader --workspace "$GITHUB_WORKSPACE" --control-source "$CONTROL_SOURCE" --admission-id "$ADMISSION_ID"
       - name: Prepare admitted website source in explicit clean environment
         env:
           CONTROL_SOURCE: ${{ github.workflow_sha }}
@@ -85,7 +85,7 @@ jobs:
           umask 077
           # Runner-owned file receives bounded metadata only.
           # shellcheck disable=SC2024
-          sudo /usr/bin/env -i PATH=/usr/bin:/bin LANG=C.UTF-8 PYTHONDONTWRITEBYTECODE=1 GITHUB_REPOSITORY=zunderlabs/zunder-guard GITHUB_REF=refs/heads/main GITHUB_REF_TYPE=branch GITHUB_EVENT_NAME=workflow_dispatch GITHUB_SHA="$CONTROL_SOURCE" /opt/zunder-hosted-ordinary/runtime/python/bin/python3.12 -I -B /opt/zunder-hosted-ordinary/source/deploy/guard/e2e/hosted_launch/prepare_website_entry.py --workspace "$GITHUB_WORKSPACE" --control-source "$CONTROL_SOURCE" --admission-id "$ADMISSION_ID" > "$RUNNER_TEMP/website-preparation-metadata.json"
+          sudo /usr/bin/env -i PATH=/usr/bin:/bin LANG=C.UTF-8 PYTHONDONTWRITEBYTECODE=1 GITHUB_REPOSITORY=zunderlabs/zunder-guard GITHUB_REF=refs/heads/main GITHUB_REF_TYPE=branch GITHUB_EVENT_NAME=workflow_dispatch GITHUB_SHA="$CONTROL_SOURCE" /var/lib/zunder-hosted-ordinary/runtime/python/bin/python3.12 -I -B /var/lib/zunder-hosted-ordinary/source/deploy/guard/e2e/hosted_launch/prepare_website_entry.py --workspace "$GITHUB_WORKSPACE" --control-source "$CONTROL_SOURCE" --admission-id "$ADMISSION_ID" > "$RUNNER_TEMP/website-preparation-metadata.json"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         if: always()
         with:

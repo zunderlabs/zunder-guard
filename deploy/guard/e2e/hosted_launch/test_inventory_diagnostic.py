@@ -107,6 +107,7 @@ class InventoryDiagnostic(unittest.TestCase):
             root=Path(td)/'root';public=Path(td)/'public';selected=root/'runtime/website/source';writes=[];trees=[]
             for name,value in [('ROOT',root),('PUBLIC',public),('SOURCE',root/'source'),('CHECKOUT',root/'checkout'),('WEBSITE',selected)]:stack.enter_context(patch.object(p,name,value))
             stack.enter_context(patch.object(p.os,'geteuid',return_value=0));stack.enter_context(patch.object(p,'capabilities',return_value={}))
+            stack.enter_context(patch.object(p,'preparation_ancestors'))  # inert fixture paths, never host admission
             stack.enter_context(patch.object(p,'source',return_value={}))
             def node(): (root/'runtime/node').mkdir(parents=True);return {}
             stack.enter_context(patch.object(p,'node',side_effect=node));stack.enter_context(patch.object(p,'website',return_value={}))
@@ -165,6 +166,54 @@ class InventoryDiagnostic(unittest.TestCase):
             function=next(n for n in source.body if isinstance(n,ast.FunctionDef)and n.name==name)
             calls=[ast.unparse(n.func)for n in ast.walk(function)if isinstance(n,ast.Call)]
             self.assertFalse(any(call in ('read','tree','write_new','str','repr','subprocess.run')or call.endswith(('.resolve','.stat','.lstat','.read_text','.rglob'))for call in calls))
+
+
+class InventoryGuardReason(unittest.TestCase):
+    def diagnostic(self,error):
+        return p.inventory_failure_diagnostic({'operation':'source-tree'},error)
+    def test_every_fixed_original_guard_maps_to_only_its_closed_code(self):
+        for message,code in p._INVENTORY_GUARD_REASONS.items():
+            with self.subTest(code=code):
+                actual=self.diagnostic(RuntimeError(message))
+                self.assertEqual(actual,{'operation':'source-tree','errorType':'RuntimeError','reason':'guard-refused','guardReason':code})
+                self.assertNotIn(message,json.dumps(actual))
+    def test_unknown_suffix_payload_and_malformed_arguments_stay_generic(self):
+        known=next(iter(p._INVENTORY_GUARD_REASONS))
+        errors=[RuntimeError(),RuntimeError(known,'private payload'),RuntimeError(None),RuntimeError(123),RuntimeError([known]),RuntimeError({known:'private payload'}),RuntimeError(known+' /private/payload'),RuntimeError('private sensitive payload')]
+        class StrSubclass(str):
+            def __hash__(self):raise AssertionError('Subclass hashing forbidden')
+        errors.append(RuntimeError(StrSubclass(known)))
+        for error in errors:
+            self.assertEqual(self.diagnostic(error),{'operation':'source-tree','errorType':'RuntimeError','reason':'guard-refused'})
+    def test_custom_runtime_error_args_and_string_callbacks_are_never_used(self):
+        class CustomRuntimeError(RuntimeError):
+            def __str__(self):raise AssertionError('No error stringification')
+            def __repr__(self):raise AssertionError('No error representation')
+            def __getattribute__(self,name):
+                if name=='args':raise AssertionError('No custom args access')
+                return super().__getattribute__(name)
+        self.assertEqual(self.diagnostic(CustomRuntimeError('Root-owned non-writable ancestor required')),{'operation':'source-tree','errorType':'RuntimeError','reason':'guard-refused'})
+        self.assertNotIn('guardReason',self.diagnostic(OSError('Root-owned non-writable ancestor required')))
+    def test_guard_table_is_exact_original_inventory_and_delegated_member_literals(self):
+        module=Path(p.__file__).with_name('inventory.py')
+        tree=ast.parse(module.read_text())
+        messages={n.args[1].value for n in ast.walk(tree)if isinstance(n,ast.Call)and isinstance(n.func,ast.Name)and n.func.id=='need'and len(n.args)==2 and isinstance(n.args[1],ast.Constant)}
+        messages.add('Safe complete source member required')
+        self.assertEqual(set(p._INVENTORY_GUARD_REASONS),messages)
+        self.assertEqual(len(p._INVENTORY_GUARD_REASONS),16)
+        self.assertEqual(len(set(p._INVENTORY_GUARD_REASONS.values())),16)
+    def test_all_original_bootstrap_ast_is_unchanged_except_exact_optional_guard_block(self):
+        tree=ast.parse(Path(p.__file__).read_text())
+        tree.body=[n for n in tree.body if not(isinstance(n,ast.FunctionDef)and n.name=='preparation_ancestors')]
+        prepare=next(n for n in tree.body if isinstance(n,ast.FunctionDef)and n.name=='prepare')
+        calls=[n for n in prepare.body if isinstance(n,ast.Expr)and isinstance(n.value,ast.Call)and isinstance(n.value.func,ast.Name)and n.value.func.id=='preparation_ancestors']
+        self.assertEqual(len(calls),1);prepare.body.remove(calls[0])
+        tree.body=[n for n in tree.body if not(isinstance(n,ast.Assign)and len(n.targets)==1 and isinstance(n.targets[0],ast.Name)and n.targets[0].id=='_INVENTORY_GUARD_REASONS')]
+        function=next(n for n in tree.body if isinstance(n,ast.FunctionDef)and n.name=='inventory_failure_diagnostic')
+        candidates=[n for n in function.body if isinstance(n,ast.If)and ast.unparse(n.test)=='type(error) is RuntimeError']
+        self.assertEqual(len(candidates),1)
+        function.body.remove(candidates[0])
+        self.assertEqual(hashlib.sha256(ast.dump(tree,include_attributes=False).encode()).hexdigest(),'d2dcacfb7e55062199fb1518c78176ace7fbeb4c1922a058e51e61f94de4303c')
 
 
 if __name__=='__main__':unittest.main()

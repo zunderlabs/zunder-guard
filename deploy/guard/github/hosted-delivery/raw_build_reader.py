@@ -25,7 +25,7 @@ spec.loader.exec_module(admit)
 PURPOSE = 'original-guard-website-build-input'
 MANIFEST = 'raw-build-input-manifest.json'
 WORKFLOW = '.github/workflows/guard-website-build-input.yml'
-PACKAGES = Path('/opt/zunder-hosted-ordinary/runtime/website')
+PACKAGES = Path('/var/lib/zunder-hosted-ordinary/runtime/website')
 MAX_ARCHIVE = 800 * 1024 * 1024
 MAX_TOTAL = 768 * 1024 * 1024
 MAX_FILE = 64 * 1024 * 1024

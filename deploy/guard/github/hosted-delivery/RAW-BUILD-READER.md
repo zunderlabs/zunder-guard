@@ -75,8 +75,8 @@ for that source/runtime boundary.
 
 Extraction creates fixed siblings under the existing packages root:
 
-- `/opt/zunder-hosted-ordinary/runtime/website/build-source`;
-- `/opt/zunder-hosted-ordinary/runtime/website/build-input/source.json`;
+- `/var/lib/zunder-hosted-ordinary/runtime/website/build-source`;
+- `/var/lib/zunder-hosted-ordinary/runtime/website/build-input/source.json`;
 - `build-input/candidate.json`, `build-input/raw-manifest.json` and
   `build-input/stage-receipt.json`.
 

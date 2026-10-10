@@ -83,7 +83,7 @@ class Materialization(unittest.TestCase):
     def test_controller_runtime_and_real_git_layout_are_distinct(self):
         self.assertFalse(c.WEBSITE.is_relative_to(c.SOURCE))
         self.assertFalse(c.CHECKOUT.is_relative_to(c.SOURCE))
-        self.assertEqual(str(c.WEBSITE), '/opt/zunder-hosted-ordinary/runtime/website/source')
+        self.assertEqual(str(c.WEBSITE), '/var/lib/zunder-hosted-ordinary/runtime/website/source')
 
     def test_exact_minimal_browser_helpers_and_transitive_imports(self):
         root = Path(__file__).resolve().parent/'browser'

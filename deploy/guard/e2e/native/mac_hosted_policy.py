@@ -69,6 +69,127 @@ def power_diagnostic(text):
         for key in('hibernatemode','standby','autopoweroff')}}
 
 
+def power_format_diagnostic(text):
+    """Closed shape observation; partial settings never satisfy admission."""
+    required=('hibernatemode','standby','autopoweroff')
+    empty={key:{'present_in_all':False,'zero_in_all':False,'ambiguous':False}for key in required}
+    def refused(reason):
+        return {'kind':'closed-power-format-observation','reason':reason,'line_count':0,
+                'section_count':0,'headerless_count':0,'multifield_count':0,
+                'duplicate_count':0,'required':empty}
+    if type(text)is not str or len(text)>65536:return refused('input-refused')
+    lines=text.splitlines()
+    if len(lines)>4096:return refused('line-bound-refused')
+    sections=[];current=None;headerless=0;multifield=0;duplicates=0;ambiguous=set()
+    for line in lines:
+        if re.fullmatch(r'(?:Battery|AC|UPS) Power:',line.strip()):
+            current={'seen':set(),'values':{}};sections.append(current)
+            if len(sections)>3:return refused('section-bound-refused')
+            continue
+        if not line.strip():continue
+        fields=line.split()
+        if current is None:headerless+=1;continue
+        if len(fields)!=2:
+            multifield+=1
+            if fields[0]in required:ambiguous.add(fields[0])
+            continue
+        key,value=fields
+        if key in current['seen']:
+            duplicates+=1
+            if key in required:ambiguous.add(key)
+        current['seen'].add(key)
+        if key in required:current['values'][key]=value
+    reason=('no-sections'if not sections else'headerless-lines'if headerless else
+            'duplicate-fields'if duplicates else'multiple-fields'if multifield else'canonical-shape')
+    return {'kind':'closed-power-format-observation','reason':reason,'line_count':len(lines),
+            'section_count':len(sections),'headerless_count':headerless,'multifield_count':multifield,
+            'duplicate_count':duplicates,'required':{key:{
+                'present_in_all':bool(sections)and key not in ambiguous and all(key in row['values']for row in sections),
+                'zero_in_all':bool(sections)and key not in ambiguous and all(row['values'].get(key)=='0'for row in sections),
+                'ambiguous':key in ambiguous}for key in required}}
+
+
+
+def capability_diagnostic(text):
+    """Current-power-source feature API observation, never an admission override."""
+    required=('hibernatemode','standby','autopoweroff')
+    def unknown(reason):
+        return {'observed':False,'reason':reason,'power_source':'unknown',
+                'features':{key:'unknown'for key in required}}
+    if type(text)is not str or len(text)>65536:return unknown('input-refused')
+    lines=text.splitlines()
+    if not 2<=len(lines)<=65:return unknown('shape-refused')
+    header=re.fullmatch(r'Capabilities for (AC|Battery|UPS) Power:',lines[0].strip())
+    if header is None:return unknown('shape-refused')
+    seen=set()
+    for line in lines[1:]:
+        key=line.strip()
+        if re.fullmatch(r'[a-z][a-z0-9_]{0,63}',key)is None or key in seen:return unknown('shape-refused')
+        seen.add(key)
+    return {'observed':True,'reason':'current-source-positive-features-only','power_source':header[1].lower(),
+            'features':{key:'supported'if key in seen else'unknown'for key in required}}
+
+
+def live_power_diagnostic(text):
+    """One fixed Apple live section; closed shape counts never change admission."""
+    required=('hibernatemode','standby','autopoweroff')
+    shape={'line_count':0,'system_header_count':0,'live_header_count':0,'unknown_header_count':0,
+           'prefix_line_count':0,'live_line_count':0,'required_duplicate_count':0,'required_multifield_count':0}
+    def unknown(reason):
+        return {'observed':False,'reason':reason,'shape':shape,
+                'required':{key:{'presence':'unknown','zero':None}for key in required}}
+    if type(text)is not str or len(text)>65536:return unknown('input-refused')
+    lines=text.splitlines()
+    if not 2<=len(lines)<=4096:return unknown('line-bound-refused')
+    shape['line_count']=len(lines)
+    system=[];live=[];nonblank=[]
+    for index,line in enumerate(lines):
+        word=line.strip()
+        if not word:continue
+        nonblank.append(index)
+        if word=='System-wide power settings:':system.append(index)
+        elif word=='Currently in use:':live.append(index)
+        elif word.endswith(':'):shape['unknown_header_count']+=1
+    shape['system_header_count']=len(system);shape['live_header_count']=len(live)
+    if shape['unknown_header_count']:return unknown('unknown-header-refused')
+    if len(live)!=1 or len(system)>1:return unknown('header-count-refused')
+    index=live[0]
+    if system:
+        if system[0]!=nonblank[0]or system[0]>=index:return unknown('header-order-refused')
+        shape['prefix_line_count']=sum(bool(line.strip())for line in lines[system[0]+1:index])
+    elif index!=nonblank[0]:return unknown('prefix-refused')
+    body=lines[index+1:];shape['live_line_count']=sum(bool(line.strip())for line in body)
+    if not shape['live_line_count']:return unknown('empty-live-section')
+    values={};ambiguous=set();seen=set()
+    for line in body:
+        fields=line.split()
+        if not fields:continue
+        key=fields[0]
+        if key not in required:continue
+        if key in seen:ambiguous.add(key);shape['required_duplicate_count']+=1
+        seen.add(key)
+        if len(fields)!=2:
+            ambiguous.add(key);shape['required_multifield_count']+=1
+        elif re.fullmatch(r'[0-9]{1,10}',fields[1])is None:ambiguous.add(key)
+        else:values[key]=fields[1]
+    return {'observed':True,'reason':'live-required-value-observation','shape':shape,'required':{key:{
+            'presence':'unknown'if key in ambiguous else'present'if key in values else'absent',
+            'zero':None if key in ambiguous or key not in values else values[key]=='0'}for key in required}}
+
+
+def power_capability_probe(*,deadline):
+    """Two bounded no-key reads; results never feed the original policy predicate."""
+    result={'kind':'closed-power-capability-observation','interpretation':'current-source-feature-api-only',
+            'capabilities':capability_diagnostic(None),'live':live_power_diagnostic(None),
+            'universal_hibernation_absence_proven':False,'universal_crash_capture_prevention_proven':False}
+    for name,argv,parse in (
+        ('capabilities',['/usr/bin/pmset','-g','cap'],capability_diagnostic),
+        ('live',['/usr/bin/pmset','-g','live'],live_power_diagnostic)):
+        try:result[name]=parse(public(argv,deadline=deadline))
+        except BaseException:
+            result[name]=parse(None);result[name]['reason']='readback-unavailable'
+    return result
+
 def inspect_sleep_and_core(paths=(Path('/private/var/vm/sleepimage'),Path('/var/vm/sleepimage'),Path('/cores'))):
     for path in paths:
         if not os.path.lexists(path):continue
@@ -170,6 +291,7 @@ def probe(*,deadline=None):
             try:
                 values[name]=public(argv,deadline=original_deadline);checks[name]={'observed':True,'passed':None}
                 if name=='power':checks[name]['diagnostic']=power_diagnostic(values[name])
+                if name=='power':checks[name]['diagnostic']['format_detail']=power_format_diagnostic(values[name])
             except BaseException:checks[name]={'observed':False,'passed':False,'reason':'readback-unavailable'}
         try:inspect_sleep_and_core();checks['sleep_image_and_core_inventory']={'observed':True,'passed':True}
         except BaseException:checks['sleep_image_and_core_inventory']={'observed':False,'passed':False,'reason':'inventory-refused-or-unavailable'}
@@ -207,10 +329,12 @@ def probe(*,deadline=None):
                 need(time.monotonic()<original_deadline)
                 checks['owned_helper_cleanup']={'observed':True,'passed':True}
             except BaseException:checks['owned_helper_cleanup']={'observed':False,'passed':False,'reason':'owned-helper-remains-unknown'}
+    capability=power_capability_probe(deadline=original_deadline)
     return {'schema':1,'kind':'actual-hosted-mac-policy-capability','policy':HOSTED,'checks':checks,
         'eligible':checks.get('effective_policy',{}).get('passed')is True and checks.get('owned_helper_cleanup',{}).get('passed')is True,
         'coverage':{'filevault':False if values.get('vault')=='FileVault is Off.'else True if values.get('vault')=='FileVault is On.'else None,'filevault_coverage':'untested','no_swap':False,'heap_locking':False,
                     'strict_native_memory_satisfied':False},
+        'power_capability_observation':capability,
         'privateInput':False,'releaseReady':False,'source_or_custody_admission_proven':False,'host_policy_modified':False}
 
 
