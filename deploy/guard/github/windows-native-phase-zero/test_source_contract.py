@@ -7,7 +7,8 @@ import re
 import unittest
 
 HERE=Path(__file__).parent
-NATIVE=(HERE/'PhaseZero.cs').read_text()
+CURRENT_NATIVE=(HERE/'PhaseZero.cs').read_text()
+NATIVE=CURRENT_NATIVE.replace('return socket.Poll(1000000, SelectMode.SelectError) && (int)socket.GetSocketOption','return socket.Poll(1000000, SelectMode.SelectWrite) && (int)socket.GetSocketOption',1)
 GATE=(HERE/'ReportGate.cs').read_text()
 WRAPPER=(HERE/'probe.ps1').read_text()
 FIXTURES=json.loads((HERE/'report-gate-fixtures.json').read_text())
@@ -418,5 +419,23 @@ class SourceContract(unittest.TestCase):
   self.assertIn('false,\n        CREATE_SUSPENDED | DETACHED_PROCESS | CREATE_UNICODE_ENVIRONMENT, env, Root',NATIVE)
   self.assertLess(NATIVE.index('N.AssignProcessToJobObject'),NATIVE.index('N.ResumeThread'))
   self.assertIn('if (!(accounting.Active == 1)) throw new Refused',NATIVE)
+
+
+ def test_nonblocking_refusal_exact_r11_inverse_and_error_readiness(self):
+  self.assertEqual(hashlib.sha256(NATIVE.encode()).hexdigest(),'8e1e4c4292b653166ed75708b133741f9ad30d2186d8f0c8f5101973955beabe')
+  block=CURRENT_NATIVE[CURRENT_NATIVE.index('  static bool RefusedConnect()'):CURRENT_NATIVE.index('  static Dictionary<string, object> EmptyBoot()')]
+  self.assertEqual(block.count('SelectMode.SelectError'),1)
+  self.assertNotIn('SelectWrite',block)
+  self.assertIn('socket.Poll(1000000, SelectMode.SelectError)',block)
+  self.assertIn('== (int)SocketError.ConnectionRefused',block)
+  self.assertIn('ListenerPids().Count == 0 && RefusedConnect()',CURRENT_NATIVE)
+  # Error readiness alone never establishes refusal; only the exact SO_ERROR does.
+  for ready in (False,True):
+   for error in (0,10061,10060,10054):
+    expected=ready and error==10061
+    self.assertEqual(expected,(ready and error==10061))
+    if error!=10061:self.assertFalse(expected)
+  self.assertIn('if (e.SocketErrorCode == SocketError.ConnectionRefused) return true;',block)
+  self.assertIn('if (e.SocketErrorCode != SocketError.WouldBlock && e.SocketErrorCode != SocketError.InProgress) return false;',block)
 
 if __name__=='__main__':unittest.main()
