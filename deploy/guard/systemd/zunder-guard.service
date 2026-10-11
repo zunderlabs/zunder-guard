@@ -1,0 +1,64 @@
+[Unit]
+Description=Zunder Guard: risk firewall between trading bots and Hyperliquid
+Documentation=https://github.com/zunderlabs/zunder-guard/blob/main/deploy/guard/README.md
+After=network-online.target time-sync.target
+Wants=network-online.target time-sync.target
+# Retried without limit: a venue or network outage at start-up must not leave positions
+# unattended for good. A start refused for a reason only a person can fix keeps being refused,
+# each time with its reason in the journal (journalctl -u zunder-guard).
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=zunder-guard
+Group=zunder-guard
+# Configuration, journal and client keys. Never a key in plain text when systemd-creds exists.
+StateDirectory=zunder-guard
+StateDirectoryMode=0700
+WorkingDirectory=/var/lib/zunder-guard
+Environment=ZUNDER_GUARD_HOME=/var/lib/zunder-guard
+# Paper mode needs no key and nothing else. install.sh adds the drop-in
+# zunder-guard.service.d/10-install.conf, which names the network and, for testnet or mainnet,
+# loads the key as a systemd credential and hands it to the binary on standard input. For
+# mainnet it also loads /etc/zunder-guard/mainnet-confirm.env, which names the account; without
+# that file Guard refuses to start on mainnet, so removing it is how a person stops mainnet.
+ExecStart=/usr/local/bin/zunder-guard run --network paper
+KillSignal=SIGTERM
+TimeoutStopSec=60
+Restart=on-failure
+RestartSec=10
+
+# Nothing of the process may end up on disk: no core dumps.
+LimitCORE=0
+UMask=0077
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+PrivateUsers=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RemoveIPC=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+# Guard needs TCP to Hyperliquid and its local listener, nothing else.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+SystemCallErrorNumber=EPERM
+
+[Install]
+WantedBy=multi-user.target

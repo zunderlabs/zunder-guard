@@ -1,0 +1,27 @@
+# yaml-language-server: $schema=https://aka.ms/winget-manifest.defaultLocale.1.10.0.schema.json
+PackageIdentifier: ZunderLabs.ZunderGuard
+PackageVersion: "@VERSION_NUMBER@"
+PackageLocale: en-US
+Publisher: Orcastrate UG (haftungsbeschränkt)
+PublisherUrl: https://zunderlabs.com
+PackageName: Zunder Guard
+PackageUrl: https://zunderlabs.com
+# Source-available, not open source.
+License: Elastic-2.0
+LicenseUrl: https://github.com/zunderlabs/zunder-guard/blob/main/LICENSE
+ShortDescription: Self-hosted risk firewall between trading bots or AI agents and Hyperliquid.
+Description: >-
+  Zunder Guard sits between a trading bot or AI agent and Hyperliquid. It sizes or refuses every
+  order against limits you set (risk per trade, daily loss stop, drawdown halt, leverage, markets,
+  mandatory stop), starts in paper mode and listens on 127.0.0.1 only. Run
+  "zunder-guard init --interactive" after installing. On Windows: paper and testnet (the
+  testnet key is kept in the Windows Credential Manager); mainnet runs on Linux.
+Moniker: zunder-guard
+Tags:
+  - trading
+  - risk-management
+  - hyperliquid
+  - firewall
+ReleaseNotesUrl: https://github.com/zunderlabs/zunder-guard/releases/tag/@VERSION@
+ManifestType: defaultLocale
+ManifestVersion: 1.10.0

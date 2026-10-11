@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=80"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "zunder-guard-harness"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = ["jsonschema>=4.23,<5", "hyperliquid-python-sdk==0.24.0", "eth-account>=0.13,<0.14"]
+
+[project.optional-dependencies]
+dev = ["mypy>=1.15,<2", "pytest>=8,<10", "ruff>=0.14,<1", "types-jsonschema>=4.23"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests", "../release"]
+pythonpath = ["src"]
+addopts = "-ra"
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.mypy]
+strict = true
+files = ["src", "tests", "../release"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["guard_harness"]
+
+[[tool.mypy.overrides]]
+module = ["hyperliquid.*"]
+ignore_missing_imports = true

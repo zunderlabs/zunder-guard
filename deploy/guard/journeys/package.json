@@ -1,0 +1,24 @@
+{
+  "name": "zunder-guard-journeys",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "check": "tsc --noEmit",
+    "test": "playwright test",
+    "fixture": "tsx purchase/fixture/server.ts"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.56.1",
+    "@types/node": "24.10.1",
+    "esbuild": "0.28.2",
+    "miniflare": "4.20260730.0",
+    "tsx": "4.20.6",
+    "typescript": "5.9.3"
+  },
+  "overrides": {
+    "miniflare": {
+      "undici": "7.29.1",
+      "sharp": "0.35.5"
+    }
+  }
+}

@@ -1,0 +1,12 @@
+name = "zunder-guard-installers"
+main = "store.ts"
+compatibility_date = "2026-08-06"
+workers_dev = false
+
+[[durable_objects.bindings]]
+name = "RELEASE_STATE"
+class_name = "ReleaseStore"
+
+[[migrations]]
+tag = "publication-v1"
+new_sqlite_classes = ["ReleaseStore"]

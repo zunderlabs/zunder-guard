@@ -1,0 +1,44 @@
+{
+  "schema": 2,
+  "version": "1.0.0",
+  "tag": "v1.0.0",
+  "commit": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "published_at": "2026-10-10T10:00:00Z",
+  "assets": {
+    "guard.tar.gz": {
+      "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "url": "https://github.com/zunderlabs/zunder-guard/releases/download/v1.0.0/guard.tar.gz"
+    }
+  },
+  "signing": {
+    "identity": "https://github.com/zunderlabs/zunder-guard/.github/workflows/release.yml@refs/tags/v1.0.0",
+    "issuer": "https://token.actions.githubusercontent.com"
+  },
+  "distribution": {
+    "unix_loader": {
+      "command": "curl -fsSL https://zunderlabs.com/i | sh"
+    },
+    "windows_loader": {
+      "command": "irm https://zunderlabs.com/i.ps1 | iex"
+    },
+    "homebrew": {
+      "command": "brew install zunderlabs/tap/zunder-guard"
+    },
+    "docker": {
+      "image": "ghcr.io/zunderlabs/zunder-guard",
+      "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    },
+    "archive": {},
+    "aws_template": {
+      "url": "https://example.com/guard/v1.0.0/cloudformation.yaml"
+    },
+    "container_native": {}
+  },
+  "platforms": [
+    "linux-amd64",
+    "linux-arm64",
+    "darwin-arm64",
+    "darwin-amd64",
+    "windows-amd64"
+  ]
+}

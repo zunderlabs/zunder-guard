@@ -1,0 +1,46 @@
+[Unit]
+Description=Zunder Guard mainnet container with encrypted host credential
+After=docker.service network-online.target time-sync.target
+# Docker shutdown can yield exit 0; keep retrying after the daemon returns.
+Wants=docker.service network-online.target time-sync.target
+# Indefinite retries, rate bounded by RestartSec; no exhausted start gate.
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=root
+Group=root
+RuntimeDirectory=zunder-guard-container
+RuntimeDirectoryMode=0700
+RuntimeDirectoryPreserve=yes
+LoadCredentialEncrypted=guard-api-wallet:/etc/zunder-guard-container/credential.cred
+# Credentials enter the service namespace after systemd prepares StandardInput.
+# The fixed Python helper opens this unit's credential after ExecStart, just before exec.
+StandardInput=null
+ExecStart=/usr/bin/python3 /usr/local/libexec/zunder-guard-container/supervisor.py run
+ExecStop=/usr/bin/python3 /usr/local/libexec/zunder-guard-container/supervisor.py stop
+ExecStopPost=/usr/bin/python3 /usr/local/libexec/zunder-guard-container/supervisor.py stop
+# Guard handles SIGTERM cleanly. Restart even after exit 0; an explicit
+# systemctl stop still suppresses restart. Persisted risk halts remain intact.
+Restart=always
+RestartSec=10
+KillSignal=SIGTERM
+TimeoutStopSec=90
+LimitCORE=0
+UMask=0077
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/run/zunder-guard-container
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+[Install]
+WantedBy=multi-user.target

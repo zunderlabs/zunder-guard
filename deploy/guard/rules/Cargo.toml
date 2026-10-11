@@ -1,0 +1,20 @@
+[package]
+name = "zunder-guard-rules"
+description = "Guard rules schema v1: the zr1_ string the website, the docs and the CLI share"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license = "Elastic-2.0"
+
+[dependencies]
+base64.workspace = true
+rust_decimal.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+zunder-risk.workspace = true
+# The bounds and defaults are the Guard core's policy (the rules are its published form).
+zunder-guard-core.workspace = true
+
+[lints]
+workspace = true

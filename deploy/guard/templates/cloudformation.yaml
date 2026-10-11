@@ -1,0 +1,256 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Zunder Guard on your own EC2 instance: installed through the signed loader, paper mode,
+  listening on 127.0.0.1, no inbound ports, shell access through SSM Session Manager. Launch it in
+  ap-northeast-1 (Tokyo), next to Hyperliquid. No key is part of this template.
+  (deploy/guard/README.md, "AWS")
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label: { default: Guard }
+        Parameters: [Rules, Account]
+      - Label: { default: Instance }
+        Parameters: [InstanceType, ImageId]
+      - Label: { default: "Public access (off by default; read the warning)" }
+        Parameters: [ExposePort, AllowedCidr]
+
+Parameters:
+  Rules:
+    Type: String
+    Description: Your rules from zunderlabs.com (zr1_…). Not secret; checked again by Guard.
+    AllowedPattern: "^zr1_[A-Za-z0-9_-]+$"
+    MaxLength: 4096
+  Account:
+    Type: String
+    AllowedPattern: "^0x[0-9a-fA-F]{40}$"
+    Description: Public Hyperliquid account address to observe in paper mode. Never a private key.
+  InstanceType:
+    Type: String
+    Default: t4g.small
+    AllowedValues: [t4g.micro, t4g.small, t4g.medium, c7g.medium, c7g.large]
+    Description: ARM (Graviton) instance. t4g.small is plenty for one account.
+  ImageId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/canonical/ubuntu/server/24.04/stable/current/arm64/hvm/ebs-gp3/ami-id
+    Description: Ubuntu 24.04 for ARM, resolved from Canonical's public SSM parameter.
+  ExposePort:
+    Type: String
+    Default: "no"
+    AllowedValues: ["no", "yes"]
+    Description: >-
+      WARNING: "yes" makes Guard listen on all interfaces and opens port 8547 to AllowedCidr.
+      Anyone who reaches the port can send orders signed with a paired client key. Leave "no"
+      and run your bot on this instance, or reach Guard through an SSM port forward.
+  AllowedCidr:
+    Type: String
+    Default: 192.0.2.1/32
+    AllowedPattern: '^((25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\.){3}(25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])/32$'
+    Description: Only with ExposePort=yes. Your bot's address as a /32; 0.0.0.0/0 is refused.
+
+Rules:
+  NoOpenInternet:
+    RuleCondition: !Equals [!Ref ExposePort, "yes"]
+    Assertions:
+      - Assert: !Not [!Equals [!Ref AllowedCidr, "0.0.0.0/0"]]
+        AssertDescription: Guard is never opened to the whole internet; give your bot's /32.
+
+Conditions:
+  Expose: !Equals [!Ref ExposePort, "yes"]
+  NotTokyo: !Not [!Equals [!Ref "AWS::Region", ap-northeast-1]]
+
+Resources:
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.77.0.0/24
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+  GatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref InternetGateway
+  Subnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.77.0.0/24
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+  RouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+  InternetRoute:
+    Type: AWS::EC2::Route
+    DependsOn: GatewayAttachment
+    Properties:
+      RouteTableId: !Ref RouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+  SubnetRoute:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref Subnet
+      RouteTableId: !Ref RouteTable
+  Role:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: SSM Session Manager and bootstrap status for this CloudFormation stack only.
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ec2.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: SessionManagerOnly
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ssm:UpdateInstanceInformation
+                  - ssmmessages:CreateControlChannel
+                  - ssmmessages:CreateDataChannel
+                  - ssmmessages:OpenControlChannel
+                  - ssmmessages:OpenDataChannel
+                Resource: "*"
+        - PolicyName: SignalOwnBootstrap
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: cloudformation:SignalResource
+                Resource: !Ref AWS::StackId
+
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [!Ref Role]
+
+  SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      VpcId: !Ref Vpc
+      GroupDescription: Zunder Guard. No inbound rules unless ExposePort is yes.
+      SecurityGroupIngress: !If
+        - Expose
+        - - IpProtocol: tcp
+            FromPort: 8547
+            ToPort: 8547
+            CidrIp: !Ref AllowedCidr
+            Description: Guard, opened explicitly by the stack's ExposePort parameter
+        - !Ref AWS::NoValue
+
+  LaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateData:
+        TagSpecifications:
+          - ResourceType: volume
+            Tags:
+              - { Key: Name, Value: !Sub '${AWS::StackName}-guard-state' }
+              - { Key: zunder:stack, Value: !Ref AWS::StackId }
+        MetadataOptions:
+          HttpTokens: required
+          HttpPutResponseHopLimit: 1
+        BlockDeviceMappings:
+          - DeviceName: /dev/sda1
+            Ebs:
+              VolumeSize: 16
+              VolumeType: gp3
+              Encrypted: true
+              DeleteOnTermination: false
+
+  Instance:
+    Type: AWS::EC2::Instance
+    DependsOn: [InternetRoute, SubnetRoute]
+    CreationPolicy:
+      ResourceSignal:
+        Count: 1
+        Timeout: PT20M
+    Properties:
+      SubnetId: !Ref Subnet
+      ImageId: !Ref ImageId
+      InstanceType: !Ref InstanceType
+      IamInstanceProfile: !Ref InstanceProfile
+      SecurityGroupIds: [!GetAtt SecurityGroup.GroupId]
+      LaunchTemplate:
+        LaunchTemplateId: !Ref LaunchTemplate
+        Version: !GetAtt LaunchTemplate.LatestVersionNumber
+      Tags:
+        - { Key: Name, Value: zunder-guard }
+      UserData:
+        Fn::Base64: !Sub
+          - |
+            #!/bin/bash
+            # Paper only. No key, licence or credential in CloudFormation parameters or logs.
+            set -euo pipefail
+            export DEBIAN_FRONTEND=noninteractive
+            apt-get update
+            apt-get install -y curl ca-certificates awscli
+            umask 077
+            loader=
+            install_log=
+            finish() {
+              result=$?
+              trap - EXIT
+              if [ -n "$loader" ]; then rm -f "$loader"; fi
+              if [ -n "$install_log" ]; then
+                if [ "$result" -eq 0 ]; then
+                  rm -f "$install_log"
+                else
+                  echo "Installer diagnostics are in the root-only file $install_log; do not share its contents."
+                fi
+              fi
+              status=FAILURE
+              if [ "$result" -eq 0 ]; then status=SUCCESS; fi
+              aws cloudformation signal-resource --region '${AWS::Region}' \
+                --stack-name '${AWS::StackId}' --logical-resource-id Instance \
+                --unique-id guard-bootstrap --status "$status" || exit 1
+              exit "$result"
+            }
+            trap finish EXIT
+            loader=$(mktemp)
+            curl -fsSL --proto '=https' --retry 3 -o "$loader" https://zunderlabs.com/i
+            install_log=$(mktemp)
+            sh "$loader" --non-interactive --network paper --rules '${Rules}' \
+              --account '${Account}' ${ListenArg} >"$install_log" 2>&1
+            rm -f "$loader"
+            systemctl is-active --quiet zunder-guard
+            curl -fsS --retry 30 --retry-all-errors --retry-delay 2 \
+              http://127.0.0.1:8547/healthz >/dev/null
+          - ListenArg: !If [Expose, "--listen 0.0.0.0:8547", ""]
+
+Outputs:
+  InstanceId:
+    Value: !Ref Instance
+  Shell:
+    Description: A shell on the instance (needs the AWS CLI and the Session Manager plugin).
+    Value: !Sub aws ssm start-session --region ${AWS::Region} --target ${Instance}
+  ConsoleShell:
+    Description: Open Session Manager in the AWS console; no local SSH key or CLI required.
+    Value: !Sub https://${AWS::Region}.console.aws.amazon.com/systems-manager/session-manager/${Instance}?region=${AWS::Region}
+  Verify:
+    Description: Run in the SSM shell. CREATE_COMPLETE means bootstrap and health check succeeded.
+    Value: curl -fsS http://127.0.0.1:8547/healthz
+  Cleanup:
+    Description: Avoid leftover storage charges after deleting this test stack.
+    Value: The encrypted root EBS volume is retained on termination to protect Guard state. Back it up, then explicitly delete it when no longer needed. Replacing the instance does not automatically reattach it.
+  NextStep:
+    Description: Preserve paper state and identities. Stop the paper bot and service; explicitly select a fresh Testnet or Mainnet service using the release activation guide. Mainnet stays stopped pending deliberate journal initialization.
+    Value: >-
+      Follow deploy/guard/systemd/ACTIVATION.md at the source commit named in this release. Use --service-instance testnet or --service-instance mainnet with matching --network, rules, account, equity cap, a separate loopback port and IP share. Never use --force to activate bootstrap paper state.
+  PairPaper:
+    Description: Keep paper mode. Add a bot client and rotate the browser pairing code in your private SSM session, then restart to apply.
+    Value: >-
+      sudo -u zunder-guard env ZUNDER_GUARD_HOME=/var/lib/zunder-guard /usr/local/bin/zunder-guard pair
+      && sudo systemctl restart zunder-guard
+  RegionNote:
+    Condition: NotTokyo
+    Description: Hyperliquid's validators are in Tokyo.
+    Value: This stack is not in ap-northeast-1; orders take longer to reach Hyperliquid.

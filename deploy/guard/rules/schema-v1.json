@@ -1,0 +1,53 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://zunderlabs.com/schemas/guard-rules-v1.json",
+  "title": "Zunder Guard rules, schema v1",
+  "description": "The JSON inside a zr1_ string (base64url, no padding). Values ending in Pct are percent: 2 means 2%. Missing fields take the default; unknown fields and out-of-bounds values are refused. Numbers have at most four decimal places. Cross-field rules: maxOpenRiskPct >= maxLossAtStopPct, maxPositionPct <= maxLeverage * 100 and minLiqDistancePct > defaultStopDistancePct. The bounds are the Guard core's policy bounds (crates/zunder-guard-core/src/policy.rs); upper bounds of the risk-engine values never exceed zunder-risk's aggressive frame. Kept equal to deploy/guard/rules/src/lib.rs by a test.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["v"],
+  "properties": {
+    "v": { "const": 1, "description": "Schema version." },
+    "maxLeverage": {
+      "type": "number", "default": 5, "exclusiveMinimum": 0, "maximum": 10, "multipleOf": 0.0001,
+      "description": "Total position value divided by equity, at most."
+    },
+    "maxLossAtStopPct": {
+      "type": "number", "default": 2, "exclusiveMinimum": 0, "maximum": 5, "multipleOf": 0.0001,
+      "description": "Loss if the stop fills, plus expected costs, in percent of equity: the risk per trade Guard sizes every entry to."
+    },
+    "stopPolicy": {
+      "enum": ["attach", "refuse"], "default": "attach",
+      "description": "An entry without a stop: attach one defaultStopDistancePct away and size from it, or refuse the entry. No entry is ever without a stop."
+    },
+    "defaultStopDistancePct": {
+      "type": "number", "default": 2, "exclusiveMinimum": 0, "maximum": 50, "multipleOf": 0.0001,
+      "description": "Optional. Distance of the stop Guard attaches, in percent of the entry price."
+    },
+    "minLiqDistancePct": {
+      "type": "number", "default": 10, "minimum": 1, "maximum": 50, "multipleOf": 0.0001,
+      "description": "The liquidation price must lie at least this far from the entry, in percent of the price."
+    },
+    "maxPositionPct": {
+      "type": "number", "default": 200, "exclusiveMinimum": 0, "maximum": 1000, "multipleOf": 0.0001,
+      "description": "One position's value, in percent of equity, at most. Never above maxLeverage * 100."
+    },
+    "maxOpenRiskPct": {
+      "type": "number", "default": 6, "exclusiveMinimum": 0, "maximum": 20, "multipleOf": 0.0001,
+      "description": "Risk to the stops summed over all open positions, in percent of equity. At least maxLossAtStopPct."
+    },
+    "dailyLossStopPct": {
+      "type": "number", "default": 6, "exclusiveMinimum": 0, "maximum": 15, "multipleOf": 0.0001,
+      "description": "Loss since the start of the UTC day that halts new entries until the next day."
+    },
+    "drawdownHaltPct": {
+      "type": "number", "default": 25, "exclusiveMinimum": 0, "maximum": 50, "multipleOf": 0.0001,
+      "description": "Fall from the equity peak that halts trading until a person resumes it."
+    },
+    "markets": {
+      "type": "array", "default": ["*"], "minItems": 1, "maxItems": 32, "uniqueItems": true,
+      "items": { "type": "string", "pattern": "^(\\*|[A-Za-z0-9]{1,30}:\\*|[A-Za-z0-9@][A-Za-z0-9:/@._-]{0,31})$" },
+      "description": "Hyperliquid market names Guard lets orders through for (for example BTC, xyz:XYZ100), \"*\" for every market of the main dex, \"dex:*\" for every market of that HIP-3 dex. HIP-3 markets are allowed only by name, never by \"*\". Beside \"*\" only HIP-3 entries may stand, and beside \"dex:*\" no other market of that dex. Guard reads at most two HIP-3 dexes."
+    }
+  }
+}

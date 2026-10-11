@@ -1,0 +1,58 @@
+name: staging-licence-verifier
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - .github/workflows/licence-verifier.yml
+      - crates/zunder-guard-core/**
+      - crates/zunder-core/**
+      - crates/zunder-risk/**
+      - Cargo.toml
+      - Cargo.lock
+      - rust-toolchain.toml
+      - deploy/guard/test/licence-verifier.mjs
+      - deploy/guard/test/test-licence-verifier.mjs
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/licence-verifier.yml
+      - crates/zunder-guard-core/**
+      - crates/zunder-core/**
+      - crates/zunder-risk/**
+      - Cargo.toml
+      - Cargo.lock
+      - rust-toolchain.toml
+      - deploy/guard/test/licence-verifier.mjs
+      - deploy/guard/test/test-licence-verifier.mjs
+permissions:
+  contents: read
+concurrency:
+  group: staging-licence-verifier-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  verifier:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Check public fixture orchestration
+        run: node --test deploy/guard/test/test-licence-verifier.mjs
+      - name: Compile the bounded offline staging verifier
+        run: |
+          rustup toolchain install
+          cargo check --locked -p zunder-guard-core --example verify_testnet_licence
+          cargo clippy --locked -p zunder-guard-core --example verify_testnet_licence -- -D warnings
+          cargo build --locked -p zunder-guard-core --example verify_testnet_licence
+      - name: Check the real Linux executable with public fixture signatures
+        run: |
+          mkdir verifier-evidence
+          node deploy/guard/test/licence-verifier.mjs "$PWD/target/debug/examples/verify_testnet_licence" verifier-evidence/receipt.json
+          cp target/debug/examples/verify_testnet_licence verifier-evidence/
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: staging-licence-verifier-${{ github.sha }}
+          path: verifier-evidence/
+          if-no-files-found: error
+          retention-days: 30

@@ -1,0 +1,222 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Zunder Guard release-state predicate v2",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "version",
+    "tag",
+    "commit",
+    "stage",
+    "channels",
+    "evidence",
+    "manifest_sha256",
+    "revision",
+    "previous",
+    "issued_at"
+  ],
+  "properties": {
+    "schema": {
+      "const": 2
+    },
+    "version": {
+      "type": "string",
+      "pattern": "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)(-rc\\.[1-9][0-9]*)?$"
+    },
+    "tag": {
+      "type": "string",
+      "pattern": "^v(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)(-rc\\.[1-9][0-9]*)?$"
+    },
+    "commit": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "stage": {
+      "enum": [
+        "staged",
+        "gated",
+        "promoted",
+        "withdrawn"
+      ]
+    },
+    "channels": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "unix_loader",
+        "windows_loader",
+        "homebrew",
+        "docker",
+        "archive",
+        "aws_template",
+        "container_native"
+      ],
+      "properties": {
+        "unix_loader": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "status",
+            "command"
+          ],
+          "properties": {
+            "status": {
+              "enum": [
+                "verified",
+                "unavailable"
+              ]
+            },
+            "command": {
+              "const": "curl -fsSL https://zunderlabs.com/i | sh"
+            }
+          }
+        },
+        "windows_loader": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "status",
+            "command"
+          ],
+          "properties": {
+            "status": {
+              "enum": [
+                "verified",
+                "unavailable"
+              ]
+            },
+            "command": {
+              "const": "irm https://zunderlabs.com/i.ps1 | iex"
+            }
+          }
+        },
+        "homebrew": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "status",
+            "command"
+          ],
+          "properties": {
+            "status": {
+              "enum": [
+                "verified",
+                "unavailable"
+              ]
+            },
+            "command": {
+              "const": "brew install zunderlabs/tap/zunder-guard"
+            }
+          }
+        },
+        "docker": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "status",
+            "image",
+            "digest"
+          ],
+          "properties": {
+            "status": {
+              "enum": [
+                "verified",
+                "unavailable"
+              ]
+            },
+            "image": {
+              "const": "ghcr.io/zunderlabs/zunder-guard"
+            },
+            "digest": {
+              "type": "string",
+              "pattern": "^sha256:[0-9a-f]{64}$"
+            }
+          }
+        },
+        "archive": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "status"
+          ],
+          "properties": {
+            "status": {
+              "enum": [
+                "verified",
+                "unavailable"
+              ]
+            }
+          }
+        },
+        "aws_template": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "status",
+            "url"
+          ],
+          "properties": {
+            "status": {
+              "enum": [
+                "verified",
+                "unavailable"
+              ]
+            },
+            "url": {
+              "type": "string",
+              "format": "uri",
+              "pattern": "^https://"
+            }
+          }
+        },
+        "container_native": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "status"
+          ],
+          "properties": {
+            "status": {
+              "enum": [
+                "verified",
+                "unavailable"
+              ]
+            }
+          }
+        }
+      }
+    },
+    "evidence": {
+      "type": "object",
+      "propertyNames": {
+        "pattern": "^(P[1-8]|I[1-7]|T[12]|D[1-7]|M[1-3])$"
+      },
+      "additionalProperties": {
+        "type": "string",
+        "format": "uri",
+        "pattern": "^https://"
+      }
+    },
+    "manifest_sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "revision": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "previous": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "issued_at": {
+      "type": "string",
+      "format": "date-time",
+      "pattern": "Z$"
+    }
+  }
+}

@@ -1,0 +1,665 @@
+# Checks for every push and pull request in github.com/zunderlabs/zunder-guard
+# Canonical private source; C1 exports this workflow to .github/workflows/ once.
+# Publishes nothing; read-only token.
+name: ci
+
+on:
+  push:
+    branches: [main, "preview/**"]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: never
+  PROPTEST_RNG_SEED: "20261010"
+
+jobs:
+  provenance:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Require exported history and a clean public tree
+        run: python3 .github/provenance/provenance.py all
+
+  rust-main:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install
+      - name: Cache Cargo sources and build output
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: guard-cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: cargo test --workspace --locked -- --exact --skip the_generator_reaches_every_path --skip the_implementation_is_the_reference --skip the_implementation_is_the_reference_when_told_in_time --skip the_order_of_the_reports_does_not_matter
+        env:
+          ZUNDER_FLOWS_CASES: "4000"
+      - name: Saved late-report daily-stop regression
+        run: cargo test --locked -p zunder-venue --test flows_model case_exact_zero_views_keep_the_day_halt_after_a_late_report -- --exact --nocapture
+        env:
+          ZUNDER_FLOWS_TRACE: "1"
+
+  # Windows: clippy and the tests natively (owner-only ACLs, the Credential Manager, Ctrl-C),
+  # then the PowerShell installer against a release made from this build, under Windows
+  # PowerShell 5.1 and PowerShell 7 (deploy/guard/test/installer-windows.ps1).
+  windows-main:
+    runs-on: windows-2025
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install
+      - name: Cache Cargo sources and build output
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: guard-cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+      - run: cargo clippy --locked --all-targets -p zunder-venue -p zunder-guard-core -p zunder-guard-mcp -p zunder-guard-rules -p zunder-guard -p zunder-redteam -- -D warnings
+      # The full model runs 4,000 histories per property on Linux. Windows
+      # exercises 400 per property on its native filesystem, including the
+      # generator's asserted coverage of every path, plus every native unit test.
+      - name: Native Windows tests (400 flow histories per property)
+        shell: pwsh
+        env:
+          ZUNDER_FLOWS_CASES: "400"
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $cargo = (Get-Command cargo -CommandType Application -ErrorAction Stop).Source
+          $arguments = @('test', '--no-fail-fast', '--locked', '-p', 'zunder-venue', '-p', 'zunder-guard-core', '-p', 'zunder-guard-mcp', '-p', 'zunder-guard-rules', '-p', 'zunder-guard', '--', '--exact', '--skip', 'the_generator_reaches_every_path', '--skip', 'the_implementation_is_the_reference', '--skip', 'the_implementation_is_the_reference_when_told_in_time', '--skip', 'the_order_of_the_reports_does_not_matter')
+          $tests = Start-Process -FilePath $cargo -ArgumentList $arguments -NoNewWindow -PassThru
+          $finished = $false
+          try {
+            # Retain the process handle until its exit code has been collected.
+            $null = $tests.Handle
+            while (-not $tests.WaitForExit(30000)) {
+              Write-Host 'Native Windows tests are active; cumulative process counters:'
+              try {
+                Get-CimInstance -ClassName Win32_Process -OperationTimeoutSec 5 -Filter "Name = 'cargo.exe' OR Name LIKE 'flows_model%'" |
+                  Select-Object Name, ProcessId,
+                    @{Name='CpuSeconds';Expression={[math]::Round(([decimal]$_.KernelModeTime + [decimal]$_.UserModeTime) / 10000000, 1)}},
+                    ReadOperationCount, WriteOperationCount, WriteTransferCount |
+                  Format-Table -AutoSize
+              } catch {
+                Write-Warning 'Process counters are unavailable; the test exit code still determines this step.'
+              }
+            }
+            $tests.WaitForExit()
+            $testExit = $tests.ExitCode
+            $finished = $true
+          } finally {
+            try {
+              if (-not $finished -and -not $tests.HasExited) {
+                & "$env:SystemRoot\System32\taskkill.exe" /PID $tests.Id /T /F | Out-Host
+                if (-not $tests.WaitForExit(10000)) {
+                  Write-Warning 'The test child did not exit after termination; this step remains failed.'
+                }
+              }
+            } catch {
+              Write-Warning 'Test child cleanup failed; the original wrapper failure is retained.'
+            } finally {
+              $tests.Dispose()
+            }
+          }
+          if ($null -eq $testExit) { throw 'The test process supplied no exit code' }
+          exit $testExit
+      - name: A local release from this build (the test double signs it)
+        shell: bash
+        run: |
+          deploy/guard/github/build-release.sh x86_64-pc-windows-msvc
+          exe=target/x86_64-pc-windows-msvc/release/zunder-guard.exe
+          v="v$("$exe" --version | tr -d '\r' | cut -d' ' -f2)"
+          for t in linux-amd64 linux-arm64 darwin-amd64 darwin-arm64; do  # stand-ins: names and sums only
+            PYTHON=python deploy/guard/packaging/package.sh "$v" "$t" "$exe" "rel/$v" >/dev/null
+          done
+          PYTHON=python deploy/guard/packaging/package.sh "$v" windows-amd64 "$exe" "rel/$v"
+          # Fixture descriptor only: this installer test never accesses a registry.
+          printf '%s\n' 'ghcr.io/zunderlabs/zunder-guard@sha256:0000000000000000000000000000000000000000000000000000000000000000' \
+            >"rel/$v/zunder-guard-$v.image.txt"
+          deploy/guard/packaging/render.sh "$v" "rel/$v" >/dev/null
+          sum=$(sha256sum "rel/$v/SHA256SUMS" | cut -d' ' -f1)
+          printf '{"identity": "https://github.com/zunderlabs/zunder-guard/.github/workflows/release.yml@refs/tags/%s", "sha256": "%s"}\n' \
+            "$v" "$sum" >"rel/$v/SHA256SUMS.sigstore.json"
+          mkdir fakebin && cp deploy/guard/test/fake-cosign fakebin/
+          printf '@"%%ProgramFiles%%\\Git\\bin\\bash.exe" "%%~dp0fake-cosign" %%*\r\n' >fakebin/cosign.cmd
+          echo "RELEASE_DIR=rel/$v" >>"$GITHUB_ENV"
+      - name: i.ps1 under Windows PowerShell 5.1
+        shell: powershell
+        run: deploy/guard/test/installer-windows.ps1 -Release $env:RELEASE_DIR -Cosign fakebin/cosign.cmd
+      - name: i.ps1 under PowerShell 7
+        shell: pwsh
+        run: deploy/guard/test/installer-windows.ps1 -Release $env:RELEASE_DIR -Cosign fakebin/cosign.cmd
+      - name: Windows ACL diagnostics on failure (empty files only)
+        if: failure()
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $root = Join-Path ([IO.Path]::GetTempPath()) ('guard-acl-' + [Guid]::NewGuid().ToString('N'))
+          $file = $null
+          function Show-Acl([string]$Path) {
+            $env:ZUNDER_ACL_PATH = $Path
+            $child = [Diagnostics.Process]::new()
+            $child.StartInfo.FileName = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
+            $child.StartInfo.Arguments = '-NoProfile -NonInteractive -Command "(Get-Acl -LiteralPath $env:ZUNDER_ACL_PATH).Sddl; try { ([Security.Principal.SecurityIdentifier]''LA'').Value } catch { '''' }"'
+            $child.StartInfo.UseShellExecute = $false
+            $child.StartInfo.RedirectStandardOutput = $true
+            $child.StartInfo.RedirectStandardError = $true
+            try {
+              $child.Start() | Out-Null
+              $stdout = $child.StandardOutput.ReadToEndAsync()
+              $stderr = $child.StandardError.ReadToEndAsync()
+              $child.WaitForExit()
+              [ordered]@{
+                stdout = $stdout.Result; stderr = $stderr.Result
+                stdout_length = $stdout.Result.Length; exit_code = $child.ExitCode
+              } | ConvertTo-Json -Compress
+            } finally { $child.Dispose() }
+            $acl = Get-Acl -LiteralPath $Path -ErrorAction Stop
+            $raw = [Security.AccessControl.RawSecurityDescriptor]::new($acl.GetSecurityDescriptorBinaryForm(), 0)
+            [ordered]@{
+              path = $Path; sddl = $acl.Sddl
+              owner = $acl.GetOwner([Security.Principal.SecurityIdentifier]).Value
+              protected = $acl.AreAccessRulesProtected
+              control_flags = $raw.ControlFlags.ToString()
+              dacl_null = ($null -eq $raw.DiscretionaryAcl)
+            } | ConvertTo-Json -Compress
+          }
+          try {
+            New-Item -ItemType Directory -Path $root | Out-Null
+            $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+            & "$env:SystemRoot\System32\icacls.exe" $root /inheritance:r /grant:r "*${sid}:(OI)(CI)F" /q
+            if ($LASTEXITCODE -ne 0) { throw 'Folder ACL command failed' }
+            Show-Acl $root
+            $path = Join-Path $root 'empty'
+            $sharing = [IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete
+            $file = [IO.FileStream]::new($path, [IO.FileMode]::CreateNew, [IO.FileAccess]::ReadWrite, $sharing)
+            Show-Acl $path
+            & "$env:SystemRoot\System32\icacls.exe" $path /inheritance:d /q
+            if ($LASTEXITCODE -ne 0) { throw 'File ACL command failed' }
+            Show-Acl $path
+          } finally {
+            if ($null -ne $file) { $file.Dispose() }
+            Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue
+            Remove-Item Env:ZUNDER_ACL_PATH -ErrorAction SilentlyContinue
+          }
+
+  rust-flows:
+    name: rust flow (${{ matrix.test }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        test:
+          - the_generator_reaches_every_path
+          - the_implementation_is_the_reference
+          - the_implementation_is_the_reference_when_told_in_time
+          - the_order_of_the_reports_does_not_matter
+    env:
+      FLOW_TEST: ${{ matrix.test }}
+      ZUNDER_FLOWS_CASES: "4000"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install
+      - name: Cache Cargo sources and build output
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: guard-cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+      - name: Require exactly one selected flow test
+        shell: bash
+        run: python deploy/guard/github/check-flow-selection.py "$FLOW_TEST"
+      - name: Run the selected flow property
+        shell: bash
+        run: cargo test --locked -p zunder-venue --test flows_model "$FLOW_TEST" -- --exact
+
+  rust:
+    name: rust
+    if: always()
+    needs: [rust-main, rust-flows]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      REQUIRED_RESULTS: ${{ toJSON(needs) }}
+    steps:
+      - name: Require every main and flow matrix job to succeed
+        shell: python
+        run: |
+          import json, os
+          results = json.loads(os.environ['REQUIRED_RESULTS'])
+          assert set(results) == {'rust-main', 'rust-flows'}, 'Unexpected dependency set'
+          assert all(job['result'] == 'success' for job in results.values()), 'A required CI dependency did not succeed'
+
+  windows-flows:
+    name: windows flow (${{ matrix.test }})
+    runs-on: windows-2025
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        test:
+          - the_generator_reaches_every_path
+          - the_implementation_is_the_reference
+          - the_implementation_is_the_reference_when_told_in_time
+          - the_order_of_the_reports_does_not_matter
+    env:
+      FLOW_TEST: ${{ matrix.test }}
+      ZUNDER_FLOWS_CASES: "400"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install
+      - name: Cache Cargo sources and build output
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: guard-cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+      - name: Require exactly one selected flow test
+        shell: bash
+        run: python deploy/guard/github/check-flow-selection.py "$FLOW_TEST"
+      - name: Native Windows flow property (400 histories)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $cargo = (Get-Command cargo -CommandType Application -ErrorAction Stop).Source
+          $arguments = @('test', '--no-fail-fast', '--locked', '-p', 'zunder-venue', '--test', 'flows_model', $env:FLOW_TEST, '--', '--exact')
+          $tests = Start-Process -FilePath $cargo -ArgumentList $arguments -NoNewWindow -PassThru
+          $finished = $false
+          try {
+            # Retain the process handle until its exit code has been collected.
+            $null = $tests.Handle
+            while (-not $tests.WaitForExit(30000)) {
+              Write-Host 'Native Windows tests are active; cumulative process counters:'
+              try {
+                Get-CimInstance -ClassName Win32_Process -OperationTimeoutSec 5 -Filter "Name = 'cargo.exe' OR Name LIKE 'flows_model%'" |
+                  Select-Object Name, ProcessId,
+                    @{Name='CpuSeconds';Expression={[math]::Round(([decimal]$_.KernelModeTime + [decimal]$_.UserModeTime) / 10000000, 1)}},
+                    ReadOperationCount, WriteOperationCount, WriteTransferCount |
+                  Format-Table -AutoSize
+              } catch {
+                Write-Warning 'Process counters are unavailable; the test exit code still determines this step.'
+              }
+            }
+            $tests.WaitForExit()
+            $testExit = $tests.ExitCode
+            $finished = $true
+          } finally {
+            try {
+              if (-not $finished -and -not $tests.HasExited) {
+                & "$env:SystemRoot\System32\taskkill.exe" /PID $tests.Id /T /F | Out-Host
+                if (-not $tests.WaitForExit(10000)) {
+                  Write-Warning 'The test child did not exit after termination; this step remains failed.'
+                }
+              }
+            } catch {
+              Write-Warning 'Test child cleanup failed; the original wrapper failure is retained.'
+            } finally {
+              $tests.Dispose()
+            }
+          }
+          if ($null -eq $testExit) { throw 'The test process supplied no exit code' }
+          exit $testExit
+
+  windows:
+    name: windows
+    if: always()
+    needs: [windows-main, windows-flows]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      REQUIRED_RESULTS: ${{ toJSON(needs) }}
+    steps:
+      - name: Require every main and flow matrix job to succeed
+        shell: python
+        run: |
+          import json, os
+          results = json.loads(os.environ['REQUIRED_RESULTS'])
+          assert set(results) == {'windows-main', 'windows-flows'}, 'Unexpected dependency set'
+          assert all(job['result'] == 'success' for job in results.values()), 'A required CI dependency did not succeed'
+
+  # Native proof runs on PR/main before any release tag. No secrets or publication.
+  macos-service:
+    name: macOS service (${{ matrix.arch }})
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            arch: arm64
+          - runner: macos-15-intel
+            arch: x86_64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 50
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Identify the native runner and exact source
+        env:
+          EXPECTED_ARCH: ${{ matrix.arch }}
+          SOURCE_SHA: ${{ github.sha }}
+        run: |
+          mkdir -p native-macos-evidence
+          test "$RUNNER_ENVIRONMENT" = github-hosted
+          test "$(uname -s)" = Darwin
+          test "$(uname -m)" = "$EXPECTED_ARCH"
+          sw_vers > native-macos-evidence/os.txt
+          uname -m > native-macos-evidence/architecture.txt
+          git rev-parse HEAD > native-macos-evidence/source-commit.txt
+          test "$(cat native-macos-evidence/source-commit.txt)" = "$SOURCE_SHA"
+          shasum -a 256 Cargo.lock rust-toolchain.toml \
+            crates/zunder-guard/src/service.rs crates/zunder-guard/src/service/macos.rs \
+            crates/zunder-guard/examples/macos_service_fixture.rs deploy/guard/macos/native-ci.sh \
+            deploy/guard/macos/crash-report-scan.py deploy/guard/macos/test-crash-report-scan.py \
+            > native-macos-evidence/source-sha256.txt
+          printf '%s\n' 'Synthetic native service gates only. Pre-login reboot, full signed installer lifecycle and crash-report coverage beyond the bounded synthetic fixture scan remain separate release gates.' > native-macos-evidence/scope.txt
+      - name: macOS bootstrap tool resolution and shell regressions (no privilege)
+        run: |
+          /usr/bin/python3 -B deploy/guard/test/macos-bootstrap.py
+          /usr/bin/python3 -B deploy/guard/test/macos-shell.py
+      - name: Crash-report scanner deterministic hit, miss and scope tests
+        run: /usr/bin/python3 -B deploy/guard/macos/test-crash-report-scan.py
+      - name: Install the repository-pinned toolchain
+        run: |
+          rustup toolchain install
+          rustc -Vv > native-macos-evidence/toolchain.txt
+      - name: Cache Cargo sources and build output
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: guard-cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+      - name: Typecheck and lint native broker, CLI and synthetic fixture
+        run: |
+          set +e
+          cargo clippy --locked -p zunder-guard --lib --bin zunder-guard --example macos_service_fixture -- -D warnings > native-macos-evidence/clippy.log 2>&1
+          result=$?
+          set -e
+          printf '%s\n' "$result" > native-macos-evidence/clippy-exit-code.txt
+          exit "$result"
+      - name: Private Keychain isolation and core-limit tests
+        run: |
+          set +e
+          cargo test --locked -p zunder-guard --lib service::macos::tests -- --test-threads=1 > native-macos-evidence/private-keychain-tests.log 2>&1
+          result=$?
+          set -e
+          printf '%s\n' "$result" > native-macos-evidence/private-keychain-exit-code.txt
+          exit "$result"
+      - name: Build the exact broker and non-shipped fixture
+        run: |
+          set +e
+          cargo build --locked -p zunder-guard --bin zunder-guard --example macos_service_fixture > native-macos-evidence/build.log 2>&1
+          result=$?
+          set -e
+          printf '%s\n' "$result" > native-macos-evidence/build-exit-code.txt
+          test "$result" = 0
+          shasum -a 256 target/debug/zunder-guard target/debug/examples/macos_service_fixture > native-macos-evidence/binary-sha256.txt
+      - name: System Keychain and launchd synthetic lifecycle
+        run: |
+          set +e
+          # Driver output intentionally belongs to the unprivileged evidence directory.
+          # shellcheck disable=SC2024
+          /usr/bin/sudo /usr/bin/env GITHUB_ACTIONS="$GITHUB_ACTIONS" RUNNER_OS="$RUNNER_OS" RUNNER_ENVIRONMENT="$RUNNER_ENVIRONMENT" /bin/bash \
+            deploy/guard/macos/native-ci.sh "$PWD/target/debug/examples/macos_service_fixture" "$PWD/native-macos-evidence" \
+            > native-macos-evidence/system-service-driver.log 2>&1
+          result=$?
+          set -e
+          printf '%s\n' "$result" > native-macos-evidence/system-service-driver-exit-code.txt
+          test "$result" = 0
+          test "$(cat native-macos-evidence/system-service-exit-code.txt)" = 0
+          test "$(cat native-macos-evidence/cleanup-errors.txt)" = 0
+          test -s native-macos-evidence/system-service-result.txt
+          test "$(cat native-macos-evidence/crash-report-scan-exit-code.txt)" = 0
+          test -s native-macos-evidence/crash-report-scan.txt
+      - name: Redact logs before retaining evidence
+        id: redact
+        if: always()
+        run: |
+          mkdir -p native-macos-evidence
+          # Logs can contain synthetic test scalars or snippets from compiler diagnostics.
+          # Keep explicit source/binary hash files intact; never upload raw crash dumps.
+          for log in native-macos-evidence/*.log; do
+            test -f "$log" || continue
+            /usr/bin/sed -E 's/(0x)?[[:xdigit:]]{64}/[redacted-64-hex]/g' "$log" > "$log.redacted"
+            /bin/mv "$log.redacted" "$log"
+          done
+      - name: Retain redacted native evidence
+        if: always() && steps.redact.outcome == 'success'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: native-macos-pr-${{ matrix.arch }}-${{ github.sha }}
+          path: |
+            native-macos-evidence/*.txt
+            native-macos-evidence/*.log
+          if-no-files-found: error
+          retention-days: 7
+
+  deny:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+
+  rules-typescript:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: zr1.ts against the shared vectors (Node in a pinned image)
+        run: |
+          docker run --rm -v "$PWD/deploy/guard/rules:/w:ro" -w /w \
+            node:24-alpine@sha256:ebfe2f90462722a7a4de65e91990e97fe0d401c70e0e762c5b53302f905ec1c1 \
+            node --test zr1.test.ts
+
+  scripts:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: shellcheck
+        run: |
+          sudo apt-get update -q && sudo apt-get install -yq shellcheck
+          shellcheck -s sh deploy/guard/install.sh deploy/guard/loader/i.sh
+          shellcheck deploy/guard/packaging/*.sh deploy/guard/github/*.sh deploy/guard/test/*.sh deploy/guard/macos/*.sh
+      - name: AWS publication and bootstrap regressions
+        run: |
+          python3 deploy/guard/github/test_publish_aws_template.py
+          python3 -m pip install PyYAML==6.0.3
+          python3 deploy/guard/test/aws_template_test.py
+      - name: Flow shard selection and workflow contracts (no Cargo execution)
+        run: python3 -B deploy/guard/github/test_flow_shards.py
+      - name: Container supervisor contract (synthetic only; no native restart claim)
+        run: python3 -B deploy/guard/test/container-supervisor.py
+      - name: Docker build context and Homebrew service policy
+        run: python3 -B deploy/guard/test/distribution.py DockerBuildContext HomebrewServicePolicy
+      - name: Container installer transaction and ownership checks
+        run: python3 -B deploy/guard/test/container-installer.py
+      - name: Offline installer replacement and CLI forwarding
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            python3 -B deploy/guard/test/installer_test.py install-only
+            python3 -B deploy/guard/test/installer_test.py init-options
+          } 2>&1 | tee "$RUNNER_TEMP/guard-offline-installer.log"
+      - name: Retain offline installer diagnostics on failure
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ci-offline-installer-${{ github.sha }}
+          path: ${{ runner.temp }}/guard-offline-installer.log
+          if-no-files-found: warn
+          retention-days: 7
+      - name: Native instance and prepared-image boundaries
+        run: |
+          python3 -B deploy/guard/test/native-instance.py
+          python3 -B deploy/guard/test/container-private-image.py
+      - name: Publication gate regressions (no network or signing)
+        run: |
+          python3 -B deploy/guard/test/release-policy.py
+          python3 -B deploy/guard/test/native-readiness.py
+          python3 -B deploy/guard/test/macos-shell.py
+          python3 -B deploy/guard/github/test_publish_loaders.py
+      - name: Workflow security audit
+        run: |
+          python3 -m pip install zizmor==1.30.1
+          # Preserve all severities, including the self-repository syntax advisory.
+          # actionlint 1.7.12 rejects the new $/ syntax; the old call uses this commit.
+          zizmor --offline --no-config --format json --no-exit-codes .github/workflows/*.yml > "$RUNNER_TEMP/workflow-security.json"
+          zizmor --offline --no-config --min-severity medium .github/workflows/*.yml
+      - name: Retain complete workflow security report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ci-workflow-security-${{ github.sha }}
+          path: ${{ runner.temp }}/workflow-security.json
+          if-no-files-found: warn
+          retention-days: 7
+      - name: actionlint
+        run: |
+          docker run --rm -v "$PWD:/repo:ro" -w /repo rhysd/actionlint:1.7.12 \
+            -shellcheck= .github/workflows/*.yml
+
+  image:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - name: Build (not pushed) and smoke-test the image
+        run: |
+          docker buildx build --load -f deploy/guard/Dockerfile -t zunder-guard:ci .
+          docker run --rm zunder-guard:ci --version
+          deploy/guard/test/image-smoke.sh zunder-guard:ci
+
+  harness:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: deploy/guard/harness
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.11'
+      - name: Install the harness and development tools
+        run: python -m pip install -e '.[dev]'
+      - name: Lint, typecheck and test release consumers
+        run: |
+          set -euo pipefail
+          {
+            ruff check . ../release
+            ruff format --check . ../release
+            mypy --strict
+            pytest -q
+          } 2>&1 | tee "$RUNNER_TEMP/guard-harness.log"
+      - name: Retain harness diagnostics on failure
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ci-harness-${{ github.sha }}
+          path: ${{ runner.temp }}/guard-harness.log
+          if-no-files-found: warn
+          retention-days: 7
+
+  journeys:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: deploy/guard/journeys
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '24'
+      - name: Install the locked fixture test dependencies
+        run: npm ci
+      - name: Typecheck and test the loopback C4 fixture
+        run: |
+          set -euo pipefail
+          {
+            npm run check
+            npm test
+          } 2>&1 | tee "$RUNNER_TEMP/guard-journeys.log"
+      - name: Retain sanitized terminal diagnostics on failure
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ci-journeys-${{ github.sha }}
+          # Reports and traces can retain original credential-bearing HTTP errors.
+          path: ${{ runner.temp }}/guard-journeys.log
+          if-no-files-found: warn
+          retention-days: 7
+
+  ci:
+    name: ci
+    if: always()
+    needs: [provenance, rust, windows, macos-service, deny, rules-typescript, scripts, image, harness, journeys]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    env:
+      REQUIRED_RESULTS: ${{ toJSON(needs) }}
+    steps:
+      - name: Require every public CI gate
+        shell: python
+        run: |
+          import json, os
+          results = json.loads(os.environ['REQUIRED_RESULTS'])
+          expected = {'provenance', 'rust', 'windows', 'macos-service', 'deny',
+                      'rules-typescript', 'scripts', 'image', 'harness', 'journeys'}
+          assert set(results) == expected, 'Unexpected CI dependency set'
+          assert all(job['result'] == 'success' for job in results.values()), 'A required CI dependency did not succeed'

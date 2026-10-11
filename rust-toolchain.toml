@@ -1,0 +1,7 @@
+# Pinned so that clippy and rustfmt behave the same on every machine.
+# Bump deliberately: change the version, run the checks in README.md, commit both together.
+[toolchain]
+channel = "1.97.0"
+components = ["clippy", "rustfmt"]
+# zunder-guard-core also builds for the browser Guard (docs/guard.md).
+targets = ["wasm32-unknown-unknown"]
