@@ -104,15 +104,18 @@ jobs:
           if-no-files-found: warn
           retention-days: 7
 
-  purchase-quotes:
+  purchase:
     name: ${{ matrix.journey }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 35
     environment: e2e
+    concurrency:
+      group: guard-e2e-purchase-${{ matrix.journey }}
+      cancel-in-progress: false
     strategy:
       fail-fast: false
       matrix:
-        journey: [P4, P7]
+        journey: [P1, P2, P3, P4, P7]
     permissions:
       contents: read
       actions: read
@@ -166,7 +169,38 @@ jobs:
           verified_asset(Path(os.environ['RUNNER_TEMP']) / 'quote-evidence/assets', 'install.sh',
                          tag=os.environ['TAG'], commit=os.environ['SOURCE'])
           PY
+      - name: Install Chromium for the pricing and checkout browser journey
+        if: ${{ contains(fromJSON('["P1","P2","P3"]'), matrix.journey) }}
+        working-directory: deploy/guard/journeys
+        run: npx playwright install --with-deps chromium
+      - name: Run paid journey through browser, testnet payment, email and released licence install
+        if: ${{ contains(fromJSON('["P1","P2","P3"]'), matrix.journey) }}
+        working-directory: deploy/guard/journeys
+        env:
+          GUARD_PAID_JOURNEY: ${{ matrix.journey }}
+          GUARD_PURCHASE_WORK: ${{ runner.temp }}/quote-evidence/${{ matrix.journey }}
+          GUARD_RELEASE_ASSETS: ${{ runner.temp }}/quote-evidence/assets
+          GUARD_RELEASE_TAG: ${{ inputs.tag }}
+          GUARD_RELEASE_COMMIT: ${{ inputs.commit }}
+          GUARD_LICENSE_ACCOUNT: ${{ vars.E2E_TESTNET_ACCOUNT }}
+          GUARD_STAGING_URL: ${{ vars.GUARD_STAGING_URL }}
+          GUARD_INBOX_URL: ${{ vars.GUARD_INBOX_URL }}
+          GUARD_EMAIL_DOMAIN: ${{ vars.GUARD_EMAIL_DOMAIN }}
+          GUARD_ACCESS_CLIENT_ID: ${{ secrets.E2E_ACCESS_CLIENT_ID }}
+          GUARD_ACCESS_CLIENT_SECRET: ${{ secrets.E2E_ACCESS_CLIENT_SECRET }}
+          GUARD_ORDER_TOKEN: ${{ secrets.E2E_ORDER_TOKEN }}
+          GUARD_INBOX_TOKEN: ${{ secrets.E2E_INBOX_TOKEN }}
+          E2E_PAYER_HYPERLIQUID_TESTNET_KEY: ${{ matrix.journey == 'P1' && secrets.E2E_PAYER_HYPERLIQUID_TESTNET_KEY || '' }}
+          E2E_PAYER_EVM_SEPOLIA_KEY: ${{ matrix.journey != 'P1' && secrets.E2E_PAYER_EVM_SEPOLIA_KEY || '' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          set +x
+          umask 077
+          GUARD_BROWSER_BOUNDARY_TEST=1 npm test -- browser-boundary.test.ts 2>&1 | tee "$RUNNER_TEMP/quote-evidence/browser-boundary.log"
+          npm test -- paid.test.ts 2>&1 | tee "$RUNNER_TEMP/quote-evidence/journey.log"
       - name: Run quote-only journey against real C4 staging
+        if: ${{ !contains(fromJSON('["P1","P2","P3"]'), matrix.journey) }}
         working-directory: deploy/guard/journeys
         env:
           JOURNEY: ${{ matrix.journey }}
@@ -184,7 +218,7 @@ jobs:
           [ -n "$GUARD_STAGING_URL" ]
           npm test -- quote.test.ts --grep "$JOURNEY quote:" \
             2>&1 | tee "$RUNNER_TEMP/quote-evidence/journey.log"
-      - name: Record passing quote journey on authenticated build bytes
+      - name: Record passing purchase journey on authenticated build bytes
         env:
           JOURNEY: ${{ matrix.journey }}
           TAG: ${{ inputs.tag }}
@@ -198,18 +232,24 @@ jobs:
           _, digest = verified_asset(root / 'assets', 'install.sh',
                                      tag=os.environ['TAG'], commit=os.environ['SOURCE'])
           row = os.environ['JOURNEY']
+          if row in {'P1', 'P2', 'P3'}:
+              receipt = json.loads((root / row / 'licensed/licence-receipt.json').read_bytes())
+              if (receipt['commit'] != os.environ['SOURCE'] or receipt['manifest_sha256'] != digest
+                  or receipt['journey'] != row or receipt['licensed'] is not True or receipt['fee_free'] is not True
+                  or receipt['mode'] != 'paper' or receipt['service_stopped'] is not True):
+                  raise SystemExit('Released-byte licence receipt differs')
           predicate = dict(schema=1, journey=row, commit=os.environ['SOURCE'],
                            manifest_sha256=digest, result='passed', tier='e2e', coverage=[])
           (root / 'predicate.json').write_text(json.dumps(predicate) + '\n')
           PY
-      - name: Attest passing quote journey
+      - name: Attest passing purchase journey
         id: evidence
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
         with:
           subject-path: ${{ runner.temp }}/quote-evidence/assets/release-manifest.json
           predicate-type: https://zunderlabs.com/guard/journey/v1
           predicate-path: ${{ runner.temp }}/quote-evidence/predicate.json
-      - name: Retain sanitized quote evidence
+      - name: Retain sanitized purchase evidence
         if: ${{ always() }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -217,7 +257,11 @@ jobs:
           path: |
             ${{ runner.temp }}/quote-evidence/assets.log
             ${{ runner.temp }}/quote-evidence/journey.log
+            ${{ runner.temp }}/quote-evidence/browser-boundary.log
             ${{ runner.temp }}/quote-evidence/predicate.json
+            ${{ runner.temp }}/quote-evidence/P*/payment/payment-attempt.json
+            ${{ runner.temp }}/quote-evidence/P*/payment/payment-receipt.json
+            ${{ runner.temp }}/quote-evidence/P*/licensed/licence-receipt.json
             ${{ steps.evidence.outputs.bundle-path }}
           if-no-files-found: warn
           retention-days: 7

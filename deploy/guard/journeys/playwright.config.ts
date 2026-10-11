@@ -37,7 +37,7 @@ export default defineConfig({
   reporter: [['list']],
   use: { baseURL: remote ?? 'http://127.0.0.1:4173', extraHTTPHeaders: headers,
     // API traces persist bearer and Access headers. Keep credential-bearing traces off.
-    trace: 'off' },
+    trace: 'off', serviceWorkers: 'block', launchOptions: { env: { PATH: process.env['PATH'] ?? '', HOME: process.env['HOME'] ?? '' } } },
   ...(remote ? {} : {
     webServer: {
       command: 'npm run fixture',
