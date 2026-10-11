@@ -590,3 +590,20 @@ a mismatch).
    provide amd64 and arm64 builds; Linux on 32-bit ARM is not built.
 7. **Licence**: Elastic License 2.0 (SPDX `Elastic-2.0`, decided 6 Oct 2026). The formula and the
    image label carry it; the public repository has the text verbatim in `LICENSE`.
+
+The shared `guard_harness.docker_paper.lifecycle` checks an immutable image's paper init,
+pairing, health, signed allow/resize/veto decisions, journal continuity after restart and Docker
+restart-policy recovery after a forced crash. It uses a testnet account address for public reads,
+with no venue key. Each run owns a unique container and volume; command logs suppress pairing
+output and redact the client key. A receipt is written only after both objects are removed.
+Pass `compose=Path(...)` to exercise the distribution Compose service through the same
+lifecycle. The harness changes only project/container names, the owned external volume and the
+host loopback port; it overrides the image with the supplied immutable identity. Compose cleanup
+removes its project network too. Crash injection runs on Linux with passwordless `sudo` and
+Python's pidfd APIs, checks the exact container cgroup, and never signals a numeric PID alone.
+The `python -m guard_harness.docker_run --tag vX.Y.Z --commit FULL_PUBLIC_SHA --account
+PUBLIC_TESTNET_ADDRESS --work /absolute/fresh-directory` command performs that admission:
+it invokes the release asset verifier (Cosign image/checksum signatures, SLSA and exact source
+CI), requires descriptor/C2/Compose image agreement, pulls by digest, then runs both paper
+lifecycles on captured payload bytes. Its receipt explicitly remains `release_ready: false`. This component does not yet cover testnet mode, upgrade
+or the full I5 row; local image checks alone grant no channel admission.

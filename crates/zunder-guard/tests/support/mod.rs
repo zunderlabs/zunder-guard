@@ -15,7 +15,13 @@
 
 #![allow(dead_code, clippy::unwrap_used)]
 
-use std::{collections::HashMap, sync::Mutex};
+use std::{
+    collections::HashMap,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicI64, Ordering},
+    },
+};
 
 use rust_decimal::Decimal;
 use serde_json::{Value, json};
@@ -37,6 +43,39 @@ pub struct Received {
     pub signer: Address,
     /// The request's `expiresAfter`, if it has one.
     pub expires_after: Option<u64>,
+    /// How many info requests the venue had answered when this came
+    /// ([`MemoryVenue::info_log`]): what was read before it was sent.
+    pub info_seen: usize,
+}
+
+/// The clock a test's Guard and its in-memory venue share: the wall clock
+/// plus an offset the test moves. A test skips over a wait measured on
+/// Guard's clock (the nonce floor after a start, a loss held for the
+/// ledger, a request budget refilling) with [`VenueClock::advance`] instead
+/// of sleeping through it, and every time the venue stamps (account reads,
+/// ledger entries, socket messages) moves with it. Left alone it is the wall
+/// clock. What Guard times on its own monotonic clock (the stream's ages and
+/// silence) and the socket's cadence still take real time.
+#[derive(Debug, Clone, Default)]
+pub struct VenueClock(Arc<AtomicI64>);
+
+impl VenueClock {
+    /// Move the clock `ms` forward.
+    pub fn advance(&self, ms: u64) {
+        self.0.fetch_add(ms as i64, Ordering::SeqCst);
+    }
+
+    /// Move the clock `ms` back: only before a Guard starts on it.
+    pub fn set_back(&self, ms: u64) {
+        self.0.fetch_sub(ms as i64, Ordering::SeqCst);
+    }
+}
+
+impl Clock for VenueClock {
+    fn now_ms(&self) -> u64 {
+        let now = i64::try_from(zunder_guard::guard::SystemClock.now_ms()).unwrap();
+        u64::try_from(now + self.0.load(Ordering::SeqCst)).unwrap()
+    }
 }
 
 /// A check run on every action the venue receives, before it acts on it.
@@ -172,6 +211,7 @@ pub struct MemoryVenue {
     /// Whether it takes orders (a sending Guard) or only answers reads.
     sends: bool,
     state: Mutex<State>,
+    clock: VenueClock,
 }
 
 pub fn meta() -> Value {
@@ -233,7 +273,13 @@ impl MemoryVenue {
                 .into(),
                 ..State::default()
             }),
+            clock: VenueClock::default(),
         }
+    }
+
+    /// The venue's clock, to share with the Guard under test.
+    pub fn clock(&self) -> VenueClock {
+        self.clock.clone()
     }
 
     /// The same venue for a Guard started again over it (a restart): the
@@ -244,6 +290,7 @@ impl MemoryVenue {
             account: self.account,
             sends: self.sends,
             state: Mutex::new(self.state.lock().unwrap().clone()),
+            clock: self.clock.clone(),
         }
     }
 
@@ -432,7 +479,7 @@ impl MemoryVenue {
                             // reduce-only orders resting on its coin, in
                             // the fill's batch.
                             if after.is_zero() && !before.is_zero() {
-                                let now = zunder_guard::guard::SystemClock.now_ms();
+                                let now = self.clock.now_ms();
                                 let gone: Vec<Value> = state
                                     .orders
                                     .iter()
@@ -466,7 +513,7 @@ impl MemoryVenue {
                                 "oid": oid, "isTrigger": false, "triggerPx": "0.0",
                                 "reduceOnly": placed.reduce_only,
                                 "cloid": placed.cloid.as_ref().map(|cloid| cloid.as_str().to_owned()),
-                                "timestamp": zunder_guard::guard::SystemClock.now_ms(),
+                                "timestamp": self.clock.now_ms(),
                             }));
                             let mut filled = json!({
                                 "totalSz": placed.size.raw(), "avgPx": placed.price.raw(), "oid": oid,
@@ -512,7 +559,7 @@ impl MemoryVenue {
                                 "cloid": placed.cloid.as_ref().map(|cloid| cloid.as_str().to_owned()),
                                 "children": [],
                                 "origSz": placed.size.raw(),
-                                "timestamp": zunder_guard::guard::SystemClock.now_ms(),
+                                "timestamp": self.clock.now_ms(),
                             }));
                             if let Some(order) = state.orders.last().cloned() {
                                 state.rested.push(order);
@@ -568,7 +615,7 @@ impl MemoryVenue {
                             state.removed.push((oid, "canceled".into()));
                             // Its waiting children go with it, reported in
                             // the same batch with their client ids.
-                            let now = zunder_guard::guard::SystemClock.now_ms();
+                            let now = self.clock.now_ms();
                             let children: Vec<u64> = state
                                 .children
                                 .iter()
@@ -779,7 +826,7 @@ impl Upstream for MemoryVenue {
                     "assetPositions": positions,
                     "time": state
                         .account_time
-                        .unwrap_or_else(|| zunder_guard::guard::SystemClock.now_ms() as i64),
+                        .unwrap_or_else(|| self.clock.now_ms() as i64),
                 })
             }
             Some("frontendOpenOrders") => Value::Array(
@@ -805,7 +852,7 @@ impl Upstream for MemoryVenue {
             }
             Some("userNonFundingLedgerUpdates") => {
                 let from = body["startTime"].as_i64().unwrap_or(0);
-                let shown = zunder_guard::guard::SystemClock.now_ms() as i64 - state.ledger_lag_ms;
+                let shown = self.clock.now_ms() as i64 - state.ledger_lag_ms;
                 Value::Array(
                     state
                         .ledger
@@ -925,6 +972,7 @@ impl Upstream for MemoryVenue {
             });
         }
         let json: Value = serde_json::from_slice(&body).unwrap();
+        let info_seen = state.info_log.len();
         if let Action::Order(order) = &request.action
             && let Some(builder) = &order.builder
             && builder.fee_tenths_bp > state.builder_approval
@@ -935,6 +983,7 @@ impl Upstream for MemoryVenue {
                 nonce: request.nonce,
                 signer,
                 expires_after: json["expiresAfter"].as_u64(),
+                info_seen,
             });
             return Ok(json!({"status": "err", "response": "Builder fee has not been approved."}));
         }
@@ -944,6 +993,7 @@ impl Upstream for MemoryVenue {
             nonce: request.nonce,
             signer,
             expires_after: json["expiresAfter"].as_u64(),
+            info_seen,
         });
         state.events += 1;
         if let Some(hook) = &state.before_send.0 {
@@ -953,7 +1003,7 @@ impl Upstream for MemoryVenue {
         // What the venue's socket reports of it: each order it rested or
         // filled (and a fill), each order a cancel took; nothing for a
         // leverage or margin update.
-        let now = zunder_guard::guard::SystemClock.now_ms();
+        let now = self.clock.now_ms();
         let statuses = reply["response"]["data"]["statuses"]
             .as_array()
             .cloned()
@@ -1091,11 +1141,7 @@ impl MemoryVenue {
     /// socket's `userNonFundingLedgerUpdates` too unless `quiet` (the HTTP
     /// ledger only).
     pub fn flow(&self, usdc: &str, quiet: bool) {
-        self.flow_at(
-            usdc,
-            zunder_guard::guard::SystemClock.now_ms() as i64,
-            quiet,
-        );
+        self.flow_at(usdc, self.clock.now_ms() as i64, quiet);
     }
 
     /// [`MemoryVenue::flow`] booked at `time` (epoch ms) on the ledger.
@@ -1159,7 +1205,7 @@ impl MemoryVenue {
     /// Something happened on the account that Guard did not send (another
     /// app's order): an `orderUpdates` event on the socket.
     pub fn outside_event(&self) {
-        let now = zunder_guard::guard::SystemClock.now_ms();
+        let now = self.clock.now_ms();
         let mut state = self.state.lock().unwrap();
         state.events += 1;
         state
@@ -1367,7 +1413,7 @@ pub async fn serve_ws<C: zunder_guard::guard::Clock>(
                             // periodic, with a cancel's or a close's events
                             // in the same tick, an entry's about a second
                             // later (the periodic ones count on from each).
-                            let now = zunder_guard::guard::SystemClock.now_ms();
+                            let now = guard.upstream().clock.now_ms();
                             let events = std::mem::take(&mut venue.state.lock().unwrap().ws_events);
                             let (snapshots, prices_paused) = {
                                 let mut state = venue.state.lock().unwrap();

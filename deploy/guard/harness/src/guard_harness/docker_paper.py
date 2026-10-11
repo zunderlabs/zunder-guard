@@ -1,0 +1,241 @@
+"""Docker paper lifecycle on one immutable image; release admission stays with the caller."""
+
+import json
+import os
+import re
+import socket
+import time
+import uuid
+from pathlib import Path
+
+from guard_harness import crash_process
+from guard_harness.cli import PAIR_SCHEMA, Pair, decode_json
+from guard_harness.paper_bot import LocalGuard, PaperError
+from guard_harness.paper_roundtrip import round_trip
+from guard_harness.runner import RunResult, run
+from guard_harness.testnet_run import ROOT
+
+
+class Docker:
+    def __init__(self, logs: Path) -> None:
+        self.logs, self.sequence = logs, 0
+        self.secrets: tuple[str, ...] = ()
+        self.extra_env: dict[str, str] = {}
+
+    def command(self, *args: str, sensitive: bool = False) -> RunResult:
+        self.sequence += 1
+        env = {name: os.environ[name] for name in ("PATH", "HOME") if name in os.environ}
+        return run(
+            ["docker", *args],
+            log=self.logs / f"docker-{self.sequence}.log",
+            timeout=90,
+            env=env | self.extra_env,
+            stdin=b"",
+            sensitive_output=sensitive,
+            secrets=self.secrets,
+        )
+
+    def remove(self, name: str) -> None:
+        self.command("rm", "--force", name)
+
+
+class Compose(Docker):
+    """Use the distribution Compose service for setup/start, Docker for observations."""
+
+    def __init__(
+        self, logs: Path, source: Path, image: str, name: str, volume: str, port: int
+    ) -> None:
+        super().__init__(logs)
+        text = source.read_text()
+        replacements = {
+            "name: zunder-guard\n": f"name: {name}\n",
+            "  guard:\n": f"  guard:\n    container_name: {name}\n",
+            '"127.0.0.1:8547:8547"': f'"127.0.0.1:{port}:8547"',
+            "  guard-data:\n": f"  guard-data:\n    external: true\n    name: {volume}\n",
+        }
+        for old, new in replacements.items():
+            if text.count(old) != 1:
+                raise PaperError("distribution Compose layout unconfirmed")
+            text = text.replace(old, new)
+        self.config = logs / "compose.yaml"
+        self.config.write_text(text)
+        self.image = image
+        self.extra_env = {"ZUNDER_GUARD_IMAGE": image}
+
+    def command(self, *args: str, sensitive: bool = False) -> RunResult:
+        if args[0] != "run":
+            return super().command(*args, sensitive=sensitive)
+        command = args[args.index(self.image) + 1 :]
+        prefix = ("compose", "--file", str(self.config))
+        if "-d" in args:
+            return super().command(
+                *prefix, "up", "--detach", "--no-build", "--pull", "never", "guard"
+            )
+        return super().command(
+            *prefix, "run", "--rm", "--no-deps", "guard", *command, sensitive=sensitive
+        )
+
+    def remove(self, name: str) -> None:
+        self.command("compose", "--file", str(self.config), "down", "--remove-orphans")
+
+
+def _ready(guard: LocalGuard, *, after: int | None = None) -> dict[str, object]:
+    deadline = time.monotonic() + 60
+    while time.monotonic() < deadline:
+        try:
+            state = guard.request("/guard/status")
+            if state.get("mode") != "paper":
+                raise PaperError("container runtime is not paper")
+            started = state.get("started_at_ms")
+            if (
+                type(started) is int
+                and state.get("last_sync_ms")
+                and (after is None or started > after)
+            ):
+                return dict(state)
+        except (PaperError, OSError):
+            pass
+        time.sleep(0.5)
+    raise PaperError("container paper readiness/restart unconfirmed")
+
+
+def lifecycle(image: str, account: str, *, work: Path, compose: Path | None = None) -> None:
+    """No venue key. A caller must verify release/cosign binding before E2E admission."""
+    if not re.fullmatch(r"(?:ghcr\.io/zunderlabs/zunder-guard@)?sha256:[0-9a-f]{64}", image):
+        raise ValueError("immutable image identity required")
+    if not re.fullmatch(r"0x[0-9a-fA-F]{40}", account) or work.exists():
+        raise ValueError("public read account and fresh workspace required")
+    work.mkdir(mode=0o700)
+    name = f"guard-paper-{uuid.uuid4().hex}"
+    volume = name + "-data"
+    mounted = ("--mount", f"type=volume,source={volume},target=/data")
+    # Docker reallocates an empty HostPort after restart. An explicit loopback port
+    # persists; a competing bind makes launch fail before any signing.
+    with socket.socket() as reservation:
+        reservation.bind(("127.0.0.1", 0))
+        host_port = reservation.getsockname()[1]
+    expected_address = f"127.0.0.1:{host_port}"
+    docker = (
+        Docker(work) if compose is None else Compose(work, compose, image, name, volume, host_port)
+    )
+    try:
+        docker.command("volume", "create", volume)
+        rules = json.loads((ROOT / "rules/vectors.json").read_bytes())["valid"][0]["canonical"]
+        docker.command(
+            "run",
+            "--rm",
+            *mounted,
+            image,
+            "init",
+            "--non-interactive",
+            "--network",
+            "paper",
+            "--account-network",
+            "testnet",
+            "--account",
+            account,
+            "--no-key",
+            "--rules",
+            rules,
+            sensitive=True,
+        )
+        paired = docker.command("run", "--rm", *mounted, image, "pair", "--json", sensitive=True)
+        value = decode_json(paired.output, PAIR_SCHEMA)
+        pair = Pair(value["client_address"], value["client_key"])
+        docker.secrets = (pair.key, account)
+        docker.command(
+            "run",
+            "-d",
+            "--name",
+            name,
+            "--restart",
+            "unless-stopped",
+            "--init",
+            "--read-only",
+            "--cap-drop",
+            "ALL",
+            "--security-opt",
+            "no-new-privileges:true",
+            "--tmpfs",
+            "/tmp",
+            *mounted,
+            "--publish",
+            f"{expected_address}:8547",
+            "--env",
+            "ZUNDER_GUARD_LISTEN=0.0.0.0:8547",
+            image,
+            "run",
+            "--network",
+            "paper",
+        )
+        address = docker.command("port", name, "8547/tcp").output.strip()
+        if address != expected_address:
+            raise PaperError("container loopback port refused")
+        guard = LocalGuard("http://" + address)
+        first = _ready(guard)
+        decisions = round_trip(guard, pair)
+        last_seq = decisions[-1].seq
+        docker.command("restart", name)
+        restarted = _ready(guard, after=int(str(first["started_at_ms"])))
+        # The decision journal must remain queryable after a real container restart.
+        events = guard.request("/guard/events?since=0")
+        if not all(
+            any(e.get("seq") == d.seq and e.get("nonce") == d.nonce for e in events)
+            for d in decisions
+        ):
+            raise PaperError("container restart lost paper decision journal")
+        before = int(docker.command("inspect", "--format", "{{.RestartCount}}", name).output)
+        # Docker's kill API is an operator stop and suppresses restart policy. On the
+        # Linux runner, kill the sole Guard process reported by this owned container.
+        processes = docker.command("top", name, "-eo", "pid,comm").output.splitlines()
+        guards = [line.split() for line in processes[1:] if line.split()[-1:] == ["zunder-guard"]]
+        if len(guards) != 1 or len(guards[0]) != 2 or not guards[0][0].isdigit():
+            raise PaperError("owned container Guard process unconfirmed")
+        pid = guards[0][0]
+        if int(pid) <= 1:
+            raise PaperError("unsafe container process identity")
+        identity = docker.command("inspect", "--format", "{{.Id}}", name).output.strip()
+        if not re.fullmatch(r"[0-9a-f]{64}", identity):
+            raise PaperError("owned container identity unconfirmed")
+        run(
+            ["sudo", "-n", "python3", str(Path(crash_process.__file__).resolve()), pid, identity],
+            log=work / "crash.log",
+            timeout=10,
+            stdin=b"",
+        )
+        _ready(guard, after=int(str(restarted["started_at_ms"])))
+        after = int(docker.command("inspect", "--format", "{{.RestartCount}}", name).output)
+        if after <= before:
+            raise PaperError("Docker did not recover the crashed paper container")
+    finally:
+        # UUID ownership is established before any start; paper has no venue exposure.
+        try:
+            docker.command("logs", name)
+        finally:
+            try:
+                docker.remove(name)
+            finally:
+                docker.command("volume", "rm", volume)
+
+    (work / "receipt.json").write_text(
+        json.dumps(
+            {
+                "mode": "paper",
+                "channel": "docker" if compose is None else "compose",
+                "image": image,
+                "checks": [
+                    "init",
+                    "pair",
+                    "health",
+                    "veto",
+                    "allow",
+                    "resize",
+                    "restart",
+                    "journal",
+                    "crash-recovery",
+                ],
+                "last_decision_seq": last_seq,
+            }
+        )
+        + "\n"
+    )

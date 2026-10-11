@@ -6,15 +6,14 @@ import os
 import socket
 import subprocess
 import time
-from decimal import ROUND_DOWN, ROUND_UP, Decimal
 from pathlib import Path
 
 import pytest
-from hyperliquid.utils.signing import order_wires_to_order_action
 
 from guard_harness.cli import GuardCLI
 from guard_harness.mcp_client import MCP, MCPError
-from guard_harness.paper_bot import LocalGuard, PaperBot, PaperError, Verdict
+from guard_harness.paper_bot import LocalGuard, PaperError
+from guard_harness.paper_roundtrip import round_trip
 from guard_harness.runner import run
 
 
@@ -111,95 +110,11 @@ def test_real_paper_decision_and_journal(tmp_path: Path) -> None:
                         with pytest.raises(MCPError, match="write refused"):
                             mcp.tool(write_tool)
                     assert mcp.entry_attempted is False
-            action = {
-                "type": "order",
-                "orders": [
-                    {
-                        "a": 10000,
-                        "b": True,
-                        "p": "100",
-                        "s": "0.1",
-                        "r": False,
-                        "t": {"limit": {"tif": "Ioc"}},
-                    }
-                ],
-                "grouping": "na",
-            }
-            decision = PaperBot(guard, pair).decide(
-                action, "veto", expected_code="unsupported_market"
-            )
-            assert decision.verdict == "veto"
-
-            # Read current public metadata; use Decimal throughout the order inputs.
-            meta = guard.request("/info", {"type": "meta"})
-            mids = guard.request("/info", {"type": "allMids"})
-            asset, instrument = next(
-                (i, item) for i, item in enumerate(meta["universe"]) if item["name"] == "BTC"
-            )
-            step = Decimal(1).scaleb(-instrument["szDecimals"])
-            price_step = Decimal(1).scaleb(-(6 - instrument["szDecimals"]))
-            price = Decimal(mids["BTC"]).quantize(price_step, rounding=ROUND_DOWN)
-            stop = (price * Decimal("0.98")).quantize(price_step, rounding=ROUND_DOWN)
-            # Give the supplied market stop its required 10% gap room, without a rewrite.
-            stop_limit = (stop * Decimal("0.89")).quantize(price_step, rounding=ROUND_DOWN)
-            small = (Decimal("20") / price / step).to_integral_value(rounding=ROUND_UP) * step
-            bot = PaperBot(guard, pair)
-            cases: list[tuple[Decimal, Verdict, str]] = [
-                (small, "allow", "allowed"),
-                (Decimal("10000"), "resize", "resized"),
+            assert [decision.verdict for decision in round_trip(guard, pair)] == [
+                "veto",
+                "allow",
+                "resize",
             ]
-            for quantity, verdict, code in cases:
-                # Refill the unchanged request budget after the previous account read.
-                # Paper plans are charged for their hypothetical forwarding too.
-                time.sleep(15)
-                size = format(quantity.normalize(), "f")
-                entry = order_wires_to_order_action(
-                    [
-                        {
-                            "a": asset,
-                            "b": True,
-                            "p": format(price.normalize(), "f"),
-                            "s": size,
-                            "r": False,
-                            "t": {"limit": {"tif": "Ioc"}},
-                        },
-                        {
-                            "a": asset,
-                            "b": False,
-                            "p": format(stop_limit.normalize(), "f"),
-                            "s": size,
-                            "r": True,
-                            "t": {
-                                "trigger": {
-                                    "isMarket": True,
-                                    "triggerPx": format(stop.normalize(), "f"),
-                                    "tpsl": "sl",
-                                }
-                            },
-                        },
-                    ],
-                    grouping="normalTpsl",
-                )
-                try:
-                    result = bot.decide(entry, verdict, expected_code=code)
-                except PaperError:
-                    events = guard.request("/guard/events?since=0")
-                    observed = next(
-                        (e.get("code") for e in reversed(events) if e.get("nonce") == bot.nonce),
-                        "missing-decision",
-                    )
-                    pytest.fail(f"paper {verdict} case failed; journal reason: {observed}")
-                event = next(
-                    e for e in guard.request("/guard/events?since=0") if e["seq"] == result.seq
-                )
-                orders = event["forward"]["orders"]
-                forwarded = Decimal(orders[0]["s"])
-                assert Decimal(orders[1]["s"]) == forwarded
-                assert orders[1]["r"] is True
-                if verdict == "resize":
-                    assert Decimal("0") < forwarded < quantity
-                else:
-                    assert forwarded == quantity
         finally:
             process.terminate()
             try:

@@ -2115,14 +2115,26 @@ mod crash_tests {
         let record = || EventBody::Error {
             text: "recovered".into(),
         };
-        // Still behind at the deadline: `Busy`, counted once.
-        let started = std::time::Instant::now();
+        // Still behind at the deadline: `Busy`, not before it, counted once.
         let until =
             || std::time::Instant::now() + std::time::Duration::from_millis(ACK_DEADLINE_MS);
-        let result = runtime().block_on(journal.append_waiting(2, record(), until()));
+        let deadline = until();
+        let result = runtime().block_on(journal.append_waiting(2, record(), deadline));
         assert!(matches!(result, Err(JournalError::Busy)), "{result:?}");
-        assert!(started.elapsed() >= std::time::Duration::from_millis(ACK_DEADLINE_MS));
+        assert!(
+            std::time::Instant::now() >= deadline,
+            "Busy before the deadline"
+        );
         assert_eq!(journal.dropped(), dropped + 1);
+        assert!(!journal.is_broken());
+        // No room by the deadline (the writer still held): a wait that
+        // answers `Busy`, the journal not broken.
+        let soon = std::time::Instant::now() + std::time::Duration::from_millis(50);
+        let busy = runtime().block_on(journal.flush_when_room(soon));
+        assert!(matches!(
+            runtime().block_on(busy.wait()),
+            Err(JournalError::Busy)
+        ));
         assert!(!journal.is_broken());
         // Caught up after 300 ms: the flush waits for room, and so does a
         // record, then taken.
@@ -2133,15 +2145,6 @@ mod crash_tests {
                 open_gate(&gate);
             })
         };
-        // No room by the deadline: a wait that answers `Busy`, the journal
-        // not broken.
-        let soon = std::time::Instant::now() + std::time::Duration::from_millis(50);
-        let busy = runtime().block_on(journal.flush_when_room(soon));
-        assert!(matches!(
-            runtime().block_on(busy.wait()),
-            Err(JournalError::Busy)
-        ));
-        assert!(!journal.is_broken());
         let durable = runtime().block_on(journal.flush_when_room(until()));
         runtime().block_on(durable.wait()).unwrap();
         let seq = runtime()
@@ -2238,18 +2241,20 @@ mod crash_tests {
         let (mut journal, _open) = behind(&gate);
         let waiting_runtime = runtime();
         let (pending, first_pending) = std::sync::mpsc::sync_channel(1);
+        let opened = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let opener = {
             let gate = gate.clone();
+            let opened = opened.clone();
             std::thread::spawn(move || {
                 if let Err(error) = first_pending.recv_timeout(std::time::Duration::from_secs(5)) {
                     open_gate(&gate);
                     panic!("intent was not polled to Pending: {error}");
                 }
                 std::thread::sleep(std::time::Duration::from_millis(300));
+                opened.store(true, std::sync::atomic::Ordering::SeqCst);
                 open_gate(&gate);
             })
         };
-        let started = std::time::Instant::now();
         let seq = waiting_runtime
             .block_on(async {
                 use std::future::Future;
@@ -2270,7 +2275,8 @@ mod crash_tests {
                 .await
             })
             .unwrap();
-        assert!(started.elapsed() >= std::time::Duration::from_millis(250));
+        // Taken only once the writer had room again.
+        assert!(opened.load(std::sync::atomic::Ordering::SeqCst));
         assert_eq!(seq, journal.last_seq());
         assert!(!journal.is_broken());
         // Refused many times while it waited: counted once.
@@ -2329,7 +2335,7 @@ mod crash_tests {
     fn crashes_at_random_points_keep_j1_j2_j3_j5_j7() {
         let mut images = 0;
         for seed in 0..300 {
-            images += run(seed);
+            images += run(zunder_guard_core::testing::seed(seed));
         }
         assert!(images > 1_000, "{images}");
     }

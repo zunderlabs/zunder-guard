@@ -76,7 +76,7 @@ jobs:
             ~/.cargo/git
             target
           key: guard-cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
-      - run: cargo clippy --locked --all-targets -p zunder-venue -p zunder-guard-core -p zunder-guard-mcp -p zunder-guard-rules -p zunder-guard -p zunder-redteam -- -D warnings
+      - run: cargo clippy --locked --all-targets -p zunder-venue -p zunder-venue-types -p zunder-guard-core -p zunder-guard-mcp -p zunder-guard-rules -p zunder-guard -p zunder-redteam -- -D warnings
       # The full model runs 4,000 histories per property on Linux. Windows
       # exercises 400 per property on its native filesystem, including the
       # generator's asserted coverage of every path, plus every native unit test.
@@ -87,7 +87,7 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           $cargo = (Get-Command cargo -CommandType Application -ErrorAction Stop).Source
-          $arguments = @('test', '--no-fail-fast', '--locked', '-p', 'zunder-venue', '-p', 'zunder-guard-core', '-p', 'zunder-guard-mcp', '-p', 'zunder-guard-rules', '-p', 'zunder-guard', '--', '--exact', '--skip', 'the_generator_reaches_every_path', '--skip', 'the_implementation_is_the_reference', '--skip', 'the_implementation_is_the_reference_when_told_in_time', '--skip', 'the_order_of_the_reports_does_not_matter')
+          $arguments = @('test', '--no-fail-fast', '--locked', '-p', 'zunder-venue', '-p', 'zunder-venue-types', '-p', 'zunder-guard-core', '-p', 'zunder-guard-mcp', '-p', 'zunder-guard-rules', '-p', 'zunder-guard', '--', '--exact', '--skip', 'the_generator_reaches_every_path', '--skip', 'the_implementation_is_the_reference', '--skip', 'the_implementation_is_the_reference_when_told_in_time', '--skip', 'the_order_of_the_reports_does_not_matter')
           $tests = Start-Process -FilePath $cargo -ArgumentList $arguments -NoNewWindow -PassThru
           $finished = $false
           try {

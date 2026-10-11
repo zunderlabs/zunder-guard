@@ -43,7 +43,7 @@ use std::{
     sync::atomic::{AtomicUsize, Ordering},
 };
 
-use proptest::prelude::*;
+use proptest::{prelude::*, test_runner::RngSeed};
 use rust_decimal::{Decimal, dec};
 use zunder_core::Timestamp;
 use zunder_risk::{RiskEngine, RiskLimits, RiskSnapshot, RiskState, VenueView};
@@ -1956,14 +1956,13 @@ fn the_saved_restart_seed_preserves_rollover_then_delayed_cash_replay() {
 #[test]
 fn the_generator_reaches_every_path() {
     use proptest::{strategy::ValueTree, test_runner::TestRunner};
-    // At least 400 cases, from a fixed seed: the rarest path (a loss after
+    // At least 400 cases, from the run's seed: the rarest path (a loss after
     // an emptied account was filled again) comes about once in 30.
-    let cases = std::env::var("ZUNDER_FLOWS_CASES")
-        .ok()
-        .and_then(|cases| cases.parse().ok())
-        .unwrap_or(4_000usize)
-        .max(400);
-    let mut runner = TestRunner::deterministic();
+    let cases = flows_cases(4_000usize).max(400);
+    let mut runner = TestRunner::new(ProptestConfig {
+        rng_seed: RngSeed::Fixed(run_seed()),
+        ..ProptestConfig::default()
+    });
     let strategy = (
         any::<bool>(),
         setup(true),
@@ -2012,13 +2011,40 @@ fn the_generator_reaches_every_path() {
     }
 }
 
+/// The seed of the required checks. `PROPTEST_RNG_SEED` (a `u64`) picks
+/// other cases: a scheduled run sets a fresh value each time and prints it,
+/// so that a failure can be reproduced with the same value. Unset, every run
+/// tries the same cases.
+const GATE_SEED: u64 = 20_261_010;
+
+/// The run's seed: `PROPTEST_RNG_SEED`, or [`GATE_SEED`]. A value that does
+/// not parse fails the test rather than being ignored.
+fn run_seed() -> u64 {
+    match std::env::var("PROPTEST_RNG_SEED") {
+        Ok(value) => value
+            .trim()
+            .parse()
+            .unwrap_or_else(|_| panic!("PROPTEST_RNG_SEED must be a u64, got {value:?}")),
+        Err(_) => GATE_SEED,
+    }
+}
+
+/// How many timelines a property tries: `ZUNDER_FLOWS_CASES`, or `default`.
+fn flows_cases<T: std::str::FromStr>(default: T) -> T {
+    match std::env::var("ZUNDER_FLOWS_CASES") {
+        Ok(value) => value
+            .trim()
+            .parse()
+            .unwrap_or_else(|_| panic!("ZUNDER_FLOWS_CASES must be a count, got {value:?}")),
+        Err(_) => default,
+    }
+}
+
 fn config() -> ProptestConfig {
     ProptestConfig {
-        cases: std::env::var("ZUNDER_FLOWS_CASES")
-            .ok()
-            .and_then(|cases| cases.parse().ok())
-            .unwrap_or(4_000),
+        cases: flows_cases(4_000),
         max_shrink_iters: 2_000,
+        rng_seed: RngSeed::Fixed(run_seed()),
         ..ProptestConfig::default()
     }
 }

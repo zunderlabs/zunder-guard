@@ -8,16 +8,15 @@
 //!   way to send an order at all.
 //! - Sending goes through `zunder-venue`'s [`HttpTransport`], which is built
 //!   from a [`VenueNetwork`]: testnet for the asking, mainnet only with a
-//!   person's [`zunder_venue::hyperliquid::MainnetConsent`].
+//!   person's [`zunder_venue_types::MainnetConsent`].
 
 use std::{future::Future, time::Duration};
 
 use serde_json::Value;
 use thiserror::Error;
 use zunder_guard_core::sign::SigningNetwork;
-use zunder_venue::hyperliquid::{
-    Endpoint, HttpTransport, Network, Transport, TransportError, VenueNetwork,
-};
+use zunder_venue::hyperliquid::{Endpoint, HttpTransport, Network, Transport, TransportError};
+use zunder_venue_types::VenueNetwork;
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum UpstreamError {

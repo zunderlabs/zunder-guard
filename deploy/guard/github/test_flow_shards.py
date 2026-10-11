@@ -95,10 +95,10 @@ class WorkflowTests(unittest.TestCase):
 
     def test_main_windows_keeps_original_packages_and_exact_four_skips(self):
         steps = CI['jobs']['windows-main']['steps']
-        self.assertTrue(any(step.get('run') == 'cargo clippy --locked --all-targets -p zunder-venue -p zunder-guard-core -p zunder-guard-mcp -p zunder-guard-rules -p zunder-guard -p zunder-redteam -- -D warnings' for step in steps))
+        self.assertTrue(any(step.get('run') == 'cargo clippy --locked --all-targets -p zunder-venue -p zunder-venue-types -p zunder-guard-core -p zunder-guard-mcp -p zunder-guard-rules -p zunder-guard -p zunder-redteam -- -D warnings' for step in steps))
         test = next(step for step in steps if step.get('name') == 'Native Windows tests (400 flow histories per property)')
         self.assertEqual(test['env'], {'ZUNDER_FLOWS_CASES': '400'})
-        expected = "@('test', '--no-fail-fast', '--locked', '-p', 'zunder-venue', '-p', 'zunder-guard-core', '-p', 'zunder-guard-mcp', '-p', 'zunder-guard-rules', '-p', 'zunder-guard', '--', '--exact', " + ', '.join("'--skip', '" + name + "'" for name in TESTS) + ')'
+        expected = "@('test', '--no-fail-fast', '--locked', '-p', 'zunder-venue', '-p', 'zunder-venue-types', '-p', 'zunder-guard-core', '-p', 'zunder-guard-mcp', '-p', 'zunder-guard-rules', '-p', 'zunder-guard', '--', '--exact', " + ', '.join("'--skip', '" + name + "'" for name in TESTS) + ')'
         self.assertIn('$arguments = ' + expected, test['run'])
         self.assertTrue(any(step.get('shell') == 'powershell' and 'installer-windows.ps1' in step.get('run', '') for step in steps))
         self.assertTrue(any(step.get('shell') == 'pwsh' and 'installer-windows.ps1' in step.get('run', '') for step in steps))

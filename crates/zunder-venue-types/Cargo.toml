@@ -1,0 +1,24 @@
+[package]
+name = "zunder-venue-types"
+description = "Venue types without I/O: instrument rules, the network choice and mainnet consent, and the errors between a caller and a venue. Compiles natively and to wasm32-unknown-unknown"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license = "Elastic-2.0"
+
+[features]
+# Lets tests outside this crate make a `MainnetConsent` from a value instead of
+# the environment (`MainnetConsent::confirm_for_tests`). Enabled only by
+# dev-dependencies; never in a release build.
+test-hooks = []
+
+[dependencies]
+rust_decimal.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+zunder-core.workspace = true
+zunder-hl-protocol.workspace = true
+
+[lints]
+workspace = true

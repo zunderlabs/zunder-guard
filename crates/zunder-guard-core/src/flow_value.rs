@@ -387,11 +387,8 @@ mod tests {
     fn four_thousand_exact_cash_ledgers_match_independent_bookkeeping() {
         // Start with a flat target cash ledger, independently advance a signed
         // fill and its signed total fee (inclusive builder) to an exposed anchor.
-        let cases = std::env::var("ZUNDER_FLOWS_CASES")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(4000usize);
-        let mut rng = fastrand::Rng::with_seed(0x66706c6f77);
+        let cases = crate::testing::cases(4000);
+        let mut rng = fastrand::Rng::with_seed(crate::testing::seed(0x66706c6f77));
         for index in 0..cases {
             let cash = Decimal::from(rng.i32(1000..100000));
             let delta = Decimal::from(rng.i32(1..11))

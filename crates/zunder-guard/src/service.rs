@@ -278,7 +278,7 @@ impl ServiceBinding {
             ])
             .arg(binding_path);
         if self.mode == "mainnet" {
-            cmd.env(zunder_venue::hyperliquid::CONFIRM_VAR, &self.account);
+            cmd.env(zunder_venue_types::CONFIRM_VAR, &self.account);
         }
         cmd
     }
@@ -800,7 +800,7 @@ mod runtime_snapshot_tests {
         assert_eq!(
             command.get_envs().collect::<Vec<_>>(),
             vec![(
-                std::ffi::OsStr::new(zunder_venue::hyperliquid::CONFIRM_VAR),
+                std::ffi::OsStr::new(zunder_venue_types::CONFIRM_VAR),
                 Some(std::ffi::OsStr::new(&binding.account))
             )]
         );
@@ -893,7 +893,7 @@ mod runtime_snapshot_tests {
         let mut rejected = 0;
         let mut accepted = 0;
         for seed in 0..128 {
-            let mut random = fastrand::Rng::with_seed(seed);
+            let mut random = fastrand::Rng::with_seed(zunder_guard_core::testing::seed(seed));
             for _ in 0..32 {
                 let mut used = admitted.clone();
                 for _ in 0..random.usize(0..5) {

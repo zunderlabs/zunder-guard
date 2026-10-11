@@ -182,7 +182,7 @@ mod tests {
     fn random_lifecycle_histories_match_independent_first_exit_model() {
         let mut outcomes = [false; 4];
         for seed in 0..256 {
-            let mut random = fastrand::Rng::with_seed(seed);
+            let mut random = fastrand::Rng::with_seed(zunder_guard_core::testing::seed(seed));
             let mut intent = StopIntent::default();
             let mut history = Vec::new();
             let mut recovery_requests = 0;

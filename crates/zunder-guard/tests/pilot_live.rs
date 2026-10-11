@@ -58,7 +58,8 @@ use zunder_guard_core::{
     sign::{Address, GuardKey, SigningNetwork},
 };
 use zunder_redteam::pilot::{self, Ending, GuardMode as Expected, Options, Outcome, Step, Timing};
-use zunder_venue::{PersistentRisk, hyperliquid::VenueNetwork};
+use zunder_venue::PersistentRisk;
+use zunder_venue_types::VenueNetwork;
 
 fn enabled() -> bool {
     std::env::var("ZUNDER_GUARD_LIVE").as_deref() == Ok("1")

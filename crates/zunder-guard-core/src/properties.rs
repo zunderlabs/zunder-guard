@@ -456,7 +456,7 @@ fn no_sequence_of_requests_makes_guard_forward_a_rule_break() {
     let mut hip3_entries = 0;
     let mut vetoes = 0;
     for seed in 0..300u64 {
-        let mut rng = Rng::with_seed(seed);
+        let mut rng = Rng::with_seed(crate::testing::seed(seed));
         let policy = policy(&mut rng);
         let equity = random_decimal(&mut rng, dec!(200), dec!(50000), 0);
         let mut engine = fixtures::engine(&policy, equity);
@@ -817,7 +817,7 @@ fn no_sequence_of_requests_makes_guard_forward_a_rule_break() {
 #[test]
 fn replays_are_always_refused() {
     for seed in 0..200u64 {
-        let mut rng = Rng::with_seed(seed);
+        let mut rng = Rng::with_seed(crate::testing::seed(seed));
         let mut auth = authenticator();
         let key = client_key();
         let mut sent: Vec<ExchangeRequest> = Vec::new();

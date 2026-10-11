@@ -33,8 +33,10 @@
 //!    venue's, whichever holds more) and every resting entry at its limit
 //!    price and waiting stop; a position or resting entry without a stop
 //!    refuses every entry.
-//! 7. The position cap: the coin's position value at most
-//!    [`Policy::max_position_of_account`] times equity.
+//! 7. The position cap: the coin's position, with the entries resting on
+//!    its side, valued at most [`Policy::max_position_of_account`] times
+//!    the sizing equity (the lower of the account's equity and the risk
+//!    engine's last, under the equity cap).
 //! 8. Liquidation: on a new position Guard sets isolated margin at the
 //!    highest whole leverage within the policy's and the venue's caps whose
 //!    liquidation lies beyond the stop's worst fill (with room for fees and
@@ -42,10 +44,16 @@
 //!    entry; an existing position must already be isolated within the
 //!    caps, and its liquidation that far away. The venue's leverage cap is
 //!    the coin's own dex's (`maxLeverage` in that dex's `meta`).
-//! 9. On a HIP-3 dex: the size its own margin account can fund at that
-//!    leverage (`withdrawable` of the dex's `clearinghouseState`), and
+//! 9. The quantity: the smallest of the bot's request, the engine's size,
+//!    the position cap's room and the size of the bot's own stop; on a
+//!    HIP-3 dex also the size its own margin account can fund at that
+//!    leverage (`withdrawable` of the dex's `clearinghouseState`) and
 //!    [`HIP3_BOOK_SHARE`] of the depth the book shows on the stop's side
 //!    down to the stop's worst fill, less what is held or rests there.
+//!    Rounded down, it must be worth the venue's minimum order value.
+//!
+//! Each step is a function of its own (`judge_entry` runs them in this
+//! order); the entry must also be a limit order, checked after the market.
 //!
 //! The account-wide rules (loss at the stop, open risk, leverage, the
 //! position cap, the daily loss stop and the drawdown halt) measure equity
@@ -79,10 +87,10 @@ use zunder_core::{Side, Symbol};
 use zunder_risk::{RiskEngine, RiskState, SizeRequest, Veto};
 
 use crate::{
-    account::{AccountView, AssetInfo, AssetKind, MIN_NOTIONAL, asset_kind},
+    account::{AccountView, AssetInfo, AssetKind, MIN_NOTIONAL, PositionView, asset_kind},
     action::{
         Action, Builder, Cancel, Cloid, ExchangeRequest, Grouping, Modify, Order, OrderAction,
-        OrderKind, OrderRef, Px, Tpsl,
+        OrderKind, OrderRef, Px, Tif, Tpsl,
     },
     policy::{Policy, StopPolicy},
 };
@@ -666,9 +674,6 @@ fn judge_order(
             );
         }
     }
-    if let Some(stopped) = halted(ctx) {
-        return Err(Box::new(stopped));
-    }
     let children: Vec<(usize, &Order)> = action
         .orders
         .iter()
@@ -803,19 +808,133 @@ fn px(value: Decimal) -> Judged<Px> {
     Px::from_decimal(value).ok_or_else(overflow)
 }
 
+/// Judge an entry by the steps of "Entries" in the module docs, one
+/// function each, in their order: the first refusal wins. `children` are
+/// the bot's TP/SL orders sent with it, with their index in its action.
 fn judge_entry(
     ctx: &Context<'_>,
     entry: &Order,
     children: &[(usize, &Order)],
     request: &ExchangeRequest,
 ) -> Judged<JudgedEntry> {
-    let policy = ctx.policy;
-    let account = ctx.account;
-    let asset = asset(ctx, entry.asset)?;
-    let coin = asset.name.as_str();
-    let side = side_of(entry.is_buy);
     let mut changes = Vec::new();
+    // 1. Halts.
+    if let Some(stopped) = halted(ctx) {
+        return Err(Box::new(stopped));
+    }
+    // 2. The market, and the order type.
+    let asset = entry_market(ctx, entry.asset)?;
+    let tif = entry_tif(entry)?;
+    // 3. The account.
+    let EntryAccount { equity, mid } = entry_account(ctx.account, &asset.name)?;
+    let side = side_of(entry.is_buy);
+    // 4. The worst fill.
+    let fill = worst_fill(ctx.policy, asset, side, mid, &entry.price, &mut changes)?;
+    // 5. The stop.
+    let stop = entry_stop(
+        ctx.policy,
+        asset,
+        side,
+        Prices {
+            worst: fill.worst,
+            mid,
+        },
+        children,
+        &mut changes,
+    )?;
+    let terms = EntryTerms {
+        asset,
+        asset_id: entry.asset,
+        side,
+        equity,
+        mid,
+        worst: fill.worst,
+        stop: stop.trigger,
+    };
+    // 6. Size, by the risk engine.
+    let sized = risk_size(ctx, &terms)?;
+    // 7. The position cap.
+    let by_cap = position_cap(ctx, &terms)?;
+    // 8. Liquidation.
+    let EntryLeverage { leverage, pre } = entry_leverage(ctx, &terms)?;
+    // 9. The quantity.
+    let quantity = entry_quantity(
+        ctx,
+        &terms,
+        entry,
+        children,
+        SizeCaps {
+            sized,
+            by_cap,
+            leverage,
+        },
+        &mut changes,
+    )?;
 
+    // What is forwarded: the entry at its worst fill and quantity, the
+    // bot's TP/SL cut to it, Guard's stop if it attaches one.
+    let forwarded_entry = Order {
+        asset: entry.asset,
+        is_buy: entry.is_buy,
+        price: fill.price,
+        size: quantity.size.clone(),
+        reduce_only: false,
+        kind: OrderKind::Limit { tif },
+        cloid: entry.cloid.clone(),
+    };
+    let forwarded_children = cut_children(children, &quantity, &mut changes);
+    let attached_stop = if stop.attached {
+        Some(attached_stop(
+            ctx,
+            &terms,
+            entry,
+            &quantity.size,
+            guard_cloid(ctx.salt, request),
+        )?)
+    } else {
+        None
+    };
+    Ok(JudgedEntry {
+        entry: forwarded_entry,
+        children: forwarded_children,
+        attached_stop,
+        pre,
+        plan: EntryPlan {
+            coin: asset.name.clone(),
+            side,
+            requested_qty: entry.size.value(),
+            qty: quantity.qty,
+            worst_price: terms.worst,
+            stop: terms.stop,
+            leverage: Some(leverage),
+        },
+        changes,
+    })
+}
+
+/// What steps 2 to 5 establish about an entry, for the steps after them.
+#[derive(Debug, Clone, Copy)]
+struct EntryTerms<'a> {
+    asset: &'a AssetInfo,
+    /// The entry's asset id, as the bot sent it (`asset.index`).
+    asset_id: u32,
+    side: Side,
+    /// The account's equity: positive.
+    equity: Decimal,
+    mid: Decimal,
+    /// The entry's worst fill (step 4).
+    worst: Decimal,
+    /// The stop's trigger (step 5): on the losing side of `worst` and `mid`.
+    stop: Decimal,
+}
+
+/// Step 2: the market. A perp of a dex Guard reads ([`asset`]), not
+/// delisted (on a HIP-3 dex: not halted), in the policy's markets; on a
+/// HIP-3 dex also margined in USDC (its margin account read) and not at
+/// its open-interest cap.
+fn entry_market<'a>(ctx: &Context<'a>, index: u32) -> Judged<&'a AssetInfo> {
+    let asset = asset(ctx, index)?;
+    let coin = asset.name.as_str();
     // A HIP-3 dex's perp: the dex is one Guard reads (`asset` checked).
     let hip3 = asset.dex != 0;
     if asset.delisted && hip3 {
@@ -829,14 +948,14 @@ fn judge_entry(
     if asset.delisted {
         return veto("unknown_market", format!("{coin} is delisted"));
     }
-    if !policy.markets.allows(coin) {
+    if !ctx.policy.markets.allows(coin) {
         return veto(
             "market_not_allowed",
             format!("{coin} is not in the policy's markets"),
         );
     }
     if hip3 {
-        match account.dex_account(asset.dex) {
+        match ctx.account.dex_account(asset.dex) {
             Some(dex) if dex.usdc => {}
             Some(dex) => {
                 return veto(
@@ -854,7 +973,7 @@ fn judge_entry(
                 );
             }
         }
-        if account.at_open_interest_cap.contains(coin) {
+        if ctx.account.at_open_interest_cap.contains(coin) {
             return veto(
                 "open_interest_cap",
                 format!(
@@ -863,12 +982,31 @@ fn judge_entry(
             );
         }
     }
-    let OrderKind::Limit { tif } = entry.kind else {
-        return veto(
+    Ok(asset)
+}
+
+/// An entry is a limit order (IOC for a market order): its time in force.
+fn entry_tif(entry: &Order) -> Judged<Tif> {
+    match entry.kind {
+        OrderKind::Limit { tif } => Ok(tif),
+        OrderKind::Trigger { .. } => veto(
             "unsupported_order",
             "an entry must be a limit order (IOC for a market order); trigger entries fill at a price nobody knows in advance",
-        );
-    };
+        ),
+    }
+}
+
+/// What step 3 reads from the account.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct EntryAccount {
+    /// Positive.
+    equity: Decimal,
+    mid: Decimal,
+}
+
+/// Step 3: the account. A positive equity (none in an account mode other
+/// than standard) and a mid price for the coin.
+fn entry_account(account: &AccountView, coin: &str) -> Judged<EntryAccount> {
     let Some(equity) = account.equity.filter(|equity| *equity > Decimal::ZERO) else {
         return veto(
             "account_unknown",
@@ -881,8 +1019,29 @@ fn judge_entry(
     let Some(mid) = account.mid(coin) else {
         return veto("no_price", format!("no mid price for {coin}"));
     };
+    Ok(EntryAccount { equity, mid })
+}
 
-    // 4. The worst fill.
+/// The result of step 4.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WorstFill {
+    /// The worst price the entry can fill at: positive.
+    worst: Decimal,
+    /// The limit to forward: the bot's own when it is the worst fill.
+    price: Px,
+}
+
+/// Step 4: the worst fill. The bot's limit, pulled in to
+/// [`Policy::entry_price_bound`] beyond the mid (rounded towards the mid)
+/// when it lies further out.
+fn worst_fill(
+    policy: &Policy,
+    asset: &AssetInfo,
+    side: Side,
+    mid: Decimal,
+    sent: &Px,
+    changes: &mut Vec<String>,
+) -> Judged<WorstFill> {
     let bound = match side {
         Side::Buy => mid
             .checked_mul(Decimal::ONE + policy.entry_price_bound)
@@ -892,7 +1051,7 @@ fn judge_entry(
             .and_then(|price| asset.round_price(price, true)),
     }
     .ok_or_else(overflow)?;
-    let sent_price = entry.price.value();
+    let sent_price = sent.value();
     let worst = match side {
         Side::Buy => sent_price.min(bound),
         Side::Sell => sent_price.max(bound),
@@ -901,7 +1060,7 @@ fn judge_entry(
         return veto("invalid", "the entry's price must be positive");
     }
     let price = if worst == sent_price {
-        entry.price.clone()
+        sent.clone()
     } else {
         changes.push(format!(
             "limit price {sent_price} pulled in to {worst}, {} from the mid {mid}",
@@ -909,10 +1068,41 @@ fn judge_entry(
         ));
         px(worst)?
     };
+    Ok(WorstFill { worst, price })
+}
 
-    // 5. The stop.
-    // The bot's stop: a market stop's trigger (its limit widened above). A
-    // stop-limit is forwarded but is no stop.
+/// The entry's worst fill and the mid, for step 5.
+#[derive(Debug, Clone, Copy)]
+struct Prices {
+    worst: Decimal,
+    mid: Decimal,
+}
+
+/// The result of step 5.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct EntryStop {
+    trigger: Decimal,
+    /// Guard attaches the stop (the bot sent none).
+    attached: bool,
+}
+
+/// Step 5: the stop. The bot's own market stop among `children` (a
+/// stop-limit is forwarded but is no stop), or with [`StopPolicy::Attach`]
+/// one at [`Policy::default_stop_distance`] from the lower of the worst
+/// fill and the mid (the higher for a short), rounded towards the price;
+/// with [`StopPolicy::Refuse`], no stop is a veto, and so are two. The
+/// stop must lie on the losing side of both the worst fill and the mid.
+fn entry_stop(
+    policy: &Policy,
+    asset: &AssetInfo,
+    side: Side,
+    prices: Prices,
+    children: &[(usize, &Order)],
+    changes: &mut Vec<String>,
+) -> Judged<EntryStop> {
+    let Prices { worst, mid } = prices;
+    // The bot's stop: a market stop's trigger (its limit widened in
+    // `widen_market_stops`).
     let own_stops: Vec<Decimal> = children
         .iter()
         .filter_map(|(_, order)| order.protective_level())
@@ -969,32 +1159,62 @@ fn judge_entry(
             ),
         );
     }
+    Ok(EntryStop {
+        trigger: stop,
+        attached,
+    })
+}
 
-    // 6. Size, by the risk engine.
-    let position = account.position(coin);
+/// Step 6: the size the risk engine allows (`RiskEngine::size_entry`):
+/// the loss at the stop, fees and slippage both ways included, within the
+/// per-trade budget, open risk within its budget, total value within the
+/// leverage cap. Open risk and value count every position and every
+/// resting entry ([`open_exposure`]).
+fn risk_size(ctx: &Context<'_>, terms: &EntryTerms<'_>) -> Judged<Decimal> {
     let (open_risk, open_notional) = open_exposure(ctx)?;
     let sizing = SizeRequest {
-        equity,
-        side,
-        entry: worst,
-        stop,
-        round_trip_cost: policy
-            .round_trip_cost_scaled(worst, asset.fee_scale)
+        equity: terms.equity,
+        side: terms.side,
+        entry: terms.worst,
+        stop: terms.stop,
+        round_trip_cost: ctx
+            .policy
+            .round_trip_cost_scaled(terms.worst, terms.asset.fee_scale)
             .ok_or_else(overflow)?,
         open_risk,
         open_notional,
-        qty_step: asset.qty_step(),
+        qty_step: terms.asset.qty_step(),
         min_notional: MIN_NOTIONAL,
     };
-    let sized = ctx.engine.size_entry(&sizing).map_err(engine_veto)?;
+    ctx.engine.size_entry(&sizing).map_err(engine_veto)
+}
 
-    // 7. The position cap.
+/// Step 7: the position cap. What the coin's position holds (at the mid)
+/// and what resting entries on the same side could add (each at the
+/// higher of its limit and the mid) may not reach
+/// [`Policy::max_position_of_account`] of the sizing equity (the lower of
+/// the account's and the risk engine's last, under the equity cap). The
+/// room left, as a quantity at the higher of the worst fill and the mid,
+/// rounded down.
+fn position_cap(ctx: &Context<'_>, terms: &EntryTerms<'_>) -> Judged<Decimal> {
+    let policy = ctx.policy;
+    let account = ctx.account;
+    let EntryTerms {
+        asset,
+        side,
+        equity,
+        mid,
+        worst,
+        ..
+    } = *terms;
+    let coin = asset.name.as_str();
     let sizing_equity = policy
         .risk_limits()
         .capped(equity.min(ctx.engine.snapshot().last));
     // What the coin's position holds, and what resting entries on the
     // same side could add to it.
-    let mut held = position
+    let mut held = account
+        .position(coin)
         .map(|position| position.qty.checked_mul(mid))
         .unwrap_or(Some(Decimal::ZERO))
         .ok_or_else(overflow)?;
@@ -1024,114 +1244,215 @@ fn judge_entry(
     }
     // Valued at the higher of the fill and the mid, so that the position
     // is within the cap at either price.
-    let by_cap = asset.round_qty_down(room.checked_div(worst.max(mid)).ok_or_else(overflow)?);
+    Ok(asset.round_qty_down(room.checked_div(worst.max(mid)).ok_or_else(overflow)?))
+}
 
-    // 8. Liquidation.
-    let mut pre = Vec::new();
-    let leverage = match position {
-        None => {
-            // The coin's one leverage setting has to suit this entry and
-            // every entry already resting on the coin.
-            let leverage = isolated_leverage(
-                asset.max_leverage,
-                policy.max_leverage,
-                side,
-                worst,
-                stop,
-                policy.stop_slippage,
-                policy.min_liquidation_distance,
-            )
-            .and_then(|leverage| {
-                resting_leverage(ctx, asset).map(|resting| resting.map_or(leverage, |r| r.min(leverage)))
-            })
-            .ok_or_else(|| {
-                Box::new(Decision::veto(
-                    "liquidation_too_close",
-                    format!(
-                        "no isolated leverage of at least 1x puts the liquidation beyond the stop {stop} and {} from the entry",
-                        percent(policy.min_liquidation_distance)
-                    ),
-                ))
-            })?;
-            // The coin already set to isolated at this leverage or less (as
-            // the venue showed moments ago): kept, with no update to send.
-            // Less leverage only puts the liquidation further away.
-            match account.leverage_settings.get(coin) {
-                Some(set) if set.isolated && set.value >= 1 && set.value <= leverage => set.value,
-                _ => {
-                    pre.push(Action::UpdateLeverage {
-                        asset: entry.asset,
-                        is_cross: false,
-                        leverage,
-                    });
-                    leverage
-                }
-            }
-        }
+/// The result of step 8.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EntryLeverage {
+    /// The isolated leverage the position runs at.
+    leverage: u32,
+    /// The `updateLeverage` to send before the entry, if one is needed.
+    pre: Vec<Action>,
+}
+
+/// Step 8: liquidation, by whether the coin holds a position.
+fn entry_leverage(ctx: &Context<'_>, terms: &EntryTerms<'_>) -> Judged<EntryLeverage> {
+    match ctx.account.position(&terms.asset.name) {
+        None => new_position_leverage(ctx, terms),
         Some(position) => {
-            if !position.leverage.isolated {
-                return veto(
-                    "cross_margin",
-                    format!(
-                        "the {coin} position is on cross margin; Guard adds only to isolated positions"
-                    ),
-                );
-            }
-            let leverage = position.leverage.value;
-            // The venue's isolated leverage is a whole number, at least 1x:
-            // a fractional cap allows its whole part (the risk engine still
-            // holds the position's value to the fractional cap).
-            let cap = venue_leverage_cap(policy.max_leverage, asset.max_leverage);
-            if Decimal::from(leverage) > cap {
-                return veto(
-                    "leverage",
-                    format!("the {coin} position runs at {leverage}x, above the cap of {cap}x"),
-                );
-            }
-            // Measured at the looser of the new stop and the stop that
-            // covers the position now: the combined position must clear
-            // both.
-            let checked_stop = match (account.covering_stop(coin, &[]), side) {
-                (Some(held), Side::Buy) => held.min(stop),
-                (Some(held), Side::Sell) => held.max(stop),
-                (None, _) => stop,
-            };
-            let fits = isolated_leverage(
-                asset.max_leverage,
-                Decimal::from(leverage),
-                side,
-                worst,
-                checked_stop,
-                policy.stop_slippage,
-                policy.min_liquidation_distance,
-            ) == Some(leverage);
-            let liquidation_clear = position.liquidation_px.is_none_or(|liquidation| {
-                liquidation_clear(side, liquidation, checked_stop, mid, policy)
-            });
-            if !fits || !liquidation_clear {
-                return veto(
-                    "liquidation_too_close",
-                    format!(
-                        "at {leverage}x the {coin} position's liquidation would lie too close to the stop {stop} or the price"
-                    ),
-                );
-            }
-            leverage
+            existing_position_leverage(ctx, terms, position).map(|leverage| EntryLeverage {
+                leverage,
+                pre: Vec::new(),
+            })
         }
-    };
+    }
+}
 
-    // 9. A HIP-3 dex's perp: its own margin account must fund the isolated
+/// Step 8 for a new position: the highest whole isolated leverage
+/// ([`isolated_leverage`]) that suits this entry and every entry already
+/// resting on the coin; an `updateLeverage` to it goes first, unless the
+/// venue showed the coin set to isolated at that leverage or less.
+fn new_position_leverage(ctx: &Context<'_>, terms: &EntryTerms<'_>) -> Judged<EntryLeverage> {
+    let policy = ctx.policy;
+    let EntryTerms {
+        asset,
+        asset_id,
+        side,
+        worst,
+        stop,
+        ..
+    } = *terms;
+    // The coin's one leverage setting has to suit this entry and every
+    // entry already resting on the coin.
+    let leverage = isolated_leverage(
+        asset.max_leverage,
+        policy.max_leverage,
+        side,
+        worst,
+        stop,
+        policy.stop_slippage,
+        policy.min_liquidation_distance,
+    )
+    .and_then(|leverage| {
+        resting_leverage(ctx, asset).map(|resting| resting.map_or(leverage, |r| r.min(leverage)))
+    })
+    .ok_or_else(|| {
+        Box::new(Decision::veto(
+            "liquidation_too_close",
+            format!(
+                "no isolated leverage of at least 1x puts the liquidation beyond the stop {stop} and {} from the entry",
+                percent(policy.min_liquidation_distance)
+            ),
+        ))
+    })?;
+    // The coin already set to isolated at this leverage or less (as the
+    // venue showed moments ago): kept, with no update to send. Less
+    // leverage only puts the liquidation further away.
+    Ok(match ctx.account.leverage_settings.get(&asset.name) {
+        Some(set) if set.isolated && set.value >= 1 && set.value <= leverage => EntryLeverage {
+            leverage: set.value,
+            pre: Vec::new(),
+        },
+        _ => EntryLeverage {
+            leverage,
+            pre: vec![Action::UpdateLeverage {
+                asset: asset_id,
+                is_cross: false,
+                leverage,
+            }],
+        },
+    })
+}
+
+/// Step 8 when adding to a position: it must already be isolated, at a
+/// leverage within the caps, and its liquidation clear of both the new
+/// stop and the stop that covers it now. Guard never changes an open
+/// position's leverage.
+fn existing_position_leverage(
+    ctx: &Context<'_>,
+    terms: &EntryTerms<'_>,
+    position: &PositionView,
+) -> Judged<u32> {
+    let policy = ctx.policy;
+    let EntryTerms {
+        asset,
+        side,
+        mid,
+        worst,
+        stop,
+        ..
+    } = *terms;
+    let coin = asset.name.as_str();
+    if !position.leverage.isolated {
+        return veto(
+            "cross_margin",
+            format!(
+                "the {coin} position is on cross margin; Guard adds only to isolated positions"
+            ),
+        );
+    }
+    let leverage = position.leverage.value;
+    // The venue's isolated leverage is a whole number, at least 1x: a
+    // fractional cap allows its whole part (the risk engine still holds the
+    // position's value to the fractional cap).
+    let cap = venue_leverage_cap(policy.max_leverage, asset.max_leverage);
+    if Decimal::from(leverage) > cap {
+        return veto(
+            "leverage",
+            format!("the {coin} position runs at {leverage}x, above the cap of {cap}x"),
+        );
+    }
+    // Measured at the looser of the new stop and the stop that covers the
+    // position now: the combined position must clear both.
+    let checked_stop = match (ctx.account.covering_stop(coin, &[]), side) {
+        (Some(held), Side::Buy) => held.min(stop),
+        (Some(held), Side::Sell) => held.max(stop),
+        (None, _) => stop,
+    };
+    let fits = isolated_leverage(
+        asset.max_leverage,
+        Decimal::from(leverage),
+        side,
+        worst,
+        checked_stop,
+        policy.stop_slippage,
+        policy.min_liquidation_distance,
+    ) == Some(leverage);
+    let liquidation_clear = position
+        .liquidation_px
+        .is_none_or(|liquidation| liquidation_clear(side, liquidation, checked_stop, mid, policy));
+    if !fits || !liquidation_clear {
+        return veto(
+            "liquidation_too_close",
+            format!(
+                "at {leverage}x the {coin} position's liquidation would lie too close to the stop {stop} or the price"
+            ),
+        );
+    }
+    Ok(leverage)
+}
+
+/// The sizes of steps 6 to 8 that bound the quantity.
+#[derive(Debug, Clone, Copy)]
+struct SizeCaps {
+    /// The risk engine's size (step 6).
+    sized: Decimal,
+    /// The position cap's room (step 7), rounded down.
+    by_cap: Decimal,
+    /// The isolated leverage (step 8): what a HIP-3 dex's margin funds.
+    leverage: u32,
+}
+
+/// The result of step 9.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Quantity {
+    /// At most the bot's request: positive and worth the venue's minimum.
+    qty: Decimal,
+    /// `qty` as forwarded: the bot's own size when it is kept.
+    size: Px,
+}
+
+/// Step 9: the quantity. The smallest of the bot's request, the engine's
+/// size, the position cap's room and the size of the bot's own stop, and
+/// on a HIP-3 dex what its margin account can fund and its book can take
+/// ([`hip3_caps`]), rounded down; worth at least the venue's minimum at
+/// the lower of the worst fill and the stop's worst fill. A cut says which
+/// rule bound it.
+fn entry_quantity(
+    ctx: &Context<'_>,
+    terms: &EntryTerms<'_>,
+    entry: &Order,
+    children: &[(usize, &Order)],
+    caps: SizeCaps,
+    changes: &mut Vec<String>,
+) -> Judged<Quantity> {
+    let policy = ctx.policy;
+    let EntryTerms {
+        asset,
+        side,
+        worst,
+        stop,
+        ..
+    } = *terms;
+    let coin = asset.name.as_str();
+    let SizeCaps {
+        sized,
+        by_cap,
+        leverage,
+    } = caps;
+    // A HIP-3 dex's perp: its own margin account must fund the isolated
     // margin, and its book must be able to take the stop.
-    let hip3_caps = if hip3 {
+    let hip3_caps = if asset.dex != 0 {
         Some(hip3_caps(ctx, asset, side, worst, stop, leverage)?)
     } else {
         None
     };
 
-    // The quantity: never more than the bot asked for (min of the request
-    // and what the rules allow: the verdict can only be allow, a resize
-    // down, or a veto), and never more than the bot's own stop covers, so
-    // that the stop is not enlarged beyond its request either.
+    // Never more than the bot asked for (min of the request and what the
+    // rules allow: the verdict can only be allow, a resize down, or a
+    // veto), and never more than the bot's own stop covers, so that the
+    // stop is not enlarged beyond its request either.
     let sent_qty = entry.size.value();
     let stop_cover = children
         .iter()
@@ -1213,76 +1534,73 @@ fn judge_entry(
         changes.push(format!("size {sent_qty} cut to {qty} {coin} for {why}"));
         px(qty)?
     };
+    Ok(Quantity { qty, size })
+}
 
-    let forwarded_entry = Order {
-        asset: entry.asset,
-        is_buy: entry.is_buy,
-        price,
-        size: size.clone(),
-        reduce_only: false,
-        kind: OrderKind::Limit { tif },
-        cloid: entry.cloid.clone(),
-    };
-    let mut forwarded_children = Vec::with_capacity(children.len());
+/// The bot's TP/SL, each cut to the entry's quantity where it is larger:
+/// a child only ever shrinks. A stop the bot sent covers at least the
+/// entry (the entry was cut to it in step 9); a take profit larger than
+/// the entry is cut to it.
+fn cut_children(
+    children: &[(usize, &Order)],
+    quantity: &Quantity,
+    changes: &mut Vec<String>,
+) -> Vec<(usize, Order)> {
+    let mut forwarded = Vec::with_capacity(children.len());
     for (index, child) in children {
-        // A child only ever shrinks to the entry's size: a stop the bot sent
-        // covers at least the entry (the entry was cut to it above), a take
-        // profit larger than the entry is cut to it.
         let mut child = (*child).clone();
-        if child.size.value() > qty {
+        if child.size.value() > quantity.qty {
             changes.push(format!(
-                "the {} child cut from {} to the entry's {qty}",
+                "the {} child cut from {} to the entry's {}",
                 match &child.kind {
                     OrderKind::Trigger { tpsl: Tpsl::Sl, .. } => "stop loss",
                     _ => "take profit",
                 },
-                child.size
+                child.size,
+                quantity.qty
             ));
-            child.size = size.clone();
+            child.size = quantity.size.clone();
         }
-        forwarded_children.push((*index, child));
+        forwarded.push((*index, child));
     }
-    let attached_stop = if attached {
-        let worst_fill = match side {
-            Side::Buy => stop
-                .checked_mul(Decimal::ONE - policy.stop_slippage)
-                .and_then(|price| asset.round_price(price, false)),
-            Side::Sell => stop
-                .checked_mul(Decimal::ONE + policy.stop_slippage)
-                .and_then(|price| asset.round_price(price, true)),
-        }
-        .ok_or_else(overflow)?;
-        Some(Order {
-            asset: entry.asset,
-            is_buy: !entry.is_buy,
-            price: px(worst_fill)?,
-            size: size.clone(),
-            reduce_only: true,
-            kind: OrderKind::Trigger {
-                is_market: true,
-                trigger_px: px(stop)?,
-                tpsl: Tpsl::Sl,
-            },
-            cloid: Some(guard_cloid(ctx.salt, request)),
-        })
-    } else {
-        None
-    };
-    Ok(JudgedEntry {
-        entry: forwarded_entry,
-        children: forwarded_children,
-        attached_stop,
-        pre,
-        plan: EntryPlan {
-            coin: coin.to_owned(),
-            side,
-            requested_qty: sent_qty,
-            qty,
-            worst_price: worst,
-            stop,
-            leverage: Some(leverage),
+    forwarded
+}
+
+/// The stop Guard attaches (step 5 under [`StopPolicy::Attach`]): a
+/// reduce-only market stop loss for `size` at the entry's stop, its limit
+/// [`Policy::stop_slippage`] beyond the trigger (rounded away from the
+/// price), under Guard's client order id `cloid`.
+fn attached_stop(
+    ctx: &Context<'_>,
+    terms: &EntryTerms<'_>,
+    entry: &Order,
+    size: &Px,
+    cloid: Cloid,
+) -> Judged<Order> {
+    let EntryTerms {
+        asset, side, stop, ..
+    } = *terms;
+    let worst_fill = match side {
+        Side::Buy => stop
+            .checked_mul(Decimal::ONE - ctx.policy.stop_slippage)
+            .and_then(|price| asset.round_price(price, false)),
+        Side::Sell => stop
+            .checked_mul(Decimal::ONE + ctx.policy.stop_slippage)
+            .and_then(|price| asset.round_price(price, true)),
+    }
+    .ok_or_else(overflow)?;
+    Ok(Order {
+        asset: entry.asset,
+        is_buy: !entry.is_buy,
+        price: px(worst_fill)?,
+        size: size.clone(),
+        reduce_only: true,
+        kind: OrderKind::Trigger {
+            is_market: true,
+            trigger_px: px(stop)?,
+            tpsl: Tpsl::Sl,
         },
-        changes,
+        cloid: Some(cloid),
     })
 }
 

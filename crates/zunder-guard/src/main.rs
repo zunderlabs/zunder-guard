@@ -54,10 +54,8 @@ use zunder_guard_core::{
     licence,
     sign::{Address, GuardKey, SigningNetwork},
 };
-use zunder_venue::{
-    PersistentRisk,
-    hyperliquid::{CONFIRM_VAR, MainnetConsent, VenueNetwork},
-};
+use zunder_venue::PersistentRisk;
+use zunder_venue_types::{CONFIRM_VAR, MainnetConsent, VenueNetwork};
 
 /// The name of the key file in Guard's home (the file store and
 /// `ZUNDER_GUARD_KEY_FILE`'s default).

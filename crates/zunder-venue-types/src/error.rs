@@ -5,7 +5,7 @@
 use thiserror::Error;
 use zunder_core::Symbol;
 
-use crate::hyperliquid::KeyError;
+use crate::key::KeyError;
 
 /// Errors from an executor, and from the venue types it is built from.
 ///

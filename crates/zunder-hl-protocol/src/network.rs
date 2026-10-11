@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 /// Which Hyperliquid network. There is deliberately no default: every
 /// caller has to say which one it means. Choosing [`Network::Mainnet`] is
 /// not consent to trade it: executors need a person's confirmation as well
-/// (`zunder-venue`'s `MainnetConsent`).
+/// (`zunder-venue-types`' `MainnetConsent`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Network {

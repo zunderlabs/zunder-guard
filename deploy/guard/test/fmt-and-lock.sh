@@ -7,4 +7,4 @@
 set -euo pipefail
 cargo fmt --all >&2
 cargo metadata --format-version 1 >/dev/null
-tar cz Cargo.lock deploy/guard/rules/src crates/zunder-guard/src crates/zunder-guard/tests crates/zunder-guard-mcp/src crates/zunder-venue/src | base64 -w0
+tar cz Cargo.lock deploy/guard/rules/src crates/zunder-guard/src crates/zunder-guard/tests crates/zunder-guard-mcp/src crates/zunder-venue/src crates/zunder-venue-types/src | base64 -w0

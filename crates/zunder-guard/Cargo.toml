@@ -46,6 +46,7 @@ zunder-guard-rules.workspace = true
 zunder-guard-mcp.workspace = true
 zunder-risk.workspace = true
 zunder-venue.workspace = true
+zunder-venue-types.workspace = true
 
 # The Credential Manager keeps a testnet key on Windows (init.rs).
 [target.'cfg(windows)'.dependencies]

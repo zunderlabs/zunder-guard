@@ -8,7 +8,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/../../.."
 TARGET=x86_64-pc-windows-gnu
-CRATES=(-p zunder-guard -p zunder-guard-core -p zunder-guard-mcp -p zunder-guard-rules -p zunder-venue -p zunder-risk -p zunder-core -p zunder-redteam)
+CRATES=(-p zunder-guard -p zunder-guard-core -p zunder-guard-mcp -p zunder-guard-rules -p zunder-venue -p zunder-venue-types -p zunder-risk -p zunder-core -p zunder-redteam)
 command -v x86_64-w64-mingw32-gcc >/dev/null || sudo apt-get install -yq gcc-mingw-w64-x86-64 >/dev/null
 rustup target list --installed | grep -qx "$TARGET" || rustup target add "$TARGET"
 export CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER=x86_64-w64-mingw32-gcc

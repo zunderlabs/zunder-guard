@@ -16,9 +16,8 @@ use std::{
 };
 
 use thiserror::Error;
-
-use super::{Network, network::VenueNetwork};
-use crate::error::ExecError;
+use zunder_hl_protocol::Network;
+use zunder_venue_types::{ExecError, VenueNetwork};
 
 /// The two REST endpoints.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -221,7 +220,8 @@ impl Transport for ScriptedTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hyperliquid::{Address, network::MainnetConsent};
+    use zunder_hl_protocol::Address;
+    use zunder_venue_types::MainnetConsent;
 
     #[test]
     fn http_transport_goes_to_the_chosen_network_only() {
@@ -231,7 +231,8 @@ mod tests {
 
         let account = "0x5e9ee1089755c3435139848e47e6635505d5a13a";
         let consent =
-            MainnetConsent::confirm(Address::from_hex(account).unwrap(), Some(account)).unwrap();
+            MainnetConsent::confirm_for_tests(Address::from_hex(account).unwrap(), Some(account))
+                .unwrap();
         let transport = HttpTransport::new(VenueNetwork::mainnet(consent)).unwrap();
         assert_eq!(transport.base_url(), "https://api.hyperliquid.xyz");
         assert_eq!(transport.network(), Some(Network::Mainnet));

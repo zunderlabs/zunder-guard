@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/zunder-core", "crates/zunder-guard", "crates/zunder-guard-core", "crates/zunder-guard-mcp", "crates/zunder-hl-protocol", "crates/zunder-risk", "crates/zunder-venue", "deploy/guard/rules", "tests/redteam"]
+members = ["crates/zunder-core", "crates/zunder-guard", "crates/zunder-guard-core", "crates/zunder-guard-mcp", "crates/zunder-hl-protocol", "crates/zunder-risk", "crates/zunder-venue", "crates/zunder-venue-types", "deploy/guard/rules", "tests/redteam"]
 
 [workspace.package]
 version = "1.0.0-rc.1"
@@ -19,6 +19,7 @@ zunder-redteam = { path = "tests/redteam" }
 zunder-hl-protocol = { path = "crates/zunder-hl-protocol" }
 zunder-risk = { path = "crates/zunder-risk" }
 zunder-venue = { path = "crates/zunder-venue" }
+zunder-venue-types = { path = "crates/zunder-venue-types" }
 
 anyhow = "1"
 clap = { version = "4", features = ["derive", "env"] }

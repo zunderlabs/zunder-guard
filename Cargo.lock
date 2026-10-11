@@ -2824,6 +2824,7 @@ dependencies = [
  "zunder-redteam",
  "zunder-risk",
  "zunder-venue",
+ "zunder-venue-types",
 ]
 
 [[package]]
@@ -2933,4 +2934,16 @@ dependencies = [
  "zunder-core",
  "zunder-hl-protocol",
  "zunder-risk",
+ "zunder-venue-types",
+]
+
+[[package]]
+name = "zunder-venue-types"
+version = "1.0.0-rc.1"
+dependencies = [
+ "rust_decimal",
+ "serde",
+ "thiserror 2.0.21",
+ "zunder-core",
+ "zunder-hl-protocol",
 ]

@@ -29,8 +29,8 @@
 //!
 //! - **The REST URL:** `https://api.hyperliquid.xyz` against
 //!   `https://api.hyperliquid-testnet.xyz` ([`Network::rest_url`]).
-//! - **L1 actions** (orders, cancels, `updateLeverage`: everything this
-//!   crate signs): the EIP-712 domain is the same on both (`Exchange`,
+//! - **L1 actions** (orders, cancels, `updateLeverage`: everything the
+//!   executor and Guard sign): the EIP-712 domain is the same on both (`Exchange`,
 //!   version `1`, chain id 1337, verifying contract zero); only the phantom
 //!   agent's `source` differs, `"a"` on mainnet and `"b"` on testnet
 //!   (`construct_phantom_agent`). The SDK's own vectors for both halves are
@@ -43,15 +43,16 @@
 //!   `signatureChainId`, which names the chain of the signing wallet, not
 //!   the Hyperliquid network: the docs give `0xa4b1` (Arbitrum) as an
 //!   example, and the Python SDK sends `0x66eee` on both networks
-//!   (`sign_user_signed_action`). **This crate signs no user-signed action
-//!   and has no code for one**: they move funds or approve keys, which is
+//!   (`sign_user_signed_action`). **This crate signs nothing, and has no
+//!   code for a user-signed action**: they move funds or approve keys, which is
 //!   the account owner's business, and an API wallet cannot sign them.
 //!   The chain name is kept here so that the difference is written down in
 //!   one place, with a test.
 
 use std::fmt;
 
-use super::{Address, Network};
+use zunder_hl_protocol::{Address, Network};
+
 use crate::error::ExecError;
 
 /// The environment variable a person sets, to the address of the account,
@@ -141,8 +142,8 @@ impl VenueNetwork {
     }
 }
 
-/// A person's go-ahead to trade one account on Hyperliquid mainnet (hard
-/// rule 1), as read at this start of the process. Outside this crate only
+/// A person's go-ahead to trade one account on Hyperliquid mainnet, as
+/// read at this start of the process. Outside this crate only
 /// [`MainnetConsent::from_env`] makes one; it cannot be cloned,
 /// deserialised or built any other way.
 #[derive(PartialEq, Eq)]

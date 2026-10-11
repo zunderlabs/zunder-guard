@@ -8,7 +8,8 @@ Guard is **source-available** under the Elastic License 2.0 ("Fee, licence key a
 |---|---|
 | `crates/zunder-guard-core` | No I/O; builds natively and for `wasm32-unknown-unknown`. Decoding, client authentication, the policy and the judge, re-signing, vetoes in Hyperliquid's shape, the licence check and issuing, the event schema. |
 | `crates/zunder-guard` | The `zunder-guard` binary: configuration, setup, loopback HTTP/WebSocket server, persistent risk and decision journals, background synchronization and kill switch. It forwards client orders without running a trading strategy. |
-| `crates/zunder-venue` | Shared venue foundations, without a trading session, executor or signer: Hyperliquid addresses, the network choice and mainnet consent, the HTTPS transport, instrument rules, and the persistent risk engine (`PersistentRisk`). |
+| `crates/zunder-venue-types` | The venue's types without I/O: instrument rules, the network choice and mainnet consent, and the errors between a caller and a venue. |
+| `crates/zunder-venue` | Shared venue foundations, without a trading session, executor or signer: the HTTPS transport, owner-only files, and the persistent risk engine (`PersistentRisk`). |
 
 ## The public contract
 

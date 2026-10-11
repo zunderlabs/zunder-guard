@@ -36,6 +36,8 @@ pub mod licence;
 pub mod policy;
 pub mod reply;
 pub mod sign;
+#[cfg(any(test, feature = "test-hooks"))]
+pub mod testing;
 pub mod wire;
 
 use serde_json::Value;
