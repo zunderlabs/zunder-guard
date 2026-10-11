@@ -208,3 +208,144 @@ def test_failed_native_execution_scrubs_all_nested_artifact_logs(
     assert "read-only runtime failed:" in body
     assert body.count("[ADDRESS]") == 2 and "[REDACTED]" in body
     assert account not in body and wallet not in body and frame.decode().strip().upper() not in body
+
+
+def test_per_user_predecessor_init_has_only_supported_command_arguments(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import guard_harness.native_testnet as module
+    from guard_harness.native_paper import Paper
+    from guard_harness.native_release import Release
+
+    monkeypatch.setattr(platform, "system", lambda: "Windows")
+    monkeypatch.setenv("ProgramData", str(tmp_path / "windows-program-data"))
+    monkeypatch.setattr(Release, "asset", lambda self, name: b"inert released-loader fixture")
+    release = Release("v1.0.0", COMMIT, tmp_path / "assets")
+    controller = module.NativeTestnet(release, release, tmp_path, "fixture-account", "pwsh.exe")
+    binary = tmp_path / "fixture-bin/zunder-guard.exe"
+    monkeypatch.setattr(Paper, "install", lambda self, release: setattr(self, "binary", binary))
+    captured: list[list[str]] = []
+
+    def capture(words: list[str], *, key: bool = False, sensitive: bool = False) -> str:
+        captured.append(words)
+        assert key is True and sensitive is True
+        raise LifecycleError("stop before executing predecessor init")
+
+    monkeypatch.setattr(controller, "command", capture)
+    work = tmp_path / "per-user"
+    with pytest.raises(LifecycleError, match="stop before executing"):
+        module.per_user(controller, work, b"inert-fixture-no-live-key")
+    rules = json.loads((ROOT / "rules/vectors.json").read_bytes())["valid"][0]["canonical"]
+    assert captured == [
+        [
+            str(binary),
+            "--home",
+            str(work / "home"),
+            "init",
+            "--non-interactive",
+            "--network",
+            "testnet",
+            "--key-stdin",
+            "--key-store",
+            "credential-manager",
+            "--rules",
+            rules,
+            "--account",
+            "fixture-account",
+        ]
+    ]
+    assert "candidate-loader-stdin" in PERUSER  # evidence token remains coverage only
+    assert not (work / "receipt.json").exists()
+
+
+@pytest.mark.parametrize("existing", [True, False])
+def test_macos_lifecycle_preserves_setup_journal_and_initializes_only_absence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, existing: bool
+) -> None:
+    import subprocess
+
+    from guard_harness.native_release import Release
+    from guard_harness.native_testnet import NativeTestnet
+
+    monkeypatch.setattr(platform, "system", lambda: "Darwin")
+    release = Release("v1.0.0", COMMIT, tmp_path / "assets")
+    controller = NativeTestnet(release, release, tmp_path / "work", "fixture-account", "sh")
+    controller.home = tmp_path / "service-state"
+    controller.home.mkdir()
+    journal = controller.home / "risk.jsonl"
+    original = b"retained setup journal prefix\n"
+    if existing:
+        journal.write_bytes(original)
+    initialized: list[list[str]] = []
+
+    def command(words: list[str], *, key: bool = False, sensitive: bool = False) -> str:
+        if words[:2] == ["sudo", "/bin/sh"]:
+            # Execute the production read-only probe on fixture files without sudo.
+            completed = subprocess.run(words[1:], capture_output=True, check=True)
+            return completed.stdout.decode()
+        initialized.append(words)
+        assert words == [
+            "sudo",
+            "-u",
+            "_zunder_guard_testnet",
+            "/fixture/released/zunder-guard",
+            "--home",
+            str(controller.home),
+            "journal-init",
+            "--mode",
+            "testnet",
+            "--note",
+            "released installer lifecycle read-only test",
+        ]
+        assert not journal.exists()
+        journal.write_bytes(b"fixture journal initialized once\n")
+        return ""
+
+    monkeypatch.setattr(controller, "command", command)
+    monkeypatch.setattr(controller, "install", lambda release, *, fresh=False: None)
+    monkeypatch.setattr(controller, "installed", lambda: Path("/fixture/released/zunder-guard"))
+
+    def stop_before_start() -> None:
+        raise LifecycleError("stop before native service or venue access")
+
+    monkeypatch.setattr(controller, "start", stop_before_start)
+    with pytest.raises(LifecycleError, match="stop before native service"):
+        controller.execute(b"")
+    if existing:
+        assert initialized == [] and journal.read_bytes() == original
+    else:
+        assert (
+            len(initialized) == 1 and journal.read_bytes() == b"fixture journal initialized once\n"
+        )
+
+
+@pytest.mark.parametrize("kind", ["empty", "directory", "symlink"])
+def test_macos_ambiguous_journal_is_never_initialized_or_reset(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kind: str
+) -> None:
+    import subprocess
+
+    from guard_harness.native_release import Release
+    from guard_harness.native_testnet import NativeTestnet
+
+    monkeypatch.setattr(platform, "system", lambda: "Darwin")
+    release = Release("v1.0.0", COMMIT, tmp_path / "assets")
+    controller = NativeTestnet(release, release, tmp_path / "work", "fixture-account", "sh")
+    controller.home = tmp_path
+    journal = tmp_path / "risk.jsonl"
+    if kind == "empty":
+        journal.touch()
+    elif kind == "directory":
+        journal.mkdir()
+    else:
+        journal.symlink_to(tmp_path / "missing")
+
+    def probe(words: list[str], *, key: bool = False, sensitive: bool = False) -> str:
+        assert words[:2] == ["sudo", "/bin/sh"]
+        subprocess.run(words[1:], capture_output=True, check=True)
+        pytest.fail("ambiguous journal must not permit initialization")
+
+    monkeypatch.setattr(controller, "command", probe)
+    with pytest.raises(subprocess.CalledProcessError):
+        controller.ensure_macos_journal()
+    assert journal.exists() or journal.is_symlink()

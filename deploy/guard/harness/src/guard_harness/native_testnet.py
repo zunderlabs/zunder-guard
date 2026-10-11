@@ -263,6 +263,41 @@ class NativeTestnet:
                 )
             )
 
+    def ensure_macos_journal(self) -> None:
+        """Preserve setup's journal; absence alone permits the explicit Testnet init."""
+        journal = self.home / "risk.jsonl"
+        state = self.command(
+            [
+                "sudo",
+                "/bin/sh",
+                "-c",
+                'if [ -L "$1" ]; then exit 2; '
+                'elif [ -f "$1" ] && [ -s "$1" ]; then printf present; '
+                'elif [ ! -e "$1" ]; then printf absent; else exit 2; fi',
+                "guard-journal-probe",
+                str(journal),
+            ]
+        )
+        if state == "present":
+            return
+        if state != "absent":
+            raise LifecycleError("cannot establish protected Testnet journal absence")
+        self.command(
+            [
+                "sudo",
+                "-u",
+                "_zunder_guard_testnet",
+                str(self.installed()),
+                "--home",
+                str(self.home),
+                "journal-init",
+                "--mode",
+                "testnet",
+                "--note",
+                "released installer lifecycle read-only test",
+            ]
+        )
+
     def execute(self, key: bytes) -> dict[str, object]:
         self.key = key
         self.work.mkdir(mode=0o700)
@@ -270,21 +305,7 @@ class NativeTestnet:
         try:
             self.install(self.previous, fresh=True)
             if self.mac:
-                self.command(
-                    [
-                        "sudo",
-                        "-u",
-                        "_zunder_guard_testnet",
-                        str(self.installed()),
-                        "--home",
-                        str(self.home),
-                        "journal-init",
-                        "--mode",
-                        "testnet",
-                        "--note",
-                        "released installer lifecycle read-only test",
-                    ]
-                )
+                self.ensure_macos_journal()
             self.start()
             active = True
             self.healthy(self.previous)
@@ -424,7 +445,6 @@ def per_user(native: NativeTestnet, work: Path, key: bytes) -> None:
                 "--key-stdin",
                 "--key-store",
                 "credential-manager",
-                "candidate-loader-stdin",
                 "--rules",
                 rules,
                 "--account",

@@ -53,6 +53,7 @@ class Fake(harness.AWS):
                                 "Value": "foreign" if self.foreign else self.marker,
                             },
                             {"Key": "zunder:purpose", "Value": "release-e2e"},
+                            {"Key": "zunder-e2e", "Value": self.marker},
                         ],
                     }
                 ]
@@ -243,17 +244,43 @@ def test_create_passes_execution_role_and_owned_sandbox_name(
     monkeypatch.setattr(
         stack,
         "owned",
-        lambda: {"Outputs": [{"OutputKey": "InstanceId", "OutputValue": "i-fixture"}]},
+        lambda: {"Outputs": [{"OutputKey": "InstanceId", "OutputValue": "i-" + "1" * 17}]},
     )
     monkeypatch.setattr(stack, "online", lambda: None)
-    role = "arn:fixture:execution-role"
-    monkeypatch.setattr("guard_harness.aws_lifecycle.re.fullmatch", lambda *args: True)
+    account_id = "1" * 12
+    role = f"arn:aws:iam::{account_id}:role/fixture-execution"
+    boundary = f"arn:aws:iam::{account_id}:policy/fixture-boundary"
     stack.create(
         "https://example.invalid/template",
         account="0x" + "a" * 40,
         rules="zr1_fixture",
         execution_role=role,
+        permissions_boundary=boundary,
     )
     assert captured["RoleARN"] == role
     assert captured["StackName"] == "zunder-e2e-" + fake.marker
-    assert captured["Parameters"][-1] == {"ParameterKey": "ExposePort", "ParameterValue": "no"}
+    assert {"ParameterKey": "ExposePort", "ParameterValue": "no"} in captured["Parameters"]
+    assert captured["Parameters"][-1] == {
+        "ParameterKey": "PermissionsBoundaryArn",
+        "ParameterValue": boundary,
+    }
+    assert {"Key": "zunder-e2e", "Value": fake.marker} in captured["Tags"]
+
+
+@pytest.mark.parametrize(
+    "boundary",
+    ["", f"arn:aws:iam::{'2' * 12}:policy/boundary", f"arn:aws:iam::{'1' * 12}:role/not-policy"],
+)
+def test_boundary_refuses_before_any_cloud_call(boundary: str) -> None:
+    fake = Fake()
+    stack = harness.Stack(fake, marker=fake.marker)
+    with pytest.raises(harness.AwsError, match="permissions boundary"):
+        stack.create(
+            "https://example.invalid/template",
+            account="0x" + "a" * 40,
+            rules="zr1_fixture",
+            execution_role=f"arn:aws:iam::{'1' * 12}:role/execution",
+            permissions_boundary=boundary,
+        )
+    assert fake.calls == []
+    assert stack.armed is False

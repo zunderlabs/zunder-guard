@@ -112,7 +112,10 @@ class Stack:
             raise AwsError("successful complete stack inventory required")
         return records
 
-    def create(self, url: str, *, account: str, rules: str, execution_role: str) -> None:
+    def create(
+        self, url: str, *, account: str, rules: str, execution_role: str, permissions_boundary: str
+    ) -> None:
+        validate_boundary(permissions_boundary, execution_role)
         if any(
             value.get("StackName") == self.name and value.get("StackStatus") != "DELETE_COMPLETE"
             for value in self.inventory()
@@ -133,8 +136,13 @@ class Stack:
                     {"ParameterKey": "Rules", "ParameterValue": rules},
                     {"ParameterKey": "InstanceType", "ParameterValue": "t4g.micro"},
                     {"ParameterKey": "ExposePort", "ParameterValue": "no"},
+                    {
+                        "ParameterKey": "PermissionsBoundaryArn",
+                        "ParameterValue": permissions_boundary,
+                    },
                 ],
                 "Tags": [
+                    {"Key": "zunder-e2e", "Value": self.marker},
                     {"Key": "zunder:purpose", "Value": "release-e2e"},
                     {"Key": "zunder:run", "Value": self.marker},
                 ],
@@ -169,6 +177,7 @@ class Stack:
         tags = {item["Key"]: item["Value"] for item in record.get("Tags", [])}
         if (
             record.get("StackName") != self.name
+            or tags.get("zunder-e2e") != self.marker
             or tags.get("zunder:run") != self.marker
             or tags.get("zunder:purpose") != "release-e2e"
         ):
@@ -315,6 +324,15 @@ class Stack:
             raise AwsError("stack survived sandbox cleanup")
 
 
+def validate_boundary(boundary: str, execution_role: str) -> None:
+    if (
+        re.fullmatch(r"arn:aws:iam::[0-9]{12}:policy/[A-Za-z0-9_+=,.@/-]+", boundary) is None
+        or re.fullmatch(r"arn:aws:iam::[0-9]{12}:role/[A-Za-z0-9_+=,.@/-]+", execution_role) is None
+        or boundary.split(":")[4] != execution_role.split(":")[4]
+    ):
+        raise AwsError("explicit same-sandbox permissions boundary required")
+
+
 def execute(
     current: Release,
     previous: Release,
@@ -324,6 +342,7 @@ def execute(
     rules: str,
     role: str,
     execution_role: str,
+    permissions_boundary: str,
     work: Path,
 ) -> dict[str, object]:
     if not re.fullmatch(r"0x[0-9a-fA-F]{40}", account) or not re.fullmatch(
@@ -337,6 +356,7 @@ def execute(
         or execution_role.split(":")[4] != role.split(":")[4]
     ):
         raise AwsError("same-sandbox CloudFormation execution role required")
+    validate_boundary(permissions_boundary, execution_role)
     caller = aws.request(["sts", "get-caller-identity"])
     if caller.get("Account") != role.split(":")[4]:
         raise AwsError("current AWS identity is outside configured sandbox")
@@ -357,7 +377,13 @@ def execute(
         "diagnostic": os.environ.get("DIAGNOSTIC") == "true",
     }
     try:
-        stack.create(template, account=account, rules=rules, execution_role=execution_role)
+        stack.create(
+            template,
+            account=account,
+            rules=rules,
+            execution_role=execution_role,
+            permissions_boundary=permissions_boundary,
+        )
         setup = (
             "set -eu\numask 077\ntest ! -e /opt/guard-install-e2e\n"
             "mkdir -m 700 /opt/guard-install-e2e\n" + "apt-get update >/dev/null 2>&1\n"
@@ -477,6 +503,7 @@ def main() -> None:
         "role",
         "region",
         "execution-role",
+        "permissions-boundary",
     ):
         parser.add_argument("--" + name, required=True)
     parser.add_argument("--assets", type=Path, required=True)
@@ -496,6 +523,7 @@ def main() -> None:
         rules=args.rules,
         role=args.role,
         execution_role=args.execution_role,
+        permissions_boundary=args.permissions_boundary,
         work=args.work,
     )
 

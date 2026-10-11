@@ -307,10 +307,13 @@ jobs:
           ROLE: ${{ vars.CFN_SANDBOX_ROLE_ARN }}
           REGION: ${{ vars.CFN_SANDBOX_REGION }}
           EXECUTION_ROLE: ${{ vars.CFN_SANDBOX_EXEC_ROLE_ARN }}
+          PERMISSIONS_BOUNDARY: ${{ vars.CFN_SANDBOX_PERMISSIONS_BOUNDARY_ARN }}
           PAPER_ACCOUNT: ${{ vars.E2E_PAPER_ACCOUNT }}
         run: |
           set -euo pipefail
-          [ -n "$ROLE" ] && [ -n "$REGION" ] && [ -n "$EXECUTION_ROLE" ]
+          [ -n "$ROLE" ] && [ -n "$REGION" ] && [ -n "$EXECUTION_ROLE" ] && [ -n "$PERMISSIONS_BOUNDARY" ]
+          [[ $PERMISSIONS_BOUNDARY =~ ^arn:aws:iam::[0-9]{12}:policy/[A-Za-z0-9_+=,.@/-]+$ ]]
+          [[ ${PERMISSIONS_BOUNDARY%%:policy/*} == "${EXECUTION_ROLE%%:role/*}" ]]
           [[ $PAPER_ACCOUNT =~ ^0x[0-9a-fA-F]{40}$ ]]
       - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         with:
@@ -331,12 +334,13 @@ jobs:
           ROLE: ${{ vars.CFN_SANDBOX_ROLE_ARN }}
           REGION: ${{ vars.CFN_SANDBOX_REGION }}
           EXECUTION_ROLE: ${{ vars.CFN_SANDBOX_EXEC_ROLE_ARN }}
+          PERMISSIONS_BOUNDARY: ${{ vars.CFN_SANDBOX_PERMISSIONS_BOUNDARY_ARN }}
           PAPER_ACCOUNT: ${{ vars.E2E_PAPER_ACCOUNT }}
         run: |
           set -euo pipefail
           umask 077
           RULES=$(python -c 'import json; print(json.load(open("deploy/guard/rules/vectors.json"))["valid"][0]["canonical"])')
-          python -m guard_harness.aws_lifecycle --tag "$TAG" --commit "$SOURCE" --previous-tag "$PREVIOUS_TAG" --previous-commit "$PREVIOUS_SOURCE" --account "$PAPER_ACCOUNT" --rules "$RULES" --role "$ROLE" --execution-role "$EXECUTION_ROLE" --region "$REGION" --assets "$RUNNER_TEMP/subjects" --work "$RUNNER_TEMP/I7"
+          python -m guard_harness.aws_lifecycle --tag "$TAG" --commit "$SOURCE" --previous-tag "$PREVIOUS_TAG" --previous-commit "$PREVIOUS_SOURCE" --account "$PAPER_ACCOUNT" --rules "$RULES" --role "$ROLE" --execution-role "$EXECUTION_ROLE" --permissions-boundary "$PERMISSIONS_BOUNDARY" --region "$REGION" --assets "$RUNNER_TEMP/subjects" --work "$RUNNER_TEMP/I7"
       - name: Prepare I7 predicate only after full lifecycle and confirmed cleanup
         if: ${{ !inputs.diagnostic && inputs.profile != 'nightly' }}
         shell: bash
