@@ -438,6 +438,18 @@ impl MemoryVenue {
             }}));
     }
 
+    /// The position in `coin` changes elsewhere to `szi` (signed), as a fill
+    /// outside Guard would leave it.
+    pub fn set_position(&self, coin: &str, szi: &str) {
+        let mut state = self.state.lock().unwrap();
+        let held = state
+            .positions
+            .iter_mut()
+            .find(|p| p["position"]["coin"] == coin)
+            .expect("a position in that coin");
+        held["position"]["szi"] = json!(szi);
+    }
+
     /// The account approves (or withdraws, with 0) a builder fee of at
     /// most `max_tenths_bp`.
     pub fn approve_builder(&self, max_tenths_bp: u64) {

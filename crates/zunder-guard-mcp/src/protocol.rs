@@ -190,12 +190,17 @@ pub fn handle(server: &mut Server, text: &str) -> Option<Value> {
                     // `experimental.exchange_expected_mode`: every request
                     // this server sends to Guard's `/exchange` carries the
                     // mode it was started for (`expectedMode`), and it sends
-                    // only to a Guard that enforces it. MCP requires every
-                    // value under `experimental` to be an object.
+                    // only to a Guard that enforces it.
+                    // `experimental.close_expected_size`: `close_position`
+                    // takes `expected_size` and then closes exactly that
+                    // quantity, only when the position is exactly that size.
+                    // MCP requires every value under `experimental` to be an
+                    // object.
                     "capabilities": {
                         "tools": {"listChanged": false},
                         "experimental": {
                             contract::EXPECTED_MODE_CAPABILITY: {"enabled": true},
+                            contract::CLOSE_EXPECTED_SIZE_CAPABILITY: {"enabled": true},
                         },
                     },
                     "serverInfo": {

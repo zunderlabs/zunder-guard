@@ -150,14 +150,20 @@ const TOOLS: [ToolDef; 9] = [
     ToolDef {
         name: "close_position",
         title: "Close a position",
-        description: "Close all or part of a position with a reduce-only IOC order 5% beyond the mid. Guard never blocks closing. Rate-limited.",
+        description: "Close all or part of a position with a reduce-only IOC order 5% beyond the mid. With expected_size it closes exactly that quantity, and only when the open position is exactly that size; otherwise nothing is sent. Guard never blocks closing. Rate-limited.",
         params: &[
             COIN,
             Param {
                 name: "fraction",
                 field: Field::Fraction,
                 required: false,
-                description: "How much to close, above 0 and at most 1, as a decimal string. Default \"1\" (all).",
+                description: "How much to close, above 0 and at most 1, as a decimal string. Default \"1\" (all). Not together with expected_size.",
+            },
+            Param {
+                name: "expected_size",
+                field: Field::Quantity,
+                required: false,
+                description: "The position's size in coins as you last saw it, as a decimal string. The close is sent only if the open position is exactly this size, and then for exactly this quantity; otherwise nothing is sent (position_size_mismatch). Not together with fraction.",
             },
         ],
         read_only: false,
@@ -499,9 +505,14 @@ impl Server {
                 self.orders.take(now);
             }
         }
-        let args = match schema::check(tool.params, arguments) {
+        let args = match schema::check(tool.params, arguments, nulls(tool)) {
             Ok(args) => args,
-            Err(error) => return Some(Outcome::fail("invalid_arguments", error.to_string())),
+            Err(error) => {
+                return Some(
+                    Outcome::fail("invalid_arguments", error.to_string())
+                        .with("sent", json!(false)),
+                );
+            }
         };
         Some(match tool.name {
             "account_overview" => {
@@ -1236,12 +1247,33 @@ impl Server {
     fn close_position(&mut self, args: &Args) -> Outcome {
         let run = |server: &mut Self| -> Result<Outcome, Outcome> {
             let coin = args.text("coin").unwrap_or_default().to_owned();
+            let expected = args.decimal("expected_size");
+            if expected.is_some() && args.decimal("fraction").is_some() {
+                return Err(Outcome::fail(
+                    "invalid_arguments",
+                    "give fraction or expected_size, not both; nothing was sent",
+                ));
+            }
             let fraction = args.decimal("fraction").unwrap_or(Decimal::ONE);
             let status = server.status()?;
             server.writable(&status, false)?;
             let (account, _) = server.account(&status)?;
             let (market, mids) = server.market(&coin)?;
-            let Some(position) = account.positions.iter().find(|p| p.coin == market.name) else {
+            let position = account.positions.iter().find(|p| p.coin == market.name);
+            if let Some(expected) = expected {
+                // Exactly the size the caller saw, or nothing: a position
+                // that grew or shrank since is not the one meant.
+                let held = position.map_or(Decimal::ZERO, |position| position.qty);
+                if held != expected {
+                    return Err(Outcome::fail(
+                        "position_size_mismatch",
+                        "the open position is not exactly expected_size; nothing was sent",
+                    )
+                    .with("expected_size", text(expected))
+                    .with("position_size", text(held)));
+                }
+            }
+            let Some(position) = position else {
                 return Err(Outcome::fail(
                     "no_position",
                     "there is no open position in this market; nothing was sent",
@@ -1253,7 +1285,19 @@ impl Server {
                     "there is no price for this market; nothing was sent",
                 ));
             };
-            let size = if fraction == Decimal::ONE {
+            let size = if let Some(expected) = expected {
+                // Equal to the position's size, so on the venue's grid; the
+                // check is the last word on what is sent.
+                if market.round_qty_down(expected) != expected {
+                    return Err(Outcome::fail(
+                        "position_size_mismatch",
+                        "expected_size is not on the venue's size grid; nothing was sent",
+                    )
+                    .with("expected_size", text(expected))
+                    .with("position_size", text(position.qty)));
+                }
+                expected
+            } else if fraction == Decimal::ONE {
                 position.qty
             } else {
                 market.round_qty_down(position.qty * fraction)
@@ -1300,12 +1344,14 @@ impl Server {
                     "side": side_name(closing),
                     "size_sent": text(size),
                     "position_size": text(position.qty),
+                    "expected_size": expected.map(text),
                     "order_price": text(price),
                     "client_order_id": cloid,
                 }),
             ))
         };
-        run(self).unwrap_or_else(|outcome| outcome)
+        // Every refusal above comes before the request: nothing was sent.
+        run(self).unwrap_or_else(|outcome| outcome.with("sent", json!(false)))
     }
 
     fn cancel_order(&mut self, args: &Args) -> Outcome {
@@ -1574,6 +1620,17 @@ impl Server {
     }
 }
 
+/// The tools that build an order refuse an explicit null: leaving a
+/// parameter out selects its default, and null must not. The kill switch
+/// (never blocked) and the reads take null as left out.
+fn nulls(tool: &ToolDef) -> schema::Nulls {
+    if tool.sends || tool.name == "preview_order" {
+        schema::Nulls::Refused
+    } else {
+        schema::Nulls::Absent
+    }
+}
+
 fn rate_limited(wait_ms: u64) -> Outcome {
     Outcome::fail(
         "rate_limited",
@@ -1583,6 +1640,7 @@ fn rate_limited(wait_ms: u64) -> Outcome {
         ),
     )
     .with("retry_after_ms", json!(wait_ms))
+    .with("sent", json!(false))
 }
 
 /// A reduce-only stop-market order protecting a `side` position (or entry)
@@ -1704,6 +1762,40 @@ fn exchange_outcome(reply: &Value, decision: Option<Value>, action: &Action) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exactly_the_order_tools_refuse_null() {
+        let refusing: Vec<&str> = TOOLS
+            .iter()
+            .filter(|tool| nulls(tool) == schema::Nulls::Refused)
+            .map(|tool| tool.name)
+            .collect();
+        assert_eq!(
+            refusing,
+            [
+                "preview_order",
+                "place_order",
+                "move_stop",
+                "close_position",
+                "cancel_order"
+            ]
+        );
+    }
+
+    #[test]
+    fn refusals_before_sending_say_nothing_was_sent() {
+        // A read that timed out sent nothing: a timeout, not an unknown
+        // outcome; close_position adds `sent: false` to every refusal that
+        // comes before its request.
+        let timeout = guard_failure(GuardError::OutcomeUnknown);
+        assert_eq!(timeout.body["error"]["code"], "guard_timeout");
+        assert_eq!(rate_limited(1_000).body["sent"], false);
+        // Only a send that may have reached Guard is unknown.
+        assert_eq!(
+            send_failure(GuardError::OutcomeUnknown).body["sent"],
+            Value::Null
+        );
+    }
 
     #[test]
     fn exactly_nine_tools_and_nothing_that_moves_funds_or_limits() {

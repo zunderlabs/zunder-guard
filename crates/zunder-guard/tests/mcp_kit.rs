@@ -292,20 +292,41 @@ async fn the_agent_kit_works_against_the_real_guard_in_paper_mode() {
 /// to `then`, as when another Guard takes over the port between a client's
 /// status read (or preview) and its request.
 fn switching_proxy(first: String, then: String, after: &'static str) -> String {
+    proxy(first, Some(then), after, Arc::new(|_: &str| {}))
+}
+
+/// Run before a request is passed on, with its path.
+type BeforeForward = Arc<dyn Fn(&str) + Send + Sync>;
+
+/// A loopback address in front of `first` (switching to `then` as in
+/// [`switching_proxy`]) that runs `before` on each request, in order,
+/// before passing it on.
+fn proxy(
+    first: String,
+    then: Option<String>,
+    after: &'static str,
+    before: BeforeForward,
+) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = format!("http://{}", listener.local_addr().unwrap());
-    let target = Arc::new(Mutex::new((first, Some(then))));
+    let target = Arc::new(Mutex::new((first, then)));
     std::thread::spawn(move || {
         for stream in listener.incoming() {
             let Ok(stream) = stream else { continue };
             let target = target.clone();
-            std::thread::spawn(move || relay(stream, &target, after));
+            let before = before.clone();
+            std::thread::spawn(move || relay(stream, &target, after, &*before));
         }
     });
     address
 }
 
-fn relay(stream: TcpStream, target: &Mutex<(String, Option<String>)>, after: &str) {
+fn relay(
+    stream: TcpStream,
+    target: &Mutex<(String, Option<String>)>,
+    after: &str,
+    before: &(dyn Fn(&str) + Send + Sync),
+) {
     let mut reader = BufReader::new(stream.try_clone().unwrap());
     let mut line = String::new();
     if reader.read_line(&mut line).is_err() {
@@ -332,6 +353,7 @@ fn relay(stream: TcpStream, target: &Mutex<(String, Option<String>)>, after: &st
     }
     // Held across the request, so requests pass one at a time, in order.
     let mut target = target.lock().unwrap();
+    before(&path);
     let client = reqwest::blocking::Client::builder()
         .no_proxy()
         .build()
@@ -809,4 +831,143 @@ async fn the_preview_reports_guards_budget_and_a_stale_view_and_sends_nothing() 
         "{events}"
     );
     assert!(running.guard.upstream().received().is_empty());
+}
+
+/// A proxy in front of `url` that records the path of every request.
+fn recording_proxy(url: String) -> (String, Arc<Mutex<Vec<String>>>) {
+    let paths = Arc::new(Mutex::new(Vec::new()));
+    let seen = paths.clone();
+    let address = proxy(
+        url,
+        None,
+        "",
+        Arc::new(move |path: &str| seen.lock().unwrap().push(path.to_owned())),
+    );
+    (address, paths)
+}
+
+/// The kit's own rule against the real testnet Guard: the caller last saw a
+/// BTC long of 0.0002, but it is 0.0003 (or 0.0001, or a short of 0.0003) by the
+/// time the kit reads it. The kit refuses, and no request reaches Guard's
+/// `/exchange`; the venue gets nothing from the kit.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_close_whose_expected_size_is_not_the_position_never_reaches_the_exchange() {
+    let testnet = start(false).await;
+    testnet.guard.upstream().add_position("BTC", "0.0002");
+    testnet.guard.sync().await;
+    // Guard protects the position with a stop of its own when it syncs.
+    let before = testnet.guard.upstream().received().len();
+    for now in ["0.0003", "0.0001", "-0.0003"] {
+        testnet.guard.upstream().set_position("BTC", now);
+        let url = testnet.url.clone();
+        let (error, refused, paths) = tokio::task::spawn_blocking(move || {
+            let (address, paths) = recording_proxy(url);
+            let mut server = kit_for(&address, KitMode::Testnet);
+            let (error, refused) = call(
+                &mut server,
+                "close_position",
+                json!({"coin": "BTC", "expected_size": "0.0002"}),
+            );
+            let paths = paths.lock().unwrap().clone();
+            (error, refused, paths)
+        })
+        .await
+        .unwrap();
+        assert!(error, "{refused}");
+        assert_eq!(
+            refused["error"]["code"], "position_size_mismatch",
+            "{refused}"
+        );
+        assert_eq!(refused["sent"], false, "{refused}");
+        assert_eq!(refused["expected_size"], "0.0002", "{refused}");
+        assert_eq!(
+            refused["position_size"],
+            now.trim_start_matches('-'),
+            "{refused}"
+        );
+        // The kit read the position through Guard and stopped there.
+        assert!(paths.iter().any(|path| path == "/info"), "{paths:?}");
+        assert!(!paths.iter().any(|path| path == "/exchange"), "{paths:?}");
+    }
+    assert_eq!(testnet.guard.upstream().received().len(), before);
+}
+
+/// A testnet Guard on the in-memory venue holds a BTC long of `held`; the
+/// kit reads exactly `expected` = `held`, then the position changes to
+/// `then` on the venue after that read, before the close reaches Guard.
+/// What bounds the close then is not the kit's check but the order itself:
+/// the kit sends exactly `expected` as a reduce-only IOC, Guard passes it
+/// on (cut to the position when it sees a smaller one), and the venue fills
+/// at most what is held. Returns the size the venue received and the
+/// position left (signed, or `None` when flat).
+async fn close_racing_a_change(
+    held: &str,
+    expected: &str,
+    then: &'static str,
+) -> (String, Option<String>) {
+    let testnet = start(false).await;
+    testnet.guard.upstream().add_position("BTC", held);
+    testnet.guard.sync().await;
+    let guard = testnet.guard.clone();
+    let url = testnet.url.clone();
+    let arguments = json!({"coin": "BTC", "expected_size": expected});
+    let (error, closed) = tokio::task::spawn_blocking(move || {
+        let address = proxy(
+            url,
+            None,
+            "",
+            Arc::new(move |path: &str| {
+                if path == "/exchange" {
+                    guard.upstream().set_position("BTC", then);
+                }
+            }),
+        );
+        let mut server = kit_for(&address, KitMode::Testnet);
+        call(&mut server, "close_position", arguments)
+    })
+    .await
+    .unwrap();
+    assert!(!error, "{closed}");
+    assert_eq!(closed["sent"], true, "{closed}");
+    // The kit read the size it was told to expect and sent exactly that.
+    assert_eq!(closed["close"]["position_size"], held, "{closed}");
+    assert_eq!(closed["close"]["size_sent"], expected, "{closed}");
+    // Guard itself protects the unprotected position with a resting stop
+    // when it first syncs; the only other order is the kit's close.
+    let received = testnet.guard.upstream().received();
+    let closes: Vec<&Value> = received
+        .iter()
+        .map(|r| &r.json["orders"][0])
+        .filter(|order| order["t"].get("trigger").is_none())
+        .collect();
+    assert_eq!(closes.len(), 1, "one close: {closes:?}");
+    let order = closes[0];
+    assert_eq!(order["r"], true, "{order}");
+    assert_eq!(order["t"], json!({"limit": {"tif": "Ioc"}}), "{order}");
+    assert_eq!(order["b"], false, "a sell closes the long: {order}");
+    let left = testnet
+        .guard
+        .upstream()
+        .positions()
+        .iter()
+        .find(|p| p["position"]["coin"] == "BTC")
+        .map(|p| p["position"]["szi"].as_str().unwrap().to_owned());
+    (order["s"].as_str().unwrap().to_owned(), left)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_position_changing_after_the_kits_read_is_closed_by_at_most_expected_size() {
+    // The long grows from 0.0002 to 0.0003 after the kit's read: exactly
+    // 0.0002 is sold, and 0.0003 - 0.0002 = 0.0001 stays open.
+    let (sent, left) = close_racing_a_change("0.0002", "0.0002", "0.0003").await;
+    assert_eq!(sent, "0.0002");
+    assert_eq!(left.as_deref(), Some("0.0001"));
+    // The long shrinks from 0.0003 to 0.0002: the kit's reduce-only sell of
+    // 0.0003 reaches the venue as no more than 0.0003 (Guard cuts a
+    // reduce-only order to the position it sees, here 0.0002), and the
+    // venue fills only what is held: flat, never short.
+    let (sent, left) = close_racing_a_change("0.0003", "0.0003", "0.0002").await;
+    let sent: Decimal = sent.parse().unwrap();
+    assert!(sent <= dec!(0.0003), "{sent}");
+    assert_eq!(left, None);
 }

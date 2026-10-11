@@ -40,7 +40,10 @@ fn initialize_and_list_exactly_the_nine_tools() {
     // An object, as MCP requires of every experimental capability.
     assert_eq!(
         init["result"]["capabilities"]["experimental"],
-        json!({"exchange_expected_mode": {"enabled": true}})
+        json!({
+            "exchange_expected_mode": {"enabled": true},
+            "close_expected_size": {"enabled": true},
+        })
     );
     assert!(
         init["result"]["instructions"]
@@ -1315,6 +1318,253 @@ fn close_and_cancel() {
         Some(Action::Cancel { asset: 1, oid: 11 })
     );
     guard.assert_only_guarded_actions();
+}
+
+/// `expected_size`: the ETH long is 0.1 (szDecimals 4, mid 3,000). The
+/// close goes out only when the position is exactly the expected size, and
+/// then as a reduce-only IOC for exactly that quantity at 3,000 × 0.95 =
+/// 2,850 (a sell) or 3,000 × 1.05 = 3,150 (a buy, closing a short).
+#[test]
+fn close_with_an_expected_size_sends_exactly_that_size_or_nothing() {
+    let guard = MockGuard::start();
+    let (mut server, _) = guard.server(Mode::Testnet, true, None);
+    let set_eth = |szi: &str| {
+        guard.with(|state| {
+            state.account["assetPositions"][0]["position"]["szi"] = json!(szi);
+        });
+    };
+
+    // Malformed, zero, negative or combined with a fraction: refused before
+    // anything is read or sent.
+    for bad in [
+        json!("0"),
+        json!("0.0"),
+        json!("-0.1"),
+        json!("+0.1"),
+        json!("1e-1"),
+        json!(".1"),
+        json!("0.1 "),
+        json!(""),
+        json!("max"),
+        json!("0.000000001"),
+        json!(0.1),
+        json!(true),
+        // Null is not absent: it would turn an exact close into a full one.
+        Value::Null,
+    ] {
+        let (error, refused) = call(
+            &mut server,
+            "close_position",
+            json!({"coin": "ETH", "expected_size": bad}),
+        );
+        assert!(error, "{bad}");
+        assert_eq!(refused["error"]["code"], "invalid_arguments", "{bad}");
+        assert_eq!(refused["sent"], false, "{bad}");
+    }
+    let (error, refused) = call(
+        &mut server,
+        "close_position",
+        json!({"coin": "ETH", "expected_size": "0.1", "fraction": "0.5"}),
+    );
+    assert!(error);
+    assert_eq!(refused["error"]["code"], "invalid_arguments");
+    assert_eq!(refused["sent"], false);
+
+    // A larger or a smaller position than expected, or none: refused, with
+    // both sizes named, nothing sent.
+    for (held, expected) in [
+        ("0.1001", "0.1"),
+        ("0.2", "0.1"),
+        ("0.0999", "0.1"),
+        ("0.05", "0.1"),
+        ("-0.1001", "0.1"),
+        ("-0.0999", "0.1"),
+    ] {
+        set_eth(held);
+        let (error, refused) = call(
+            &mut server,
+            "close_position",
+            json!({"coin": "ETH", "expected_size": expected}),
+        );
+        assert!(error, "{held}");
+        assert_eq!(refused["error"]["code"], "position_size_mismatch", "{held}");
+        assert_eq!(refused["sent"], false, "{held}");
+        assert_eq!(refused["expected_size"], expected, "{held}");
+        assert_eq!(
+            refused["position_size"],
+            held.trim_start_matches('-'),
+            "{held}"
+        );
+    }
+    let (error, refused) = call(
+        &mut server,
+        "close_position",
+        json!({"coin": "BTC", "expected_size": "0.01"}),
+    );
+    assert!(error);
+    assert_eq!(refused["error"]["code"], "position_size_mismatch");
+    assert_eq!(refused["position_size"], "0");
+    assert_eq!(refused["sent"], false);
+    assert!(guard.exchanges().is_empty());
+
+    // A position off the venue's size grid (szDecimals 4) cannot be closed
+    // by exactly its size: refused with both sizes, nothing sent.
+    set_eth("0.10005");
+    let (error, refused) = call(
+        &mut server,
+        "close_position",
+        json!({"coin": "ETH", "expected_size": "0.10005"}),
+    );
+    assert!(error);
+    assert_eq!(refused["error"]["code"], "position_size_mismatch");
+    assert_eq!(refused["expected_size"], "0.10005");
+    assert_eq!(refused["position_size"], "0.10005");
+    assert_eq!(refused["sent"], false);
+    assert!(guard.exchanges().is_empty());
+
+    // Exactly the size (compared as numbers: 0.10000 is 0.1): a reduce-only
+    // IOC sell of exactly 0.1, carrying the pinned mode.
+    set_eth("0.1");
+    let (error, closed) = call(
+        &mut server,
+        "close_position",
+        json!({"coin": "ETH", "expected_size": "0.10000"}),
+    );
+    assert!(!error, "{closed}");
+    assert_eq!(closed["sent"], true, "{closed}");
+    assert_eq!(closed["close"]["size_sent"], "0.1");
+    assert_eq!(closed["close"]["expected_size"], "0.1");
+    // A short of 0.1: a reduce-only IOC buy of exactly 0.1.
+    set_eth("-0.1");
+    let (error, closed) = call(
+        &mut server,
+        "close_position",
+        json!({"coin": "ETH", "expected_size": "0.1"}),
+    );
+    assert!(!error, "{closed}");
+    assert_eq!(closed["close"]["side"], "buy");
+    let bodies = guard.exchanges();
+    assert_eq!(bodies.len(), 2);
+    for (body, is_buy, price) in [(&bodies[0], false, "2850"), (&bodies[1], true, "3150")] {
+        assert_eq!(body["expectedMode"], "testnet");
+        let Some(Action::Order { orders, grouping }) = decode_action(&body["action"]) else {
+            panic!("not an order");
+        };
+        assert_eq!(grouping, Grouping::Na);
+        assert_eq!(orders.len(), 1);
+        assert_eq!(orders[0].is_buy, is_buy);
+        assert!(orders[0].reduce_only);
+        assert_eq!(orders[0].order_type, OrderType::Limit { tif: Tif::Ioc });
+        assert_eq!(orders[0].size, "0.1");
+        assert_eq!(orders[0].price, price);
+    }
+    guard.assert_only_guarded_actions();
+}
+
+/// An explicit null never selects a default on the tools that build an
+/// order: `fraction` (all of the position), `limit_price` (an immediate
+/// order instead of a resting one), `size` on the preview (Guard's maximum),
+/// `stop_order_id` (the stop chosen for the caller) and `expected_size` are
+/// refused, nothing sent. Leaving them out still selects the default, and
+/// reads still take null as absent.
+#[test]
+fn an_explicit_null_never_selects_a_default_on_an_order_tool() {
+    let guard = MockGuard::start();
+    let (mut server, _) = guard.server(Mode::Testnet, true, None);
+    for (tool, arguments, param) in [
+        (
+            "close_position",
+            json!({"coin": "ETH", "fraction": null}),
+            "fraction",
+        ),
+        (
+            "close_position",
+            json!({"coin": "ETH", "expected_size": null}),
+            "expected_size",
+        ),
+        (
+            "place_order",
+            json!({"coin": "BTC", "side": "buy", "stop": "58800", "size": "0.01", "limit_price": null}),
+            "limit_price",
+        ),
+        (
+            "preview_order",
+            json!({"coin": "BTC", "side": "buy", "stop": "58800", "limit_price": null}),
+            "limit_price",
+        ),
+        (
+            "preview_order",
+            json!({"coin": "BTC", "side": "buy", "stop": "58800", "size": null}),
+            "size",
+        ),
+        (
+            "move_stop",
+            json!({"coin": "ETH", "new_stop": "2950", "stop_order_id": null}),
+            "stop_order_id",
+        ),
+    ] {
+        let (error, refused) = call(&mut server, tool, arguments);
+        assert!(error, "{tool} {param}");
+        assert_eq!(
+            refused["error"]["code"], "invalid_arguments",
+            "{tool} {param}"
+        );
+        assert!(
+            refused["error"]["reason"]
+                .as_str()
+                .unwrap()
+                .contains(&format!("`{param}`")),
+            "{refused}"
+        );
+        assert_eq!(refused["sent"], false, "{tool} {param}");
+    }
+    assert!(guard.exchanges().is_empty());
+    // Reads take null as absent.
+    let (error, read) = call(&mut server, "recent_decisions", json!({"limit": null}));
+    assert!(!error, "{read}");
+    // Left out, the default still applies: the whole ETH position of 0.1.
+    let (error, closed) = call(&mut server, "close_position", json!({"coin": "ETH"}));
+    assert!(!error, "{closed}");
+    assert_eq!(closed["close"]["size_sent"], "0.1");
+    assert_eq!(guard.exchanges().len(), 1);
+}
+
+/// A close refused by the call-rate limit says nothing was sent, and
+/// nothing was.
+#[test]
+fn a_rate_limited_close_says_nothing_was_sent() {
+    let guard = MockGuard::start();
+    let (mut server, _) = guard.server(Mode::Testnet, true, None);
+    for _ in 0..40 {
+        call(&mut server, "limits", json!({}));
+    }
+    let (error, limited) = call(
+        &mut server,
+        "close_position",
+        json!({"coin": "ETH", "expected_size": "0.1"}),
+    );
+    assert!(error);
+    assert_eq!(limited["error"]["code"], "rate_limited");
+    assert_eq!(limited["sent"], false);
+    assert!(guard.exchanges().is_empty());
+}
+
+/// The kill switch is never blocked by a null: its note left as null pulls
+/// it like a note left out.
+#[test]
+fn the_kill_switch_takes_a_null_reason() {
+    let guard = MockGuard::start();
+    let dir = temp_dir("kill-null");
+    let kill = dir.join("kill");
+    let (mut server, _) = guard.server(Mode::Testnet, true, Some(kill.clone()));
+    let (error, pulled) = call(
+        &mut server,
+        "kill_switch",
+        json!({"confirm": true, "reason": null}),
+    );
+    assert!(!error, "{pulled}");
+    assert_eq!(pulled["guard_reports_killed"], true, "{pulled}");
+    assert!(kill.exists());
 }
 
 #[test]

@@ -94,6 +94,11 @@ pub const REQUEST_TTL_MS: u64 = 20_000;
 /// `initialize` capabilities, under `experimental`) that says `/exchange`
 /// requests carry and enforce `expectedMode`.
 pub const EXPECTED_MODE_CAPABILITY: &str = "exchange_expected_mode";
+/// The entry of this server's `initialize` capabilities, under
+/// `experimental`, that says `close_position` takes `expected_size`: it
+/// closes exactly that quantity, and only when the open position is exactly
+/// that size.
+pub const CLOSE_EXPECTED_SIZE_CAPABILITY: &str = "close_expected_size";
 /// The entry of the status's `capabilities` that says `/guard/kill` takes
 /// and enforces `expectedMode` as well.
 pub const KILL_EXPECTED_MODE_CAPABILITY: &str = "kill_expected_mode";
