@@ -116,6 +116,18 @@ impl GuardClient {
         self.get(STATUS_PATH)
     }
 
+    /// Guard's status within `timeout`: for the look before a kill, which
+    /// must not hold the kill up for long when Guard hangs.
+    pub fn status_within(&self, timeout: Duration) -> Result<Value, GuardError> {
+        let response = self
+            .http
+            .get(self.url.join(STATUS_PATH)?)
+            .timeout(timeout)
+            .send()
+            .map_err(classify)?;
+        read(response)
+    }
+
     pub fn events(&self, since: u64) -> Result<Value, GuardError> {
         self.get(&format!("{EVENTS_PATH}?since={since}"))
     }

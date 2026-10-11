@@ -99,13 +99,20 @@ pub fn kill_wire(reason: &str) -> wire::Wire {
 
 /// Decode and authenticate a kill request: `{"action": {"type":
 /// "zunderGuardKill", "reason": "..."}, "nonce", "signature",
-/// "expiresAfter"?}`, strictly (no other fields, no vault), the reason at
-/// most [`MAX_KILL_REASON`] printable characters. The nonce is the client's
-/// one sequence, shared with `/exchange`.
+/// "expiresAfter"?, "expectedMode"?}`, strictly (no other fields, no
+/// vault), the reason at most [`MAX_KILL_REASON`] printable characters. The
+/// nonce is the client's one sequence, shared with `/exchange`.
+///
+/// `expectedMode` follows the same rules as on `/exchange` ([`admit`]): not
+/// signed; absent, nothing changes; exactly `"paper"`, `"testnet"` or
+/// `"mainnet"`, anything else (null included) malformed. A mode other than
+/// `running` is refused right after decoding, before the signature is
+/// checked, so the nonce stays unused and nothing is pulled.
 pub fn admit_kill(
     auth: &mut Authenticator,
     body: &Value,
     now_ms: u64,
+    running: RunMode,
 ) -> Result<KillRequest, Refusal> {
     let bad = |text: &str| Refusal::Decode(DecodeError::Malformed(text.to_owned()));
     let fields = body
@@ -118,6 +125,7 @@ pub fn admit_kill(
             "signature",
             "expiresAfter",
             "vaultAddress",
+            "expectedMode",
         ]
         .contains(&key.as_str())
     }) {
@@ -162,6 +170,18 @@ pub fn admit_kill(
             .get("signature")
             .ok_or_else(|| bad("the request has no `signature`"))?,
     )?;
+    let expected_mode =
+        match fields.get("expectedMode") {
+            None => None,
+            Some(value) => Some(value.as_str().and_then(RunMode::from_name).ok_or_else(|| {
+                bad("`expectedMode` must be \"paper\", \"testnet\" or \"mainnet\"")
+            })?),
+        };
+    if let Some(expected) = expected_mode
+        && expected != running
+    {
+        return Err(Refusal::ModeMismatch { expected, running });
+    }
     let client =
         auth.authenticate_wire(&kill_wire(reason), nonce, &signature, expires_after, now_ms)?;
     Ok(KillRequest {
@@ -229,24 +249,31 @@ mod tests {
         let mut auth = authenticator();
         let now = START + 10_000;
         let body = kill_body(&client_key(), "agent saw a bug", now);
-        let admitted = admit_kill(&mut auth, &body, now).unwrap();
+        let admitted = admit_kill(&mut auth, &body, now, RunMode::Testnet).unwrap();
         assert_eq!(admitted.reason, "agent saw a bug");
         assert_eq!(admitted.client.client, client_key().address());
         // The same request again: a replay.
         assert_eq!(
-            admit_kill(&mut auth, &body, now).unwrap_err().code(),
+            admit_kill(&mut auth, &body, now, RunMode::Testnet)
+                .unwrap_err()
+                .code(),
             "auth_replay"
         );
         // Another reason under the same signature: someone else's signer.
         let mut changed = kill_body(&client_key(), "agent saw a bug", now + 1);
         changed["action"]["reason"] = json!("something else");
-        assert!(admit_kill(&mut auth, &changed, now).is_err());
+        assert!(admit_kill(&mut auth, &changed, now, RunMode::Testnet).is_err());
         // A stranger's key.
         let stranger = GuardKey::from_hex(&format!("0x{}", "42".repeat(32))).unwrap();
         assert_eq!(
-            admit_kill(&mut auth, &kill_body(&stranger, "x", now + 2), now)
-                .unwrap_err()
-                .code(),
+            admit_kill(
+                &mut auth,
+                &kill_body(&stranger, "x", now + 2),
+                now,
+                RunMode::Testnet
+            )
+            .unwrap_err()
+            .code(),
             "auth_unknown_signer"
         );
         // Shapes: another type, an extra field, an empty or overlong
@@ -254,19 +281,25 @@ mod tests {
         let mut other = kill_body(&client_key(), "x", now + 3);
         other["action"]["type"] = json!("order");
         assert_eq!(
-            admit_kill(&mut auth, &other, now).unwrap_err().code(),
+            admit_kill(&mut auth, &other, now, RunMode::Testnet)
+                .unwrap_err()
+                .code(),
             "malformed"
         );
         let mut extra = kill_body(&client_key(), "x", now + 4);
         extra["action"]["resume"] = json!(true);
         assert_eq!(
-            admit_kill(&mut auth, &extra, now).unwrap_err().code(),
+            admit_kill(&mut auth, &extra, now, RunMode::Testnet)
+                .unwrap_err()
+                .code(),
             "malformed"
         );
         for reason in ["", " ", &"x".repeat(201), "a\nb"] {
             let body = kill_body(&client_key(), reason, now + 5);
             assert_eq!(
-                admit_kill(&mut auth, &body, now).unwrap_err().code(),
+                admit_kill(&mut auth, &body, now, RunMode::Testnet)
+                    .unwrap_err()
+                    .code(),
                 "malformed",
                 "{reason:?}"
             );
@@ -274,18 +307,20 @@ mod tests {
         let mut vault = kill_body(&client_key(), "x", now + 6);
         vault["vaultAddress"] = json!("0x0000000000000000000000000000000000000001");
         assert_eq!(
-            admit_kill(&mut auth, &vault, now).unwrap_err().code(),
+            admit_kill(&mut auth, &vault, now, RunMode::Testnet)
+                .unwrap_err()
+                .code(),
             "vault"
         );
         // The kill and /exchange share one nonce sequence per client.
         let later = kill_body(&client_key(), "again", now + 7);
-        assert!(admit_kill(&mut auth, &later, now).is_ok());
+        assert!(admit_kill(&mut auth, &later, now, RunMode::Testnet).is_ok());
     }
 
     /// `expectedMode` beside the signed action: another mode than Guard's
     /// is refused before the signature is checked (the nonce stays
-    /// unused), the same mode or none admits the request exactly as signed,
-    /// and the kill request takes no such field.
+    /// unused), and the same mode or none admits the request exactly as
+    /// signed.
     #[test]
     fn a_request_expecting_another_mode_is_refused_before_authentication() {
         let mut auth = authenticator();
@@ -365,11 +400,102 @@ mod tests {
                 .code(),
             "malformed"
         );
-        // The kill request stays strict.
-        let mut kill = kill_body(&client_key(), "x", now + 11);
-        kill["expectedMode"] = json!("testnet");
+    }
+
+    /// The kill request takes `expectedMode` under the same rules: another
+    /// mode is refused before the signature is checked (nonce unused,
+    /// nothing pulled), the same mode or none admits it, any other value or
+    /// a misspelt field is malformed.
+    #[test]
+    fn a_kill_expecting_another_mode_is_refused_before_authentication() {
+        let mut auth = authenticator();
+        let now = START + 10_000;
+        let plain = kill_body(&client_key(), "stop", now);
+        let mut expects_mainnet = plain.clone();
+        expects_mainnet["expectedMode"] = json!("mainnet");
+        let refused = admit_kill(&mut auth, &expects_mainnet, now, RunMode::Testnet).unwrap_err();
         assert_eq!(
-            admit_kill(&mut auth, &kill, now).unwrap_err().code(),
+            refused,
+            Refusal::ModeMismatch {
+                expected: RunMode::Mainnet,
+                running: RunMode::Testnet
+            }
+        );
+        assert_eq!(refused.code(), "mode_mismatch");
+        // Checked before the signature: a forged one gets the mismatch too.
+        let mut forged = expects_mainnet.clone();
+        forged["signature"]["r"] = json!("0x1");
+        assert_eq!(
+            admit_kill(&mut auth, &forged, now, RunMode::Testnet)
+                .unwrap_err()
+                .code(),
+            "mode_mismatch"
+        );
+        for running in [RunMode::Paper, RunMode::Mainnet] {
+            let mut expects_testnet = plain.clone();
+            expects_testnet["expectedMode"] = json!("testnet");
+            assert_eq!(
+                admit_kill(&mut auth, &expects_testnet, now, running)
+                    .unwrap_err()
+                    .code(),
+                "mode_mismatch"
+            );
+        }
+        // The nonce was not consumed: the same signed kill expecting the
+        // right mode is admitted, as signed.
+        let mut expects_testnet = plain.clone();
+        expects_testnet["expectedMode"] = json!("testnet");
+        let admitted = admit_kill(&mut auth, &expects_testnet, now, RunMode::Testnet).unwrap();
+        assert_eq!(admitted.reason, "stop");
+        assert_eq!(admitted.client.client, client_key().address());
+        assert_eq!(
+            admit_kill(&mut auth, &plain, now, RunMode::Testnet)
+                .unwrap_err()
+                .code(),
+            "auth_replay"
+        );
+        // Without the field, as before, in every mode.
+        for (nonce, running) in [
+            (now + 1, RunMode::Paper),
+            (now + 2, RunMode::Testnet),
+            (now + 3, RunMode::Mainnet),
+        ] {
+            let body = kill_body(&client_key(), "stop", nonce);
+            assert!(admit_kill(&mut auth, &body, now, running).is_ok());
+        }
+        // Any other value, null included, or a misspelt field: malformed.
+        for bad in [
+            json!("live"),
+            json!("Testnet"),
+            json!(null),
+            json!(true),
+            json!(["testnet"]),
+        ] {
+            let mut body = kill_body(&client_key(), "stop", now + 10);
+            body["expectedMode"] = bad.clone();
+            assert_eq!(
+                admit_kill(&mut auth, &body, now, RunMode::Testnet)
+                    .unwrap_err()
+                    .code(),
+                "malformed",
+                "{bad}"
+            );
+        }
+        let mut misspelt = kill_body(&client_key(), "stop", now + 11);
+        misspelt["expected_mode"] = json!("testnet");
+        assert_eq!(
+            admit_kill(&mut auth, &misspelt, now, RunMode::Testnet)
+                .unwrap_err()
+                .code(),
+            "malformed"
+        );
+        // Inside the signed action it is an extra action field: malformed.
+        let mut inside = kill_body(&client_key(), "stop", now + 12);
+        inside["action"]["expectedMode"] = json!("testnet");
+        assert_eq!(
+            admit_kill(&mut auth, &inside, now, RunMode::Testnet)
+                .unwrap_err()
+                .code(),
             "malformed"
         );
     }

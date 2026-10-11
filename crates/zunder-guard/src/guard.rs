@@ -4801,9 +4801,10 @@ impl<U: Upstream, C: Clock> Guard<U, C> {
             "version": env!("CARGO_PKG_VERSION"),
             "mode": inner.mode.name(),
             // What this Guard understands beyond schema 1's first fields,
-            // so a client can tell before relying on it: `/exchange`
-            // refuses a request whose `expectedMode` is not `mode`.
-            "capabilities": {"exchange_expected_mode": true},
+            // so a client can tell before relying on it: `/exchange` and
+            // `/guard/kill` refuse a request whose `expectedMode` is not
+            // `mode`.
+            "capabilities": {"exchange_expected_mode": true, "kill_expected_mode": true},
             "network": inner.config.network.map(|network| network.name()),
             "account": inner.account.to_hex(),
             "started_at_ms": self.started_ms,
@@ -4966,7 +4967,12 @@ impl<U: Upstream, C: Clock> Guard<U, C> {
         let now = self.clock.now_ms();
         {
             let mut inner = self.inner.lock().await;
-            let admitted = match zunder_guard_core::admit_kill(&mut inner.auth, body, now) {
+            // A kill expecting another mode (`expectedMode`) is refused
+            // before its signature is checked, as on /exchange: nothing is
+            // pulled. `inner.mode` never changes.
+            let running = inner.mode.run_mode();
+            let admitted = match zunder_guard_core::admit_kill(&mut inner.auth, body, now, running)
+            {
                 Ok(admitted) => admitted,
                 Err(refusal) => {
                     return self.refuse(&mut inner, now, "kill", body, &refusal);

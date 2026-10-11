@@ -6,11 +6,12 @@ import re
 import socket
 import time
 import uuid
+from collections.abc import Sequence
 from pathlib import Path
 
 from guard_harness import crash_process
 from guard_harness.cli import PAIR_SCHEMA, Pair, decode_json
-from guard_harness.paper_bot import LocalGuard, PaperError
+from guard_harness.paper_bot import Decision, LocalGuard, PaperError
 from guard_harness.paper_roundtrip import round_trip
 from guard_harness.runner import RunResult, run
 from guard_harness.testnet_run import ROOT
@@ -99,6 +100,18 @@ def _ready(guard: LocalGuard, *, after: int | None = None) -> dict[str, object]:
     raise PaperError("container paper readiness/restart unconfirmed")
 
 
+def _journal(guard: LocalGuard, decisions: Sequence[Decision]) -> None:
+    events = guard.request("/guard/events?since=0")
+    if not isinstance(events, list) or not all(
+        any(
+            isinstance(e, dict) and e.get("seq") == d.seq and e.get("nonce") == d.nonce
+            for e in events
+        )
+        for d in decisions
+    ):
+        raise PaperError("container lifecycle lost paper decision journal")
+
+
 def lifecycle(image: str, account: str, *, work: Path, compose: Path | None = None) -> None:
     """No venue key. A caller must verify release/cosign binding before E2E admission."""
     if not re.fullmatch(r"(?:ghcr\.io/zunderlabs/zunder-guard@)?sha256:[0-9a-f]{64}", image):
@@ -143,7 +156,7 @@ def lifecycle(image: str, account: str, *, work: Path, compose: Path | None = No
         value = decode_json(paired.output, PAIR_SCHEMA)
         pair = Pair(value["client_address"], value["client_key"])
         docker.secrets = (pair.key, account)
-        docker.command(
+        launch = (
             "run",
             "-d",
             "--name",
@@ -168,6 +181,7 @@ def lifecycle(image: str, account: str, *, work: Path, compose: Path | None = No
             "--network",
             "paper",
         )
+        docker.command(*launch)
         address = docker.command("port", name, "8547/tcp").output.strip()
         if address != expected_address:
             raise PaperError("container loopback port refused")
@@ -177,13 +191,7 @@ def lifecycle(image: str, account: str, *, work: Path, compose: Path | None = No
         last_seq = decisions[-1].seq
         docker.command("restart", name)
         restarted = _ready(guard, after=int(str(first["started_at_ms"])))
-        # The decision journal must remain queryable after a real container restart.
-        events = guard.request("/guard/events?since=0")
-        if not all(
-            any(e.get("seq") == d.seq and e.get("nonce") == d.nonce for e in events)
-            for d in decisions
-        ):
-            raise PaperError("container restart lost paper decision journal")
+        _journal(guard, decisions)
         before = int(docker.command("inspect", "--format", "{{.RestartCount}}", name).output)
         # Docker's kill API is an operator stop and suppresses restart policy. On the
         # Linux runner, kill the sole Guard process reported by this owned container.
@@ -203,10 +211,20 @@ def lifecycle(image: str, account: str, *, work: Path, compose: Path | None = No
             timeout=10,
             stdin=b"",
         )
-        _ready(guard, after=int(str(restarted["started_at_ms"])))
+        recovered = _ready(guard, after=int(str(restarted["started_at_ms"])))
         after = int(docker.command("inspect", "--format", "{{.RestartCount}}", name).output)
         if after <= before:
             raise PaperError("Docker did not recover the crashed paper container")
+        _journal(guard, decisions)
+        # Reinstall the same immutable release while retaining documented data. Retain
+        # the old container's logs before removal; final cleanup keeps the new logs too.
+        docker.command("logs", name)
+        docker.remove(name)
+        docker.command(*launch)
+        if docker.command("port", name, "8547/tcp").output.strip() != expected_address:
+            raise PaperError("reinstalled container loopback port refused")
+        _ready(guard, after=int(str(recovered["started_at_ms"])))
+        _journal(guard, decisions)
     finally:
         # UUID ownership is established before any start; paper has no venue exposure.
         try:
@@ -233,6 +251,9 @@ def lifecycle(image: str, account: str, *, work: Path, compose: Path | None = No
                     "restart",
                     "journal",
                     "crash-recovery",
+                    "crash-journal",
+                    "reinstall",
+                    "reinstall-journal",
                 ],
                 "last_decision_seq": last_seq,
             }

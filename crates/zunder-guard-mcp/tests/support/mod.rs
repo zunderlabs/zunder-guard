@@ -82,6 +82,27 @@ pub struct MockState {
     pub kill_file: Option<PathBuf>,
     /// The answer to `userRole` for the client key.
     pub client_role: Value,
+    /// The mode the server under test was started for.
+    pub pinned: Option<&'static str>,
+    /// Every `/exchange` body that passed Guard's checks and went on to
+    /// the venue (never in paper mode).
+    pub forwarded: Vec<Value>,
+    /// Once the next status has been answered, the mode of the service
+    /// behind this address becomes this one: another Guard took over the
+    /// port between the server's status read and its request.
+    pub mode_after_status: Option<&'static str>,
+    /// With `mode_after_status`: the Guard that takes over is an older one,
+    /// without `capabilities.exchange_expected_mode`.
+    pub older_after_status: bool,
+    /// Whether the mock answers `POST /guard/kill` as Guard does (checking
+    /// `expectedMode` against `kill_expected_mode` and the mode, then
+    /// latching); otherwise the endpoint does not exist (an older Guard).
+    pub kill_endpoint: bool,
+    /// The next status reads answer HTTP 502.
+    pub status_failures: usize,
+    /// The next status reads answer only after this many milliseconds
+    /// each (a Guard busy with the venue).
+    pub status_delays: Vec<u64>,
 }
 
 pub struct MockGuard {
@@ -101,7 +122,8 @@ impl MockGuard {
                 "equity": "2000", "positions": 1, "open_orders": 1, "last_sync_ms": NOW,
                 "last_error": null, "rules": default_rules(),
                 "fee": {"mode": "off", "why": "phase 1"}, "clients": [CLIENT],
-                "last_event": 0, "journal_broken": false
+                "last_event": 0, "journal_broken": false,
+                "capabilities": {"exchange_expected_mode": true, "kill_expected_mode": true}
             }),
             meta: json!({"universe": [
                 {"name": "BTC", "szDecimals": 5, "maxLeverage": 40},
@@ -137,6 +159,13 @@ impl MockGuard {
             http_failures: Vec::new(),
             kill_file: None,
             client_role: json!({"role": "missing"}),
+            pinned: None,
+            forwarded: Vec::new(),
+            mode_after_status: None,
+            older_after_status: false,
+            kill_endpoint: false,
+            status_failures: 0,
+            status_delays: Vec::new(),
         }));
         let shared = state.clone();
         thread::spawn(move || {
@@ -165,6 +194,11 @@ impl MockGuard {
         })
     }
 
+    /// Every `/exchange` body that reached the venue.
+    pub fn forwarded(&self) -> Vec<Value> {
+        self.with(|state| state.forwarded.clone())
+    }
+
     /// A server for this Guard, started for `network` (on mainnet with
     /// Guard's account confirmed).
     pub fn server(
@@ -188,6 +222,7 @@ impl MockGuard {
             let path = kill_file.clone();
             self.with(|state| state.kill_file = path);
         }
+        self.with(|state| state.pinned = Some(network.name()));
         let clock = ManualClock::at(NOW);
         let server = Server::new(
             Config {
@@ -214,6 +249,10 @@ impl MockGuard {
                 "a builder field: {body}"
             );
             assert!(body["expiresAfter"].as_u64().is_some());
+            // Every request names the mode the server was started for,
+            // beside the signed fields.
+            let pinned = self.with(|state| state.pinned).expect("a server");
+            assert_eq!(body["expectedMode"], pinned, "{body}");
         }
         assert_eq!(
             self.with(|state| state.bad_signatures),
@@ -250,6 +289,15 @@ fn serve(stream: TcpStream, state: &Arc<Mutex<MockState>>) {
     }
     let body: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
     let (path, query) = target.split_once('?').unwrap_or((target.as_str(), ""));
+    if path == "/guard/status" {
+        let delay = {
+            let mut state = state.lock().expect("mock state");
+            (!state.status_delays.is_empty()).then(|| state.status_delays.remove(0))
+        };
+        if let Some(ms) = delay {
+            thread::sleep(std::time::Duration::from_millis(ms));
+        }
+    }
     let (code, text) = {
         let mut state = state.lock().expect("mock state");
         state.received.push(Received {
@@ -260,6 +308,9 @@ fn serve(stream: TcpStream, state: &Arc<Mutex<MockState>>) {
         let reply = route(&mut state, &method, path, query, &body);
         if path == "/exchange" && !state.http_failures.is_empty() {
             state.http_failures.remove(0)
+        } else if path == "/guard/status" && state.status_failures > 0 {
+            state.status_failures -= 1;
+            (502, "{\"error\":\"bad gateway\"}".to_owned())
         } else {
             (200, reply.to_string())
         }
@@ -286,6 +337,19 @@ fn route(state: &mut MockState, method: &str, path: &str, query: &str, body: &Va
             {
                 status["killed"] = json!(reason.trim());
             }
+            if let Some(mode) = state.mode_after_status.take() {
+                state.status["mode"] = json!(mode);
+                state.status["network"] = json!(if mode == "mainnet" {
+                    "mainnet"
+                } else {
+                    "testnet"
+                });
+                if state.older_after_status
+                    && let Some(object) = state.status.as_object_mut()
+                {
+                    object.remove("capabilities");
+                }
+            }
             status
         }
         ("GET", "/guard/events") => {
@@ -311,6 +375,7 @@ fn route(state: &mut MockState, method: &str, path: &str, query: &str, body: &Va
             _ => json!({"error": "unknown info type"}),
         },
         ("POST", "/exchange") => exchange(state, body),
+        ("POST", "/guard/kill") if state.kill_endpoint => kill(state, body),
         _ => json!({"error": "not found"}),
     }
 }
@@ -324,9 +389,57 @@ fn push_event(state: &mut MockState, mut event: Value) -> u64 {
     seq
 }
 
+/// Guard's `POST /guard/kill`: `expectedMode` checked as Guard checks it
+/// (unknown to a Guard without `kill_expected_mode`; anything but the three
+/// names malformed; another mode pulls nothing), then the switch latched.
+/// Unlike Guard, the mock does not authenticate the kill, track its nonce,
+/// answer `already` or journal refusals; `crates/zunder-guard/tests/mcp_kit.rs`
+/// runs the kill against the real Guard.
+fn kill(state: &mut MockState, body: &Value) -> Value {
+    if let Some(expected) = body.get("expectedMode") {
+        if state.status["capabilities"]["kill_expected_mode"] != true
+            || !matches!(expected.as_str(), Some("paper" | "testnet" | "mainnet"))
+        {
+            return json!({"status": "err", "code": "malformed", "response": "Zunder Guard veto [malformed]: the request has an unknown field `expectedMode`"});
+        }
+        if *expected != state.status["mode"] {
+            return json!({"status": "err", "code": "mode_mismatch", "response": "Zunder Guard veto [mode_mismatch]: the request expects another mode; nothing was pulled"});
+        }
+    }
+    let reason = body["action"]["reason"].as_str().unwrap_or("").to_owned();
+    state.status["killed"] = json!(reason);
+    json!({"status": "ok", "killed": reason})
+}
+
 fn exchange(state: &mut MockState, body: &Value) -> Value {
     let nonce = body["nonce"].as_u64().unwrap_or(0);
     let expires = body["expiresAfter"].as_u64();
+    // `expectedMode` before the signature, as Guard checks it. (Guard
+    // decodes the whole request first and checks the mode right after; the
+    // mock skips that decoding, since this server's requests always
+    // decode. What matters is the same: the mode before authentication.)
+    // A Guard without the capability does not know the field and refuses
+    // the request as malformed.
+    if let Some(expected) = body.get("expectedMode") {
+        if state.status["capabilities"]["exchange_expected_mode"] != true {
+            return json!({"status": "err", "code": "malformed", "response": "Zunder Guard veto [malformed]: the request has an unknown field `expectedMode`"});
+        }
+        if !matches!(expected.as_str(), Some("paper" | "testnet" | "mainnet")) {
+            return json!({"status": "err", "code": "malformed", "response": "Zunder Guard veto [malformed]: `expectedMode` must be \"paper\", \"testnet\" or \"mainnet\""});
+        }
+        if *expected != state.status["mode"] {
+            push_event(
+                state,
+                json!({"kind": "decision", "via": "http", "client": null, "nonce": nonce,
+                       "action": body["action"]["type"], "verdict": "veto", "code": "mode_mismatch",
+                       "text": "the request expects another mode", "changes": []}),
+            );
+            return json!({"status": "err", "code": "mode_mismatch", "response": format!(
+                "Zunder Guard veto [mode_mismatch]: the request expects {expected}, but Guard runs {}; nothing was judged or sent",
+                state.status["mode"]
+            )});
+        }
+    }
     // Authenticate as Guard does: the signature must recover to a client,
     // signed for either phantom-agent source.
     let action = decode_action(&body["action"]);
@@ -375,6 +488,7 @@ fn exchange(state: &mut MockState, body: &Value) -> Value {
     if state.status["mode"] == "paper" {
         return json!({"status": "err", "response": "Zunder Guard paper mode: would allow [allowed]: allowed as asked (nothing was sent)"});
     }
+    state.forwarded.push(body.clone());
     let reply = match body["action"]["type"].as_str() {
         Some("order") => {
             let orders = body["action"]["orders"]

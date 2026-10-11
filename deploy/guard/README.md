@@ -593,7 +593,9 @@ a mismatch).
 
 The shared `guard_harness.docker_paper.lifecycle` checks an immutable image's paper init,
 pairing, health, signed allow/resize/veto decisions, journal continuity after restart and Docker
-restart-policy recovery after a forced crash. It uses a testnet account address for public reads,
+restart-policy recovery after a forced crash, and removal/recreation on the same retained data
+volume. The original decision journal must survive restart, crash recovery and reinstall.
+It uses a testnet account address for public reads,
 with no venue key. Each run owns a unique container and volume; command logs suppress pairing
 output and redact the client key. A receipt is written only after both objects are removed.
 Pass `compose=Path(...)` to exercise the distribution Compose service through the same
@@ -605,5 +607,6 @@ The `python -m guard_harness.docker_run --tag vX.Y.Z --commit FULL_PUBLIC_SHA --
 PUBLIC_TESTNET_ADDRESS --work /absolute/fresh-directory` command performs that admission:
 it invokes the release asset verifier (Cosign image/checksum signatures, SLSA and exact source
 CI), requires descriptor/C2/Compose image agreement, pulls by digest, then runs both paper
-lifecycles on captured payload bytes. Its receipt explicitly remains `release_ready: false`. This component does not yet cover testnet mode, upgrade
+lifecycles on captured payload bytes. Its receipt explicitly remains `release_ready: false`.
+This component does not yet cover testnet mode, upgrade
 or the full I5 row; local image checks alone grant no channel admission.

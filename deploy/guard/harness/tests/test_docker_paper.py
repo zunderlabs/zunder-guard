@@ -240,3 +240,27 @@ def test_changed_compose_layout_is_refused(tmp_path: Path) -> None:
     source.write_text("services: {}\n")
     with pytest.raises(PaperError, match="layout"):
         container.Compose(tmp_path, source, "sha256:" + "a" * 64, "owned", "owned-data", 18547)
+
+
+@pytest.mark.parametrize("lost_at", [2, 3])
+def test_lost_journal_after_crash_or_reinstall_refuses_receipt(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, lost_at: int
+) -> None:
+    install_fakes(monkeypatch)
+
+    class LostGuard(FakeGuard):
+        reads = 0
+
+        def request(self, path: str) -> Any:
+            self.reads += 1
+            return [] if self.reads == lost_at else [{"seq": 1, "nonce": 100}]
+
+    monkeypatch.setattr(container, "LocalGuard", LostGuard)
+    with pytest.raises(PaperError, match="journal"):
+        container.lifecycle("sha256:" + "a" * 64, "0x" + "1" * 40, work=tmp_path / "run")
+    assert not (tmp_path / "run/receipt.json").exists()
+    launches = [args for args, _ in FakeDocker.calls if "--restart" in args]
+    assert len(launches) == lost_at - 1
+    if lost_at == 3:
+        assert launches[0] == launches[1]
+    assert FakeDocker.calls[-1][0][:2] == ("volume", "rm")

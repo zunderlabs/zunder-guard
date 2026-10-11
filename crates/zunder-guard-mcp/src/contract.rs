@@ -13,6 +13,11 @@
 //!
 //! - `GET /guard/status` and `GET /guard/events?since=N`, schema 1
 //!   ([`Status`], [`parse_status`]).
+//! - Every `/exchange` request carries `expectedMode` (the mode this server
+//!   was started for) beside the signed fields, and is sent only to a Guard
+//!   whose status has `capabilities.exchange_expected_mode: true`
+//!   ([`EXPECTED_MODE_CAPABILITY`]). Such a Guard refuses a request
+//!   expecting another mode (`mode_mismatch`) before judging or sending.
 //! - The status's `rules` is a `zr1_` rules code
 //!   (`deploy/guard/rules/schema-v1.json`, with Guard's optional
 //!   `defaultStopDistancePct`) ([`Rules::decode`]).
@@ -71,6 +76,14 @@ pub const MIN_NOTIONAL: Decimal = Decimal::TEN;
 /// nonce window is 30 s back and 5 s ahead.
 pub const REQUEST_TTL_MS: u64 = 20_000;
 
+/// The entry of the status's `capabilities` (and of this server's own
+/// `initialize` capabilities, under `experimental`) that says `/exchange`
+/// requests carry and enforce `expectedMode`.
+pub const EXPECTED_MODE_CAPABILITY: &str = "exchange_expected_mode";
+/// The entry of the status's `capabilities` that says `/guard/kill` takes
+/// and enforces `expectedMode` as well.
+pub const KILL_EXPECTED_MODE_CAPABILITY: &str = "kill_expected_mode";
+
 /// The network a Guard runs on, as its status's `mode` names it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -123,6 +136,14 @@ pub struct Status {
     pub last_event: u64,
     pub equity: Option<Decimal>,
     pub version: String,
+    /// Guard's status lists `capabilities.exchange_expected_mode` as the
+    /// literal `true`: its `/exchange` refuses a request whose
+    /// `expectedMode` is not the mode it runs in. This server sends nothing
+    /// to a Guard without it.
+    pub exchange_expected_mode: bool,
+    /// The same for `/guard/kill` (`capabilities.kill_expected_mode`,
+    /// literal `true`): the kill request then carries `expectedMode` too.
+    pub kill_expected_mode: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -214,7 +235,19 @@ pub fn parse_status(value: &Value) -> Result<Status, ContractError> {
             .and_then(Value::as_str)
             .map(sanitize::version)
             .unwrap_or_else(|| "unknown".to_owned()),
+        // Only the literal `true`: a string, a number or a missing entry
+        // (an older Guard, which refuses `expectedMode` as malformed) is no.
+        exchange_expected_mode: capability(object, EXPECTED_MODE_CAPABILITY),
+        kill_expected_mode: capability(object, KILL_EXPECTED_MODE_CAPABILITY),
     })
+}
+
+/// A capability Guard's status lists as the literal `true`.
+fn capability(status: &serde_json::Map<String, Value>, name: &str) -> bool {
+    status
+        .get("capabilities")
+        .and_then(|capabilities| capabilities.get(name))
+        == Some(&Value::Bool(true))
 }
 
 /// A decimal that Guard or the venue wrote as a string (or, leniently, a
@@ -1118,6 +1151,54 @@ mod tests {
             parse_status(&bad_mode).unwrap_err(),
             ContractError::NotAGuard
         );
+    }
+
+    #[test]
+    fn only_a_literal_true_says_guard_enforces_the_expected_mode() {
+        let mut status = json!({
+            "schema": 1, "version": "0.1.0", "mode": "testnet",
+            "account": "0x14791697260e4c9a71f18484c9f997b308e59325",
+            "rules": "zr1_eyJ2IjoxfQ"
+        });
+        // An older Guard: no capabilities at all.
+        assert!(!parse_status(&status).unwrap().exchange_expected_mode);
+        for (capabilities, enforced) in [
+            (json!({"exchange_expected_mode": true}), true),
+            (json!({"exchange_expected_mode": false}), false),
+            (json!({"exchange_expected_mode": "true"}), false),
+            (json!({"exchange_expected_mode": 1}), false),
+            (json!({"exchange_expected_mode": null}), false),
+            (json!({"exchange_expected_mode": {}}), false),
+            (json!({"expected_mode": true}), false),
+            (json!({}), false),
+            (json!(["exchange_expected_mode"]), false),
+            (json!(true), false),
+            (Value::Null, false),
+        ] {
+            status["capabilities"] = capabilities.clone();
+            let parsed = parse_status(&status).unwrap();
+            assert_eq!(parsed.exchange_expected_mode, enforced, "{capabilities}");
+            assert!(!parsed.kill_expected_mode, "{capabilities}");
+        }
+        // The kill's capability is read the same way, on its own.
+        for (capabilities, exchange, kill) in [
+            (
+                json!({"exchange_expected_mode": true, "kill_expected_mode": true}),
+                true,
+                true,
+            ),
+            (json!({"kill_expected_mode": true}), false, true),
+            (
+                json!({"exchange_expected_mode": true, "kill_expected_mode": "true"}),
+                true,
+                false,
+            ),
+        ] {
+            status["capabilities"] = capabilities.clone();
+            let parsed = parse_status(&status).unwrap();
+            assert_eq!(parsed.exchange_expected_mode, exchange, "{capabilities}");
+            assert_eq!(parsed.kill_expected_mode, kill, "{capabilities}");
+        }
     }
 
     #[test]

@@ -268,6 +268,9 @@ pub struct Config {
 
 /// Guard latches the kill file within one sync (5 s by default).
 pub const KILL_CONFIRM_WAIT_MS: u64 = 15_000;
+/// How long `kill_switch` looks at Guard's status before pulling: short,
+/// so that a hanging Guard does not hold the kill up.
+const KILL_LOOK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// A tool's result: `isError` and the structured content.
 #[derive(Debug, Clone, PartialEq)]
@@ -454,6 +457,9 @@ impl Server {
             "mode": status.mode,
             "expected_mode": self.config.network,
             "mode_matches": status.mode == self.config.network,
+            // Whether Guard refuses a request meant for another mode;
+            // without it, every order tool refuses.
+            "enforces_expected_mode": status.exchange_expected_mode,
             "kill_switch_pulled": status.killed,
             "risk_state": status.risk_state,
             "journal_ready": status.journal_ready,
@@ -581,7 +587,14 @@ impl Server {
     /// `entry`: the request may open a position. Only entries need the
     /// client key's role checked with the venue, so that a failing look-up
     /// never holds up a close, a tighter stop or a cancel.
+    /// Every refusal here comes before any `/exchange` request: `sent` is
+    /// `false`.
     fn writable(&mut self, status: &Status, entry: bool) -> Result<(), Outcome> {
+        self.writable_checks(status, entry)
+            .map_err(|outcome| outcome.with("sent", json!(false)))
+    }
+
+    fn writable_checks(&mut self, status: &Status, entry: bool) -> Result<(), Outcome> {
         let Some(key) = &self.key else {
             return Err(Outcome::fail(
                 "no_client_key",
@@ -596,6 +609,17 @@ impl Server {
                     status.mode.name(),
                     self.config.network.name()
                 ),
+            ));
+        }
+        // The status above is only a snapshot: another Guard may take over
+        // the address before the request arrives. Every request therefore
+        // carries `expectedMode`, which Guard checks against the mode it
+        // runs in before anything else; a Guard that does not say it does
+        // (an older one) gets nothing.
+        if !status.exchange_expected_mode {
+            return Err(Outcome::fail(
+                "expected_mode_unsupported",
+                "Guard's status does not list the exchange_expected_mode capability, so it cannot refuse a request meant for another network; update zunder-guard. Nothing was sent",
             ));
         }
         let address = key.address().to_hex();
@@ -643,22 +667,51 @@ impl Server {
     }
 
     /// Sign `action`, send it to Guard, and report Guard's verdict and the
-    /// venue's reply.
-    fn send(&mut self, action: &Action, since: u64) -> Outcome {
+    /// venue's reply. `status` is the one [`Self::writable`] passed; the
+    /// two conditions that make the request safe to post are checked here
+    /// again, so that no caller can send without them.
+    fn send(&mut self, action: &Action, status: &Status) -> Outcome {
+        if status.mode != self.config.network {
+            return Outcome::fail(
+                "network_mismatch",
+                "Guard's status does not show it running this server's network; nothing was sent",
+            )
+            .with("sent", json!(false));
+        }
+        if !status.exchange_expected_mode {
+            return Outcome::fail(
+                "expected_mode_unsupported",
+                "Guard's status does not list the exchange_expected_mode capability; nothing was sent",
+            )
+            .with("sent", json!(false));
+        }
+        let since = status.last_event;
         let nonce = self.next_nonce();
         let Some(key) = &self.key else {
-            return Outcome::fail("no_client_key", "no client key; nothing was sent");
+            return Outcome::fail("no_client_key", "no client key; nothing was sent")
+                .with("sent", json!(false));
         };
         let source = match self.config.network {
             Mode::Mainnet => Network::Mainnet,
             Mode::Paper | Mode::Testnet => Network::Testnet,
         };
         let expires = nonce + REQUEST_TTL_MS;
-        let Some(body) = signed_request(key, source, action, nonce, Some(expires)) else {
+        // `expectedMode` is the mode this server was started for, never the
+        // mode a status reported: Guard refuses the request unless it runs
+        // in exactly this mode.
+        let Some(body) = signed_request(
+            key,
+            source,
+            action,
+            nonce,
+            Some(expires),
+            self.config.network,
+        ) else {
             return Outcome::fail(
                 "unsignable",
                 "the request could not be signed; nothing was sent",
-            );
+            )
+            .with("sent", json!(false));
         };
         let reply = match self.guard.exchange(body) {
             Ok(reply) => reply,
@@ -800,7 +853,7 @@ impl Server {
                     )
                 }
             };
-            let outcome = server.send(&action, status.last_event);
+            let outcome = server.send(&action, &status);
             Ok(outcome.with(
                 "order",
                 json!({
@@ -930,7 +983,7 @@ impl Server {
                     "placed_new",
                 ),
             };
-            Ok(server.send(&action, status.last_event).with(
+            Ok(server.send(&action, &status).with(
                 "stop",
                 json!({
                     "coin": market.name,
@@ -1004,7 +1057,7 @@ impl Server {
                 }],
                 grouping: Grouping::Na,
             };
-            Ok(server.send(&action, status.last_event).with(
+            Ok(server.send(&action, &status).with(
                 "close",
                 json!({
                     "coin": market.name,
@@ -1058,7 +1111,7 @@ impl Server {
                         asset: market.asset,
                         oid,
                     },
-                    status.last_event,
+                    &status,
                 )
                 .with(
                     "cancel",
@@ -1101,6 +1154,54 @@ impl Server {
             );
         }
         let reason = sanitize::quote(args.text("reason").unwrap_or("pulled by an agent"), 120);
+        // A Guard that reports another mode than this server was started
+        // for is not the one meant: its kill switch would close that
+        // Guard's positions (on mainnet, say, for a server started for
+        // testnet), and Guard accepts a kill signed for either network. So
+        // a quick look first (read leniently: any status naming another
+        // mode refuses), and the kill names this server's mode
+        // (`expectedMode`), which Guard enforces: another Guard answering
+        // it, or one whose status was slow or unreadable, pulls nothing.
+        // Only a status that is read, names this mode and lacks
+        // `kill_expected_mode` (an older Guard, which would refuse the
+        // field) gets the kill without it. A slow look holds the kill up by
+        // at most `KILL_LOOK_TIMEOUT`.
+        let raw = self.guard.status_within(KILL_LOOK_TIMEOUT).ok();
+        let reported_mode = raw
+            .as_ref()
+            .and_then(|value| value.get("mode"))
+            .and_then(Value::as_str)
+            .and_then(Mode::parse);
+        if let Some(mode) = reported_mode
+            && mode != self.config.network
+        {
+            return Outcome::fail(
+                "network_mismatch",
+                format!(
+                    "Guard runs {}, but this server was started for {}; its kill switch was not pulled. Ask a person to run `zunder-guard kill` on the machine running the Guard meant",
+                    mode.name(),
+                    self.config.network.name()
+                ),
+            )
+            .with("sent", json!(false));
+        }
+        let looked = raw
+            .as_ref()
+            .and_then(|value| contract::parse_status(value).ok());
+        let expected_mode = match &looked {
+            Some(status) if !status.kill_expected_mode => None,
+            _ => Some(self.config.network),
+        };
+        // Sent with the field to a Guard whose status could not be read, a
+        // `malformed` answer means an older Guard that does not know it:
+        // nothing was pulled there, so the kill file (this server's Guard's,
+        // named by a person) is the way, as for a Guard without the
+        // endpoint.
+        let older_guard = |reply: &Value| {
+            looked.is_none()
+                && expected_mode.is_some()
+                && reply.get("code").and_then(Value::as_str) == Some("malformed")
+        };
         // Guard's signed kill endpoint first; the kill file only for a Guard
         // without it (or without a client key here).
         let source = match self.config.network {
@@ -1109,7 +1210,7 @@ impl Server {
         };
         let nonce = self.next_nonce();
         let endpoint = self.key.as_ref().map(|key| {
-            sign::signed_kill_request(key, source, &format!("mcp: {reason}"), nonce)
+            sign::signed_kill_request(key, source, &format!("mcp: {reason}"), nonce, expected_mode)
                 .ok_or(GuardError::NotSent)
                 .and_then(|body| self.guard.kill(body))
         });
@@ -1121,21 +1222,39 @@ impl Server {
                     .and_then(Value::as_bool)
                     .unwrap_or(false),
             ),
-            Some(Ok(reply)) if reply.get("status").and_then(Value::as_str) == Some("err") => {
+            Some(Ok(reply))
+                if reply.get("status").and_then(Value::as_str) == Some("err")
+                    && !older_guard(&reply) =>
+            {
                 let code = reply
                     .get("code")
                     .and_then(Value::as_str)
                     .map(contract::known_code)
                     .unwrap_or_else(|| "other".to_owned());
+                if code == "mode_mismatch" {
+                    // Another Guard answered the kill: nothing was pulled,
+                    // and the kill file (this server's Guard's) is left
+                    // alone too.
+                    return Outcome::fail(
+                        "mode_mismatch",
+                        format!(
+                            "The Guard that answered runs in another mode than this server's {}; its kill switch was not pulled. Ask a person to run `zunder-guard kill` on the machine running the Guard meant",
+                            self.config.network.name()
+                        ),
+                    )
+                    .with("sent", json!(false));
+                }
                 return Outcome::fail(
                     "kill_switch_refused",
                     format!(
                         "Guard refused the kill request ({code}); ask a person to run `zunder-guard kill` on the machine running Guard"
                     ),
-                );
+                )
+                .with("sent", json!(false));
             }
             // No endpoint (an older Guard: a 404, or an answer that is not
-            // Guard's), or no client key: the file.
+            // Guard's, or `malformed` for the field above), or no client
+            // key: the file.
             Some(Ok(_)) | Some(Err(GuardError::Http(404))) | None => match &self.config.kill_file {
                 Some(path) => match contract::pull_kill_switch(path, &reason) {
                     Ok(outcome) => ("kill_file", outcome == KillOutcome::AlreadyPulled),
@@ -1151,8 +1270,9 @@ impl Server {
                 None => {
                     return Outcome::fail(
                         "kill_switch_not_configured",
-                        "Guard has no kill endpoint and this server has no --kill-file (or no client key); ask a person to run `zunder-guard kill` on the machine running Guard",
-                    );
+                        "Guard did not take the kill request (no kill endpoint, or an older Guard that does not know expectedMode) and this server has no --kill-file (or no client key); ask a person to run `zunder-guard kill` on the machine running Guard",
+                    )
+                    .with("sent", json!(false));
                 }
             },
             // Guard down, or no answer: write the kill file too when one is

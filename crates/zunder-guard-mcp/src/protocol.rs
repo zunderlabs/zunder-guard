@@ -24,7 +24,10 @@ use std::io::{self, BufRead, Write};
 
 use serde_json::{Value, json};
 
-use crate::tools::{self, Server};
+use crate::{
+    contract,
+    tools::{self, Server},
+};
 
 /// Largest message accepted: 1 MiB.
 pub const MAX_MESSAGE: usize = 1 << 20;
@@ -184,7 +187,17 @@ pub fn handle(server: &mut Server, text: &str) -> Option<Value> {
                 id,
                 json!({
                     "protocolVersion": version,
-                    "capabilities": {"tools": {"listChanged": false}},
+                    // `experimental.exchange_expected_mode`: every request
+                    // this server sends to Guard's `/exchange` carries the
+                    // mode it was started for (`expectedMode`), and it sends
+                    // only to a Guard that enforces it. MCP requires every
+                    // value under `experimental` to be an object.
+                    "capabilities": {
+                        "tools": {"listChanged": false},
+                        "experimental": {
+                            contract::EXPECTED_MODE_CAPABILITY: {"enabled": true},
+                        },
+                    },
                     "serverInfo": {
                         "name": "zunder-guard-mcp",
                         "title": "Zunder Guard",

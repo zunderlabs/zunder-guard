@@ -378,6 +378,10 @@ async fn a_request_expecting_another_mode_is_refused_and_nothing_is_sent() {
         status["capabilities"]["exchange_expected_mode"], true,
         "{status}"
     );
+    assert_eq!(
+        status["capabilities"]["kill_expected_mode"], true,
+        "{status}"
+    );
 
     let body = ccxt_market_buy("10", now());
     for expected in ["mainnet", "paper"] {
@@ -947,6 +951,62 @@ async fn a_signed_kill_request_pulls_the_switch_and_flattens() {
     // And entries are refused, with the code as a field.
     let refused = post(&guard.url, "/exchange", &ccxt_market_buy("0.1", now())).await;
     assert_eq!(refused["code"], "kill_switch", "{refused}");
+}
+
+/// A kill expecting another mode is refused before its signature is
+/// checked: nothing latched, no kill file, the position left open, the
+/// refusal journaled. The same signed kill expecting the right mode then
+/// pulls the switch (its nonce was not spent). Any other value is
+/// malformed.
+#[tokio::test]
+async fn a_kill_expecting_another_mode_pulls_nothing() {
+    let guard = start(false).await;
+    let reply = post(&guard.url, "/exchange", &ccxt_market_buy("0.1", now())).await;
+    assert_eq!(reply["status"], "ok", "{reply}");
+    let positions = guard.venue().positions().len();
+    assert_eq!(positions, 1);
+    let client = GuardKey::from_hex(CLIENT_KEY).unwrap();
+    let body = kill_request(&client, "stop", now());
+    for (expected, code) in [
+        (json!("mainnet"), "mode_mismatch"),
+        (json!("paper"), "mode_mismatch"),
+        (json!("Testnet"), "malformed"),
+        (Value::Null, "malformed"),
+    ] {
+        let mut wrong = body.clone();
+        wrong["expectedMode"] = expected.clone();
+        let refused = post(&guard.url, "/guard/kill", &wrong).await;
+        assert_eq!(refused["status"], "err", "{refused}");
+        assert_eq!(refused["code"], code, "{expected}: {refused}");
+    }
+    let mut misplaced = body.clone();
+    misplaced["action"]["expectedMode"] = json!("testnet");
+    assert_eq!(
+        post(&guard.url, "/guard/kill", &misplaced).await["code"],
+        "malformed"
+    );
+    assert!(!guard.dir.path().join("kill").exists());
+    assert_eq!(guard.venue().positions().len(), positions);
+    let status: Value = reqwest::get(format!("{}/guard/status", guard.url))
+        .await
+        .unwrap()
+        .json_text()
+        .await;
+    assert_eq!(status["killed"], Value::Null, "{status}");
+    let journaled = events(&guard.url).await;
+    assert!(journaled.iter().all(|event| event["kind"] != "kill"));
+    let refusals = journaled
+        .iter()
+        .filter(|event| event["kind"] == "decision" && event["code"] == "mode_mismatch")
+        .count();
+    assert_eq!(refusals, 2, "{journaled:?}");
+
+    let mut right = body;
+    right["expectedMode"] = json!("testnet");
+    let killed = post(&guard.url, "/guard/kill", &right).await;
+    assert_eq!(killed["status"], "ok", "{killed}");
+    assert!(guard.dir.path().join("kill").exists());
+    assert!(guard.venue().positions().is_empty());
 }
 
 #[tokio::test]

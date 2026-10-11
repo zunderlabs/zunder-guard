@@ -40,3 +40,10 @@ sealed directory may not contain unlisted files. The existing release.yml cosign
 checksum verification then cover the immutable metadata too. The workflow requires repository
 variable `AWS_TEMPLATE_BASE_URL`; it supplies infrastructure location at runtime, with the signed
 template descriptor ending in `/guard/<tag>/cloudformation.yaml`.
+
+`python -m guard_harness.staged_state --tag vX.Y.Z --commit FULL_PUBLIC_SHA --work
+/absolute/fresh-directory` authenticates the assembled release through the real asset verifier,
+then writes `staged.predicate.json`. It binds the original manifest bytes and produces revision
+1 with no predecessor, all channels unavailable and no journey evidence. The predicate is an
+input for `verify.yml` attestation, not an authenticated published state by itself. Signing,
+staging endpoint publication and the complete verify workflow remain integration requirements.

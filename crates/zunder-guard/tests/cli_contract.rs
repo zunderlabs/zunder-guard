@@ -612,9 +612,10 @@ async fn status_json_and_health() {
     assert_eq!(status["halted"], false);
     assert_eq!(status["kill_switch"], false);
     assert_eq!(status["journal"]["ok"], true);
-    // `/exchange` takes `expectedMode` (C3), and says so.
+    // `/exchange` and `/guard/kill` take `expectedMode`, and say so.
     assert_eq!(
-        status["capabilities"]["exchange_expected_mode"], true,
+        status["capabilities"],
+        json!({"exchange_expected_mode": true, "kill_expected_mode": true}),
         "{status}"
     );
     let licence = &status["licence"];

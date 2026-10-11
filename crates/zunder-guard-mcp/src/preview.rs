@@ -632,6 +632,8 @@ mod tests {
             last_event: 0,
             equity: None,
             version: "test".into(),
+            exchange_expected_mode: true,
+            kill_expected_mode: true,
         }
     }
 

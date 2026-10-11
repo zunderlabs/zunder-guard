@@ -30,6 +30,8 @@ use zunder_hl_protocol::{
 };
 use zunder_venue::hyperliquid::Address;
 
+use crate::contract::Mode;
+
 /// `t` of an order.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OrderType {
@@ -245,14 +247,23 @@ fn signature_wire(signature: &Signature) -> Wire {
 }
 
 /// The JSON body of a request to `/exchange`, in the Python SDK's field
-/// order (action, nonce, signature, vaultAddress, expiresAfter). The vault
-/// address is always null. `None` when it cannot be signed.
+/// order (action, nonce, signature, vaultAddress, expiresAfter), followed
+/// by Guard's `expectedMode`: the mode this server was started for. The
+/// vault address is always null. `None` when it cannot be signed.
+///
+/// `expectedMode` sits beside the signed fields and is not signed: the
+/// signature covers exactly what the SDK's would. Guard refuses the request
+/// (`mode_mismatch`) before judging or sending anything when it runs in
+/// another mode, so a request meant for one network is never sent on
+/// another, even when another Guard took over the address after this
+/// server last read its status.
 pub fn signed_request(
     key: &ClientKey,
     source: Network,
     action: &Action,
     nonce: u64,
     expires_after: Option<u64>,
+    expected_mode: Mode,
 ) -> Option<Vec<u8>> {
     let wire = action.to_wire();
     let signature = sign_wire(key, source, &wire, nonce, expires_after)?;
@@ -262,6 +273,7 @@ pub fn signed_request(
         ("signature", signature_wire(&signature)),
         ("vaultAddress", Wire::Null),
         ("expiresAfter", expires_after.map_or(Wire::Null, Wire::UInt)),
+        ("expectedMode", Wire::str(expected_mode.name())),
     ]);
     request.to_json().ok()
 }
@@ -270,25 +282,33 @@ pub fn signed_request(
 /// `{"type": "zunderGuardKill", "reason": reason}`, signed exactly as an L1
 /// action. It is not a Hyperliquid action and not an [`Action`]: it can
 /// only pull Guard's kill switch, which nothing but a person releases.
-/// `None` when it cannot be signed.
+/// With `expected_mode`, the body ends with Guard's `expectedMode` (not
+/// signed), which a Guard listing `capabilities.kill_expected_mode`
+/// enforces: one in another mode pulls nothing (`mode_mismatch`). Sent only
+/// to such a Guard; an older one refuses the field. `None` when it cannot
+/// be signed.
 pub fn signed_kill_request(
     key: &ClientKey,
     source: Network,
     reason: &str,
     nonce: u64,
+    expected_mode: Option<Mode>,
 ) -> Option<Vec<u8>> {
     let wire = Wire::Map(vec![
         ("type", Wire::str("zunderGuardKill")),
         ("reason", Wire::str(reason)),
     ]);
     let signature = sign_wire(key, source, &wire, nonce, None)?;
-    let request = Wire::Map(vec![
+    let mut fields = vec![
         ("action", wire),
         ("nonce", Wire::UInt(nonce)),
         ("signature", signature_wire(&signature)),
         ("vaultAddress", Wire::Null),
-    ]);
-    request.to_json().ok()
+    ];
+    if let Some(mode) = expected_mode {
+        fields.push(("expectedMode", Wire::str(mode.name())));
+    }
+    Wire::Map(fields).to_json().ok()
 }
 
 /// The action as JSON, exactly as it is sent.
@@ -517,6 +537,25 @@ mod tests {
     }
 
     #[test]
+    fn a_kill_request_carries_the_expected_mode_only_when_asked() {
+        let body = |mode| {
+            let bytes =
+                signed_kill_request(&key(), Network::Testnet, "stop", 1_791_000_000_000, mode)
+                    .unwrap();
+            let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            (bytes, value)
+        };
+        let (_, plain) = body(None);
+        assert!(plain.get("expectedMode").is_none());
+        let (bytes, with) = body(Some(Mode::Mainnet));
+        assert!(bytes.ends_with(br#","expectedMode":"mainnet"}"#));
+        // Not signed: the signature and the action are the same.
+        assert_eq!(with["signature"], plain["signature"]);
+        assert_eq!(with["action"], plain["action"]);
+        assert_eq!(body(Some(Mode::Paper)).1["expectedMode"], "paper");
+    }
+
+    #[test]
     fn a_signed_request_recovers_to_the_client_key() {
         let action = Action::Cancel { asset: 1, oid: 9 };
         let body = signed_request(
@@ -525,11 +564,37 @@ mod tests {
             &action,
             1_791_000_000_000,
             Some(1_791_000_030_000),
+            Mode::Testnet,
         )
         .unwrap();
         let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(value["vaultAddress"], serde_json::Value::Null);
         assert_eq!(value["expiresAfter"], 1_791_000_030_000u64);
+        // The expected mode rides beside the signed fields, last; the
+        // signature below recovers from the action, nonce and expiry alone.
+        assert_eq!(value["expectedMode"], "testnet");
+        assert!(body.ends_with(br#","expectedMode":"testnet"}"#));
+        for (mode, name) in [
+            (Mode::Paper, "paper"),
+            (Mode::Testnet, "testnet"),
+            (Mode::Mainnet, "mainnet"),
+        ] {
+            let other = signed_request(
+                &key(),
+                Network::Testnet,
+                &action,
+                1_791_000_000_000,
+                Some(1_791_000_030_000),
+                mode,
+            )
+            .unwrap();
+            let other: serde_json::Value = serde_json::from_slice(&other).unwrap();
+            assert_eq!(other["expectedMode"], name);
+            // Signing is deterministic (RFC 6979): the mode changes no
+            // signed byte.
+            assert_eq!(other["signature"], value["signature"]);
+            assert_eq!(other["action"], value["action"]);
+        }
         let fixed = |text: &str| {
             let digits = text.trim_start_matches("0x");
             let padded = format!("{digits:0>64}");

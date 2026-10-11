@@ -5,6 +5,11 @@
 //! one side, Guard's real HTTP server, judge and journals on the other, the
 //! in-memory venue behind Guard (reads only). Nothing can be sent.
 //!
+//! One test also runs a testnet Guard on the in-memory venue (which records
+//! what it is sent) behind the same address as a paper Guard, to show that
+//! the kit's `expectedMode` stops a request meant for one mode from being
+//! sent in another.
+//!
 //! Account: 10,000 USDC, mids BTC 60,000, ETH 3,000, SOL 150; Guard's
 //! default policy.
 
@@ -12,7 +17,11 @@
 
 mod support;
 
-use std::sync::Arc;
+use std::{
+    io::{BufRead, BufReader, Read, Write},
+    net::{TcpListener, TcpStream},
+    sync::{Arc, Mutex},
+};
 
 use rust_decimal::dec;
 use serde_json::{Value, json};
@@ -28,7 +37,7 @@ use zunder_guard::{
 use zunder_guard_core::{
     auth::AuthConfig,
     licence::FeeMode,
-    sign::{Address, GuardKey},
+    sign::{Address, GuardKey, SigningNetwork},
 };
 use zunder_guard_mcp::{
     contract::{self, Mode as KitMode},
@@ -51,15 +60,26 @@ fn api_key() -> GuardKey {
 struct Running {
     url: String,
     guard: Arc<Guard<MemoryVenue>>,
-    _dir: TestDir,
+    dir: TestDir,
 }
 
 async fn start_paper() -> Running {
-    let dir = TestDir::new("mcp-kit");
+    start(true).await
+}
+
+/// A Guard on the in-memory venue: paper (the venue only read), or testnet
+/// (Guard signs with the API wallet key and sends to the in-memory venue).
+async fn start(paper: bool) -> Running {
+    let dir = TestDir::new(if paper { "mcp-kit" } else { "mcp-kit-testnet" });
     let config = GuardConfig {
         network: Some(GuardNetwork::Testnet),
-        mode: GuardMode::Paper,
+        mode: if paper {
+            GuardMode::Paper
+        } else {
+            GuardMode::Testnet
+        },
         account: Some(ACCOUNT.to_owned()),
+        api_wallet: (!paper).then(|| api_key().address().to_hex()),
         state_dir: dir.path().to_owned(),
         auth: AuthConfig {
             clients: vec![GuardKey::from_hex(CLIENT_KEY).unwrap().address().to_hex()],
@@ -68,25 +88,33 @@ async fn start_paper() -> Running {
         ..GuardConfig::default()
     };
     let risk = PersistentRisk::initialise_for(
-        &config.risk_journal(true),
+        &config.risk_journal(paper),
         config.policy.risk_limits(),
-        &config.journal_scope(true).unwrap(),
+        &config.journal_scope(paper).unwrap(),
         Timestamp::from_millis(SystemClock.now_ms() as i64),
         dec!(10000),
         "mcp kit test",
     )
     .unwrap();
-    let journal = DecisionJournal::open(&config.decision_journal(true)).unwrap();
+    let journal = DecisionJournal::open(&config.decision_journal(paper)).unwrap();
     let venue = MemoryVenue::new(
         api_key().address(),
         Address::from_hex(ACCOUNT).unwrap(),
         "10000",
-    )
-    .read_only();
+    );
+    let venue = if paper { venue.read_only() } else { venue };
+    let mode = if paper {
+        Mode::Paper
+    } else {
+        Mode::Send {
+            key: api_key(),
+            network: SigningNetwork::Testnet,
+        }
+    };
     let guard = Guard::new(
         Setup {
             config,
-            mode: Mode::Paper,
+            mode,
             risk,
             journal,
             fee: FeeMode::Off("test".into()),
@@ -110,14 +138,18 @@ async fn start_paper() -> Running {
     Running {
         url: format!("http://{addr}"),
         guard,
-        _dir: dir,
+        dir,
     }
 }
 
 fn kit(url: &str) -> Server {
+    kit_for(url, KitMode::Paper)
+}
+
+fn kit_for(url: &str, network: KitMode) -> Server {
     Server::new(
         Config {
-            network: KitMode::Paper,
+            network,
             kill_file: None,
             confirm_account: None,
             kill_confirm_wait_ms: 5_000,
@@ -228,4 +260,193 @@ async fn the_agent_kit_works_against_the_real_guard_in_paper_mode() {
     );
     // Paper: nothing reached the venue at any point.
     assert!(running.guard.upstream().received().is_empty());
+}
+
+/// One loopback address in front of two Guards: requests go to `first`
+/// until it has answered a status, then to `then`, as when another Guard
+/// takes over the port between a client's status read and its request.
+fn switching_proxy(first: String, then: String) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = format!("http://{}", listener.local_addr().unwrap());
+    let target = Arc::new(Mutex::new((first, Some(then))));
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(stream) = stream else { continue };
+            let target = target.clone();
+            std::thread::spawn(move || relay(stream, &target));
+        }
+    });
+    address
+}
+
+fn relay(stream: TcpStream, target: &Mutex<(String, Option<String>)>) {
+    let mut reader = BufReader::new(stream.try_clone().unwrap());
+    let mut line = String::new();
+    if reader.read_line(&mut line).is_err() {
+        return;
+    }
+    let mut parts = line.split_whitespace();
+    let method = parts.next().unwrap_or_default().to_owned();
+    let path = parts.next().unwrap_or_default().to_owned();
+    let mut length = 0usize;
+    loop {
+        let mut header = String::new();
+        if reader.read_line(&mut header).is_err() || header == "\r\n" || header.is_empty() {
+            break;
+        }
+        if let Some((name, value)) = header.split_once(':')
+            && name.eq_ignore_ascii_case("content-length")
+        {
+            length = value.trim().parse().unwrap_or(0);
+        }
+    }
+    let mut body = vec![0u8; length];
+    if reader.read_exact(&mut body).is_err() {
+        return;
+    }
+    // Held across the request, so requests pass one at a time, in order.
+    let mut target = target.lock().unwrap();
+    let client = reqwest::blocking::Client::builder()
+        .no_proxy()
+        .build()
+        .unwrap();
+    let url = format!("{}{path}", target.0);
+    let response = if method == "GET" {
+        client.get(url).send()
+    } else {
+        client
+            .post(url)
+            .header("content-type", "application/json")
+            .body(body)
+            .send()
+    }
+    .unwrap();
+    let code = response.status().as_u16();
+    let text = response.text().unwrap();
+    if path.starts_with("/guard/status")
+        && let Some(next) = target.1.take()
+    {
+        target.0 = next;
+    }
+    drop(target);
+    let mut stream = stream;
+    let _ = write!(
+        stream,
+        "HTTP/1.1 {code} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{text}",
+        text.len()
+    );
+    let _ = stream.flush();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_testnet_guard_taking_over_the_address_refuses_the_paper_kits_order_and_sends_nothing() {
+    let (paper, testnet) = tokio::join!(start(true), start(false));
+    let (first, then) = (paper.url.clone(), testnet.url.clone());
+    let order = json!({"coin": "BTC", "side": "buy", "stop": "58800", "size": "0.01"});
+    let asked = order.clone();
+    // The kit is started for paper and reads a paper Guard's status; the
+    // order then reaches a testnet Guard, which would send it: paper
+    // requests are signed for testnet, and Guard authenticates a client's
+    // signature for either network.
+    let (error, refused) = tokio::task::spawn_blocking(move || {
+        let address = switching_proxy(first, then);
+        let mut server = kit_for(&address, KitMode::Paper);
+        call(&mut server, "place_order", asked)
+    })
+    .await
+    .unwrap();
+    assert!(error, "{refused}");
+    assert_eq!(refused["error"]["code"], "mode_mismatch", "{refused}");
+    assert_eq!(refused["outcome"], "vetoed_by_guard", "{refused}");
+    assert_eq!(refused["sent"], false, "{refused}");
+    // Nothing reached the venue, and Guard judged nothing.
+    assert!(testnet.guard.upstream().received().is_empty());
+    assert!(paper.guard.upstream().received().is_empty());
+    let url = testnet.url.clone();
+    let events =
+        tokio::task::spawn_blocking(move || get_json(&format!("{url}/guard/events?since=0")))
+            .await
+            .unwrap();
+    let decisions: Vec<&Value> = events
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|event| event["kind"] == "decision")
+        .collect();
+    assert_eq!(decisions.len(), 1, "{events}");
+    assert_eq!(decisions[0]["code"], "mode_mismatch", "{events}");
+    assert!(
+        events
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|event| event["kind"] != "sent")
+    );
+
+    // The same order from a kit started for testnet goes through that Guard
+    // to the venue: the field beside the signed action changes nothing else.
+    let url = testnet.url.clone();
+    let (error, placed) = tokio::task::spawn_blocking(move || {
+        let mut server = kit_for(&url, KitMode::Testnet);
+        call(&mut server, "place_order", order)
+    })
+    .await
+    .unwrap();
+    assert!(!error, "{placed}");
+    assert_eq!(placed["sent"], true, "{placed}");
+    assert!(!testnet.guard.upstream().received().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_testnet_guard_taking_over_the_address_ignores_the_paper_kits_kill_switch() {
+    let (paper, testnet) = tokio::join!(start(true), start(false));
+    // The testnet Guard has a position its kill switch would close.
+    testnet.guard.upstream().add_position("BTC", "0.01");
+    testnet.guard.sync().await;
+    assert_eq!(testnet.guard.upstream().positions().len(), 1);
+    let (first, then) = (paper.url.clone(), testnet.url.clone());
+    // The kit, started for paper, looks at the paper Guard's status (which
+    // lists kill_expected_mode); the kill then reaches the testnet Guard.
+    let (error, refused) = tokio::task::spawn_blocking(move || {
+        let address = switching_proxy(first, then);
+        let mut server = kit_for(&address, KitMode::Paper);
+        call(
+            &mut server,
+            "kill_switch",
+            json!({"confirm": true, "reason": "agent test"}),
+        )
+    })
+    .await
+    .unwrap();
+    assert!(error, "{refused}");
+    assert_eq!(refused["error"]["code"], "mode_mismatch", "{refused}");
+    assert_eq!(refused["sent"], false, "{refused}");
+    // The testnet Guard's kill switch is untouched and its position open.
+    let status = testnet.guard.status().await;
+    assert_eq!(status["killed"], Value::Null, "{status}");
+    assert_eq!(
+        status["capabilities"]["kill_expected_mode"], true,
+        "{status}"
+    );
+    assert!(!testnet.dir.path().join("kill").exists());
+    assert_eq!(testnet.guard.upstream().positions().len(), 1);
+    let status = paper.guard.status().await;
+    assert_eq!(status["killed"], Value::Null, "{status}");
+
+    // The same kill from a kit started for testnet pulls that Guard's
+    // switch and closes the position.
+    let url = testnet.url.clone();
+    let (error, pulled) = tokio::task::spawn_blocking(move || {
+        let mut server = kit_for(&url, KitMode::Testnet);
+        call(
+            &mut server,
+            "kill_switch",
+            json!({"confirm": true, "reason": "agent test"}),
+        )
+    })
+    .await
+    .unwrap();
+    assert!(!error, "{pulled}");
+    assert_eq!(pulled["pulled_through"], "guard_kill_endpoint", "{pulled}");
+    assert!(testnet.guard.upstream().positions().is_empty());
 }

@@ -33,6 +33,12 @@ fn initialize_and_list_exactly_the_nine_tools() {
         init["result"]["capabilities"]["tools"]["listChanged"],
         false
     );
+    // The sender guarantee: every exchange request carries the pinned mode.
+    // An object, as MCP requires of every experimental capability.
+    assert_eq!(
+        init["result"]["capabilities"]["experimental"],
+        json!({"exchange_expected_mode": {"enabled": true}})
+    );
     assert!(
         init["result"]["instructions"]
             .as_str()
@@ -83,6 +89,73 @@ fn initialize_and_list_exactly_the_nine_tools() {
     );
     let batch = zunder_guard_mcp::protocol::handle(&mut server, "[1, 2]").unwrap();
     assert_eq!(batch["error"]["code"], -32600);
+}
+
+/// The `initialize` result's capabilities follow MCP's `ServerCapabilities`
+/// schema (2024-11-05 to 2025-11-25): an object whose known members are
+/// objects, `tools`, `prompts` and `resources` with only boolean flags, and
+/// every value under `experimental` an object. Clients built on the
+/// official SDKs validate this and refuse to connect otherwise.
+fn assert_server_capabilities(capabilities: &Value) {
+    let members = capabilities.as_object().expect("capabilities is an object");
+    for (name, value) in members {
+        let object = value
+            .as_object()
+            .unwrap_or_else(|| panic!("capabilities.{name} must be an object: {value}"));
+        match name.as_str() {
+            "experimental" => {
+                for (key, entry) in object {
+                    assert!(
+                        entry.is_object(),
+                        "capabilities.experimental.{key} must be an object: {entry}"
+                    );
+                }
+            }
+            "tools" | "prompts" => {
+                for (key, flag) in object {
+                    assert_eq!(key, "listChanged", "capabilities.{name}.{key}");
+                    assert!(flag.is_boolean(), "capabilities.{name}.{key}: {flag}");
+                }
+            }
+            "resources" => {
+                for (key, flag) in object {
+                    assert!(
+                        ["listChanged", "subscribe"].contains(&key.as_str()),
+                        "capabilities.resources.{key}"
+                    );
+                    assert!(flag.is_boolean(), "capabilities.resources.{key}: {flag}");
+                }
+            }
+            "logging" | "completions" | "tasks" => {}
+            other => panic!("capabilities.{other} is not in MCP's schema"),
+        }
+    }
+}
+
+#[test]
+fn the_initialize_capabilities_follow_mcps_schema() {
+    let guard = MockGuard::start();
+    let (mut server, _) = guard.server(Mode::Testnet, true, None);
+    for (id, version) in [
+        (1, "2025-11-25"),
+        (2, "2025-06-18"),
+        (3, "2025-03-26"),
+        (4, "2024-11-05"),
+        (5, "1999-01-01"),
+    ] {
+        let init = rpc(
+            &mut server,
+            id,
+            "initialize",
+            json!({"protocolVersion": version, "capabilities": {}, "clientInfo": {"name": "test", "version": "1"}}),
+        );
+        assert_server_capabilities(&init["result"]["capabilities"]);
+    }
+    // The checker itself refuses what a client SDK refuses.
+    let refused = std::panic::catch_unwind(|| {
+        assert_server_capabilities(&json!({"experimental": {"exchange_expected_mode": true}}))
+    });
+    assert!(refused.is_err());
 }
 
 #[test]
@@ -272,6 +345,7 @@ fn nothing_is_sent_to_the_wrong_network_an_unknown_guard_or_without_a_key() {
     let (error, refused) = call(&mut server, "place_order", order.clone());
     assert!(error);
     assert_eq!(refused["error"]["code"], "network_mismatch");
+    assert_eq!(refused["sent"], false);
     // Started for mainnet, Guard on testnet: refused too.
     let guard = MockGuard::start();
     let (mut server, _) = guard.server(Mode::Mainnet, true, None);
@@ -306,6 +380,436 @@ fn nothing_is_sent_to_the_wrong_network_an_unknown_guard_or_without_a_key() {
     let (error, _) = call(&mut server, "account_overview", json!({}));
     assert!(!error);
     assert!(guard.exchanges().is_empty());
+}
+
+#[test]
+fn every_exchange_request_carries_the_mode_the_server_was_started_for() {
+    for (mode, name) in [
+        (Mode::Paper, "paper"),
+        (Mode::Testnet, "testnet"),
+        (Mode::Mainnet, "mainnet"),
+    ] {
+        let guard = MockGuard::start();
+        guard.with(|state| state.status["mode"] = json!(name));
+        let (mut server, clock) = guard.server(mode, true, None);
+        let (error, placed) = call(
+            &mut server,
+            "place_order",
+            json!({"coin": "BTC", "side": "buy", "stop": "58800", "size": "0.01"}),
+        );
+        assert!(!error, "{name}: {placed}");
+        clock.advance(1_000);
+        let (error, moved) = call(
+            &mut server,
+            "move_stop",
+            json!({"coin": "ETH", "new_stop": "2950"}),
+        );
+        assert!(!error, "{name}: {moved}");
+        clock.advance(1_000);
+        let (error, cancelled) = call(
+            &mut server,
+            "cancel_order",
+            json!({"coin": "ETH", "order_id": 11}),
+        );
+        assert!(!error, "{name}: {cancelled}");
+        clock.advance(1_000);
+        let (error, closed) = call(&mut server, "close_position", json!({"coin": "ETH"}));
+        assert!(!error, "{name}: {closed}");
+        let bodies = guard.exchanges();
+        assert_eq!(bodies.len(), 4, "{name}");
+        for body in &bodies {
+            // Beside the signed fields, never inside the action, and
+            // nothing else added (the field order is pinned in `sign.rs`).
+            assert_eq!(body["expectedMode"], name, "{body}");
+            assert!(body["action"].get("expectedMode").is_none(), "{body}");
+            let mut keys: Vec<&str> = body
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect();
+            keys.sort_unstable();
+            assert_eq!(
+                keys,
+                [
+                    "action",
+                    "expectedMode",
+                    "expiresAfter",
+                    "nonce",
+                    "signature",
+                    "vaultAddress"
+                ],
+                "{body}"
+            );
+        }
+        // The mock authenticated every one of them as Guard does: the
+        // signed action is unchanged by the field beside it.
+        guard.assert_only_guarded_actions();
+        if mode != Mode::Paper {
+            assert_eq!(guard.forwarded().len(), 4, "{name}");
+        }
+    }
+}
+
+#[test]
+fn a_guard_replaced_between_the_status_read_and_the_send_refuses_and_nothing_reaches_the_venue() {
+    // Started for testnet; Guard's status says testnet; then a mainnet
+    // Guard answers on the same address. The request still says testnet,
+    // so Guard refuses it before judging and the venue sees nothing.
+    let guard = MockGuard::start();
+    guard.with(|state| state.mode_after_status = Some("mainnet"));
+    let (mut server, clock) = guard.server(Mode::Testnet, true, None);
+    let (error, refused) = call(
+        &mut server,
+        "place_order",
+        json!({"coin": "BTC", "side": "buy", "stop": "58800", "size": "0.01"}),
+    );
+    assert!(error, "{refused}");
+    assert_eq!(refused["error"]["code"], "mode_mismatch", "{refused}");
+    assert_eq!(refused["outcome"], "vetoed_by_guard");
+    assert_eq!(refused["sent"], false);
+    assert_eq!(
+        refused["error"]["reason"],
+        "The request expected Guard in another mode (paper, testnet or mainnet) than it runs in; nothing was judged or sent. Nothing was sent to the venue."
+    );
+    assert_eq!(refused["guard_decision"]["code"], "mode_mismatch");
+    let bodies = guard.exchanges();
+    assert_eq!(bodies.len(), 1);
+    assert_eq!(bodies[0]["expectedMode"], "testnet");
+    assert!(guard.forwarded().is_empty());
+    // The refusal is clean: no unknown outcome, so nothing waits on a look.
+    // The next call reads the mainnet status and refuses locally.
+    clock.advance(1_000);
+    let (_, next) = call(
+        &mut server,
+        "place_order",
+        json!({"coin": "BTC", "side": "buy", "stop": "58800", "size": "0.01"}),
+    );
+    assert_eq!(next["error"]["code"], "network_mismatch", "{next}");
+    assert_eq!(guard.exchanges().len(), 1);
+
+    // An exit too: a close meant for testnet never closes on mainnet.
+    let guard = MockGuard::start();
+    guard.with(|state| state.mode_after_status = Some("mainnet"));
+    let (mut server, _) = guard.server(Mode::Testnet, true, None);
+    let (error, refused) = call(&mut server, "close_position", json!({"coin": "ETH"}));
+    assert!(error, "{refused}");
+    assert_eq!(refused["error"]["code"], "mode_mismatch", "{refused}");
+    assert_eq!(refused["sent"], false);
+    assert!(guard.forwarded().is_empty());
+
+    // Started for paper; a testnet Guard takes over. Paper requests are
+    // signed for testnet, which that Guard would otherwise accept.
+    let guard = MockGuard::start();
+    guard.with(|state| {
+        state.status["mode"] = json!("paper");
+        state.mode_after_status = Some("testnet");
+    });
+    let (mut server, _) = guard.server(Mode::Paper, true, None);
+    let (error, refused) = call(
+        &mut server,
+        "place_order",
+        json!({"coin": "BTC", "side": "buy", "stop": "58800", "size": "0.01"}),
+    );
+    assert!(error, "{refused}");
+    assert_eq!(refused["error"]["code"], "mode_mismatch", "{refused}");
+    assert_eq!(guard.exchanges()[0]["expectedMode"], "paper");
+    assert!(guard.forwarded().is_empty());
+    assert_eq!(guard.with(|state| state.bad_signatures), 0);
+
+    // An older Guard (no capability) takes over: it does not know the field
+    // and refuses the request as unreadable. Nothing is sent, and the
+    // refusal is clean (no unknown outcome to look at first).
+    let guard = MockGuard::start();
+    guard.with(|state| {
+        state.mode_after_status = Some("mainnet");
+        state.older_after_status = true;
+    });
+    let (mut server, clock) = guard.server(Mode::Testnet, true, None);
+    let (error, refused) = call(
+        &mut server,
+        "place_order",
+        json!({"coin": "BTC", "side": "buy", "stop": "58800", "size": "0.01"}),
+    );
+    assert!(error, "{refused}");
+    assert_eq!(refused["error"]["code"], "malformed", "{refused}");
+    assert_eq!(refused["outcome"], "vetoed_by_guard", "{refused}");
+    assert_eq!(refused["sent"], false);
+    assert!(guard.forwarded().is_empty());
+    clock.advance(1_000);
+    let (_, next) = call(
+        &mut server,
+        "place_order",
+        json!({"coin": "BTC", "side": "buy", "stop": "58800", "size": "0.01"}),
+    );
+    // Not `check_first`: the status now shows mainnet, refused locally.
+    assert_eq!(next["error"]["code"], "network_mismatch", "{next}");
+    assert_eq!(guard.exchanges().len(), 1);
+}
+
+#[test]
+fn the_kill_switch_of_a_guard_in_another_mode_is_not_pulled() {
+    let dir = temp_dir("kill-other-mode");
+    let kill = dir.join("kill");
+    // Started for testnet; the address answers as a mainnet Guard.
+    let guard = MockGuard::start();
+    guard.with(|state| state.status["mode"] = json!("mainnet"));
+    let (mut server, _) = guard.server(Mode::Testnet, true, Some(kill.clone()));
+    let (error, refused) = call(
+        &mut server,
+        "kill_switch",
+        json!({"confirm": true, "reason": "stop"}),
+    );
+    assert!(error, "{refused}");
+    assert_eq!(refused["error"]["code"], "network_mismatch", "{refused}");
+    assert_eq!(refused["sent"], false);
+    assert!(!kill.exists());
+    assert!(guard.with(|state| state.received.iter().all(|r| r.method == "GET")));
+}
+
+/// The kill requests this server posted to `/guard/kill`.
+fn kill_bodies(guard: &MockGuard) -> Vec<Value> {
+    guard.with(|state| {
+        state
+            .received
+            .iter()
+            .filter(|r| r.path == "/guard/kill")
+            .map(|r| r.body.clone())
+            .collect()
+    })
+}
+
+#[test]
+fn the_kill_request_names_the_mode_when_guard_enforces_it() {
+    for (mode, name) in [
+        (Mode::Paper, "paper"),
+        (Mode::Testnet, "testnet"),
+        (Mode::Mainnet, "mainnet"),
+    ] {
+        let guard = MockGuard::start();
+        guard.with(|state| {
+            state.kill_endpoint = true;
+            state.status["mode"] = json!(name);
+        });
+        let (mut server, _) = guard.server(mode, true, None);
+        let (error, pulled) = call(
+            &mut server,
+            "kill_switch",
+            json!({"confirm": true, "reason": "stop"}),
+        );
+        assert!(!error, "{name}: {pulled}");
+        assert_eq!(pulled["pulled_through"], "guard_kill_endpoint");
+        assert_eq!(pulled["guard_reports_killed"], true);
+        let bodies = kill_bodies(&guard);
+        assert_eq!(bodies.len(), 1);
+        assert_eq!(bodies[0]["expectedMode"], name, "{}", bodies[0]);
+        assert!(bodies[0]["action"].get("expectedMode").is_none());
+    }
+    // A Guard that does not list kill_expected_mode gets the kill without
+    // the field (it would refuse it), and is pulled.
+    let guard = MockGuard::start();
+    guard.with(|state| {
+        state.kill_endpoint = true;
+        state.status["capabilities"] = json!({"exchange_expected_mode": true});
+    });
+    let (mut server, _) = guard.server(Mode::Testnet, true, None);
+    let (error, pulled) = call(
+        &mut server,
+        "kill_switch",
+        json!({"confirm": true, "reason": "stop"}),
+    );
+    assert!(!error, "{pulled}");
+    assert!(kill_bodies(&guard)[0].get("expectedMode").is_none());
+}
+
+#[test]
+fn a_guard_replaced_between_the_status_read_and_the_kill_pulls_nothing() {
+    let dir = temp_dir("kill-replaced");
+    let kill = dir.join("kill");
+    let guard = MockGuard::start();
+    guard.with(|state| {
+        state.kill_endpoint = true;
+        state.mode_after_status = Some("mainnet");
+    });
+    let (mut server, _) = guard.server(Mode::Testnet, true, Some(kill.clone()));
+    let (error, refused) = call(
+        &mut server,
+        "kill_switch",
+        json!({"confirm": true, "reason": "stop"}),
+    );
+    assert!(error, "{refused}");
+    assert_eq!(refused["error"]["code"], "mode_mismatch", "{refused}");
+    assert_eq!(refused["sent"], false);
+    assert_eq!(kill_bodies(&guard)[0]["expectedMode"], "testnet");
+    // The Guard now answering was not pulled, and the kill file of the
+    // Guard meant was not written on its behalf either.
+    assert_eq!(
+        guard.with(|state| state.status["killed"].clone()),
+        Value::Null
+    );
+    assert!(!kill.exists());
+}
+
+#[test]
+fn the_kill_still_pulls_when_guards_status_cannot_be_read() {
+    // Guard's status fails (an HTTP error): the kill goes ahead through the
+    // kill file of an older Guard without the endpoint.
+    let dir = temp_dir("kill-status-down");
+    let kill = dir.join("kill");
+    let guard = MockGuard::start();
+    guard.with(|state| state.status_failures = 1);
+    let (mut server, _) = guard.server(Mode::Testnet, true, Some(kill.clone()));
+    let (error, pulled) = call(
+        &mut server,
+        "kill_switch",
+        json!({"confirm": true, "reason": "stop"}),
+    );
+    assert!(!error, "{pulled}");
+    assert_eq!(pulled["pulled_through"], "kill_file", "{pulled}");
+    assert!(kill.exists());
+    // And through Guard's endpoint, still naming the mode: whose Guard
+    // answers is unknown, so the field decides.
+    let guard = MockGuard::start();
+    guard.with(|state| {
+        state.kill_endpoint = true;
+        state.status_failures = 1;
+    });
+    let (mut server, _) = guard.server(Mode::Testnet, true, None);
+    let (error, pulled) = call(
+        &mut server,
+        "kill_switch",
+        json!({"confirm": true, "reason": "stop"}),
+    );
+    assert!(!error, "{pulled}");
+    assert_eq!(pulled["pulled_through"], "guard_kill_endpoint", "{pulled}");
+    assert_eq!(kill_bodies(&guard)[0]["expectedMode"], "testnet");
+    // A mainnet Guard whose status cannot be read is not pulled by a
+    // server started for testnet: it refuses the named mode.
+    let guard = MockGuard::start();
+    guard.with(|state| {
+        state.kill_endpoint = true;
+        state.status_failures = 1;
+        state.status["mode"] = json!("mainnet");
+    });
+    let (mut server, _) = guard.server(Mode::Testnet, true, Some(kill.clone()));
+    std::fs::remove_file(&kill).unwrap();
+    let (error, refused) = call(
+        &mut server,
+        "kill_switch",
+        json!({"confirm": true, "reason": "stop"}),
+    );
+    assert!(error, "{refused}");
+    assert_eq!(refused["error"]["code"], "mode_mismatch", "{refused}");
+    assert_eq!(
+        guard.with(|state| state.status["killed"].clone()),
+        Value::Null
+    );
+    assert!(!kill.exists());
+    // An older Guard (no kill_expected_mode) whose status cannot be read
+    // refuses the field as malformed: the kill file is written instead.
+    let guard = MockGuard::start();
+    guard.with(|state| {
+        state.kill_endpoint = true;
+        state.status_failures = 1;
+        state.status["capabilities"] = json!({"exchange_expected_mode": true});
+    });
+    let (mut server, _) = guard.server(Mode::Testnet, true, Some(kill.clone()));
+    let (error, pulled) = call(
+        &mut server,
+        "kill_switch",
+        json!({"confirm": true, "reason": "stop"}),
+    );
+    assert!(!error, "{pulled}");
+    assert_eq!(pulled["pulled_through"], "kill_file", "{pulled}");
+    assert!(kill.exists());
+    assert_eq!(kill_bodies(&guard)[0]["expectedMode"], "testnet");
+}
+
+#[test]
+fn a_status_that_names_another_mode_refuses_the_kill_even_when_unreadable_otherwise() {
+    // Not a status this server can parse (no rules, no account), but it
+    // says mainnet: refused, nothing posted.
+    let guard = MockGuard::start();
+    guard.with(|state| {
+        state.kill_endpoint = true;
+        state.status = json!({"schema": 2, "mode": "mainnet"});
+    });
+    let (mut server, _) = guard.server(Mode::Testnet, true, None);
+    let (error, refused) = call(
+        &mut server,
+        "kill_switch",
+        json!({"confirm": true, "reason": "stop"}),
+    );
+    assert!(error, "{refused}");
+    assert_eq!(refused["error"]["code"], "network_mismatch", "{refused}");
+    assert!(kill_bodies(&guard).is_empty());
+}
+
+#[test]
+fn a_slow_status_holds_the_kill_up_for_at_most_two_seconds() {
+    let guard = MockGuard::start();
+    guard.with(|state| {
+        state.kill_endpoint = true;
+        state.status_delays = vec![5_000];
+    });
+    let (mut server, _) = guard.server(Mode::Testnet, true, None);
+    let started = std::time::Instant::now();
+    let (error, pulled) = call(
+        &mut server,
+        "kill_switch",
+        json!({"confirm": true, "reason": "stop"}),
+    );
+    let elapsed = started.elapsed();
+    assert!(!error, "{pulled}");
+    assert_eq!(pulled["pulled_through"], "guard_kill_endpoint", "{pulled}");
+    assert_eq!(kill_bodies(&guard)[0]["expectedMode"], "testnet");
+    assert!(
+        elapsed < std::time::Duration::from_millis(4_000),
+        "{elapsed:?}"
+    );
+}
+
+#[test]
+fn a_guard_that_does_not_enforce_the_expected_mode_gets_nothing() {
+    for capabilities in [
+        None,
+        Some(json!({})),
+        Some(json!({"exchange_expected_mode": false})),
+        Some(json!({"exchange_expected_mode": "true"})),
+        Some(json!({"exchange_expected_mode": 1})),
+    ] {
+        let guard = MockGuard::start();
+        guard.with(|state| match &capabilities {
+            None => {
+                state.status.as_object_mut().unwrap().remove("capabilities");
+            }
+            Some(value) => state.status["capabilities"] = value.clone(),
+        });
+        let (mut server, clock) = guard.server(Mode::Testnet, true, None);
+        for (tool, arguments) in [
+            (
+                "place_order",
+                json!({"coin": "BTC", "side": "buy", "stop": "58800", "size": "0.01"}),
+            ),
+            ("move_stop", json!({"coin": "ETH", "new_stop": "2950"})),
+            ("cancel_order", json!({"coin": "ETH", "order_id": 11})),
+            ("close_position", json!({"coin": "ETH"})),
+        ] {
+            clock.advance(1_000);
+            let (error, refused) = call(&mut server, tool, arguments);
+            assert!(error, "{tool}: {refused}");
+            assert_eq!(
+                refused["error"]["code"], "expected_mode_unsupported",
+                "{tool} {capabilities:?}: {refused}"
+            );
+            assert_eq!(refused["sent"], false, "{tool}");
+        }
+        assert!(guard.exchanges().is_empty(), "{capabilities:?}");
+        // Reading still works, and says why orders are refused.
+        let (error, overview) = call(&mut server, "account_overview", json!({}));
+        assert!(!error, "{overview}");
+        assert_eq!(overview["guard"]["enforces_expected_mode"], false);
+    }
 }
 
 #[test]
