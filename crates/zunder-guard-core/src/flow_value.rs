@@ -22,33 +22,32 @@ fn quantity(position: &Value) -> Option<Decimal> {
 
 /// Refuse ledger data that the permissive display-oriented flow parser
 /// could otherwise skip or treat as a zero fee during exact reconstruction.
-pub fn valid_ledger(rows: &[Value]) -> bool {
+/// `user` and `dexes` are the account and the USDC perp accounts Guard
+/// manages: a field the flow of an entry needs there (the fee the account
+/// pays among them) is required as `ledger::classify` requires it, no more.
+pub fn valid_ledger(
+    rows: &[Value],
+    user: crate::sign::Address,
+    dexes: &std::collections::BTreeSet<String>,
+) -> bool {
     let mut ids = std::collections::BTreeSet::new();
     rows.iter().all(|row| {
-        let (Some(time), Some(hash), Some(kind)) = (
-            row["time"].as_i64(),
-            row["hash"].as_str(),
-            row["delta"]["type"].as_str(),
-        ) else {
+        // A time, a hash, a type and non-negative amounts: the checks the
+        // flows applied to the account stops pass too (`ledger::classify`).
+        let Ok(kind) = crate::ledger::check_entry(row) else {
             return false;
         };
-        if hash.is_empty() || !ids.insert((time, hash, kind)) {
+        let (Some(time), Some(hash)) = (row["time"].as_i64(), row["hash"].as_str()) else {
+            return false;
+        };
+        if !ids.insert((time, hash, kind)) {
             return false;
         }
         let delta = &row["delta"];
-        for key in [
-            "fee",
-            "usdc",
-            "usdcValue",
-            "requestedUsd",
-            "netWithdrawnUsd",
-            "amount",
-        ] {
-            if let Some(value) = delta.get(key)
-                && number(value).is_none_or(|value| value < Decimal::ZERO)
-            {
-                return false;
-            }
+        // Every field the flow needs, the fee the account pays among them
+        // (never taken as zero): as the flows applied to the account stops.
+        if crate::ledger::classify(row, user, dexes).is_err() {
+            return false;
         }
         let fields: &[&str] = match kind {
             "deposit"
@@ -247,17 +246,42 @@ mod tests {
         value.parse().unwrap()
     }
 
+    const SENDER: &str = "0x0000000000000000000000000000000000000001";
+    const RECEIVER: &str = "0x0000000000000000000000000000000000000002";
+
+    /// `valid_ledger` for the account `user`, managing the main dex.
+    fn valid_for(rows: &[Value], user: &str) -> bool {
+        let dexes = std::collections::BTreeSet::from([String::new()]);
+        valid_ledger(rows, crate::sign::Address::from_hex(user).unwrap(), &dexes)
+    }
+
+    fn valid(rows: &[Value]) -> bool {
+        valid_for(rows, SENDER)
+    }
+
     #[test]
     fn malformed_duplicate_or_unknown_ledger_cannot_be_exact() {
         let row = json!({"time":100000,"hash":"flow","delta":{"type":"deposit","usdc":"50"}});
-        assert!(valid_ledger(std::slice::from_ref(&row)));
-        assert!(!valid_ledger(&[row.clone(), row.clone()]));
+        assert!(valid(std::slice::from_ref(&row)));
+        assert!(!valid(&[row.clone(), row.clone()]));
         let mut malformed = row.clone();
         malformed["delta"]["fee"] = json!("bad");
-        assert!(!valid_ledger(&[malformed]));
+        assert!(!valid(&[malformed]));
         let mut unknown = row;
         unknown["delta"]["type"] = json!("newCollateralMovement");
-        assert!(!valid_ledger(&[unknown]));
+        assert!(!valid(&[unknown]));
+        // A transfer the account pays without its fee: the fee is part of
+        // what moved, never zero. The receiver's side needs no fee, as for
+        // the flows applied to the account stops (`ledger::classify`).
+        let transfer = json!({"time":100000,"hash":"t","delta":{"type":"internalTransfer","usdc":"50",
+            "user":SENDER, "destination":RECEIVER,"fee":"1"}});
+        assert!(valid(std::slice::from_ref(&transfer)));
+        let mut feeless = transfer;
+        if let Some(delta) = feeless["delta"].as_object_mut() {
+            delta.remove("fee");
+        }
+        assert!(!valid_for(std::slice::from_ref(&feeless), SENDER));
+        assert!(valid_for(&[feeless], RECEIVER));
     }
 
     #[test]

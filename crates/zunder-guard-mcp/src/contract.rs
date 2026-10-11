@@ -269,14 +269,30 @@ fn capability(status: &serde_json::Map<String, Value>, name: &str) -> bool {
         == Some(&Value::Bool(true))
 }
 
-/// A decimal that Guard or the venue wrote as a string (or, leniently, a
-/// JSON number written without an exponent).
+/// A decimal that Guard or the venue wrote, as both write money: a string.
+/// A JSON number is refused: it would reach `Decimal` through `f64`
+/// (hard rule 7).
 pub fn decimal_value(value: &Value) -> Option<Decimal> {
     match value {
         Value::String(text) => decimal_text(text),
-        Value::Number(number) => decimal_text(&number.to_string()),
         _ => None,
     }
+}
+
+/// The most decimal places a rules code's number may have (the rules
+/// schema v1, as Guard's rules crate reads it).
+const RULES_DECIMALS: u32 = 4;
+
+/// A number of a rules code (`zr1_…`), whose schema writes percentages and
+/// the leverage as JSON numbers (the rules crate and its TypeScript twin):
+/// plain decimal notation with at most [`RULES_DECIMALS`] places, which
+/// the shortest text of an `f64` gives back exactly. Never a price, size
+/// or amount: those are strings ([`decimal_value`]).
+fn rules_number(value: &Value) -> Option<Decimal> {
+    let Value::Number(number) = value else {
+        return None;
+    };
+    decimal_text(&number.to_string()).filter(|value| value.scale() <= RULES_DECIMALS)
 }
 
 /// Plain decimal notation only: no exponent, no sign other than a leading
@@ -394,9 +410,9 @@ impl Rules {
         let number = |key: &str, default: Decimal| -> Result<Decimal, ContractError> {
             match object.get(key) {
                 None => Ok(default),
-                Some(value @ Value::Number(_)) => {
-                    decimal_value(value).ok_or_else(|| fail("a number is not plain decimal"))
-                }
+                Some(value @ Value::Number(_)) => rules_number(value).ok_or_else(|| {
+                    fail("a number is not plain decimal with at most four decimal places")
+                }),
                 Some(_) => Err(fail("a number field holds something else")),
             }
         };
@@ -1322,6 +1338,31 @@ mod tests {
                 .risk_limits()
                 .drawdown_stop,
             dec!(0.0025)
+        );
+        // At most four decimal places, as Guard's rules crate reads them.
+        assert!(Rules::decode(&encode(r#"{"v":1,"drawdownHaltPct":12.34567}"#)).is_err());
+        assert_eq!(
+            Rules::decode(&encode(r#"{"v":1,"drawdownHaltPct":12.3456}"#))
+                .unwrap()
+                .drawdown_halt_pct,
+            dec!(12.3456)
+        );
+    }
+
+    #[test]
+    fn money_from_guard_and_the_venue_is_a_string_never_a_number() {
+        // Hard rule 7: a JSON number would reach Decimal through f64.
+        assert_eq!(decimal_value(&json!("2000.5")), Some(dec!(2000.5)));
+        assert_eq!(decimal_value(&json!(2000.5)), None);
+        assert_eq!(decimal_value(&json!(2000)), None);
+        assert_eq!(decimal_value(&json!("1e3")), None);
+        // So an account whose value comes as a number cannot be read.
+        assert!(
+            crate::venue::parse_account(&json!({
+                "marginSummary": {"accountValue": 2000.5},
+                "assetPositions": []
+            }))
+            .is_err()
         );
     }
 

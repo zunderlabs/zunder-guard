@@ -976,12 +976,20 @@ impl Dir {
     fn new() -> Self {
         static COUNTER: AtomicUsize = AtomicUsize::new(0);
         let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!(
-            "zunder-flows-model-{}-{unique}",
-            std::process::id()
-        ));
-        fs::remove_dir_all(&path).ok();
-        fs::create_dir_all(&path).unwrap();
+        // Every journal record is synced to disk, thousands per property; in
+        // memory (`/dev/shm`, where Linux has it) a sync costs nothing and the
+        // journal's contents, which are what is compared, are the same.
+        let name = format!("zunder-flows-model-{}-{unique}", std::process::id());
+        let memory = cfg!(target_os = "linux").then(|| PathBuf::from("/dev/shm"));
+        let path = memory
+            .into_iter()
+            .chain([std::env::temp_dir()])
+            .map(|base| base.join(&name))
+            .find(|path| {
+                fs::remove_dir_all(path).ok();
+                fs::create_dir_all(path).is_ok()
+            })
+            .expect("a scratch directory for the journal");
         Self(path)
     }
 

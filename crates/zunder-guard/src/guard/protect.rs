@@ -99,21 +99,40 @@ impl<U: Upstream, C: Clock> Guard<U, C> {
     /// background sync: once nothing Guard sent can still be on its way (a
     /// stop placed with a fill may not show yet), and at least every 30 s
     /// all the same. In paper mode it journals what it would do, once.
-    pub(super) async fn protect(&self, inner: &mut Inner, now: u64, account: &AccountView) {
-        self.protect_planned(inner, now, account, true).await;
+    pub(super) async fn protect(
+        &self,
+        inner: &mut Inner,
+        now: u64,
+        account: &AccountView,
+        read_started: Option<u64>,
+    ) {
+        self.protect_planned(inner, now, account, true, read_started)
+            .await;
     }
 
     /// [`Guard::protect`]; `use_planned` false (a partial read) leaves the
     /// resting entries' stops out, as they were judged on an older view.
+    /// `read_started`: when the complete read `account` comes from began, on
+    /// Guard's monotonic clock (`None` for a partial read); only a complete
+    /// read begun at or after `Protection::until` ends the protection an
+    /// unknown outcome keeps due.
     pub(super) async fn protect_planned(
         &self,
         inner: &mut Inner,
         now: u64,
         account: &AccountView,
         use_planned: bool,
+        read_started: Option<u64>,
     ) {
         inner.protection.last_ms = Some(now);
-        inner.protection.at_next_sync = false;
+        match (inner.protection.until, read_started) {
+            (_, None) if inner.protection.at_next_sync => {}
+            (Some(until), Some(started)) if started < until => {}
+            _ => {
+                inner.protection.until = None;
+                inner.protection.at_next_sync = false;
+            }
+        }
         let planned = if use_planned {
             Self::planned_stops(inner)
         } else {
@@ -192,7 +211,11 @@ impl<U: Upstream, C: Clock> Guard<U, C> {
             inner.protection.alert = Some(summary);
             return;
         }
-        let mut to_close = unpriced;
+        // Each coin to close, with why it has no stop.
+        let mut to_close: Vec<(String, &str)> = unpriced
+            .into_iter()
+            .map(|coin| (coin, "no stop could be priced"))
+            .collect();
         for (coin, action) in &actions {
             let result = self
                 .send_one(inner, now, seq, action, self.clock.now_ms() + ACTION_TTL_MS)
@@ -213,10 +236,10 @@ impl<U: Upstream, C: Clock> Guard<U, C> {
                 _ => self.rests(inner, action).await,
             };
             if !placed {
-                to_close.push(coin.clone());
+                to_close.push((coin.clone(), "Guard's stop was refused"));
             }
         }
-        for coin in to_close {
+        for (coin, why) in to_close {
             let Some(position) = account.position(&coin).cloned() else {
                 continue;
             };
@@ -231,7 +254,7 @@ impl<U: Upstream, C: Clock> Guard<U, C> {
                     position.qty,
                 )
                 .await;
-            problems.push(format!("{coin}: Guard's stop was refused; {text}"));
+            problems.push(format!("{coin}: {why}; {text}"));
         }
         if seq > 0 {
             inner

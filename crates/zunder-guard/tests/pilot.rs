@@ -248,8 +248,9 @@ impl Running {
         for task in self.tasks {
             let _ = task.await;
         }
-        // Connection tasks hold Guard until their connections close.
-        for _ in 0..200 {
+        // Connection tasks hold Guard until their connections close; a
+        // loaded machine may take a while to run them to their end.
+        for _ in 0..1_200 {
             if Arc::strong_count(&self.guard) == 1 {
                 break;
             }
@@ -499,13 +500,15 @@ async fn every_step_on_testnet_over_the_in_memory_venue() {
         log.lines()
             .any(|line| line.contains("\"kind\":\"request\""))
     );
-    assert!(
-        log.lines()
-            .all(|line| serde_json::from_str::<Value>(line).is_ok())
-    );
+    for line in log.lines() {
+        if let Err(error) = serde_json::from_str::<Value>(line) {
+            panic!("pilot.jsonl: {error} in {line:?}\n--- whole log ---\n{log}");
+        }
+    }
     assert!(!log.contains(CLIENT_KEY.trim_start_matches("0x")));
+    // The watch polls the window's start and its end, however slow Guard is.
     let watch = std::fs::read_to_string(home.logs.join("watch.jsonl")).unwrap();
-    assert!(watch.lines().count() >= 2);
+    assert!(watch.lines().count() >= 2, "{watch}");
     // Every entry carried the client's id (Guard's own closes of the
     // flatten carry none, its stops 0x7a67).
     for received in guard.venue().received() {

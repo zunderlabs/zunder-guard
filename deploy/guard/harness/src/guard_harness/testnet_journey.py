@@ -1,5 +1,6 @@
 """Shared T1/T2 execution on an already authenticated, exclusively owned testnet Guard."""
 
+import re
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -23,7 +24,12 @@ class Journey:
 
     @property
     def passed(self) -> bool:
-        return self.protected_entry is not None and self.cleaned is not None and self.guard_stopped
+        return (
+            self.failure is None
+            and self.protected_entry is not None
+            and self.cleaned is not None
+            and self.guard_stopped
+        )
 
 
 def execute(
@@ -39,6 +45,7 @@ def execute(
     stop_guard: Callable[[], None],
     admit_entry: Callable[[], None] = lambda: None,
     begin_cleanup: Callable[[], None] = lambda: None,
+    capture_entry: Callable[[Ownership, int, int], None] = lambda *_: None,
     now_ms: Callable[[], int] = lambda: time.time_ns() // 1_000_000,
 ) -> Journey:
     """One entry attempt, actual protection readback, owned cleanup and independent scan.
@@ -59,7 +66,25 @@ def execute(
     _need(_object(status.get("risk")).get("state") == "active")
     _need(_object(status.get("risk")).get("journal_ready") is True)
     _need(status.get("killed") is None and status.get("journal_broken") is False)
-    _need(status.get("last_error") is None and _object(status.get("fee")).get("mode") == "off")
+    _need(status.get("last_error") is None)
+    fee = _object(status.get("fee"))
+    if fee.get("mode") != "off":
+        approval = _object(fee.get("approval"))
+        maximum = approval.get("max_tenths_bp")
+        _need(
+            fee.get("mode") == "builder"
+            and isinstance(fee.get("address"), str)
+            and re.fullmatch(r"0x[0-9a-fA-F]{40}", fee["address"]) is not None
+            and type(fee.get("fee_tenths_bp")) is int
+            and fee["fee_tenths_bp"] == 20
+            and fee.get("charged") is True
+            and fee.get("paper") is False
+            and fee.get("entries_blocked") is False
+            and approval.get("state") == "approved"
+            and type(maximum) is int
+            and maximum >= 20
+            and approval.get("error") is None
+        )
     started, synced = _oid(status.get("started_at_ms")), _oid(status.get("last_sync_ms"))
     current = now_ms()
     _need(process_started_ms <= started <= synced <= current and current - synced <= 60000)
@@ -105,6 +130,7 @@ def execute(
         )
         _need(not error and result.get("sent") is True)
         protected = observe(cleaning=False)
+        capture_entry(protected, begun, now_ms())
     except (Exception, KeyboardInterrupt):
         failure = "entry_or_protection"
     finally:

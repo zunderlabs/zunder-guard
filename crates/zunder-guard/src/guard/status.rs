@@ -117,6 +117,11 @@ impl<U: Upstream, C: Clock> Guard<U, C> {
                 "tracked": engine.positions().len(),
                 "flows_applied": inner.ledger.flows_applied,
                 "flow_note": inner.ledger.flow_note,
+                // A ledger entry Guard cannot account for, and until when
+                // (epoch ms) it refuses new positions for it.
+                "ledger_unaccounted": inner.ledger.unaccounted.as_ref().map(|(text, _)| text),
+                "entries_refused_until_ms": Self::unaccounted_refusal(&inner, self.clock.now_ms())
+                    .and(inner.ledger.unaccounted.as_ref().map(|(_, until)| *until)),
                 "journal_ready": inner.risk.check_ready().is_ok(),
             },
             "equity_cap": inner.config.policy.max_trading_equity_usd,

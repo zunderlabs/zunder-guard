@@ -106,7 +106,8 @@ def test_transport_is_bounded_fixed_origin_get_and_no_redirect(
         def open(self, request: Any, *, timeout: int) -> Reply:
             calls.append(request.full_url)
             assert request.get_method() == "GET" and timeout == 30
-            assert request.data is None and request.headers == {}
+            assert request.data is None
+            assert request.headers == {"User-agent": "zunder-guard-release/1.0"}
             return Reply()
 
     def opener(handler: Any) -> Opener:

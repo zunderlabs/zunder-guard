@@ -9,10 +9,14 @@ if (remote) {
     throw new Error('remote journeys require debug logging disabled to protect credentials');
   }
   requireHttps(remote, 'staging');
-  for (const name of ['GUARD_ORDER_TOKEN', 'GUARD_INBOX_TOKEN', 'GUARD_INBOX_URL', 'GUARD_EMAIL_DOMAIN', 'GUARD_ACCESS_CLIENT_ID', 'GUARD_ACCESS_CLIENT_SECRET']) {
+  const approvalOnly = process.env['GUARD_PAID_JOURNEY'] === 'P8';
+  const required = approvalOnly
+    ? ['GUARD_ACCESS_CLIENT_ID', 'GUARD_ACCESS_CLIENT_SECRET']
+    : ['GUARD_ORDER_TOKEN', 'GUARD_INBOX_TOKEN', 'GUARD_INBOX_URL', 'GUARD_EMAIL_DOMAIN', 'GUARD_ACCESS_CLIENT_ID', 'GUARD_ACCESS_CLIENT_SECRET'];
+  for (const name of required) {
     if (!process.env[name]) throw new Error(`missing environment variable: ${name}`);
   }
-  requireHttps(process.env['GUARD_INBOX_URL'] ?? '', 'inbox');
+  if (!approvalOnly) requireHttps(process.env['GUARD_INBOX_URL'] ?? '', 'inbox');
   headers['CF-Access-Client-Id'] = process.env['GUARD_ACCESS_CLIENT_ID'] ?? '';
   headers['CF-Access-Client-Secret'] = process.env['GUARD_ACCESS_CLIENT_SECRET'] ?? '';
 }

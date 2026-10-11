@@ -40,10 +40,12 @@ zunder-risk.workspace = true
 zunder-venue.workspace = true
 # Hyperliquid's price and size grid (`InstrumentRules`).
 zunder-venue-types.workspace = true
+# Guard core's stop rule (`OpenOrderView`, the covering stop), so that what
+# this server shows and pre-checks is what Guard judges; also holds this
+# server's action builders to Guard core's encoding (`sign.rs` tests).
+zunder-guard-core.workspace = true
 
 [dev-dependencies]
-# Holding this server's action builders to Guard core's encoding (`sign.rs`).
-zunder-guard-core.workspace = true
 zunder-guard-mcp = { path = ".", features = ["test-hooks"] }
 
 [lints]

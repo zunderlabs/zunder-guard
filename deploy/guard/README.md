@@ -11,7 +11,7 @@ is what we built, and what it talks to.
 | `Dockerfile`, `Dockerfile.dockerignore`, `compose.yaml` | Image (static, distroless, non-root, two architectures) and Compose |
 | `systemd/zunder-guard.service` | The hardened unit for servers |
 | `templates/` | AWS (`cloudformation.yaml`); other provider templates are deferred |
-| `github/workflows/` | `release.yml`, `publish.yml`, `ci.yml` for `github.com/zunderlabs/zunder-guard` (kept outside `.github/`, so nothing runs here) |
+| `github/workflows/` | `ci`, `release`, `verify`, `promote`, `nightly`, `monitor`, plus reusable install/journey consumers for the public repository (kept outside `.github/` here) |
 | `github/build-release.sh`, `packaging/` | Reproducible builds and archives; the Homebrew formula's template |
 | `rules/` | Rules schema v1: Rust crate `zunder-guard-rules`, `zr1.ts`, `schema-v1.json`, `vectors.json` |
 | `test/` | Every test, run on the Linux build host |
@@ -393,7 +393,7 @@ and WebSocket on port 443. It listens on 127.0.0.1:8547. No telemetry or relay i
 Optional licence renewal is off by default:
 `licence_auto_update = true` with a renewal token also contacts
 `zunderlabs.com/api/licence/renewal` over HTTPS, from 14 days before expiry, at most every
-6 hours. Licence verification itself stays offline. To see the connections for yourself:
+6 hours (a testnet licence from Orcastrate's staging checkout: `staging.zunderlabs.com` instead). Licence verification itself stays offline. To see the connections for yourself:
 
 ```sh
 sudo ss -tnp | grep zunder-guard     # every open connection of the process
@@ -454,18 +454,18 @@ padding, canonical: no stray bits) of a JSON object, at most 4,096 characters in
 `vectors.json` holds 11 valid and 53 invalid cases that both pass (the canonical strings were
 computed by a third, independent Python implementation).
 
-| Field | Default | Allowed (provisional) |
+| Field | Default | Allowed |
 |---|---|---|
 | `v` | (required) | 1 |
-| `maxLeverage` | 5 | above 0, at most 10 |
-| `maxLossAtStopPct` | 2 | above 0, at most 5 |
+| `maxLeverage` | 5 | above 0, at most 50 |
+| `maxLossAtStopPct` | 2 | above 0, at most 25 |
 | `stopPolicy` | `"attach"` | `"attach"` (Guard attaches a stop and sizes from it), `"refuse"` |
 | `defaultStopDistancePct` (optional) | 2 | above 0, at most 50: where the attached stop goes |
 | `minLiqDistancePct` | 10 | 1 to 50 |
-| `maxPositionPct` | 200 | above 0, at most 1000, and at most `maxLeverage` × 100 |
-| `maxOpenRiskPct` | 6 | above 0, at most 20, and at least `maxLossAtStopPct` |
-| `dailyLossStopPct` | 6 | above 0, at most 15 |
-| `drawdownHaltPct` | 25 | above 0, at most 50 |
+| `maxPositionPct` | 200 | above 0, at most 5000, and at most `maxLeverage` × 100 |
+| `maxOpenRiskPct` | 6 | above 0, at most 100, and at least `maxLossAtStopPct` |
+| `dailyLossStopPct` | 6 | above 0, at most 50 |
+| `drawdownHaltPct` | 25 | above 0, at most 90 |
 | `markets` | `["*"]` (every market of the main dex) | 1 to 32 unique entries: names `^[A-Za-z0-9@][A-Za-z0-9:/@._-]{0,31}$`, `dex:*` (`^[A-Za-z0-9]{1,30}:\*$`, every market of that HIP-3 dex) and `*`, which stands alone among main-dex names but may stand beside HIP-3 entries; no market beside its own dex's `dex:*`. A HIP-3 market (`dex:COIN`) is never covered by `*`. The two HIP-3 forms were refused by earlier v1 decoders, so codes written before decode unchanged. Guard itself reads at most two HIP-3 dexes. |
 
 `requireStop` is gone: with either stop policy no entry is ever without a stop (the risk engine
@@ -476,11 +476,13 @@ the default; unknown fields and out-of-bounds values are refused. The encoder al
 every field, `defaultStopDistancePct` included, in the order above, numbers without trailing
 zeros.
 
-**The bounds are provisional.** Their source of truth is the Guard core's policy configuration
-(`crates/zunder-guard-core`, being built); align `number_bounds()` in `lib.rs`, `NUMBER_BOUNDS`
-in `zr1.ts`, `schema-v1.json` and the vectors to it once it lands (the tests keep the four
-equal). Until then the risk-engine values are capped at `RiskLimits::aggressive()`, so no rules
-string goes beyond what `zunder-risk` allows. Their defaults are Guard core's own preset
+**The bounds are the Guard core's policy bounds** (the `…_BOUNDS` constants in
+`crates/zunder-guard-core/src/policy.rs`), which `number_bounds()` in `lib.rs` reads;
+`NUMBER_BOUNDS` in `zr1.ts`, `schema-v1.json` and the vectors follow them (the tests keep the
+four equal). The maxima were widened by decision on 11 Oct 2026 ("Guard's maximum bounds
+widened"): they are what a person may set, not advice, and on mainnet the mainnet
+ceiling still applies. A code with the wider values is refused by a decoder built before.
+Their defaults are Guard core's own preset
 (`Policy::guard_defaults()`), not read from `RiskLimits::default()`; tests pin both.
 
 Checks, in order (the first failure is reported; codes are shared): length (`too_long`),
@@ -493,21 +495,28 @@ then `markets` (`markets`) and the two cross-field rules (`open_risk_below_trade
 
 ## Release pipeline and publishing
 
-`github/workflows/release.yml` (tag → assembled prerelease, image, provenance),
-`publish.yml` (legacy stable-release publisher), `ci.yml` (checks on every push). Actions are pinned by commit; `slsa-github-generator` by tag, as it
-requires. Permissions are per job; nothing runs on `pull_request_target`. Linux and both macOS
-architectures build and install natively; Windows uses MSVC. Publishing requires successful
-completed CI and release runs for the tag commit, every signed asset, and a verified immutable
-image digest covered by `SHA256SUMS`, and complete identified maintainer-attested native
-observations bound to those exact assets. The new automated prerelease transition is separate
-from canonical promotion. Lifecycle staging, the complete journey gate and automatic promotion
-are still being integrated; a prerelease alone does not grant channel admission. The retained
-`github/promote-release.sh` and downstream publisher enforce the legacy promotion gate.
-`github/verify-release-assets.sh` verifies build subjects only. See
-[Native readiness and promotion](github/NATIVE-READINESS.md). Prereleases do not promote
-packages or `latest`. Homebrew and AWS additionally require their own exact public-entrypoint
-attestations before their publisher jobs acquire write credentials; native service evidence
-alone does not establish those channels.
+`ci.yml` checks exported source on every push and pull request with a fixed property seed.
+`release.yml` builds, reproduces and signs immutable subjects, runs native source prerequisites,
+and assembles a prerelease. `verify.yml` stages authenticated subjects and calls the full install,
+purchase, testnet and SDK matrix; its aggregate independently verifies all required evidence.
+Only a stable tag with its own complete gate can enter `promote.yml`. Promotion publishes the
+canonical channels, runs fresh-runner installation smoke, and withdraws and restores captured
+prior subjects when publication or smoke fails. A release candidate cannot promote channels.
+
+`nightly.yml` first authenticates the latest promoted complete gate and exact canonical bytes,
+then reruns I1/I3/I4/I5 and staging P1 using those subjects, plus property tests on the promoted
+source with a recorded random seed. Nightly uses the current harness and cannot retrospectively
+attest a release gate. `monitor.yml` runs P9 every 30 minutes against C5 only: exact authenticated
+canonical subjects, branded pages, checkout status, dry-run quotes, malformed renewal refusal
+and fresh issuer heartbeat. Failure alerts use GitHub workflow notifications and the bounded
+production email seam. Scheduled checks do not trade, promote or restore channels.
+
+These flows are implemented in source; complete hosted verification, promotion smoke,
+rollback and scheduled runs still require actual successful evidence for a release claim.
+Fixture CI or an assembled prerelease cannot substitute for that evidence. Actions are pinned
+by commit, with the SLSA generator pinned by its required version tag. Permissions are scoped
+per job; nothing runs on `pull_request_target`. The standalone operator publication, native
+service and licence-verifier workflows have been absorbed into these required flows.
 
 The versioned AWS template publisher accepts `--staging` for `vX.Y.Z-rc.N` rehearsals;
 without it, stable tags are required. Both modes create only the immutable

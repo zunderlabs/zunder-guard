@@ -28,7 +28,7 @@ use zunder_guard::{
     testdir::TestDir,
 };
 use zunder_guard_core::{
-    action::Action,
+    action::{Action, Protection},
     auth::AuthConfig,
     event::EventBody,
     licence::FeeMode,

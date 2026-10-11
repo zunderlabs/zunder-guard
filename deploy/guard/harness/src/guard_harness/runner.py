@@ -26,6 +26,7 @@ def run(
     env: Mapping[str, str] | None = None,
     secrets: Sequence[str] = (),
     sensitive_output: bool = False,
+    sensitive_stdout: bool = False,
     stdin: bytes | None = None,
 ) -> RunResult:
     """Execute without a shell. Secrets must enter through stdin/env, never argv.
@@ -49,11 +50,19 @@ def run(
             input=stdin,
         )
         output = completed.stdout
-        diagnostic_output = completed.stdout + completed.stderr
+        diagnostic_output = (
+            b"[sensitive stdout withheld]\n" + completed.stderr
+            if sensitive_stdout
+            else completed.stdout + completed.stderr
+        )
         returncode = completed.returncode
     except subprocess.TimeoutExpired as error:
         output = (error.stdout or b"") + (error.stderr or b"") + b"\ncommand timed out\n"
-        diagnostic_output = output
+        diagnostic_output = (
+            b"[sensitive stdout withheld]\n" + (error.stderr or b"") + b"\ncommand timed out\n"
+            if sensitive_stdout
+            else output
+        )
         returncode = 124
     text = output.decode("utf-8", errors="replace")
     diagnostic_text = diagnostic_output.decode("utf-8", errors="replace")
@@ -61,6 +70,8 @@ def run(
         if secret:
             text = text.replace(secret, "[REDACTED]")
             diagnostic_text = diagnostic_text.replace(secret, "[REDACTED]")
+    if sensitive_stdout:
+        diagnostic_text = diagnostic_text[-65536:]
     # pair --json creates a key unknown before invocation. Retaining that output
     # would leak it into CI artifacts; keep only a marker for sensitive commands.
     logged = "[sensitive command output withheld]\n" if sensitive_output else diagnostic_text

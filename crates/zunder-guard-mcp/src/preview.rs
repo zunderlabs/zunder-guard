@@ -20,6 +20,7 @@ use rust_decimal::{Decimal, dec};
 use serde::Serialize;
 use serde_json::{Value, json};
 use zunder_core::Side;
+use zunder_venue_types::{passive, toward_position};
 
 use crate::{
     contract::{ENTRY_PRICE_BOUND, GuardPreview, ROUND_TRIP_COST, reason_for},
@@ -113,25 +114,25 @@ pub fn entry_price(
     side: Side,
     limit: Option<Decimal>,
 ) -> Option<Decimal> {
-    let bound = match side {
-        Side::Buy => mid
-            .checked_mul(Decimal::ONE + ENTRY_PRICE_BOUND)
-            .and_then(|price| market.round_price(price, false))?,
-        Side::Sell => mid
-            .checked_mul(Decimal::ONE - ENTRY_PRICE_BOUND)
-            .and_then(|price| market.round_price(price, true))?,
+    let factor = match side {
+        Side::Buy => Decimal::ONE + ENTRY_PRICE_BOUND,
+        Side::Sell => Decimal::ONE - ENTRY_PRICE_BOUND,
     };
-    match (side, limit) {
-        (_, None) => Some(bound),
-        (Side::Buy, Some(limit)) => market.round_price(limit.min(bound), false),
-        (Side::Sell, Some(limit)) => market.round_price(limit.max(bound), true),
-    }
+    let bound = mid
+        .checked_mul(factor)
+        .and_then(|price| market.round_price(price, passive(side)))?;
+    let price = match (side, limit) {
+        (_, None) => bound,
+        (Side::Buy, Some(limit)) => limit.min(bound),
+        (Side::Sell, Some(limit)) => limit.max(bound),
+    };
+    market.round_price(price, passive(side))
 }
 
 /// A stop for a `side` entry on the venue's grid, rounded towards the price:
 /// tighter than asked, never looser.
 pub fn round_stop(market: &Market, side: Side, stop: Decimal) -> Option<Decimal> {
-    market.round_price(stop, side == Side::Buy)
+    market.round_price(stop, toward_position(side))
 }
 
 fn text(value: Option<Decimal>) -> Value {
@@ -330,6 +331,17 @@ mod tests {
         assert_eq!(
             entry_price(&btc(), dec!(60000), Side::Sell, None),
             Some(dec!(59700))
+        );
+        // Towards the passive side off the grid: from a mid of 60,000.5 a
+        // market buy's bound 60,300.5025 goes down to 60,300, a market
+        // sell's 59,700.4975 up to 59,701.
+        assert_eq!(
+            entry_price(&btc(), dec!(60000.5), Side::Buy, None),
+            Some(dec!(60300))
+        );
+        assert_eq!(
+            entry_price(&btc(), dec!(60000.5), Side::Sell, None),
+            Some(dec!(59701))
         );
         // Stops round towards the price: up for a buy, down for a sell.
         assert_eq!(

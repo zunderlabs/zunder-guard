@@ -1,6 +1,6 @@
 [package]
 name = "zunder-hl-protocol"
-description = "Hyperliquid's protocol rules, implemented once: MessagePack actions, L1 action hashes and phantom-agent signatures, addresses, networks and the price grid. No I/O; compiles natively and to wasm32-unknown-unknown"
+description = "Hyperliquid's protocol rules, implemented once: the order-path action model, MessagePack actions, L1 action hashes and phantom-agent signatures, addresses, networks and the price grid. No I/O; compiles natively and to wasm32-unknown-unknown"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

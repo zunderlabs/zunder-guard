@@ -23,6 +23,34 @@ class VerifiedPredicate:
     predicate: dict[str, Any]
     workflow: str
     source_commit: str
+    invocation_uri: str = ""
+    run_id: str = ""
+    run_attempt: str = ""
+
+
+def invocation_run(uri: str) -> tuple[str, str]:
+    """Canonical public invocation identity, never an artifact-name or predicate claim."""
+    match = re.fullmatch(
+        re.escape(f"https://github.com/{REPOSITORY}/actions/runs/")
+        + r"([1-9][0-9]*)/attempts/([1-9][0-9]*)",
+        uri,
+    )
+    if match is None:
+        raise AttestationError("expected exact public HTTPS workflow invocation URI")
+    return match.group(1), match.group(2)
+
+
+def expected_invocation(run_id: str | None, attempt: str | None) -> tuple[str, str] | None:
+    if run_id is None and attempt is None:
+        return None
+    if (
+        not isinstance(run_id, str)
+        or not isinstance(attempt, str)
+        or re.fullmatch(r"[1-9][0-9]*", run_id) is None
+        or re.fullmatch(r"[1-9][0-9]*", attempt) is None
+    ):
+        raise AttestationError("expected run and attempt must be paired canonical positive IDs")
+    return run_id, attempt
 
 
 def verify_predicate(
@@ -34,12 +62,15 @@ def verify_predicate(
     tag: str,
     predicate_type: str,
     log: Path,
+    expected_run_id: str | None = None,
+    expected_run_attempt: str | None = None,
 ) -> VerifiedPredicate:
     """Authenticate signer, issuer, hosted runner, source commit and predicate type.
 
     gh also checks the subject's digest against the file. This function does not
     accept a claimed predicate from an unverified bundle or a caller-provided JSON.
     """
+    expected = expected_invocation(expected_run_id, expected_run_attempt)
     if workflow not in WORKFLOWS:
         raise AttestationError("untrusted signer workflow")
     if not re.fullmatch(r"[0-9a-f]{40}", commit):
@@ -90,4 +121,16 @@ def verify_predicate(
     predicate = statement.get("predicate")
     if not isinstance(predicate, dict):
         raise AttestationError("verified predicate must be an object")
-    return VerifiedPredicate(predicate, workflow, commit)
+    # gh documents signature.certificate as authenticated OIDC metadata. Predicate
+    # invocation claims and raw bundle/certificate bytes are never fallback sources.
+    signature = entry["verificationResult"].get("signature")
+    certificate = signature.get("certificate") if isinstance(signature, dict) else None
+    uri = certificate.get("runInvocationURI") if isinstance(certificate, dict) else None
+    if not isinstance(uri, str):
+        raise AttestationError("verified certificate invocation URI missing")
+    run_id, attempt = invocation_run(uri)
+    if expected is not None and (run_id, attempt) != expected:
+        raise AttestationError(
+            "authenticated workflow run or attempt differs from expected invocation"
+        )
+    return VerifiedPredicate(predicate, workflow, commit, uri, run_id, attempt)

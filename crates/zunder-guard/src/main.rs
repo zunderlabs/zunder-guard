@@ -1964,14 +1964,20 @@ fn licence_show(paths: &Paths, target: &TargetArgs, json: bool) -> Result<()> {
     ) {
         println!("{line}");
     }
-    println!(
-        "automatic renewal: {}",
-        if config.licence_auto_update {
-            "on (asks zunderlabs.com for a renewed key from 14 days before the end)"
-        } else {
-            "off (nothing is fetched; set licence_auto_update and licence_renewal_token to switch it on)"
-        }
-    );
+    if config.licence_auto_update {
+        let origin = licence_life::renewal_origin(
+            config.licence.as_deref(),
+            &licence_life::issuers_for(&config),
+        );
+        println!(
+            "automatic renewal: on (asks {} for a renewed key from 14 days before the end)",
+            origin.host()
+        );
+    } else {
+        println!(
+            "automatic renewal: off (nothing is fetched; set licence_auto_update and licence_renewal_token to switch it on)"
+        );
+    }
     let target = target.resolve(paths)?;
     match guard_status(&target) {
         Some(status) => println!(
@@ -1998,9 +2004,9 @@ async fn renew_forever(path: PathBuf) {
             // Every issuer key built in; `renew_once` keeps only those that
             // count on the config's network (mainnet: production only).
             let issuers = licence::LicenceIssuers::built_in(licence::FeeNetwork::Testnet);
-            let result = licence_life::renew_once(&path, &issuers, now, |body| {
+            let result = licence_life::renew_once(&path, &issuers, now, |origin, body| {
                 asked = true;
-                post_renewal(body)
+                post_renewal(origin, body)
             })
             .await;
             if asked {
@@ -2027,14 +2033,23 @@ async fn renew_forever(path: PathBuf) {
     }
 }
 
-/// One request to the licence service: its HTTP status and JSON answer.
-async fn post_renewal(body: Value) -> std::result::Result<(u16, Value), String> {
+/// One request to the licence service at `origin` (chosen by
+/// `licence_life::renewal_origin` from the licence key, a compiled-in URL):
+/// its HTTP status and JSON answer. No redirect is followed and only https
+/// is spoken, so the renewal token in `body` reaches that origin and no
+/// other; a redirect is answered as its own status, which is an error.
+async fn post_renewal(
+    origin: licence_life::RenewalOrigin,
+    body: Value,
+) -> std::result::Result<(u16, Value), String> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_millis(licence_life::REQUEST_TIMEOUT_MS))
+        .redirect(reqwest::redirect::Policy::none())
+        .https_only(true)
         .build()
         .map_err(|error| error.to_string())?;
     let mut response = client
-        .post(licence_life::RENEWAL_URL)
+        .post(origin.url())
         .header("content-type", "application/json")
         .body(body.to_string())
         .send()

@@ -566,7 +566,6 @@ jobs:
       - name: Publication gate regressions (no network or signing)
         run: |
           python3 -B deploy/guard/test/release-policy.py
-          python3 -B deploy/guard/test/native-readiness.py
           python3 -B deploy/guard/test/macos-shell.py
           python3 -B deploy/guard/github/test_publish_loaders.py
       - name: Workflow security audit
@@ -670,10 +669,37 @@ jobs:
           if-no-files-found: warn
           retention-days: 7
 
+  licence-verifier:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Check public fixture orchestration
+        run: node --test deploy/guard/test/test-licence-verifier.mjs
+      - name: Compile the bounded offline staging verifier
+        run: |
+          rustup toolchain install
+          cargo check --locked -p zunder-guard-core --example verify_testnet_licence
+          cargo clippy --locked -p zunder-guard-core --example verify_testnet_licence -- -D warnings
+          cargo build --locked -p zunder-guard-core --example verify_testnet_licence
+      - name: Check the real Linux executable with public fixture signatures
+        run: |
+          mkdir verifier-evidence
+          node deploy/guard/test/licence-verifier.mjs "$PWD/target/debug/examples/verify_testnet_licence" verifier-evidence/receipt.json
+          cp target/debug/examples/verify_testnet_licence verifier-evidence/
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: staging-licence-verifier-${{ github.sha }}
+          path: verifier-evidence/
+          if-no-files-found: error
+          retention-days: 30
+
   ci:
     name: ci
     if: always()
-    needs: [provenance, rust, windows, macos-service, deny, rules-typescript, scripts, image, harness, journeys]
+    needs: [provenance, rust, windows, macos-service, deny, rules-typescript, scripts, image, harness, journeys, licence-verifier]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     env:
@@ -685,6 +711,6 @@ jobs:
           import json, os
           results = json.loads(os.environ['REQUIRED_RESULTS'])
           expected = {'provenance', 'rust', 'windows', 'macos-service', 'deny',
-                      'rules-typescript', 'scripts', 'image', 'harness', 'journeys'}
+                      'rules-typescript', 'scripts', 'image', 'harness', 'journeys', 'licence-verifier'}
           assert set(results) == expected, 'Unexpected CI dependency set'
           assert all(job['result'] == 'success' for job in results.values()), 'A required CI dependency did not succeed'

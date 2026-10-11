@@ -11,7 +11,9 @@ from guard_harness.runner import RunError, RunResult
 TYPE = "https://example.com/predicate/v1"
 
 
-def verify(tmp_path: Path) -> attestation.VerifiedPredicate:
+def verify(
+    tmp_path: Path, *, run_id: str | None = None, attempt: str | None = None
+) -> attestation.VerifiedPredicate:
     return attestation.verify_predicate(
         tmp_path / "manifest.json",
         tmp_path / "bundle.json",
@@ -20,6 +22,8 @@ def verify(tmp_path: Path) -> attestation.VerifiedPredicate:
         tag="v1.0.0",
         predicate_type=TYPE,
         log=tmp_path / "verification.log",
+        expected_run_id=run_id,
+        expected_run_attempt=attempt,
     )
 
 
@@ -60,13 +64,23 @@ def test_reads_only_authenticated_predicate(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     result = [
-        {"verificationResult": {"statement": {"predicateType": TYPE, "predicate": {"revision": 1}}}}
+        {
+            "verificationResult": {
+                "statement": {"predicateType": TYPE, "predicate": {"revision": 1}},
+                "signature": {
+                    "certificate": {
+                        "runInvocationURI": "https://github.com/zunderlabs/zunder-guard/actions/runs/123/attempts/2"
+                    }
+                },
+            }
+        }
     ]
     install_verifier(monkeypatch, tmp_path, result)
     verified = verify(tmp_path)
     assert verified.predicate == {"revision": 1}
     assert verified.source_commit == "a" * 40
     assert verified.workflow == "verify.yml"
+    assert verified.run_id == "123" and verified.run_attempt == "2"
 
 
 @pytest.mark.parametrize(
@@ -97,3 +111,87 @@ def test_signature_verification_failure_propagates(
     monkeypatch.setattr(attestation, "run", fail)
     with pytest.raises(RunError, match="bad signature"):
         verify(tmp_path)
+
+
+def authenticated(uri: object) -> list[dict[str, Any]]:
+    return [
+        {
+            "verificationResult": {
+                "statement": {"predicateType": TYPE, "predicate": {"revision": 1}},
+                "signature": {"certificate": {"runInvocationURI": uri}},
+            }
+        }
+    ]
+
+
+@pytest.mark.parametrize("run_id,attempt", [("123", "2"), (None, None)])
+def test_exact_invocation_from_official_verified_certificate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, run_id: str | None, attempt: str | None
+) -> None:
+    uri = "https://github.com/zunderlabs/zunder-guard/actions/runs/123/attempts/2"
+    install_verifier(monkeypatch, tmp_path, authenticated(uri))
+    value = verify(tmp_path, run_id=run_id, attempt=attempt)
+    assert value.invocation_uri == uri and value.run_id == "123" and value.run_attempt == "2"
+
+
+@pytest.mark.parametrize(
+    "uri",
+    [
+        "https://github.com/zunderlabs/zunder-guard/actions/runs/124/attempts/2",
+        "https://github.com/zunderlabs/zunder-guard/actions/runs/123/attempts/3",
+    ],
+)
+def test_same_commit_predicate_from_other_run_or_attempt_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, uri: str
+) -> None:
+    install_verifier(monkeypatch, tmp_path, authenticated(uri))
+    with pytest.raises(attestation.AttestationError, match="differs from expected invocation"):
+        verify(tmp_path, run_id="123", attempt="2")
+
+
+@pytest.mark.parametrize(
+    "uri",
+    [
+        None,
+        {},
+        123,
+        "https://github.com/other/repo/actions/runs/123/attempts/2",
+        "https://github.com/zunderlabs/zunder-guard/actions/runs/0123/attempts/2",
+        "https://github.com/zunderlabs/zunder-guard/actions/runs/123",
+        "https://github.com/zunderlabs/zunder-guard/actions/runs/123/attempts/2?run=123",
+        "https://github.com/zunderlabs/zunder-guard/actions/runs/123/attempts/2\n",
+    ],
+)
+def test_missing_or_noncanonical_verified_invocation_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, uri: object
+) -> None:
+    install_verifier(monkeypatch, tmp_path, authenticated(uri))
+    with pytest.raises(attestation.AttestationError):
+        verify(tmp_path, run_id="123", attempt="2")
+
+
+def test_raw_bundle_and_predicate_run_claims_cannot_replace_verified_certificate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    uri = "https://github.com/zunderlabs/zunder-guard/actions/runs/123/attempts/2"
+    response = authenticated(uri)
+    result = response[0]["verificationResult"]
+    del result["signature"]
+    result["statement"]["predicate"]["runInvocationURI"] = uri
+    response[0]["attestation"] = {"certificate": {"runInvocationURI": uri}}
+    install_verifier(monkeypatch, tmp_path, response)
+    with pytest.raises(
+        attestation.AttestationError, match="verified certificate invocation URI missing"
+    ):
+        verify(tmp_path, run_id="123", attempt="2")
+
+
+@pytest.mark.parametrize("run_id,attempt", [("123", None), (None, "2"), ("0", "2"), ("123", "02")])
+def test_expected_invocation_must_be_complete_canonical_pair(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, run_id: str | None, attempt: str | None
+) -> None:
+    monkeypatch.setattr(
+        attestation, "run", lambda *args, **kwargs: pytest.fail("must validate first")
+    )
+    with pytest.raises(attestation.AttestationError, match="paired canonical positive IDs"):
+        verify(tmp_path, run_id=run_id, attempt=attempt)

@@ -367,6 +367,74 @@ async fn after_a_crash_guard_asks_the_venue_what_became_of_unanswered_actions() 
     let _: PathBuf = path;
 }
 
+/// A recovery that panics (here: the venue's `orderStatus` read) serves
+/// bots again, its flag cleared on the way out (`ClearOnDrop`), and what
+/// the binary does then (`main.rs`: a panicked recovery task calls
+/// `recovery_failed`) raises an alert and journals an error record.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_recovery_that_panics_serves_bots_again_with_an_alert() {
+    let dir = TestDir::new("journal-recovery-panic");
+    let path = config(dir.path()).decision_journal(false);
+    let guard = start_with(dir.path(), venue(), true, SystemClock).await;
+    let venue = guard.upstream().fork();
+    drop(guard);
+    // An intent on disk when the process died, its order never answered.
+    let mut journal = DecisionJournal::open(&path).unwrap();
+    let action = json!({"type": "order", "orders": [{"a": 1, "b": true, "p": "3000", "s": "0.1",
+        "r": false, "t": {"limit": {"tif": "Ioc"}}, "c": "0x7a680000000000000000000000000002"}],
+        "grouping": "na"});
+    journal
+        .append(
+            Timestamp::from_millis(SystemClock.now_ms() as i64),
+            EventBody::Intent { of: 0, action },
+        )
+        .unwrap();
+    drop(journal);
+    venue.panic_on_info("orderStatus");
+    let guard = start_with(dir.path(), venue, false, SystemClock).await;
+    let pending = guard.pending_for_recovery().await;
+    assert_eq!(pending.len(), 1);
+    guard.set_recovering(true);
+    assert!(guard.recovering());
+    let task = tokio::spawn({
+        let guard = guard.clone();
+        async move { guard.recover_after(pending, 0, 90_000).await }
+    });
+    let error = task.await.unwrap_err();
+    assert!(error.is_panic(), "{error}");
+    assert!(!guard.recovering());
+    guard.recovery_failed().await;
+    let text = "recovery after a restart failed: what became of the actions sent before it is not known; check the account";
+    let status = guard.status().await;
+    assert!(
+        status["alerts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|alert| alert == text),
+        "{status}"
+    );
+    let events = guard.events(0).await;
+    let errors = events
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|event| event["kind"] == "error" && event["text"] == text)
+        .count();
+    assert_eq!(errors, 1, "{events}");
+    // Nothing was concluded for the intent: it is still pending for the
+    // next start.
+    assert!(
+        !events
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|event| event["kind"] == "recovered"),
+        "{events}"
+    );
+    assert_eq!(guard.pending_for_recovery().await.len(), 1);
+}
+
 /// While the decision journal cannot be written,
 /// no new position is opened, but Guard still flattens and protects, each
 /// action recorded in the emergency log first, with an alert.

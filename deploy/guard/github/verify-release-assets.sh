@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Draft asset verification only: signatures, checksums, provenance and source CI.
-# This does NOT authorize customer publication; use verify-release.sh or promote-release.sh.
+# Build authentication alone does not authorize publication; verify.yml and promote.yml require the complete authenticated journey gate.
 set -euo pipefail
 [ $# -eq 2 ] || { echo "usage: verify-release-assets.sh <vX.Y.Z> <empty-output-dir>" >&2; exit 2; }
 TAG=$1 OUT=$2

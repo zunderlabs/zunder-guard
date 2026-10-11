@@ -242,6 +242,10 @@ impl<U: Upstream, C: Clock> Guard<U, C> {
             decision = ReasonCode::Journal.veto(format!(
                 "the risk journal does not allow new positions: {error}"
             ));
+        } else if opens && let Some(text) = Self::unaccounted_refusal(&inner, now) {
+            decision = ReasonCode::AccountUnreadable.veto(text);
+        } else if opens && let Some(text) = Self::pending_entry_refusal(&inner, now) {
+            decision = ReasonCode::AccountUnreadable.veto(text);
         } else if opens && let Some(text) = inner.fee.entry_refusal() {
             decision = ReasonCode::FeeNotApproved.veto(text);
         } else if is_modify(&request)
@@ -348,6 +352,16 @@ impl<U: Upstream, C: Clock> Guard<U, C> {
             decision = ReasonCode::AccountUnreadable.veto(
                 "the account's views have all been left out for 10 s or more (each may or may not show a deposit or withdrawal); new positions wait for one that can be read",
             );
+        }
+        // A ledger entry Guard cannot account for may have moved money:
+        // no new positions for the rest of the UTC day it was seen.
+        if opens && let Some(text) = Self::unaccounted_refusal(&inner, now) {
+            decision = ReasonCode::AccountUnreadable.veto(text);
+        }
+        // An earlier entry whose outcome is unknown may still arrive: the
+        // account as read does not show it, on its coin or in open risk.
+        if opens && let Some(text) = Self::pending_entry_refusal(&inner, now) {
+            decision = ReasonCode::AccountUnreadable.veto(text);
         }
         // What a forwarded request sends is the venue's weight too: within
         // the request budget, or refused (reduce-only orders always go).

@@ -6,9 +6,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any
-from urllib.parse import urlsplit
 
-from guard_harness.attestation import AttestationError, verify_predicate
+from guard_harness.attestation import (
+    AttestationError,
+    expected_invocation,
+    invocation_run,
+    verify_predicate,
+)
 from guard_harness.release_state import GATE_JOURNEYS
 from guard_harness.state_verifier import VerifiedState, authenticate_state
 
@@ -79,6 +83,13 @@ def _check(predicate: dict[str, Any], journey: str, commit: str, digest: str) ->
         raise AttestationError("mainnet coverage omits or changes a required check")
 
 
+def journey_invocation(bundles: Mapping[str, JourneyBundle]) -> tuple[str, str]:
+    identities = {invocation_run(evidence.reference) for evidence in bundles.values()}
+    if len(identities) != 1:
+        raise AttestationError("journey references must identify one exact run and attempt")
+    return next(iter(identities))
+
+
 def authenticate_journeys(
     manifest: Path,
     bundles: Mapping[str, JourneyBundle],
@@ -86,6 +97,8 @@ def authenticate_journeys(
     commit: str,
     tag: str,
     logs: Path,
+    expected_run_id: str | None = None,
+    expected_run_attempt: str | None = None,
 ) -> frozenset[str]:
     """Return a complete set only after each bundle passes the official verifier.
 
@@ -95,16 +108,10 @@ def authenticate_journeys(
     """
     if set(bundles) != GATE_JOURNEYS:
         raise AttestationError("gate requires exactly the complete automated journey set")
-    for evidence in bundles.values():
-        url = urlsplit(evidence.reference)
-        if (
-            url.scheme != "https"
-            or not url.hostname
-            or url.username
-            or url.password
-            or url.fragment
-        ):
-            raise AttestationError("journey reference must be a public HTTPS URL")
+    run_id, attempt = journey_invocation(bundles)
+    expected = expected_invocation(expected_run_id, expected_run_attempt)
+    if expected is not None and (run_id, attempt) != expected:
+        raise AttestationError("journey references identify a different requested run or attempt")
     manifest_bytes = manifest.read_bytes()
     digest = hashlib.sha256(manifest_bytes).hexdigest()
     with TemporaryDirectory(prefix="guard-evidence-") as directory:
@@ -129,6 +136,8 @@ def authenticate_journeys(
                 tag=tag,
                 predicate_type=PREDICATE_TYPE,
                 log=logs / f"{journey}.log",
+                expected_run_id=run_id,
+                expected_run_attempt=attempt,
             )
             _check(verified.predicate, journey, commit, digest)
     return GATE_JOURNEYS
@@ -147,6 +156,8 @@ def authenticate_gate(
     workflow: str,
     previous: VerifiedState,
     logs: Path,
+    expected_run_id: str | None = None,
+    expected_run_attempt: str | None = None,
 ) -> VerifiedState:
     """Authenticate journey evidence and lifecycle against the same captured bytes."""
     with TemporaryDirectory(prefix="guard-gate-") as directory:
@@ -154,8 +165,15 @@ def authenticate_gate(
         subject.write_bytes(manifest.read_bytes())
         subject.chmod(0o444)
         journeys = authenticate_journeys(
-            subject, journey_bundles, commit=commit, tag=tag, logs=logs
+            subject,
+            journey_bundles,
+            commit=commit,
+            tag=tag,
+            logs=logs,
+            expected_run_id=expected_run_id,
+            expected_run_attempt=expected_run_attempt,
         )
+        run_id, attempt = journey_invocation(journey_bundles)
         state = authenticate_state(
             subject,
             served,
@@ -168,6 +186,10 @@ def authenticate_gate(
             previous=previous,
             verified_journeys=journeys,
             log=logs / "lifecycle.log",
+            # Promotion is a separate invocation; verify staged/gated belongs to
+            # the same verified caller run as its journey attestations.
+            expected_run_id=run_id if workflow == "verify.yml" else None,
+            expected_run_attempt=attempt if workflow == "verify.yml" else None,
         )
     references = {journey: evidence.reference for journey, evidence in journey_bundles.items()}
     if state.predicate["evidence"] != references:

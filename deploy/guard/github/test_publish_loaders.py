@@ -126,29 +126,22 @@ assert.equal(worker.fetch(new Request('https://other.example/i')).status,404);
 
 
 class PublicationWiringTest(unittest.TestCase):
-    def setUp(self):
+    def test_canonical_publication_requires_exact_promoted_chain_and_rollback(self):
         import yaml
         workflows = Path(__file__).parent / 'workflows'
         if not workflows.is_dir():
             workflows = Path(__file__).resolve().parents[3] / '.github/workflows'
-        self.job = yaml.safe_load((workflows / 'publish.yml').read_text())['jobs']['installers']
-    def test_verified_serialized_protected_job(self):
-        self.assertEqual(self.job['needs'], 'verify')
-        self.assertEqual(self.job['environment'], 'installer-publish')
-        self.assertEqual(self.job['concurrency'], {'group':'guard-canonical-installers','cancel-in-progress':False})
-        self.assertEqual(self.job['permissions'], {'contents':'read'})
-        self.assertIn("github.repository == 'zunderlabs/zunder-guard'", self.job['if'])
-        self.assertIn('!github.event.release.draft', self.job['if'])
-        self.assertIn('!github.event.release.prerelease', self.job['if'])
-    def test_exact_artifacts_and_environment_only_credentials(self):
-        steps=self.job['steps']
-        self.assertTrue(all(len(step['uses'].rsplit('@',1)[1])==40 for step in steps if 'uses' in step))
-        fetch=next(step for step in steps if step.get('uses','').startswith('actions/download-artifact@'))
-        self.assertEqual(fetch['with']['name'],'verified')
-        publish=steps[-1]
-        self.assertEqual(publish['env']['CLOUDFLARE_API_TOKEN'],'${{ secrets.CLOUDFLARE_INSTALLER_TOKEN }}')
-        self.assertNotIn('TOKEN',publish['run'])
-        self.assertIn('--tag "$TAG"',publish['run'])
+        document = yaml.safe_load((workflows / 'promote.yml').read_text())
+        self.assertEqual(document['concurrency'], {'group': 'guard-release-promotion', 'cancel-in-progress': False})
+        self.assertEqual(document['jobs']['promote']['environment'], 'promote')
+        steps = document['jobs']['promote']['steps']
+        admission = next(i for i, step in enumerate(steps) if '--phase prepare' in step.get('run', ''))
+        publish = next(i for i, step in enumerate(steps) if '--phase publish' in step.get('run', ''))
+        self.assertLess(admission, publish)
+        self.assertEqual(steps[publish]['env']['INSTALLER_PUBLISH_TOKEN'], '${{ secrets.INSTALLER_PUBLISH_TOKEN }}')
+        self.assertEqual(document['jobs']['rollback']['needs'], ['promote', 'canonical-smoke'])
+        self.assertIn('always()', document['jobs']['rollback']['if'])
+        self.assertFalse((workflows / 'publish.yml').exists())
 
 
 if __name__ == '__main__': unittest.main()

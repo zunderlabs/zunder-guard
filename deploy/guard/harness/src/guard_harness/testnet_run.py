@@ -12,7 +12,7 @@ import sys
 import tarfile
 import time
 from pathlib import Path
-from typing import BinaryIO
+from typing import Any, BinaryIO
 
 from guard_harness.release_state import validate_build
 from guard_harness.runner import run
@@ -129,6 +129,8 @@ def execute_release(
     port: int,
     deadline: float,
     key_stdin: BinaryIO,
+    service_marker: str | None = None,
+    builder_approval: Path | None = None,
 ) -> int:
     """Calling reusable workflow owns global C6 serialization and the actual job deadline."""
     if (
@@ -145,8 +147,9 @@ def execute_release(
     if work.exists() or work.is_symlink() or not work.is_absolute():
         raise ProcessError("fresh private journey workspace required")
     work.mkdir(mode=0o700)
+    row = "T2" if service_marker is not None else "T1"
     receipt: dict[str, object] = {
-        "journey": "T1",
+        "journey": row,
         "tag": tag,
         "commit": commit,
         "account_sha256": hashlib.sha256(account.lower().encode()).hexdigest(),
@@ -177,18 +180,59 @@ def execute_release(
         )
         receipt.update(binary_sha256=digest, manifest_sha256=manifest_digest, stage="foreground")
         _receipt(work, receipt)
-        owner = Foreground(
-            work / "subject",
-            sha256=digest,
-            work=work / "runtime",
-            account=account,
-            api_wallet=api_wallet,
-            port=port,
-            key_stdin=key_stdin,
-        )
+        if service_marker is None:
+            owner = Foreground(
+                work / "subject",
+                sha256=digest,
+                work=work / "runtime",
+                account=account,
+                api_wallet=api_wallet,
+                port=port,
+                key_stdin=key_stdin,
+            )
+        else:
+            from guard_harness.testnet_service_owner import ServiceOwner
+
+            owner = ServiceOwner(
+                work / "subject",
+                sha256=digest,
+                work=work / "runtime",
+                account=account,
+                api_wallet=api_wallet,
+                port=port,
+                key_stdin=key_stdin,
+                assets=work / "assets",
+                tag=tag,
+                commit=commit,
+                marker=service_marker,
+            )
         receipt["stage"] = "journey"
         _receipt(work, receipt)
-        result = owner.journey(TestnetReads(), version=tag[1:], deadline=deadline)
+        reads = TestnetReads()
+        captured: dict[str, Any] = {}
+
+        def capture_entry(observed: object, begun: int, ended: int) -> None:
+            if builder_approval is None:
+                return
+            from guard_harness.testnet_process import OwnedLocalGuard
+            from guard_harness.testnet_protection import _orders
+
+            captured.update(
+                events=_orders(OwnedLocalGuard(owner).request("/guard/events?since=0")),
+                fills=_orders(
+                    reads({"type": "userFillsByTime", "user": account, "startTime": begun})
+                ),
+                started_ms=begun,
+                ended_ms=ended,
+            )
+
+        # Raw account events/fills stay in memory and never enter artifact uploads.
+        if builder_approval is None:
+            result = owner.journey(reads, version=tag[1:], deadline=deadline)
+        else:
+            result = owner.journey(
+                reads, version=tag[1:], deadline=deadline, capture_entry=capture_entry
+            )
         receipt.update(
             result="passed" if result.passed else "failed",
             failure=result.failure,
@@ -210,19 +254,61 @@ def execute_release(
                 "scan": result.cleaned.flat_scan,
             }
         if result.passed:
+            if builder_approval is not None:
+                from guard_harness.builder_journey import correlate_fee, produce_descriptor
+
+                descriptor = produce_descriptor(
+                    work / "assets",
+                    work / "builder-subject",
+                    account=account,
+                    tag=tag,
+                    commit=commit,
+                )
+                proof = correlate_fee(
+                    json.loads(descriptor.read_bytes()),
+                    json.loads(_read(builder_approval, 65536)),
+                    receipt,
+                    client=owner.pair.address.lower(),
+                    **captured,
+                )
+                with (work / "P8.fee-proof.json").open("x") as stream:
+                    stream.write(json.dumps(proof) + "\n")
+                with (work / "P8.predicate.json").open("x") as stream:
+                    stream.write(
+                        json.dumps(
+                            {
+                                "schema": 1,
+                                "journey": "P8",
+                                "commit": commit,
+                                "manifest_sha256": manifest_digest,
+                                "result": "passed",
+                                "tier": "e2e",
+                                "coverage": [
+                                    "staging-approve",
+                                    "testnet-owner-approval",
+                                    "guard-builder-wire",
+                                    "actual-builder-fee",
+                                    "owned-cleanup",
+                                    "all-dex-flat",
+                                ],
+                            }
+                        )
+                        + "\n"
+                    )
             predicate = {
                 "schema": 1,
-                "journey": "T1",
+                "journey": row,
                 "commit": commit,
                 "manifest_sha256": manifest_digest,
                 "result": "passed",
                 "tier": "e2e",
                 "coverage": ["signed-release", "protected-entry", "owned-cleanup", "all-dex-flat"],
             }
-            with (work / "T1.predicate.json").open("x") as stream:
+            with (work / f"{row}.predicate.json").open("x") as stream:
                 stream.write(json.dumps(predicate) + "\n")
         return 0 if result.passed else 1
     except (Exception, KeyboardInterrupt):
+        receipt["result"] = "failed"
         receipt["failure"] = "journey_incomplete_keep_protection"
         return 1
     finally:
@@ -239,6 +325,8 @@ def main() -> int:
         parser.add_argument("--" + name, required=True)
     parser.add_argument("--work", type=Path, required=True)
     parser.add_argument("--port", type=int, default=18547)
+    parser.add_argument("--service-marker")
+    parser.add_argument("--builder-approval", type=Path)
     parser.add_argument(
         "--deadline",
         type=float,

@@ -12,6 +12,7 @@ use std::collections::HashMap;
 use rust_decimal::Decimal;
 use serde_json::{Value, json};
 use zunder_core::{Side, Symbol};
+use zunder_guard_core::account::{OpenOrderView, covering_stop_among, parse_open_order};
 use zunder_venue_types::{InstrumentRules, Round};
 
 use crate::{contract::decimal_value, sanitize};
@@ -40,10 +41,11 @@ impl Market {
         self.rules.round_qty(qty, Round::Down)
     }
 
-    /// `price` on the venue's grid, rounded up or down.
-    pub fn round_price(&self, price: Decimal, up: bool) -> Option<Decimal> {
-        self.rules
-            .round_price(price, if up { Round::Up } else { Round::Down })
+    /// `price` on the venue's grid, rounded in `direction` (named by what
+    /// the price is for: `zunder_venue_types::{toward_position, passive,
+    /// aggressive}`).
+    pub fn round_price(&self, price: Decimal, direction: Round) -> Option<Decimal> {
+        self.rules.round_price(price, direction)
     }
 }
 
@@ -205,33 +207,31 @@ pub struct OpenOrder {
     pub reduce_only: bool,
     pub is_position_tpsl: bool,
     pub cloid: Option<String>,
+    /// The same order as Guard core reads it: whether it protects a
+    /// position is Guard's rule, never this server's own. `Err` with why
+    /// when Guard core's parser refuses it: then it protects nothing, the
+    /// overview says so, and the rest of the read stands (closing and
+    /// cancelling never depend on an unrelated order).
+    pub view: Result<OpenOrderView, String>,
 }
 
 impl OpenOrder {
-    /// A stop loss (not a take profit) that can only close.
+    /// A stop loss that protects, by Guard's rule
+    /// ([`OpenOrderView::is_protective_stop`]): a reduce-only market stop
+    /// whose limit leaves room to fill. A stop-limit is none (once
+    /// triggered it can rest unfilled on the wrong side of the market).
     pub fn is_stop_loss(&self) -> bool {
-        self.is_trigger
-            && self.order_type.starts_with("Stop")
-            && (self.reduce_only || self.is_position_tpsl)
-            && self.trigger_price.is_some()
+        self.view
+            .as_ref()
+            .is_ok_and(OpenOrderView::is_protective_stop)
     }
 
-    /// Whether this order protects `position`: a stop loss on the closing
-    /// side, on the losing side of the mark.
+    /// Whether this order protects `position`: a protective stop on the
+    /// closing side ([`OpenOrderView::stops_position`]), as Guard counts it.
     pub fn protects(&self, position: &Position) -> bool {
-        if self.coin != position.coin
-            || !self.is_stop_loss()
-            || self.side != position.side.opposite()
-        {
-            return false;
-        }
-        match (self.trigger_price, position.mark()) {
-            (Some(trigger), Some(mark)) => match position.side {
-                Side::Buy => trigger < mark,
-                Side::Sell => trigger > mark,
-            },
-            _ => false,
-        }
+        self.view
+            .as_ref()
+            .is_ok_and(|view| view.stops_position(&position.coin, position.side))
     }
 
     /// Whether it covers the whole position on its own.
@@ -251,6 +251,7 @@ pub fn parse_open_orders(value: &Value) -> Result<Vec<OpenOrder>, VenueError> {
                 Some("A") => Side::Sell,
                 _ => return Err(bad()),
             };
+            let view = parse_open_order(order).map_err(|error| error.to_string());
             Ok(OpenOrder {
                 coin: order
                     .get("coin")
@@ -287,6 +288,7 @@ pub fn parse_open_orders(value: &Value) -> Result<Vec<OpenOrder>, VenueError> {
                     .and_then(Value::as_str)
                     .filter(|cloid| is_cloid(cloid))
                     .map(str::to_owned),
+                view,
             })
         })
         .collect()
@@ -299,36 +301,20 @@ pub fn is_cloid(text: &str) -> bool {
         && text.bytes().skip(2).all(|b| b.is_ascii_hexdigit())
 }
 
-/// The stop that protects `position`, for the overview and for refusing a
-/// cancel that would leave it unprotected: the tightest stop that covers
-/// the whole position alone; failing that, if stops together cover it, the
-/// loosest of them; otherwise none.
+/// The stop that bounds the loss of `position`, for the overview and for
+/// refusing a cancel that would leave it unprotected: Guard core's covering
+/// stop ([`covering_stop_among`]), the rule Guard judges a cancel by. Stops
+/// sized to separate entries cover the position together, tightest first,
+/// as one size-weighted trigger; `None` when they do not cover it all.
 pub fn effective_stop(position: &Position, orders: &[OpenOrder]) -> Option<Decimal> {
-    let stops: Vec<&OpenOrder> = orders.iter().filter(|o| o.protects(position)).collect();
-    let tighter = |a: Decimal, b: Decimal| match position.side {
-        Side::Buy => a.max(b),
-        Side::Sell => a.min(b),
-    };
-    let looser = |a: Decimal, b: Decimal| match position.side {
-        Side::Buy => a.min(b),
-        Side::Sell => a.max(b),
-    };
-    let whole = stops
-        .iter()
-        .filter(|o| o.covers(position))
-        .filter_map(|o| o.trigger_price)
-        .reduce(tighter);
-    if whole.is_some() {
-        return whole;
-    }
-    let total = stops
-        .iter()
-        .try_fold(Decimal::ZERO, |sum, o| sum.checked_add(o.size))?;
-    if total >= position.qty {
-        stops.iter().filter_map(|o| o.trigger_price).reduce(looser)
-    } else {
-        None
-    }
+    covering_stop_among(
+        &position.coin,
+        position.side,
+        position.qty,
+        orders.iter().filter_map(|order| order.view.as_ref().ok()),
+        &[],
+        None,
+    )
 }
 
 fn side_name(side: Side) -> &'static str {
@@ -404,6 +390,19 @@ pub fn overview(account: &Account, orders: &[OpenOrder]) -> Value {
             })
         })
         .collect();
+    // Orders Guard core's parser refused: they count as no stop.
+    let warnings: Vec<Value> = orders
+        .iter()
+        .filter_map(|order| {
+            order.view.as_ref().err().map(|why| {
+                json!(format!(
+                    "order {} could not be read as Guard reads it ({}): it counts as no stop",
+                    order.oid,
+                    sanitize::quote(why, 120)
+                ))
+            })
+        })
+        .collect();
     json!({
         "equity_usd": text(Some(account.equity)),
         "withdrawable_usd": text(account.withdrawable),
@@ -411,6 +410,7 @@ pub fn overview(account: &Account, orders: &[OpenOrder]) -> Value {
         "open_orders": open_orders,
         "open_orders_shown": open_orders.len(),
         "open_orders_total": orders.len(),
+        "warnings": warnings,
     })
 }
 
@@ -460,11 +460,62 @@ mod tests {
             .map(|o| o.oid)
             .collect();
         assert_eq!(protecting, vec![1, 4]);
-        // The whole-covering stop wins.
-        assert_eq!(effective_stop(short, &orders), Some(dec!(3100)));
-        // Without it, 0.1 of 0.2 is covered: unprotected.
+        // Guard's covering stop: the tighter 3,050 closes its 0.1 first,
+        // then 3,100 the other 0.1: (0.1 × 3,050 + 0.1 × 3,100) / 0.2 =
+        // 3,075, the loss the two stops bound together.
+        assert_eq!(effective_stop(short, &orders), Some(dec!(3075)));
+        // Without the whole one, 0.1 of 0.2 is covered: unprotected.
         let partial: Vec<OpenOrder> = orders.iter().filter(|o| o.oid != 1).cloned().collect();
         assert_eq!(effective_stop(short, &partial), None);
+    }
+
+    #[test]
+    fn only_what_guard_counts_as_a_stop_protects() {
+        let account = parse_account(&account()).unwrap();
+        let short = &account.positions[0];
+        let orders = parse_open_orders(&json!([
+            // A stop-limit: it can trigger and rest unfilled. No stop.
+            {"coin": "ETH", "side": "B", "limitPx": "3420", "sz": "0.2", "oid": 1, "isTrigger": true,
+             "triggerPx": "3100", "orderType": "Stop Limit", "reduceOnly": true},
+            // A market stop whose limit lies within 5% of its trigger
+            // (3,100 × 1.05 = 3,255): it may not fill. No stop.
+            {"coin": "ETH", "side": "B", "limitPx": "3200", "sz": "0.2", "oid": 2, "isTrigger": true,
+             "triggerPx": "3100", "orderType": "Stop Market", "reduceOnly": true},
+            // A market stop that may open a position: no stop.
+            {"coin": "ETH", "side": "B", "limitPx": "3420", "sz": "0.2", "oid": 3, "isTrigger": true,
+             "triggerPx": "3100", "orderType": "Stop Market", "reduceOnly": false},
+        ]))
+        .unwrap();
+        assert!(orders.iter().all(|order| !order.is_stop_loss()));
+        assert!(orders.iter().all(|order| !order.protects(short)));
+        assert_eq!(effective_stop(short, &orders), None);
+        // A position TP/SL (size 0) covers the whole position alone.
+        let tpsl = parse_open_orders(&json!([
+            {"coin": "ETH", "side": "B", "limitPx": "3420", "sz": "0.0", "oid": 4, "isTrigger": true,
+             "triggerPx": "3100", "orderType": "Stop Market", "reduceOnly": true, "isPositionTpsl": true},
+        ]))
+        .unwrap();
+        assert_eq!(effective_stop(short, &tpsl), Some(dec!(3100)));
+        // An order Guard core cannot read (a stop without its limit) does
+        // not fail the read: it protects nothing, and the overview says so.
+        let odd = parse_open_orders(&json!([
+            {"coin": "ETH", "side": "B", "sz": "0.2", "oid": 5, "isTrigger": true,
+             "triggerPx": "3100", "orderType": "Stop Market", "reduceOnly": true},
+            {"coin": "ETH", "side": "B", "limitPx": "3420", "sz": "0.2", "oid": 6, "isTrigger": true,
+             "triggerPx": "3100", "orderType": "Stop Market", "reduceOnly": true},
+        ]))
+        .unwrap();
+        assert!(odd[0].view.is_err() && !odd[0].protects(short));
+        assert_eq!(effective_stop(short, &odd), Some(dec!(3100)));
+        let shown = overview(&account, &odd);
+        assert_eq!(shown["open_orders_total"], 2);
+        assert!(
+            shown["warnings"][0]
+                .as_str()
+                .unwrap()
+                .starts_with("order 5 could not be read"),
+            "{shown}"
+        );
     }
 
     #[test]

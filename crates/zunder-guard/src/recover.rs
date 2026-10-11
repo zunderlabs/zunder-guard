@@ -446,13 +446,13 @@ fn order_known(answer: &Value) -> Option<bool> {
     }
 }
 
+/// Whether two prices or sizes are the same decimal. Both sides write them
+/// as strings (the action's wire form, the venue's `orderStatus`); a JSON
+/// number would reach `Decimal` through `f64` (hard rule 7) and matches
+/// nothing.
 fn same_number(a: &Value, b: &Value) -> bool {
     let number = |value: &Value| -> Option<rust_decimal::Decimal> {
-        match value {
-            Value::String(text) => text.parse().ok(),
-            Value::Number(number) => number.to_string().parse().ok(),
-            _ => None,
-        }
+        value.as_str().and_then(|text| text.parse().ok())
     };
     matches!((number(a), number(b)), (Some(a), Some(b)) if a == b)
 }
@@ -719,6 +719,17 @@ mod tests {
             event.extend(fields.clone());
         }
         event
+    }
+
+    #[test]
+    fn prices_and_sizes_match_as_decimal_strings_only() {
+        // The same decimal written two ways matches; a JSON number on
+        // either side never does (it would go through f64).
+        assert!(same_number(&json!("3000.10"), &json!("3000.1")));
+        assert!(!same_number(&json!("3000.1"), &json!("3000.2")));
+        assert!(!same_number(&json!(3000.1), &json!("3000.1")));
+        assert!(!same_number(&json!("0.1"), &json!(0.1)));
+        assert!(!same_number(&json!(5), &json!(5)));
     }
 
     #[test]

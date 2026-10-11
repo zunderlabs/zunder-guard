@@ -1884,6 +1884,100 @@ fn a_partly_refused_request_is_an_error() {
 }
 
 #[test]
+fn an_unreadable_venue_reply_blocks_entries_until_account_overview() {
+    let order = json!({"coin": "BTC", "side": "buy", "stop": "58800", "size": "0.01"});
+    for (reply, statuses) in [
+        // A fill without its average price: what filled cannot be told.
+        (
+            json!({"status": "ok", "response": {"type": "order", "data": {"statuses": [
+                {"filled": {"totalSz": "0.01", "oid": 5}}, "waitingForTrigger"]}}}),
+            json!([{"status": "unreadable"}, {"status": "accepted", "what": "waitingForTrigger"}]),
+        ),
+        // A status this server does not know.
+        (
+            json!({"status": "ok", "response": {"type": "order", "data": {"statuses": [
+                "somethingNew", "waitingForTrigger"]}}}),
+            json!([{"status": "unreadable"}, {"status": "accepted", "what": "waitingForTrigger"}]),
+        ),
+        // No statuses at all for an order.
+        (
+            json!({"status": "ok", "response": {"type": "order", "data": {"statuses": []}}}),
+            json!([]),
+        ),
+    ] {
+        let guard = MockGuard::start();
+        guard.with(|state| state.scripted.push(reply.clone()));
+        let (mut server, clock) = guard.server(Mode::Testnet, true, None);
+        let (error, unknown) = call(&mut server, "place_order", order.clone());
+        assert!(error, "{unknown}");
+        assert_eq!(
+            unknown["error"]["code"], "venue_reply_unreadable",
+            "{reply}"
+        );
+        assert!(
+            unknown["error"]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("place_order refuses until you do"),
+            "{unknown}"
+        );
+        assert_eq!(unknown["outcome"], "unknown", "{unknown}");
+        assert_eq!(unknown["sent"], true, "{unknown}");
+        assert_eq!(unknown["venue_statuses"], statuses, "{unknown}");
+        // The uncertain flag: the next entry is refused locally, nothing
+        // sent, until the agent has looked at the account.
+        clock.advance(6_000);
+        let (error, blocked) = call(&mut server, "place_order", order.clone());
+        assert!(error);
+        assert_eq!(blocked["error"]["code"], "check_first", "{reply}");
+        assert_eq!(blocked["sent"], false, "{blocked}");
+        assert_eq!(guard.exchanges().len(), 1);
+        let (error, overview) = call(&mut server, "account_overview", json!({}));
+        assert!(!error, "{overview}");
+        clock.advance(6_000);
+        let (error, placed) = call(&mut server, "place_order", order.clone());
+        assert!(!error, "{placed}");
+        assert_eq!(placed["sent"], true, "{placed}");
+        assert_eq!(guard.exchanges().len(), 2);
+    }
+}
+
+#[test]
+fn a_request_the_venue_refused_whole_is_an_error_that_does_not_block() {
+    let guard = MockGuard::start();
+    guard.with(|state| {
+        state.scripted.push(
+            json!({"status": "ok", "response": {"type": "order", "data": {"statuses": [
+                {"error": "Insufficient margin to place order. asset=0"},
+                {"error": "Insufficient margin to place order. asset=0"}
+            ]}}}),
+        );
+    });
+    let (mut server, clock) = guard.server(Mode::Testnet, true, None);
+    let order = json!({"coin": "BTC", "side": "buy", "stop": "58800", "size": "0.01"});
+    let (error, refused) = call(&mut server, "place_order", order.clone());
+    assert!(error, "{refused}");
+    assert_eq!(refused["error"]["code"], "venue_refused", "{refused}");
+    assert_eq!(refused["outcome"], "venue_refused");
+    assert_eq!(refused["sent"], true);
+    // The venue's words, quoted.
+    assert_eq!(
+        refused["venue_statuses"],
+        json!([
+            {"status": "error", "venue_quoted": "Insufficient margin to place order. asset=0"},
+            {"status": "error", "venue_quoted": "Insufficient margin to place order. asset=0"}
+        ]),
+        "{refused}"
+    );
+    // Nothing is uncertain: the next entry goes without account_overview.
+    clock.advance(6_000);
+    let (error, placed) = call(&mut server, "place_order", order);
+    assert!(!error, "{placed}");
+    assert_eq!(placed["sent"], true, "{placed}");
+    assert_eq!(guard.exchanges().len(), 2);
+}
+
+#[test]
 fn a_client_key_the_venue_knows_is_refused() {
     let guard = MockGuard::start();
     guard.with(|state| state.client_role = json!({"role": "agent", "data": {"user": "0x5e9ee1089755c3435139848e47e6635505d5a13a"}}));

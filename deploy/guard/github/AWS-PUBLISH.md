@@ -5,8 +5,8 @@ stable release can copy its signed `cloudformation.yaml` asset into S3 at
 `guard/vX.Y.Z/cloudformation.yaml`. No template is uploaded from checkout HEAD, no mutable
 `latest` object is created, and publishing does not enable the website's release switch.
 
-The optional `aws-template` job in `publish.yml` uses GitHub OIDC for a 15-minute AWS
-session. Its prerequisite job requires successful CI and release runs for the tagged commit,
+The staging job in `verify.yml` uses GitHub OIDC for a 15-minute AWS
+session after authenticating the exact release source and signed immutable template. It
 checks all assets and their SLSA provenance, and verifies the release's Sigstore signature against
 `.github/workflows/release.yml@refs/tags/vX.Y.Z`; the publisher checks that the exact
 asset has one matching entry in those signed checksums. An existing version is reused
@@ -39,13 +39,13 @@ with this trust policy, replacing `ACCOUNT_ID`:
     "Action": "sts:AssumeRoleWithWebIdentity",
     "Condition": {"StringEquals": {
       "token.actions.githubusercontent.com:aud": "sts.amazonaws.com",
-      "token.actions.githubusercontent.com:sub": "repo:zunderlabs/zunder-guard:environment:aws-template-publish"
+      "token.actions.githubusercontent.com:sub": "repo:zunderlabs/zunder-guard:environment:staging"
     }}
   }]
 }
 ```
 
-Create the GitHub environment `aws-template-publish`, restrict deployment to release
+Use the protected GitHub environment `staging`, restrict deployment to release
 **tags** `v*` (no branches), and require a release maintainer to approve it. Protect
 release tags against replacement. The standard environment OIDC subject scopes the
 role to that repository/environment; it does not itself restrict a workflow filename.
@@ -115,7 +115,7 @@ Local checks (no AWS calls):
 
 ```sh
 python3 deploy/guard/github/test_publish_aws_template.py
-actionlint deploy/guard/github/workflows/publish.yml
+actionlint deploy/guard/github/workflows/verify.yml
 ```
 
 References: [AWS conditional-write policies](https://docs.aws.amazon.com/AmazonS3/latest/userguide/conditional-writes-enforce.html),

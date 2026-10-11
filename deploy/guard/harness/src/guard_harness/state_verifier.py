@@ -31,6 +31,8 @@ def authenticate_state(
     previous: VerifiedState | None,
     verified_journeys: Set[str],
     log: Path,
+    expected_run_id: str | None = None,
+    expected_run_attempt: str | None = None,
 ) -> VerifiedState:
     """Verify before trusting any supplied JSON or predecessor links.
 
@@ -56,6 +58,8 @@ def authenticate_state(
             tag=tag,
             predicate_type=PREDICATE_TYPE,
             log=log,
+            expected_run_id=expected_run_id,
+            expected_run_attempt=expected_run_attempt,
         )
     try:
         build: Any = json.loads(manifest_bytes)

@@ -282,7 +282,7 @@ function Install-ZunderGuard {
   $CosignVersion = 'v3.1.3'
   $CosignSha256 = '9fe59be0eca1271873ce019061335eb1ac419b7059202e797828467ddabe33be'
 
-  if ($KeyStdin -and ($Network -ne 'testnet' -or -not $ManagedService)) { throw 'Private KeyStdin requires explicit protected Testnet service setup.' }
+  if ($KeyStdin -and ($Network -ne 'testnet' -or -not $NonInteractive -or $InstallOnly -or $Force -or -not [Console]::IsInputRedirected)) { throw 'Private KeyStdin requires explicit noninteractive Testnet setup through redirected stdin.' }
   if ($ManagedService -and $Network -notin @('mainnet','testnet')) { throw 'Managed service requires a sending network.' }
   if ($Network -eq 'mainnet' -or ($Network -eq 'testnet' -and $ManagedService)) {
     Install-ZgMainnet $Rules $Account $ConfirmAccount $EquityCap $Licence $Id $V $Base $NonInteractive $InstallOnly $Force $InstallDir $Network $KeyStdin
@@ -305,8 +305,9 @@ function Install-ZunderGuard {
   if ($NonInteractive -and -not $InstallOnly) {
     if (-not $Rules) { throw '-NonInteractive needs -Rules' }
     if (-not $Account) { throw '-NonInteractive needs -Account' }
-    if ($Network -and $Network -ne 'paper') { throw '-NonInteractive sets up paper mode; run it without -NonInteractive for testnet (the key is typed, hidden)' }
-    $Network = 'paper'
+    if ($Network -eq 'testnet') {
+      if (-not $KeyStdin) { throw 'Noninteractive Testnet needs private KeyStdin; no key is read from an environment or file.' }
+    } else { $Network = 'paper' }
   }
   if (-not $InstallDir) { $InstallDir = Join-Path $env:LOCALAPPDATA 'Programs\zunder-guard' }
   # Windows PowerShell 5.1 may still default to older TLS.
@@ -394,7 +395,8 @@ function Install-ZunderGuard {
     }
     $InitArgs = @('init')
     if ($NonInteractive) {
-      $InitArgs += @('--non-interactive', '--network', 'paper', '--rules', $Rules, '--account', $Account)
+      $InitArgs += @('--non-interactive', '--network', $Network, '--rules', $Rules, '--account', $Account)
+      if ($Network -eq 'testnet') { $InitArgs += @('--key-stdin', '--key-store', 'credential-manager') }
     } else {
       $InitArgs += '--interactive'
       if ($Rules) { $InitArgs += @('--rules', $Rules) }

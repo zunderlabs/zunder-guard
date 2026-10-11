@@ -1600,7 +1600,10 @@ fn watch(s: &mut Session) -> Result<(), Stop> {
         interval.as_millis(),
         s.opts.timing.watch_ms / 1000
     ));
-    while Instant::now() < until {
+    // The window's start and its end are both polled, however slowly the
+    // answers come: the last poll starts at or after the end.
+    loop {
+        let started = Instant::now();
         let at = now_ms();
         let status = client
             .get(&url)
@@ -1634,13 +1637,15 @@ fn watch(s: &mut Session) -> Result<(), Stop> {
                 json!({"at_ms": at, "unreachable": error})
             }
         };
-        use std::io::Write as _;
-        if writeln!(log, "{line}").and_then(|()| log.flush()).is_err() {
+        if session::append_line(&mut log, &line.to_string()).is_err() {
             return Err(Stop::Failed(
                 "watch.jsonl can no longer be written".to_owned(),
             ));
         }
-        std::thread::sleep(interval);
+        if started >= until {
+            break;
+        }
+        std::thread::sleep(interval.min(until.saturating_duration_since(Instant::now())));
     }
     s.check(
         "C7",

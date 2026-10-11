@@ -625,20 +625,28 @@ def case_init_options_offline():
     block = "set -- init\n" + block.replace("</dev/tty", "</dev/null")
     capture = 'guard() { printf "%s\\n" "$@"; }\n'
     base = {"PATH": os.environ["PATH"], "RULES": "zr1_fixture", "SERVICE": "1",
-            "NO_MAINNET": "", "FORCE": "0", "LISTEN": "", "SHARE": "", "LICENCE": "",
+            "ACCOUNT_NETWORK": "", "NO_MAINNET": "", "FORCE": "0", "LISTEN": "", "SHARE": "", "LICENCE": "",
             "CAP": "100", "ACCOUNT": PAPER_ACCOUNT, "CONFIRM": PAPER_ACCOUNT, "KEY_FILE": "/dev/null"}
-    for network in ("", "paper", "testnet", "mainnet"):
-        env = {**base, "NONINTERACTIVE": "0", "NETWORK": network}
+    # Default leaves the CLI's account-network selection intact. An explicit paper
+    # read network is forwarded independently of its paper execution mode.
+    for network, account_network in (("", ""), ("paper", ""), ("testnet", ""),
+                                     ("mainnet", ""), ("paper", "mainnet"), ("paper", "testnet")):
+        env = {**base, "NONINTERACTIVE": "0", "NETWORK": network,
+               "ACCOUNT_NETWORK": account_network}
         result = subprocess.run(["sh", "-eu", "-c", capture + block], env=env,
                                 stdin=subprocess.DEVNULL, capture_output=True, text=True)
         args = result.stdout.splitlines()
-        expected = ["init", "--rules", "zr1_fixture", "--no-key", "--equity-cap", "100",
-                    "--account", PAPER_ACCOUNT]
+        expected = ["init"]
+        if account_network:
+            expected += ["--account-network", account_network]
+        expected += ["--rules", "zr1_fixture", "--no-key", "--equity-cap", "100",
+                     "--account", PAPER_ACCOUNT]
         if network:
             expected += ["--network", network]
         expected += ["--interactive"]
         (ok if result.returncode == 0 and args == expected else fail)(
-            "interactive selected mode forwarded with explicit consent still in CLI: " + (network or "ask"),
+            "interactive selected mode forwarded with explicit consent still in CLI: "
+            + (network or "ask") + ("; account-network=" + account_network if account_network else ""),
             result.stdout + result.stderr)
     env = {**base, "NONINTERACTIVE": "1", "NETWORK": "mainnet"}
     result = subprocess.run(["sh", "-eu", "-c", capture + block], env=env,
@@ -648,6 +656,35 @@ def case_init_options_offline():
                 "--confirm-mainnet", PAPER_ACCOUNT, "--key-stdin"]
     (ok if result.returncode == 0 and result.stdout.splitlines() == expected else fail)(
         "noninteractive explicit account-consent and stdin contract preserved", result.stdout + result.stderr)
+    for account_network in ("mainnet", "testnet"):
+        env = {**base, "NONINTERACTIVE": "1", "NETWORK": "paper",
+               "ACCOUNT_NETWORK": account_network, "CONFIRM": ""}
+        result = subprocess.run(["sh", "-eu", "-c", capture + block], env=env,
+                                stdin=subprocess.DEVNULL, capture_output=True, text=True)
+        expected = ["init", "--account-network", account_network, "--rules", "zr1_fixture",
+                    "--no-key", "--equity-cap", "100", "--non-interactive", "--network", "paper",
+                    "--account", PAPER_ACCOUNT]
+        (ok if result.returncode == 0 and result.stdout.splitlines() == expected else fail)(
+            "noninteractive paper read network forwarded without mainnet consent or key: "
+            + account_network, result.stdout + result.stderr)
+    # Exercise the actual redirection as well as --key-stdin; this is an inert
+    # non-key frame, consumed only by this argument-capture fixture.
+    with tempfile.TemporaryDirectory(prefix="guard-init-stdin-") as directory:
+        frame = Path(directory) / "fixture-input"
+        observed = Path(directory) / "observed-input"
+        frame.write_bytes(b"inert fixture stdin frame\n")
+        consume = 'guard() { printf "%s\\n" "$@"; cat > "$CAPTURE_STDIN"; }\n'
+        env = {**base, "NONINTERACTIVE": "1", "NETWORK": "mainnet",
+               "KEY_FILE": str(frame), "CAPTURE_STDIN": str(observed)}
+        result = subprocess.run(["sh", "-eu", "-c", consume + block], env=env,
+                                stdin=subprocess.DEVNULL, capture_output=True, text=True)
+        expected = ["init", "--rules", "zr1_fixture", "--no-key", "--equity-cap", "100",
+                    "--non-interactive", "--network", "mainnet", "--account", PAPER_ACCOUNT,
+                    "--confirm-mainnet", PAPER_ACCOUNT, "--key-stdin"]
+        (ok if result.returncode == 0 and result.stdout.splitlines() == expected
+         and observed.is_file() and observed.read_bytes() == frame.read_bytes() else fail)(
+            "noninteractive mainnet stdin frame reaches Guard exactly once without argv exposure",
+            result.stdout + result.stderr)
 
 
 def main():

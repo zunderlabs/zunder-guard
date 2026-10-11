@@ -1,34 +1,18 @@
 // Copyright 2026 Orcastrate UG (haftungsbeschränkt)
 // SPDX-License-Identifier: Elastic-2.0
 import { randomUUID } from 'node:crypto';
-import { spawn } from 'node:child_process';
 import { mkdir } from 'node:fs/promises';
 import { join } from 'node:path';
+import { renewPurchase } from './renewal.js';
 import { test, expect } from '@playwright/test';
 import { safe, get, post, validInboxMessage } from './safe.js';
+import { command } from './subprocess.js';
 import { restrictAccessHeaders } from './browser-access.js';
 
-function command(module: string, args: string[], env: NodeJS.ProcessEnv, input = ''): Promise<void> {
-  return new Promise((resolve, reject) => {
-    const child = spawn(process.env['GUARD_PYTHON'] ?? 'python', ['-m', module, ...args], {
-      env, detached: true, stdio: ['pipe', 'ignore', 'ignore'],
-    });
-    const timer = setTimeout(() => {
-      if (child.pid) { try { process.kill(-child.pid, 'SIGKILL'); } catch { /* exited */ } }
-    }, 180_000);
-    child.stdin.on('error', () => { /* exit handler returns only a fixed error */ });
-    child.stdin.end(input);
-    child.once('error', () => { clearTimeout(timer); reject(new Error('Purchase subprocess could not start')); });
-    child.once('close', code => {
-      clearTimeout(timer);
-      if (code === 0) resolve(); else reject(new Error('Purchase subprocess failed; reconcile private receipts; never retry payment'));
-    });
-  });
-}
 
 const journey = process.env['GUARD_PAID_JOURNEY'] ?? 'P1';
 const network = journey === 'P2' ? 'arbitrum' : journey === 'P3' ? 'base' : 'hyperliquid';
-test.skip(!['P1', 'P2', 'P3'].includes(process.env['GUARD_PAID_JOURNEY'] ?? ''), 'paid journey requires explicit hosted release inputs');
+test.skip(!['P1', 'P2', 'P3', 'P6'].includes(process.env['GUARD_PAID_JOURNEY'] ?? ''), 'paid journey requires explicit hosted release inputs');
 
 test(`${journey} pricing to paid email to installed released licence`, async ({ page, request }) => {
   test.setTimeout(15 * 60_000);
@@ -98,6 +82,7 @@ test(`${journey} pricing to paid email to installed released licence`, async ({ 
   }
   const deadline = Date.now() + 10 * 60_000;
   let licence = '';
+  let renewalToken = '';
   while (Date.now() < deadline) {
     const scan = await post(request, '/api/licence/order/check', {
       headers: { Origin: origin ?? '' }, data: { id: order.id, token: body.token },
@@ -119,13 +104,21 @@ test(`${journey} pricing to paid email to installed released licence`, async ({ 
       expect(validInboxMessage(value, email, since), 'paid inbox metadata').toBe(true);
       const text = (value as { text: string }).text;
       const match = text.match(/\bzgl1_[A-Za-z0-9_-]+/);
+      const renew = text.match(/\/licence#renew=([A-Za-z0-9_-]{43})(?![A-Za-z0-9_-])/);
+      if (renew) renewalToken = renew[1] ?? '';
       if (match && state.state === 'delivered' && state.key_issued === true) licence = match[0];
     }
     if (licence) break;
     await new Promise(resolve => setTimeout(resolve, 5000));
   }
   expect(Boolean(licence), 'licence arrived by email after delivered order').toBe(true);
+  let renewalInput = '';
+  if (journey === 'P6') {
+    expect(Boolean(renewalToken), 'emailed renewal token required').toBe(true);
+    renewalInput = await renewPurchase(page, request, { origin: origin ?? '', domain: domain ?? '',
+      since: Date.now(), email, token: renewalToken, oldKey: licence, root: privateWork, paymentEnv });
+  }
   await mkdir(join(privateWork, 'licensed'), { mode: 0o700 });
   await command('guard_harness.purchase_licence', ['--assets', assets ?? '', '--work', join(privateWork, 'licensed'),
-    '--tag', tag ?? '', '--commit', commit ?? '', '--account', account ?? '', '--journey', journey], clean, licence + '\n');
+    '--tag', tag ?? '', '--commit', commit ?? '', '--account', account ?? '', '--journey', journey], clean, (renewalInput || licence) + '\n');
 });

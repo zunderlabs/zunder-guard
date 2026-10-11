@@ -27,9 +27,9 @@
       "canonical": "zr1_eyJ2IjoxLCJtYXhMZXZlcmFnZSI6MywibWF4TG9zc0F0U3RvcFBjdCI6MC44NSwic3RvcFBvbGljeSI6ImF0dGFjaCIsImRlZmF1bHRTdG9wRGlzdGFuY2VQY3QiOjEuNSwibWluTGlxRGlzdGFuY2VQY3QiOjEwLCJtYXhQb3NpdGlvblBjdCI6MjAwLCJtYXhPcGVuUmlza1BjdCI6NiwiZGFpbHlMb3NzU3RvcFBjdCI6NiwiZHJhd2Rvd25IYWx0UGN0IjoyNSwibWFya2V0cyI6WyJCVEMiLCJ4eXo6WFlaMTAwIiwiUFVSUi9VU0RDIiwiQDEwNyIsImtQRVBFIl19"
     },
     {
-      "name": "every upper bound (the stop distance just below the liquidation distance)",
-      "json": "{\"v\":1,\"maxLeverage\":10,\"maxLossAtStopPct\":5,\"defaultStopDistancePct\":49.9999,\"minLiqDistancePct\":50,\"maxPositionPct\":1000,\"maxOpenRiskPct\":20,\"dailyLossStopPct\":15,\"drawdownHaltPct\":50}",
-      "canonical": "zr1_eyJ2IjoxLCJtYXhMZXZlcmFnZSI6MTAsIm1heExvc3NBdFN0b3BQY3QiOjUsInN0b3BQb2xpY3kiOiJhdHRhY2giLCJkZWZhdWx0U3RvcERpc3RhbmNlUGN0Ijo0OS45OTk5LCJtaW5MaXFEaXN0YW5jZVBjdCI6NTAsIm1heFBvc2l0aW9uUGN0IjoxMDAwLCJtYXhPcGVuUmlza1BjdCI6MjAsImRhaWx5TG9zc1N0b3BQY3QiOjE1LCJkcmF3ZG93bkhhbHRQY3QiOjUwLCJtYXJrZXRzIjpbIioiXX0"
+      "name": "every upper bound, widened 11 Oct 2026 (the stop distance just below the liquidation distance)",
+      "json": "{\"v\":1,\"maxLeverage\":50,\"maxLossAtStopPct\":25,\"defaultStopDistancePct\":49.9999,\"minLiqDistancePct\":50,\"maxPositionPct\":5000,\"maxOpenRiskPct\":100,\"dailyLossStopPct\":50,\"drawdownHaltPct\":90}",
+      "canonical": "zr1_eyJ2IjoxLCJtYXhMZXZlcmFnZSI6NTAsIm1heExvc3NBdFN0b3BQY3QiOjI1LCJzdG9wUG9saWN5IjoiYXR0YWNoIiwiZGVmYXVsdFN0b3BEaXN0YW5jZVBjdCI6NDkuOTk5OSwibWluTGlxRGlzdGFuY2VQY3QiOjUwLCJtYXhQb3NpdGlvblBjdCI6NTAwMCwibWF4T3BlblJpc2tQY3QiOjEwMCwiZGFpbHlMb3NzU3RvcFBjdCI6NTAsImRyYXdkb3duSGFsdFBjdCI6OTAsIm1hcmtldHMiOlsiKiJdfQ"
     },
     {
       "name": "every lower edge",
@@ -182,8 +182,8 @@
       "field": "defaultStopDistancePct"
     },
     {
-      "name": "leverage above the aggressive frame",
-      "json": "{\"v\":1,\"maxLeverage\":11}",
+      "name": "leverage above 50",
+      "json": "{\"v\":1,\"maxLeverage\":50.0001}",
       "code": "out_of_range",
       "field": "maxLeverage"
     },
@@ -200,8 +200,8 @@
       "field": "maxLossAtStopPct"
     },
     {
-      "name": "risk per trade above 5%",
-      "json": "{\"v\":1,\"maxLossAtStopPct\":5.0001}",
+      "name": "risk per trade above 25%",
+      "json": "{\"v\":1,\"maxLossAtStopPct\":25.0001}",
       "code": "out_of_range",
       "field": "maxLossAtStopPct"
     },
@@ -225,7 +225,7 @@
     },
     {
       "name": "daily loss above the bound",
-      "json": "{\"v\":1,\"dailyLossStopPct\":16}",
+      "json": "{\"v\":1,\"dailyLossStopPct\":51}",
       "code": "out_of_range",
       "field": "dailyLossStopPct"
     },
@@ -236,8 +236,8 @@
       "field": "minLiqDistancePct"
     },
     {
-      "name": "position above 10x",
-      "json": "{\"v\":1,\"maxPositionPct\":1000.5}",
+      "name": "position above 50x",
+      "json": "{\"v\":1,\"maxPositionPct\":5000.5}",
       "code": "out_of_range",
       "field": "maxPositionPct"
     },
@@ -261,7 +261,7 @@
     },
     {
       "name": "first bad field wins",
-      "json": "{\"v\":1,\"drawdownHaltPct\":99,\"maxLeverage\":11}",
+      "json": "{\"v\":1,\"drawdownHaltPct\":99,\"maxLeverage\":51}",
       "code": "out_of_range",
       "field": "maxLeverage"
     },

@@ -25,8 +25,8 @@ use k256::ecdsa::SigningKey;
 use zeroize::Zeroizing;
 use zunder_hl_protocol::{
     Network, Signature, Wire,
+    action::{self as hl, Cloid, Px, Tpsl, exchange_request_fields, signature_wire},
     sign::{self as hl_sign, parse_hex32},
-    wire::minimal_hex,
 };
 use zunder_venue::hyperliquid::Address;
 
@@ -42,17 +42,18 @@ pub enum OrderType {
     StopMarket { trigger_px: String },
 }
 
+/// The times in force this server sends: no post-only (`Alo`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tif {
     Gtc,
     Ioc,
 }
 
-impl Tif {
-    fn name(self) -> &'static str {
-        match self {
-            Tif::Gtc => "Gtc",
-            Tif::Ioc => "Ioc",
+impl From<Tif> for hl::Tif {
+    fn from(tif: Tif) -> Self {
+        match tif {
+            Tif::Gtc => hl::Tif::Gtc,
+            Tif::Ioc => hl::Tif::Ioc,
         }
     }
 }
@@ -71,33 +72,30 @@ pub struct OrderWire {
 }
 
 impl OrderWire {
-    fn to_wire(&self) -> Wire {
-        let order_type = match &self.order_type {
-            OrderType::Limit { tif } => Wire::Map(vec![(
-                "limit",
-                Wire::Map(vec![("tif", Wire::str(tif.name()))]),
-            )]),
-            OrderType::StopMarket { trigger_px } => Wire::Map(vec![(
-                "trigger",
-                Wire::Map(vec![
-                    ("isMarket", Wire::Bool(true)),
-                    ("triggerPx", Wire::str(trigger_px.clone())),
-                    ("tpsl", Wire::str("sl")),
-                ]),
-            )]),
+    /// The order in `zunder-hl-protocol`'s model, which encodes it. `None`
+    /// when a price or size is not a plain decimal, or the cloid is not
+    /// `0x` and 32 hex digits: such an order is never signed.
+    fn to_order(&self) -> Option<hl::Order> {
+        let kind = match &self.order_type {
+            OrderType::Limit { tif } => hl::OrderKind::Limit { tif: (*tif).into() },
+            OrderType::StopMarket { trigger_px } => hl::OrderKind::Trigger {
+                is_market: true,
+                trigger_px: Px::parse(trigger_px)?,
+                tpsl: Tpsl::Sl,
+            },
         };
-        let mut fields = vec![
-            ("a", Wire::UInt(u64::from(self.asset))),
-            ("b", Wire::Bool(self.is_buy)),
-            ("p", Wire::str(self.price.clone())),
-            ("s", Wire::str(self.size.clone())),
-            ("r", Wire::Bool(self.reduce_only)),
-            ("t", order_type),
-        ];
-        if let Some(cloid) = &self.cloid {
-            fields.push(("c", Wire::str(cloid.clone())));
-        }
-        Wire::Map(fields)
+        Some(hl::Order {
+            asset: self.asset,
+            is_buy: self.is_buy,
+            price: Px::parse(&self.price)?,
+            size: Px::parse(&self.size)?,
+            reduce_only: self.reduce_only,
+            kind,
+            cloid: match &self.cloid {
+                Some(cloid) => Some(Cloid::parse(cloid)?),
+                None => None,
+            },
+        })
     }
 }
 
@@ -108,6 +106,15 @@ pub enum Grouping {
     Na,
     /// An entry followed by its stop loss, as the SDKs send TP/SL.
     NormalTpsl,
+}
+
+impl From<Grouping> for hl::Grouping {
+    fn from(grouping: Grouping) -> Self {
+        match grouping {
+            Grouping::Na => hl::Grouping::Na,
+            Grouping::NormalTpsl => hl::Grouping::NormalTpsl,
+        }
+    }
 }
 
 /// Everything this server can sign. Three variants, on purpose: see the
@@ -138,39 +145,33 @@ impl Action {
         }
     }
 
-    /// In the Python SDK's field order.
-    pub(crate) fn to_wire(&self) -> Wire {
-        match self {
-            Action::Order { orders, grouping } => Wire::Map(vec![
-                ("type", Wire::str("order")),
-                (
-                    "orders",
-                    Wire::Array(orders.iter().map(OrderWire::to_wire).collect()),
-                ),
-                (
-                    "grouping",
-                    Wire::str(match grouping {
-                        Grouping::Na => "na",
-                        Grouping::NormalTpsl => "normalTpsl",
-                    }),
-                ),
-            ]),
-            Action::Cancel { asset, oid } => Wire::Map(vec![
-                ("type", Wire::str("cancel")),
-                (
-                    "cancels",
-                    Wire::Array(vec![Wire::Map(vec![
-                        ("a", Wire::UInt(u64::from(*asset))),
-                        ("o", Wire::UInt(*oid)),
-                    ])]),
-                ),
-            ]),
-            Action::Modify { oid, order } => Wire::Map(vec![
-                ("type", Wire::str("modify")),
-                ("oid", Wire::UInt(*oid)),
-                ("order", order.to_wire()),
-            ]),
-        }
+    /// The action in `zunder-hl-protocol`'s model: never a builder, a
+    /// take profit, a post-only order or any other action type. `None`
+    /// when an order cannot be encoded ([`OrderWire`]).
+    pub(crate) fn to_protocol(&self) -> Option<hl::Action> {
+        Some(match self {
+            Action::Order { orders, grouping } => hl::Action::Order(hl::OrderAction {
+                orders: orders
+                    .iter()
+                    .map(OrderWire::to_order)
+                    .collect::<Option<_>>()?,
+                grouping: (*grouping).into(),
+                builder: None,
+            }),
+            Action::Cancel { asset, oid } => hl::Action::Cancel(vec![hl::Cancel {
+                asset: *asset,
+                order: hl::OrderRef::Oid(*oid),
+            }]),
+            Action::Modify { oid, order } => hl::Action::Modify(hl::Modify {
+                oid: hl::OrderRef::Oid(*oid),
+                order: order.to_order()?,
+            }),
+        })
+    }
+
+    /// In the venue's field order (`zunder-hl-protocol`'s encoding).
+    pub(crate) fn to_wire(&self) -> Option<Wire> {
+        self.to_protocol().map(|action| action.to_wire())
     }
 }
 
@@ -237,19 +238,11 @@ pub(crate) fn sign_wire(
     hl_sign::sign_l1_action(&key.key, source, action, nonce, expires_after).ok()
 }
 
-/// `{"r", "s", "v"}` of a request body.
-fn signature_wire(signature: &Signature) -> Wire {
-    Wire::Map(vec![
-        ("r", Wire::str(minimal_hex(&signature.r))),
-        ("s", Wire::str(minimal_hex(&signature.s))),
-        ("v", Wire::UInt(u64::from(signature.v))),
-    ])
-}
-
 /// The JSON body of a request to `/exchange`, in the Python SDK's field
 /// order (action, nonce, signature, vaultAddress, expiresAfter), followed
 /// by Guard's `expectedMode`: the mode this server was started for. The
-/// vault address is always null. `None` when it cannot be signed.
+/// vault address is always null. `None` when it cannot be signed or an
+/// order cannot be encoded ([`OrderWire`]).
 ///
 /// `expectedMode` sits beside the signed fields and is not signed: the
 /// signature covers exactly what the SDK's would. Guard refuses the request
@@ -265,17 +258,11 @@ pub fn signed_request(
     expires_after: Option<u64>,
     expected_mode: Mode,
 ) -> Option<Vec<u8>> {
-    let wire = action.to_wire();
+    let wire = action.to_wire()?;
     let signature = sign_wire(key, source, &wire, nonce, expires_after)?;
-    let request = Wire::Map(vec![
-        ("action", wire),
-        ("nonce", Wire::UInt(nonce)),
-        ("signature", signature_wire(&signature)),
-        ("vaultAddress", Wire::Null),
-        ("expiresAfter", expires_after.map_or(Wire::Null, Wire::UInt)),
-        ("expectedMode", Wire::str(expected_mode.name())),
-    ]);
-    request.to_json().ok()
+    let mut fields = exchange_request_fields(wire, nonce, &signature, expires_after);
+    fields.push(("expectedMode", Wire::str(expected_mode.name())));
+    Wire::Map(fields).to_json().ok()
 }
 
 /// The body of Guard's own kill request (`POST /guard/kill`): the action
@@ -311,9 +298,11 @@ pub fn signed_kill_request(
     Wire::Map(fields).to_json().ok()
 }
 
-/// The action as JSON, exactly as it is sent.
-pub fn action_json(action: &Action) -> serde_json::Value {
-    action.to_wire().to_value()
+/// The action as JSON, exactly as it is sent. `None` when an order cannot
+/// be encoded ([`OrderWire`]); such an action is never signed either, and
+/// a preview of it (`{"action": null}`) is refused by Guard as malformed.
+pub fn action_json(action: &Action) -> Option<serde_json::Value> {
+    action.to_wire().map(|wire| wire.to_value())
 }
 
 /// The address that signed `action` with this nonce and expiry: what Guard
@@ -333,12 +322,15 @@ pub fn recover_signer(
         s: parse_hex32(s)?,
         v: u8::try_from(v).ok()?,
     };
-    let connection_id = hl_sign::action_hash(&action.to_wire(), nonce, None, expires_after).ok()?;
+    let connection_id =
+        hl_sign::action_hash(&action.to_wire()?, nonce, None, expires_after).ok()?;
     hl_sign::recover_signer(&hl_sign::agent_digest(source, &connection_id), &signature)
 }
 
 #[cfg(test)]
 mod tests {
+    use zunder_hl_protocol::wire::minimal_hex;
+
     use super::*;
 
     /// The throwaway key of the Python SDK's signing tests
@@ -369,6 +361,7 @@ mod tests {
             grouping: Grouping::Na,
         }
         .to_wire()
+        .unwrap()
     }
 
     #[test]
@@ -420,7 +413,8 @@ mod tests {
             }],
             grouping: Grouping::Na,
         };
-        let hash = hl_sign::action_hash(&action.to_wire(), 1_677_777_606_040, None, None).unwrap();
+        let hash = hl_sign::action_hash(&action.to_wire().unwrap(), 1_677_777_606_040, None, None)
+            .unwrap();
         let hex: String = hash.iter().map(|b| format!("{b:02x}")).collect();
         assert_eq!(
             hex,
@@ -510,7 +504,7 @@ mod tests {
             oid: 77_738_308,
         };
         assert_eq!(
-            serde_json::to_string(&cancel.to_wire()).unwrap(),
+            serde_json::to_string(&cancel.to_wire().unwrap()).unwrap(),
             r#"{"type":"cancel","cancels":[{"a":3,"o":77738308}]}"#
         );
         let modify = Action::Modify {
@@ -528,12 +522,68 @@ mod tests {
             },
         };
         assert_eq!(
-            serde_json::to_string(&modify.to_wire()).unwrap(),
+            serde_json::to_string(&modify.to_wire().unwrap()).unwrap(),
             concat!(
                 r#"{"type":"modify","oid":5,"order":{"a":0,"b":false,"p":"52920","s":"0.01","r":true,"#,
                 r#""t":{"trigger":{"isMarket":true,"triggerPx":"58800","tpsl":"sl"}}}}"#
             )
         );
+    }
+
+    /// A price, size or trigger that is not a plain decimal, or a cloid
+    /// that is not `0x` and 32 hex digits, is never signed: the protocol
+    /// model refuses it, where the old builder signed any text.
+    #[test]
+    fn an_order_with_text_the_venue_would_not_read_is_never_signed() {
+        let good = OrderWire {
+            asset: 1,
+            is_buy: true,
+            price: "3101.5".into(),
+            size: "0.5".into(),
+            reduce_only: false,
+            order_type: OrderType::Limit { tif: Tif::Ioc },
+            cloid: Some("0x7a6d0000000000000000000000000001".into()),
+        };
+        let order = |orders| Action::Order {
+            orders,
+            grouping: Grouping::Na,
+        };
+        assert!(action_json(&order(vec![good.clone()])).is_some());
+        let bad = [
+            OrderWire {
+                price: "-3101.5".into(),
+                ..good.clone()
+            },
+            OrderWire {
+                size: "1e-3".into(),
+                ..good.clone()
+            },
+            OrderWire {
+                order_type: OrderType::StopMarket {
+                    trigger_px: " 2940".into(),
+                },
+                ..good.clone()
+            },
+            OrderWire {
+                cloid: Some("0x01".into()),
+                ..good.clone()
+            },
+        ];
+        for wire in bad {
+            for action in [
+                order(vec![good.clone(), wire.clone()]),
+                Action::Modify {
+                    oid: 5,
+                    order: wire.clone(),
+                },
+            ] {
+                assert_eq!(action_json(&action), None, "{action:?}");
+                assert_eq!(
+                    signed_request(&key(), Network::Testnet, &action, 1, None, Mode::Testnet),
+                    None
+                );
+            }
+        }
     }
 
     #[test]
@@ -613,7 +663,7 @@ mod tests {
         let digest = hl_sign::agent_digest(
             Network::Testnet,
             &hl_sign::action_hash(
-                &action.to_wire(),
+                &action.to_wire().unwrap(),
                 1_791_000_000_000,
                 None,
                 Some(1_791_000_030_000),
@@ -706,8 +756,8 @@ mod tests {
                     },
                 },
             };
-            let wire = action.to_wire();
-            let json = action_json(&action);
+            let wire = action.to_wire().unwrap();
+            let json = action_json(&action).unwrap();
             let decoded = zunder_guard_core::action::decode_action_value(&json)
                 .unwrap_or_else(|error| panic!("{case}: {error} {json}"));
             assert_eq!(

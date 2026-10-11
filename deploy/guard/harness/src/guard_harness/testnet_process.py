@@ -9,6 +9,7 @@ import signal
 import subprocess
 import time
 import tomllib
+from collections.abc import Callable
 from pathlib import Path
 from typing import BinaryIO
 
@@ -18,6 +19,7 @@ from guard_harness.paper_bot import LocalGuard
 from guard_harness.runner import run
 from guard_harness.staged_subjects import _private
 from guard_harness.testnet_journey import Journey, execute
+from guard_harness.testnet_ownership import Ownership
 from guard_harness.testnet_protection import Entry, _object, _orders, entry_plan
 from guard_harness.testnet_scan import TestnetReads
 
@@ -188,6 +190,7 @@ class Foreground:
         *,
         version: str,
         deadline: float,
+        capture_entry: Callable[[Ownership, int, int], None] = lambda *_: None,
     ) -> Journey:
         # Caller derives this monotonic deadline from the actual job's remaining lifetime.
         _need(math.isfinite(deadline) and deadline > time.monotonic())
@@ -225,6 +228,7 @@ class Foreground:
                 stop_guard=self.stop_after_flat,
                 admit_entry=admit_entry,
                 begin_cleanup=begin_cleanup,
+                capture_entry=capture_entry,
             )
 
 

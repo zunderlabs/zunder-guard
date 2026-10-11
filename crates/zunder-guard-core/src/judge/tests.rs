@@ -546,6 +546,121 @@ fn only_a_listed_perp_of_a_dex_guard_reads_gets_through() {
     assert_eq!(judged(&policy, &held, &margin).code, "unknown_market");
 }
 
+/// Every rule at the maximum a person may set since 11 Oct 2026: 50x, 25%
+/// at the stop, 5,000% per position, 100% open risk, 50% daily, 90%
+/// drawdown; the rest the defaults.
+fn policy_at_the_maxima() -> Policy {
+    let policy = Policy {
+        max_leverage: dec!(50),
+        max_loss_at_stop: dec!(0.25),
+        max_position_of_account: dec!(50),
+        max_open_risk: dec!(1),
+        daily_loss_stop: dec!(0.5),
+        drawdown_halt: dec!(0.9),
+        ..Policy::default()
+    };
+    assert_eq!(policy.validate(), Ok(()));
+    policy
+}
+
+#[test]
+fn at_the_widened_maxima_every_entry_still_gets_a_stop_and_is_sized_from_it() {
+    // Buy 100 ETH at 3,000 (the mid), IOC, no stop. As in
+    // `an_entry_without_a_stop_gets_one_and_is_sized_from_it`: stop 2,940,
+    // risk per unit 60 + 3.3 = 63.3. Budget: 25% of 10,000 = 2,500, so
+    // 2,500 / 63.3 = 39.49447... ETH, down to the 0.0001 step: 39.4944.
+    // Position cap and leverage room: 50 * 10,000 / 3,000 = 166.67, not
+    // binding.
+    let policy = policy_at_the_maxima();
+    let decision = judged(
+        &policy,
+        &account(dec!(10000)),
+        &orders(
+            vec![limit(ETH, true, "3000", "100", Tif::Ioc)],
+            Grouping::Na,
+        ),
+    );
+    assert_eq!(decision.verdict, Verdict::Resize, "{decision:?}");
+    let forward = decision.forward.as_ref().unwrap();
+    let action = forwarded_orders(&decision);
+    let (entry, stop) = (&action.orders[0], &action.orders[1]);
+    assert_eq!(entry.size.value(), dec!(39.4944));
+    assert_eq!(stop.stop_trigger(), Some(dec!(2940)));
+    assert!(stop.reduce_only && !stop.is_buy);
+    assert_eq!(stop.size.value(), dec!(39.4944));
+    // Loss at the stop, costs included: 39.4944 * 63.3 = 2,499.99552 <=
+    // 2,500.
+    assert!(dec!(39.4944) * dec!(63.3) <= dec!(2500));
+    // The 50x cap does not raise the isolated leverage: the liquidation
+    // must lie 17.98% away (worked out in the test named above), which
+    // ETH's 2% maintenance margin allows at 5x and no higher. (Margining
+    // 118,483 of ETH at 5x needs 23,697 USDC; on the main dex the venue,
+    // not Guard, refuses an order the account cannot margin.)
+    assert_eq!(
+        forward.pre,
+        vec![Action::UpdateLeverage {
+            asset: ETH,
+            is_cross: false,
+            leverage: 5
+        }]
+    );
+    // Under `refuse`, an entry without a stop is still refused.
+    let refuse = Policy {
+        stop: StopPolicy::Refuse,
+        ..policy
+    };
+    let decision = judged(
+        &refuse,
+        &account(dec!(10000)),
+        &orders(vec![limit(ETH, true, "3000", "1", Tif::Ioc)], Grouping::Na),
+    );
+    assert_eq!(decision.code, "stop_required");
+}
+
+#[test]
+fn at_the_widened_maxima_the_halts_and_the_kill_switch_still_refuse() {
+    let policy = policy_at_the_maxima();
+    let held = account(dec!(10000));
+    let entry = orders(vec![limit(SOL, true, "150", "1", Tif::Ioc)], Grouping::Na);
+    let judge_with = |engine: &RiskEngine, killed: bool| {
+        judge(
+            &Context {
+                policy: &policy,
+                engine,
+                account: &held,
+                killed,
+                builder: None,
+                salt: b"test",
+            },
+            &entry,
+        )
+    };
+    let later = Timestamp::from_millis(1_791_000_100_000);
+    // A loss of 49.99% today is within the 50% stop; 50% halts for the day.
+    let engine_at = |equity: Decimal| {
+        let mut engine = engine(&policy, dec!(10000));
+        engine.observe(later, equity);
+        engine
+    };
+    let within = judge_with(&engine_at(dec!(5001)), false);
+    assert!(within.forward.is_some(), "{within:?}");
+    assert_eq!(
+        judge_with(&engine_at(dec!(5000)), false).code,
+        "daily_loss_stop"
+    );
+    // A fall of 90% from the peak stops until a review (and is checked
+    // before the daily stop).
+    assert_eq!(
+        judge_with(&engine_at(dec!(1000)), false).code,
+        "drawdown_halt"
+    );
+    // The kill switch refuses whatever the rules allow.
+    assert_eq!(
+        judge_with(&engine(&policy, dec!(10000)), true).code,
+        "kill_switch"
+    );
+}
+
 #[test]
 fn the_stop_policy_refuse_requires_a_stop() {
     let policy = Policy {
@@ -693,6 +808,80 @@ fn isolated_leverage_matches_hand_computed_cases() {
             dec!(0.05)
         ),
         None
+    );
+}
+
+#[test]
+fn the_liquidation_rule_still_binds_at_the_widened_50x_cap() {
+    // The policy's leverage cap may be 50 since 11 Oct 2026. The isolated
+    // leverage Guard sets stays bounded by the liquidation rule and by the
+    // coin's own maximum, whatever the cap.
+    //
+    // Long at 100, stop 99.99 (0.01% away), the policy's smallest stop
+    // slippage 5%, the smallest min distance 1%, venue max 50 (l = 1%):
+    // worst fill 99.99 * 0.95 = 94.9905, distance 0.050095, needed
+    // 0.050095 * 1.1 + 0.05 = 0.1051045. (1/L - 0.01) / 0.99 >= 0.1051045
+    // -> 1/L >= 0.114053455 -> L <= 8.77: 8. No valid policy gets more:
+    // a stop slippage of at least 5% puts the stop's worst fill at least 5%
+    // away, so the liquidation must lie at least 10.5% away.
+    assert_eq!(
+        isolated_leverage(
+            50,
+            dec!(50),
+            Side::Buy,
+            dec!(100),
+            dec!(99.99),
+            dec!(0.05),
+            dec!(0.01)
+        ),
+        Some(8)
+    );
+    // The same short: worst fill 100.01 * 1.05 = 105.0105, distance
+    // 0.050105, needed 0.1051155. (1/L - 0.01) / 1.01 >= 0.1051155 ->
+    // 1/L >= 0.116166655 -> L <= 8.6: 8.
+    assert_eq!(
+        isolated_leverage(
+            50,
+            dec!(50),
+            Side::Sell,
+            dec!(100),
+            dec!(100.01),
+            dec!(0.05),
+            dec!(0.01)
+        ),
+        Some(8)
+    );
+    // Even with no stop slippage at all (below what a policy allows) the
+    // 5% funding room alone caps it: distance 0.0001, needed 0.00011 +
+    // 0.05 = 0.05011; 1/L >= 0.05011 * 0.99 + 0.01 = 0.0596089 -> L <=
+    // 16.78: 16, never 50.
+    assert_eq!(
+        isolated_leverage(
+            50,
+            dec!(50),
+            Side::Buy,
+            dec!(100),
+            dec!(99.99),
+            dec!(0),
+            dec!(0.01)
+        ),
+        Some(16)
+    );
+    // The coin's own maximum wins over a 50x cap. A 2x coin (l = 1/4),
+    // stop 0.01% away, no stop slippage: needed 0.05011. At 3x the
+    // liquidation would lie (1/3 - 0.25) / 0.75 = 11.1% away, enough, so
+    // only the coin's maximum holds it to 2x.
+    assert_eq!(
+        isolated_leverage(
+            2,
+            dec!(50),
+            Side::Buy,
+            dec!(100),
+            dec!(99.99),
+            dec!(0),
+            dec!(0.01)
+        ),
+        Some(2)
     );
 }
 
@@ -1616,6 +1805,22 @@ fn guard_never_forwards_more_than_the_bot_asked_for() {
 }
 
 #[test]
+fn guard_cloids_are_the_prefix_and_28_hex_digits_of_the_hash() {
+    // Built from bytes since the action model moved into
+    // zunder-hl-protocol; the text is the one built before: the prefix,
+    // then the first 14 bytes of keccak(salt ‖ data) in lowercase hex.
+    let (salt, data) = (b"salt".as_slice(), b"data".as_slice());
+    let hash = crate::sign::keccak256(&[salt, data].concat());
+    let mut expected = GUARD_CLOID_PREFIX.to_owned();
+    for byte in &hash[..14] {
+        expected.push_str(&format!("{byte:02x}"));
+    }
+    let cloid = guard_cloid_of(salt, data);
+    assert_eq!(cloid.as_str(), expected);
+    assert_eq!(Cloid::parse(&expected), Some(cloid));
+}
+
+#[test]
 fn an_unprotected_position_gets_guards_market_stop() {
     // The ETH long of 10 without its stop: Guard's stop 2% below the 3,000
     // mid at 2,940, worst fill 2,940 x 0.9 = 2,646, for all 10.
@@ -1829,6 +2034,196 @@ fn a_market_stop_capped_at_its_trigger_is_widened() {
         panic!()
     };
     assert_eq!(sent.orders[0].price.value(), dec!(2500));
+}
+
+/// ETH (4 size decimals: prices on 5 significant figures and at most 2
+/// decimals) at a mid of 3,001.37, so that every price Guard works out from
+/// it falls between two grid steps and the rounding direction shows.
+fn off_grid_eth(equity: Decimal) -> AccountView {
+    let mut account = account(equity);
+    account.mids.insert("ETH".to_owned(), dec!(3001.37));
+    account
+}
+
+#[test]
+fn each_entry_price_rounds_the_way_its_rule_says() {
+    let policy = Policy::default();
+    let account = off_grid_eth(dec!(10000));
+    // A buy far above the mid is pulled in to 3,001.37 * 1.005 =
+    // 3,016.37685: passive, down to 3,016.3 (up would be 3,016.4). Its
+    // attached stop 2% below the lower of mid and fill: 3,001.37 * 0.98 =
+    // 2,941.3426, towards the position, up to 2,941.4 (down: 2,941.3). The
+    // stop's limit 10% below that: 2,647.26, aggressive for the selling
+    // stop, down to 2,647.2 (up: 2,647.3).
+    let decision = judged(
+        &policy,
+        &account,
+        &orders(
+            vec![limit(ETH, true, "3200", "0.1", Tif::Ioc)],
+            Grouping::Na,
+        ),
+    );
+    let action = forwarded_orders(&decision);
+    assert_eq!(action.orders[0].price.value(), dec!(3016.3));
+    assert_eq!(action.orders[1].stop_trigger(), Some(dec!(2941.4)));
+    assert_eq!(action.orders[1].price.value(), dec!(2647.2));
+    // A sell far below: 3,001.37 * 0.995 = 2,986.36315, passive, up to
+    // 2,986.4. Its stop 2% above the higher of mid and fill: 3,061.3974,
+    // towards the position, down to 3,061.3. Its limit 10% above:
+    // 3,367.43, aggressive for the buying stop, up to 3,367.5.
+    let decision = judged(
+        &policy,
+        &account,
+        &orders(
+            vec![limit(ETH, false, "2500", "0.1", Tif::Ioc)],
+            Grouping::Na,
+        ),
+    );
+    let action = forwarded_orders(&decision);
+    assert_eq!(action.orders[0].price.value(), dec!(2986.4));
+    assert_eq!(action.orders[1].stop_trigger(), Some(dec!(3061.3)));
+    assert_eq!(action.orders[1].price.value(), dec!(3367.5));
+}
+
+#[test]
+fn a_bots_market_stop_is_widened_to_the_aggressive_side() {
+    let policy = Policy::default();
+    let account = off_grid_eth(dec!(10000));
+    let own_stop = |is_buy: bool, trigger: &str, limit_px: &str| Order {
+        asset: ETH,
+        is_buy,
+        price: Px::parse(limit_px).unwrap(),
+        size: Px::parse("0.1").unwrap(),
+        reduce_only: true,
+        kind: OrderKind::Trigger {
+            is_market: true,
+            trigger_px: Px::parse(trigger).unwrap(),
+            tpsl: Tpsl::Sl,
+        },
+        cloid: None,
+    };
+    // A long's stop at 2,951.3 with its limit at 2,940: widened to
+    // 2,951.3 * 0.9 = 2,656.17, down to 2,656.1 (up: 2,656.2).
+    let decision = judged(
+        &policy,
+        &account,
+        &orders(
+            vec![
+                limit(ETH, true, "3001.3", "0.1", Tif::Gtc),
+                own_stop(false, "2951.3", "2940"),
+            ],
+            Grouping::NormalTpsl,
+        ),
+    );
+    assert_eq!(
+        forwarded_orders(&decision).orders[1].price.value(),
+        dec!(2656.1),
+        "{decision:?}"
+    );
+    // A short's stop at 3,051.3 with its limit at 3,060: 3,356.43, up to
+    // 3,356.5 (down: 3,356.4).
+    let decision = judged(
+        &policy,
+        &account,
+        &orders(
+            vec![
+                limit(ETH, false, "3001.4", "0.1", Tif::Gtc),
+                own_stop(true, "3051.3", "3060"),
+            ],
+            Grouping::NormalTpsl,
+        ),
+    );
+    assert_eq!(
+        forwarded_orders(&decision).orders[1].price.value(),
+        dec!(3356.5),
+        "{decision:?}"
+    );
+}
+
+#[test]
+fn the_minimum_is_checked_at_the_stops_worst_fill_rounded_down() {
+    // BTC (5 size decimals: whole-dollar prices here) at a mid of 59,672:
+    // the attached stop 59,672 * 0.98 = 58,478.56, up to 58,479; its worst
+    // fill 58,479 * 0.9 = 52,631.1, aggressive for the selling stop, down to
+    // 52,631. 0.00019 BTC is worth 0.00019 * 52,631 = 9.99989 there, below
+    // the venue's 10 (rounded up to 52,632 it would be 10.00008: allowed).
+    let mut account = account(dec!(10000));
+    account.mids.insert("BTC".to_owned(), dec!(59672));
+    let decision = judged(
+        &Policy::default(),
+        &account,
+        &orders(
+            vec![limit(BTC, true, "59672", "0.00019", Tif::Ioc)],
+            Grouping::Na,
+        ),
+    );
+    assert_eq!(decision.code, "below_minimum", "{decision:?}");
+    // 0.0002 BTC: 0.0002 * 52,631 = 10.5262, enough.
+    let decision = judged(
+        &Policy::default(),
+        &account,
+        &orders(
+            vec![limit(BTC, true, "59672", "0.0002", Tif::Ioc)],
+            Grouping::Na,
+        ),
+    );
+    assert!(decision.forward.is_some(), "{decision:?}");
+}
+
+#[test]
+fn guards_own_stops_round_towards_the_position_and_fill_aggressively() {
+    let policy = Policy::default();
+    let blank = engine(&policy, dec!(10000));
+    let position = |side: Side| PositionView {
+        coin: "ETH".into(),
+        side,
+        qty: dec!(1),
+        entry: dec!(3000),
+        leverage: Leverage {
+            isolated: true,
+            value: 5,
+        },
+        liquidation_px: None,
+    };
+    let stop_of = |account: &AccountView, planned: &[(String, Side, Decimal)]| {
+        let (actions, _, problems) =
+            protect_actions_with(account, &policy, &blank, b"test", 7, planned);
+        let order = actions.first().map(|(_, action)| match action {
+            Action::Order(order) => order.orders[0].clone(),
+            other => panic!("{other:?}"),
+        });
+        (order, problems)
+    };
+    // A long: 3,001.37 * 0.98 = 2,941.3426, up to 2,941.4; worst 2,647.26,
+    // down to 2,647.2.
+    let mut long = off_grid_eth(dec!(10000));
+    long.positions.push(position(Side::Buy));
+    let stop = stop_of(&long, &[]).0.unwrap();
+    assert_eq!(stop.stop_trigger(), Some(dec!(2941.4)));
+    assert_eq!(stop.price.value(), dec!(2647.2));
+    // A short: 3,061.3974 down to 3,061.3; worst 3,367.43 up to 3,367.5.
+    let mut short = off_grid_eth(dec!(10000));
+    short.positions.push(position(Side::Sell));
+    let stop = stop_of(&short, &[]).0.unwrap();
+    assert_eq!(stop.stop_trigger(), Some(dec!(3061.3)));
+    assert_eq!(stop.price.value(), dec!(3367.5));
+    // A planned stop is compared as it would be placed, towards the
+    // position: a long's at 3,001.33 places at 3,001.4, at or above the
+    // 3,001.37 mid, so the price is through it (rounded down, 3,001.3, it
+    // would not be); a short's at 3,001.38 places at 3,001.3, through as
+    // well (rounded up, 3,001.4, it would not be).
+    for (account, side, planned) in [
+        (&long, Side::Buy, dec!(3001.33)),
+        (&short, Side::Sell, dec!(3001.38)),
+    ] {
+        let (_, problems) = stop_of(account, &[("ETH".to_owned(), side, planned)]);
+        assert!(
+            problems
+                .iter()
+                .any(|problem| problem.contains("the price is through the stop")),
+            "{side:?}: {problems:?}"
+        );
+    }
 }
 
 pub(crate) mod hip3;

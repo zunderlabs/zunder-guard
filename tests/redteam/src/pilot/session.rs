@@ -398,7 +398,7 @@ impl<'a> Session<'a> {
         // The log first: a standard output that went away (the SSM session
         // closed) must neither panic nor lose the record of what was sent.
         if let Some(log) = self.log.as_mut()
-            && writeln!(log, "{text}").and_then(|()| log.flush()).is_err()
+            && append_line(log, &text).is_err()
         {
             let _ = writeln!(
                 std::io::stderr(),
@@ -1415,6 +1415,17 @@ fn write_last_send(dir: &std::path::Path, at: u64) -> std::io::Result<()> {
     std::fs::rename(&fresh, &path)
 }
 
+/// Append `text` and its newline in one write: the log is opened for
+/// appending, so a `--step watch` running beside another step never splits
+/// the other's line (`writeln!` writes the text and the newline separately).
+pub(super) fn append_line(log: &mut File, text: &str) -> std::io::Result<()> {
+    let mut line = String::with_capacity(text.len() + 1);
+    line.push_str(text);
+    line.push('\n');
+    log.write_all(line.as_bytes())?;
+    log.flush()
+}
+
 /// One line on standard output; a closed output is ignored, never a panic.
 fn echo(text: &str) {
     let mut out = std::io::stdout().lock();
@@ -1624,5 +1635,44 @@ mod tests {
         let mut bad = options(GuardMode::Testnet, checks::PILOT_URL, false);
         bad.confirm_account = "P".to_owned();
         assert!(static_checks(&bad).unwrap_err().contains("not an address"));
+    }
+
+    /// `--step watch` beside another step: two handles append to the same
+    /// `pilot.jsonl`, and every line stays whole.
+    #[test]
+    fn two_appenders_never_split_a_line() {
+        let dir = std::env::temp_dir().join(format!(
+            "zunder-pilot-append-{}-{}",
+            std::process::id(),
+            crate::now_ms()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut opts = options(GuardMode::Testnet, checks::PILOT_URL, false);
+        opts.log_dir = dir.clone();
+        let writers: Vec<_> = ["step", "watch"]
+            .into_iter()
+            .map(|who| {
+                let mut log = open_log(&opts, "pilot.jsonl").unwrap();
+                std::thread::spawn(move || {
+                    let pad = "x".repeat(2_000);
+                    for n in 0..1_000 {
+                        let line = json!({"who": who, "n": n, "pad": pad}).to_string();
+                        append_line(&mut log, &line).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for writer in writers {
+            writer.join().unwrap();
+        }
+        let text = std::fs::read_to_string(dir.join("pilot.jsonl")).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(text.lines().count(), 2_000);
+        for line in text.lines() {
+            assert!(
+                serde_json::from_str::<Value>(line).is_ok(),
+                "split: {line:.80}"
+            );
+        }
     }
 }

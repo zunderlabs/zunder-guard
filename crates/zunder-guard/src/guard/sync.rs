@@ -13,7 +13,7 @@ use zunder_guard_core::{account::requests, event::EventBody, licence, sign::Addr
 use crate::upstream::Upstream;
 
 use super::{
-    Guard, Inner,
+    CompleteRead, Guard, Inner,
     clock::{self, Clock, stamp},
     emergency::exposed,
     fee::LICENCE_ALERT,
@@ -123,6 +123,7 @@ impl<U: Upstream, C: Clock> Guard<U, C> {
     pub async fn sync(&self) {
         let mut inner = self.inner.lock().await;
         let started = self.clock.now_ms();
+        let started_mono = self.clock.monotonic_ms();
         Self::check_kill(&mut inner, started);
         Self::licence_tick(&mut inner, started, true);
         self.expire_hold(&mut inner, started);
@@ -152,14 +153,14 @@ impl<U: Upstream, C: Clock> Guard<U, C> {
                 .sends
                 .last_ms
                 .is_some_and(|sent| started.saturating_sub(sent) < SYNC_LOCKED_AFTER_SEND_MS);
-        let (mut inner, _read_started, read) = if sending {
+        let (mut inner, read_started, read_started_mono, read) = if sending {
             let read = self
                 .sync_read_locked(&mut inner.caches, started, deadline)
                 .await;
             inner.sync.read_twice = false;
             inner.sync.last_reads = 1;
             inner.sync.unlock_next = share_locked && read.is_err();
-            (inner, started, read)
+            (inner, started, started_mono, read)
         } else {
             let mut caches = inner.caches.clone();
             let sent_before = inner.sends.answered;
@@ -170,9 +171,10 @@ impl<U: Upstream, C: Clock> Guard<U, C> {
             if inner.sends.answered == sent_before {
                 inner.sync.read_twice = false;
                 inner.sync.last_reads = 1;
-                (inner, started, read)
+                (inner, started, started_mono, read)
             } else {
                 let now = self.clock.now_ms();
+                let now_mono = self.clock.monotonic_ms();
                 let deadline = inner
                     .ledger
                     .hold
@@ -183,7 +185,7 @@ impl<U: Upstream, C: Clock> Guard<U, C> {
                     .await;
                 inner.sync.read_twice = true;
                 inner.sync.last_reads = 2;
-                (inner, now, read)
+                (inner, now, now_mono, read)
             }
         };
         // Awaited reads may cross the hold deadline. Expire before any
@@ -192,6 +194,29 @@ impl<U: Upstream, C: Clock> Guard<U, C> {
         self.expire_hold(&mut inner, now);
         // A complete read of every dex Guard manages.
         let read_ok = matches!(&read, Ok(read) if read.unread.is_empty());
+        if let Ok(AccountRead { view, unread }) = &read
+            && unread.is_empty()
+        {
+            let this = CompleteRead {
+                wall: read_started,
+                mono: read_started_mono,
+                venue_ms: view.dexes.iter().filter_map(|dex| dex.time).min(),
+            };
+            // The newest by when it began: two syncs may overlap.
+            if inner
+                .sync
+                .last_complete
+                .is_none_or(|last| last.mono <= this.mono)
+            {
+                inner.sync.last_complete = Some(this);
+            }
+            // Entries whose outcome was unknown that this read resolves.
+            let last = inner.sync.last_complete;
+            inner
+                .sends
+                .unknown_entries
+                .retain(|pending| !pending.resolved(now, last.as_ref()));
+        }
         match read {
             Ok(AccountRead {
                 view: account,
@@ -225,7 +250,10 @@ impl<U: Upstream, C: Clock> Guard<U, C> {
                 if let Some(reason) = Self::halt_reason(&inner) {
                     self.flatten(&mut inner, now, &account, &reason).await;
                 } else if settled || overdue || inner.protection.at_next_sync {
-                    self.protect_planned(&mut inner, now, &account, false).await;
+                    // A partial read never ends the protection an unknown
+                    // outcome keeps due.
+                    self.protect_planned(&mut inner, now, &account, false, None)
+                        .await;
                 }
             }
             Ok(AccountRead { view: account, .. }) => {
@@ -271,7 +299,8 @@ impl<U: Upstream, C: Clock> Guard<U, C> {
                     // alerts of their own.
                     inner.protection.alert = None;
                 } else if settled || overdue || inner.protection.at_next_sync {
-                    self.protect(&mut inner, now, &account).await;
+                    self.protect(&mut inner, now, &account, Some(read_started_mono))
+                        .await;
                 }
             }
             Err(error) => {
@@ -458,6 +487,9 @@ impl<U: Upstream, C: Clock> Guard<U, C> {
                 tokio::select! {
                     () = self.clock.sleep(wait) => cadence.ticked(self.clock.monotonic_ms()),
                     _ = self.hold_started.notified() => continue,
+                    // A send whose outcome is unknown: a round now (its
+                    // protection runs settled or not), the cadence kept.
+                    _ = self.protect_soon.notified() => {}
                 }
             }
             self.sync().await;

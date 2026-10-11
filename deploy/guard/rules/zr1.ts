@@ -4,8 +4,8 @@
 //
 // The TypeScript twin of deploy/guard/rules/src/lib.rs. Both pass vectors.json; schema-v1.json
 // documents the same defaults and bounds. Values ending in Pct are percent (2 means 2%).
-// Defaults are the reconciled schema v1; bounds are provisional until the Guard core's policy
-// configuration lands, and never beyond zunder-risk's aggressive frame. No dependencies; runs in browsers and in Node 22.18+ (type stripping: erasable syntax only).
+// Defaults are the reconciled schema v1; bounds are the Guard core's policy bounds
+// (crates/zunder-guard-core/src/policy.rs, maxima widened 11 Oct 2026). No dependencies; runs in browsers and in Node 22.18+ (type stripping: erasable syntax only).
 // Specification, including the order of checks: deploy/guard/README.md, "Rules schema v1".
 
 export const PREFIX = "zr1_";
@@ -66,14 +66,14 @@ export const FIELDS: readonly (keyof Rules)[] = [
 
 /** Numeric fields in canonical order. Kept equal to the Rust crate by vectors.json and schema-v1.json. */
 export const NUMBER_BOUNDS: readonly NumberBounds[] = [
-  { field: "maxLeverage", default: 5, min: 0, minInclusive: false, max: 10 },
-  { field: "maxLossAtStopPct", default: 2, min: 0, minInclusive: false, max: 5 },
+  { field: "maxLeverage", default: 5, min: 0, minInclusive: false, max: 50 },
+  { field: "maxLossAtStopPct", default: 2, min: 0, minInclusive: false, max: 25 },
   { field: "defaultStopDistancePct", default: 2, min: 0, minInclusive: false, max: 50 },
   { field: "minLiqDistancePct", default: 10, min: 1, minInclusive: true, max: 50 },
-  { field: "maxPositionPct", default: 200, min: 0, minInclusive: false, max: 1000 },
-  { field: "maxOpenRiskPct", default: 6, min: 0, minInclusive: false, max: 20 },
-  { field: "dailyLossStopPct", default: 6, min: 0, minInclusive: false, max: 15 },
-  { field: "drawdownHaltPct", default: 25, min: 0, minInclusive: false, max: 50 },
+  { field: "maxPositionPct", default: 200, min: 0, minInclusive: false, max: 5000 },
+  { field: "maxOpenRiskPct", default: 6, min: 0, minInclusive: false, max: 100 },
+  { field: "dailyLossStopPct", default: 6, min: 0, minInclusive: false, max: 50 },
+  { field: "drawdownHaltPct", default: 25, min: 0, minInclusive: false, max: 90 },
 ];
 
 export function defaults(): Rules {

@@ -1,56 +1,27 @@
 # Canonical installer publication
 
-`publish.yml`'s `installers` job serves the exact signature-verified release assets at
-`https://zunderlabs.com/i` and `https://zunderlabs.com/i.ps1`. It does not rebuild the
-website or rewrite other routes. Public query-string aliases are not promised; use these
-canonical URLs exactly. The loaders still independently verify the downloaded installer.
+`verify.yml` stages signed loaders and lifecycle state through the installer-store API.
+`promote.yml` admits a stable release only after the independently authenticated complete
+journey gate, then publishes canonical `/i`, `/i.ps1`, `/guard/release.json` and its
+`.sigstore` bundle atomically with a captured predecessor digest. The website consumes
+this authenticated state; publication does not rebuild website source.
 
-## One-time setup
+The private producer owns installer-store deployment, durable storage, exact route custody
+and token provisioning. Consumer workflow environments `staging` and `promote` receive
+`INSTALLER_PUBLISH_TOKEN`; production monitor receives only `MONITOR_ALERT_TOKEN`. No
+Cloudflare account or zone administration credential is needed by these consumers.
 
-Create protected GitHub environment `installer-publish`. Set `INSTALLER_PUBLISH=enabled`
-in repository variables. Set `CLOUDFLARE_ACCOUNT_ID` and `CLOUDFLARE_ZONE_ID` in this
-environment. Secret `CLOUDFLARE_INSTALLER_TOKEN` is a narrowly scoped Cloudflare API token:
-Workers Scripts Edit on the one account, Workers Routes Edit and Zone Read on the
-`zunderlabs.com` zone. No DNS edits or global API key. Keep environment approval rules
-consistent with the release gate; ordinary workflow code must not bypass it.
+Publication authenticates checksums, provenance, source and lifecycle/journey attestations
+before sending a bounded request to the fixed TLS endpoint. Both loaders remain unchanged
+signed release assets. Public query aliases are not promised. Exact readback compares both
+loader bytes, predicate and bundle against one authenticated capsule with equal digest
+headers. Redirects, races, partial responses and unknown POST outcomes fail without retry.
 
-The fixed Worker is `zunder-guard-installers`; reserve that name for this publisher.
-Before every upload, the publisher checks the account-wide script inventory. An existing
-script must carry exactly the managed tag `zunder-guard-canonical-installers-v1` and have
-no bindings, logpush or tail consumers. An unrecognized existing script is refused even
-when it has no route in this zone. Do not tag another application to bypass this check;
-choose and review a migration separately. First publication adds the marker, allowing safe
-retries after a partial routing failure. Reserve this script exclusively for this pipeline;
-do not attach other domains, routes, bindings or workflows to it.
-Canonical DNS must already be proxied through Cloudflare. Existing exact `/i` or `/i.ps1`
-Worker routes owned by another script cause publication to stop before mutation. Resolve
-that ownership deliberately, not by deleting unrelated routes. The uploader validates the
-zone's account and domain before making any change.
+Promotion captures prior channel subjects. A failed canonical smoke invokes authenticated
+withdrawal and compare-and-swap restoration. An absent predecessor cannot be invented.
+A prepared rollback path or unsuccessful command does not establish actual restoration.
 
-## Pipeline
-
-Release publication → full existing signature/provenance/exact-source verification →
-verified artifact → serialized installer job → latest-stable release recheck → local
-loader checksum recheck → Worker upload → two exact routes → public SHA256 comparison.
-
-Older delayed runs refuse to replace current loaders. Repeating the current release is
-idempotent. Partial upload/routing/propagation failure fails the job; rerun the same current
-release after diagnosis. This is not an atomic multi-route transaction. Do not delete a
-published tag or change its assets to fix a deployment. Worker route fail-open behavior,
-plan quotas and zone routing must be checked in the real rehearsal.
-
-## Local validation
-
-```sh
-python3 deploy/guard/github/test_publish_loaders.py
-python3 deploy/guard/github/publish-loaders.py --release-dir rel --tag v1.0.0 --render-only /tmp/guard-installers.mjs
-```
-
-Rendering needs verified `i`, `i.ps1` and `SHA256SUMS` from the same release. It does not
-contact Cloudflare. Tests use synthetic loader bytes and mocked API calls, including actual
-Node execution of the generated Worker. A protected CI publication and public-byte proof
-remain required before marking the route available.
-
-API contracts: [Worker module upload](https://developers.cloudflare.com/api/resources/workers/subresources/scripts/methods/update/),
-[Worker routes](https://developers.cloudflare.com/api/resources/workers/subresources/routes/),
-[routing semantics](https://developers.cloudflare.com/workers/configuration/routing/routes/).
+The former direct Cloudflare publisher and its mock tests are historical helper regressions,
+not the active release entrypoint. Never dispatch an operator publisher to bypass the full
+gate. Required consumer behavior is covered by harness publication, state, gate, promotion
+and canonical-readback tests; hosted evidence is still required.

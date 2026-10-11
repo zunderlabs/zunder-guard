@@ -41,6 +41,8 @@ tokio-tungstenite.workspace = true
 toml.workspace = true
 zeroize.workspace = true
 zunder-core.workspace = true
+# Floats and dates refused in the config, as in every Zunder config.
+zunder-config.workspace = true
 zunder-guard-core.workspace = true
 zunder-guard-rules.workspace = true
 # `zunder-guard mcp`: the agent kit's MCP server in the one binary users install.

@@ -27,4 +27,4 @@ mod rules;
 pub use error::ExecError;
 pub use key::{KeyError, address_from_env};
 pub use network::{CONFIRM_VAR, MainnetConsent, VenueNetwork};
-pub use rules::{InstrumentKind, InstrumentRules, Round};
+pub use rules::{InstrumentKind, InstrumentRules, Round, aggressive, passive, toward_position};

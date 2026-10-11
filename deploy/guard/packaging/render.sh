@@ -110,7 +110,7 @@ text = replace_once(text,
 path.write_text(text)
 PY
 # The installer/guardian are release bytes, authenticated before privilege/key handling.
-for pair in 'install-container.py:install-container.py' 'supervisor.py:container-supervisor.py' 'operations.py:container-operations.py' 'zunder-guard-container.service:zunder-guard-container.service' 'zunder-guard-setup-guardian.service:zunder-guard-setup-guardian.service'; do
+for pair in 'install-container.py:install-container.py' 'install-container-paper.py:install-container-paper.py' 'supervisor.py:container-supervisor.py' 'operations.py:container-operations.py' 'zunder-guard-container.service:zunder-guard-container.service' 'zunder-guard-setup-guardian.service:zunder-guard-setup-guardian.service'; do
   cp "$HERE/../container/${pair%%:*}" "$DIST/${pair#*:}"
 done
 chmod 0644 "$DIST"/*

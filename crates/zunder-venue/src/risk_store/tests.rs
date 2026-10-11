@@ -89,16 +89,26 @@ fn write_lines(dir: &TestDir, lines: &[String]) {
 /// Write a journal of chained records with the given events and states,
 /// checksums and all, bypassing the store's own checks.
 fn forge(dir: &TestDir, steps: &[(i64, JournalEvent, RiskSnapshot)]) {
+    let steps: Vec<_> = steps
+        .iter()
+        .map(|(ms, event, state)| (*ms, event.clone(), state.clone(), FlowFields::default()))
+        .collect();
+    forge_with(dir, &steps);
+}
+
+/// [`forge`], each record with its flow fields (a horizon makes it a
+/// version 3 record).
+fn forge_with(dir: &TestDir, steps: &[(i64, JournalEvent, RiskSnapshot, FlowFields)]) {
     let mut prev = String::new();
     let mut text = String::new();
-    for (seq, (ms, event, state)) in (1..).zip(steps) {
+    for (seq, (ms, event, state, fields)) in (1..).zip(steps) {
         let (record, line) = JournalRecord::new(
             seq,
             at(*ms),
             event.clone(),
             state.clone(),
             prev,
-            FlowFields::default(),
+            fields.clone(),
         )
         .unwrap();
         prev = record.check;
@@ -259,17 +269,22 @@ fn a_review_refuses_pending_money_without_mutation() {
             let event = JournalEvent::ResumedAfterReview {
                 note: "bypass".into(),
             };
+            // Refused for the pending flow alone: the step itself is a
+            // resumption from a drawdown stop.
+            let refused = without_flows
+                .journal
+                .append(
+                    at(4 * HOUR),
+                    event.clone(),
+                    cleared.snapshot(),
+                    FlowFields::default(),
+                    None,
+                )
+                .unwrap_err();
             assert!(
-                without_flows
-                    .journal
-                    .append(
-                        at(4 * HOUR),
-                        event.clone(),
-                        cleared.snapshot(),
-                        FlowFields::default(),
-                        None,
-                    )
-                    .is_err()
+                matches!(&refused, JournalError::Inconsistent { message, .. }
+                    if message == "refusing to write: a review cannot discard pending account flows"),
+                "{refused:?}"
             );
             assert_eq!(fs::read(dir.journal()).unwrap(), bytes);
             // A checksummed forged record is refused by the reader too.
@@ -293,7 +308,12 @@ fn a_review_refuses_pending_money_without_mutation() {
         // assertion, then prove the reader rejects a forged resume.
         if let Some(forged) = forged {
             fs::write(dir.journal(), forged).unwrap();
-            assert!(PersistentRisk::read(&dir.journal()).is_err());
+            let refused = PersistentRisk::read(&dir.journal()).unwrap_err();
+            assert!(
+                matches!(&refused, JournalError::Inconsistent { message, .. }
+                    if message == "a review cannot discard pending account flows"),
+                "{refused:?}"
+            );
             fs::write(dir.journal(), &bytes).unwrap();
         }
         let mut restored = PersistentRisk::open(&dir.journal(), &limits())
@@ -1575,4 +1595,376 @@ fn a_second_scope_record_or_one_that_changes_the_state_is_refused() {
     changed.last = dec!(2500);
     forge(&dir, &[(0, initialised(), fresh()), (1, scoped(), changed)]);
     assert!(inconsistent(PersistentRisk::open(&dir.journal(), &limits())).contains("scope"));
+}
+
+/// A record's flow fields: the main dex's horizon at `venue_ms`, no view.
+fn seen(venue_ms: i64) -> FlowFields {
+    FlowFields {
+        horizon: Some([(String::new(), venue_ms)].into()),
+        view: None,
+    }
+}
+
+/// A view of 2,000 observed at `at_ms`, the main dex's account read at
+/// `venue_ms` venue time.
+fn view(at_ms: i64, venue_ms: i64) -> SeenView {
+    SeenView {
+        at: at(at_ms),
+        times: [(String::new(), venue_ms)].into(),
+        equity: dec!(2000),
+    }
+}
+
+/// The message the reader refuses the forged journal with.
+fn refused_by_reader(dir: &TestDir) -> String {
+    inconsistent(PersistentRisk::open(&dir.journal(), &limits()))
+}
+
+#[test]
+fn a_horizon_belongs_in_a_version_3_record_and_only_there() {
+    let dir = TestDir::new("tamper-version");
+    // `line` re-encoded from version `from` to `to`, checksum and all.
+    let reencoded = |line: &str, from: u32, to: u32| {
+        let body = format!(
+            "{{{}",
+            line.split_once("\",").unwrap().1.replace(
+                &format!(r#""version":{from}"#),
+                &format!(r#""version":{to}"#)
+            )
+        );
+        let check = hex(&Sha3_256::digest(body.as_bytes()));
+        format!("{CHECK_PREFIX}{check}\",{}", &body[1..])
+    };
+    // A record without a horizon claiming version 3.
+    forge(
+        &dir,
+        &[
+            (0, initialised(), fresh()),
+            (HOUR, JournalEvent::Updated, fresh()),
+        ],
+    );
+    let mut forged = lines(&dir);
+    forged[1] = reencoded(&forged[1], RECORD_VERSION, JOURNAL_VERSION);
+    write_lines(&dir, &forged);
+    assert_eq!(
+        refused_by_reader(&dir),
+        "a horizon in a record of version 3, and only there"
+    );
+    // A record with a horizon claiming version 2.
+    forge_with(
+        &dir,
+        &[
+            (0, initialised(), fresh(), FlowFields::default()),
+            (HOUR, JournalEvent::Updated, fresh(), seen(HOUR)),
+        ],
+    );
+    let mut forged = lines(&dir);
+    forged[1] = reencoded(&forged[1], JOURNAL_VERSION, RECORD_VERSION);
+    write_lines(&dir, &forged);
+    assert_eq!(
+        refused_by_reader(&dir),
+        "a horizon in a record of version 3, and only there"
+    );
+    // A view without a horizon (a version 2 record).
+    forge_with(
+        &dir,
+        &[
+            (0, initialised(), fresh(), FlowFields::default()),
+            (
+                HOUR,
+                JournalEvent::Updated,
+                fresh(),
+                FlowFields {
+                    horizon: None,
+                    view: Some(view(HOUR, HOUR)),
+                },
+            ),
+        ],
+    );
+    assert_eq!(
+        refused_by_reader(&dir),
+        "a flowed record or a view without a horizon"
+    );
+}
+
+#[test]
+fn a_flowed_record_lists_its_views_in_its_event_only() {
+    let dir = TestDir::new("tamper-flowed-view");
+    forge_with(
+        &dir,
+        &[
+            (0, initialised(), fresh(), FlowFields::default()),
+            (
+                HOUR,
+                JournalEvent::Flowed {
+                    base: 1,
+                    views: Vec::new(),
+                    flows: Vec::new(),
+                },
+                fresh(),
+                FlowFields {
+                    view: Some(view(HOUR, HOUR)),
+                    ..seen(HOUR)
+                },
+            ),
+        ],
+    );
+    assert_eq!(
+        refused_by_reader(&dir),
+        "a flowed record lists its views in the event"
+    );
+}
+
+#[test]
+fn the_horizon_never_goes_back() {
+    let dir = TestDir::new("tamper-horizon");
+    // Earlier on the main dex.
+    forge_with(
+        &dir,
+        &[
+            (0, initialised(), fresh(), FlowFields::default()),
+            (HOUR, JournalEvent::Updated, fresh(), seen(HOUR)),
+            (2 * HOUR, JournalEvent::Updated, fresh(), seen(HOUR - 1)),
+        ],
+    );
+    assert_eq!(refused_by_reader(&dir), "the horizon went back");
+    // A dex left out.
+    forge_with(
+        &dir,
+        &[
+            (0, initialised(), fresh(), FlowFields::default()),
+            (
+                HOUR,
+                JournalEvent::Updated,
+                fresh(),
+                FlowFields {
+                    horizon: Some([(String::new(), HOUR), ("xyz".to_owned(), HOUR)].into()),
+                    view: None,
+                },
+            ),
+            (2 * HOUR, JournalEvent::Updated, fresh(), seen(2 * HOUR)),
+        ],
+    );
+    assert_eq!(refused_by_reader(&dir), "the horizon went back");
+    // The same horizon again is fine.
+    forge_with(
+        &dir,
+        &[
+            (0, initialised(), fresh(), FlowFields::default()),
+            (HOUR, JournalEvent::Updated, fresh(), seen(HOUR)),
+            (2 * HOUR, JournalEvent::Updated, fresh(), seen(HOUR)),
+        ],
+    );
+    PersistentRisk::open(&dir.journal(), &limits()).unwrap();
+}
+
+#[test]
+fn a_view_is_observed_with_its_record_and_within_its_horizon() {
+    let dir = TestDir::new("tamper-view");
+    // Observed a millisecond after the record's time.
+    forge_with(
+        &dir,
+        &[
+            (0, initialised(), fresh(), FlowFields::default()),
+            (
+                HOUR,
+                JournalEvent::Updated,
+                fresh(),
+                FlowFields {
+                    view: Some(view(HOUR + 1, HOUR)),
+                    ..seen(HOUR)
+                },
+            ),
+        ],
+    );
+    assert_eq!(
+        refused_by_reader(&dir),
+        "a view observed at another time than its record"
+    );
+    // Read before the venue time the record before had reached.
+    forge_with(
+        &dir,
+        &[
+            (0, initialised(), fresh(), FlowFields::default()),
+            (HOUR, JournalEvent::Updated, fresh(), seen(HOUR)),
+            (
+                2 * HOUR,
+                JournalEvent::Updated,
+                fresh(),
+                FlowFields {
+                    view: Some(view(2 * HOUR, HOUR - 1)),
+                    ..seen(2 * HOUR)
+                },
+            ),
+        ],
+    );
+    assert_eq!(
+        refused_by_reader(&dir),
+        "a view that goes back in venue time"
+    );
+    // Read beyond the record's own horizon.
+    forge_with(
+        &dir,
+        &[
+            (0, initialised(), fresh(), FlowFields::default()),
+            (
+                HOUR,
+                JournalEvent::Updated,
+                fresh(),
+                FlowFields {
+                    view: Some(view(HOUR, HOUR + 1)),
+                    ..seen(HOUR)
+                },
+            ),
+        ],
+    );
+    assert_eq!(refused_by_reader(&dir), "a view beyond the horizon");
+}
+
+#[test]
+fn a_flowed_records_views_are_in_order_and_never_go_back() {
+    let dir = TestDir::new("tamper-flowed-views");
+    // Record 2 reached 1:00 venue time; record 3 replays from it.
+    let flowed = |views: Vec<SeenView>| {
+        [
+            (0, initialised(), fresh(), FlowFields::default()),
+            (HOUR, JournalEvent::Updated, fresh(), seen(HOUR)),
+            (
+                3 * HOUR,
+                JournalEvent::Flowed {
+                    base: 2,
+                    views,
+                    flows: Vec::new(),
+                },
+                fresh(),
+                seen(2 * HOUR),
+            ),
+        ]
+    };
+    // Observed at 2:00, then a millisecond before.
+    forge_with(
+        &dir,
+        &flowed(vec![view(2 * HOUR, 2 * HOUR), view(2 * HOUR - 1, 2 * HOUR)]),
+    );
+    assert_eq!(refused_by_reader(&dir), "views out of order");
+    // Read before the venue time its base had reached.
+    forge_with(&dir, &flowed(vec![view(2 * HOUR, HOUR - 1)]));
+    assert_eq!(
+        refused_by_reader(&dir),
+        "a view that goes back in venue time"
+    );
+}
+
+#[test]
+fn a_second_initialised_record_is_refused_by_writer_and_reader() {
+    let dir = TestDir::new("tamper-initialised");
+    let mut risk = journal_with(&dir, &[]);
+    let before = fs::read(dir.journal()).unwrap();
+    let refused = risk.commit(at(HOUR), initialised()).unwrap_err();
+    assert!(
+        matches!(&refused, JournalError::Inconsistent { message, .. }
+            if message == "refusing to write: a second `initialised` record"),
+        "{refused:?}"
+    );
+    assert_eq!(fs::read(dir.journal()).unwrap(), before);
+    drop(risk);
+    fs::remove_file(broken_marker(&dir.journal())).ok();
+    // The reader refuses it before the step is checked.
+    forge(
+        &dir,
+        &[(0, initialised(), fresh()), (HOUR, initialised(), fresh())],
+    );
+    assert_eq!(
+        refused_by_reader(&dir),
+        "only the first record may be `initialised`"
+    );
+}
+
+#[test]
+fn a_repair_record_never_changes_the_state() {
+    let dir = TestDir::new("tamper-repair");
+    let repaired = || JournalEvent::Repaired {
+        cut_bytes: 51,
+        note: String::new(),
+    };
+    let higher = RiskSnapshot {
+        peak: dec!(2200),
+        last: dec!(2200),
+        ..fresh()
+    };
+    forge(
+        &dir,
+        &[(0, initialised(), fresh()), (HOUR, repaired(), higher)],
+    );
+    assert_eq!(refused_by_reader(&dir), "a repair changed the state");
+    forge(
+        &dir,
+        &[(0, initialised(), fresh()), (HOUR, repaired(), fresh())],
+    );
+    PersistentRisk::open(&dir.journal(), &limits()).unwrap();
+}
+
+#[test]
+fn a_flow_listed_again_must_be_the_flow_first_listed() {
+    // An unknown withdrawal of the whole 2,000 at 1:00, pending; a view
+    // of 0 at 2:00. Then a forged flowed record from the last record
+    // lists the same flow id at 1,000 instead.
+    let dir = TestDir::new("tamper-flow-changed");
+    let mut risk = PersistentRisk::initialise(&dir.journal(), limits(), at(0), dec!(2000), "test")
+        .unwrap()
+        .with_flows();
+    let withdrawal = Flow {
+        time_ms: HOUR,
+        amount: dec!(-2000),
+        id: "withdraw".into(),
+        dex: String::new(),
+        between: false,
+        value: None,
+    };
+    risk.apply_flow(at(HOUR), &withdrawal).unwrap();
+    let out = risk.observe_view_at(
+        at(2 * HOUR),
+        [(String::new(), 2 * HOUR)].into(),
+        dec!(0),
+        &VenueView::default(),
+        true,
+    );
+    assert!(out.journal_error.is_none(), "{out:?}");
+    drop(risk);
+    let records = PersistentRisk::read(&dir.journal()).unwrap();
+    assert!(
+        records.iter().any(|record| matches!(&record.event,
+            JournalEvent::Flowed { flows, .. } if flows.contains(&withdrawal))),
+        "{records:?}"
+    );
+    let last = records.last().unwrap();
+    let changed = Flow {
+        amount: dec!(-1000),
+        ..withdrawal
+    };
+    let (_, line) = JournalRecord::new(
+        last.seq + 1,
+        at(3 * HOUR),
+        JournalEvent::Flowed {
+            base: last.seq,
+            views: Vec::new(),
+            flows: vec![changed],
+        },
+        last.state.clone(),
+        last.check.clone(),
+        FlowFields {
+            horizon: last.horizon.clone(),
+            view: None,
+        },
+    )
+    .unwrap();
+    let mut forged = fs::read(dir.journal()).unwrap();
+    forged.extend_from_slice(line.as_bytes());
+    fs::write(dir.journal(), forged).unwrap();
+    let refused = PersistentRisk::read(&dir.journal()).unwrap_err();
+    assert!(
+        matches!(&refused, JournalError::Inconsistent { message, .. }
+            if message == "the flow withdraw changed since it was listed"),
+        "{refused:?}"
+    );
 }

@@ -20,7 +20,7 @@ interface Capsule {
   channel: Channel; expected: string | null; predicate: string; bundle: string;
   unix: string; windows: string;
 }
-interface Stored extends Capsule { digest: string; state: Predicate }
+interface Stored extends Capsule { digest: string; state: Predicate; canonicalPrevious?: string | null }
 const transitions: Record<Stage, readonly Stage[]> = {
   staged: ['gated', 'withdrawn'], gated: ['promoted', 'withdrawn'],
   promoted: ['withdrawn'], withdrawn: [],
@@ -33,6 +33,20 @@ function response(body: string | null, status = 200, type = 'application/json'):
 async function digest(value: string): Promise<string> {
   const hash = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(value));
   return Array.from(new Uint8Array(hash), byte => byte.toString(16).padStart(2, '0')).join('');
+}
+async function readBody(request: Request, limit: number): Promise<string> {
+  const reader = request.body?.getReader();
+  if (!reader) throw new Error();
+  const chunks: Uint8Array[] = []; let size = 0;
+  while (true) {
+    const part = await reader.read(); if (part.done) break;
+    size += part.value.length;
+    if (size > limit) { await reader.cancel(); throw new RangeError(); }
+    chunks.push(part.value);
+  }
+  const bytes = new Uint8Array(size); let offset = 0;
+  for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.length; }
+  return new TextDecoder('utf-8', { fatal: true }).decode(bytes);
 }
 function parse(value: unknown): { capsule: Capsule; state: Predicate } {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error();
@@ -55,23 +69,38 @@ export class ReleaseStore {
   constructor(private readonly ctx: State) {}
   async fetch(request: Request): Promise<Response> {
     const path = new URL(request.url).pathname;
+    if (request.method === 'POST' && path === '/guard/restore') {
+      let expected: string; let restore: string;
+      try {
+        const text = await readBody(request, 1024);
+        const value = JSON.parse(text) as Record<string, unknown>;
+        if (Object.keys(value).sort().join(',') !== 'expected,restore' ||
+          typeof value['expected'] !== 'string' || !hex.test(value['expected']) ||
+          typeof value['restore'] !== 'string' || !hex.test(value['restore'])) throw new Error();
+        expected = value['expected']; restore = value['restore'];
+      } catch (error) { return response(null, error instanceof RangeError ? 413 : 400); }
+      return this.ctx.storage.transaction(async txn => {
+        const head = await txn.get<Stored>('canonical');
+        if (head?.digest !== expected || head.state.stage !== 'withdrawn' || !head.state.previous) return response(null, 409);
+        const withdrawal = await txn.get<Stored>(`build:${head.state.manifest_sha256}`);
+        const promotion = await txn.get<Stored>(`capsule:${head.state.previous}`);
+        const prior = await txn.get<Stored>(`capsule:${restore}`);
+        const priorHead = prior && await txn.get<Stored>(`build:${prior.state.manifest_sha256}`);
+        if (withdrawal?.digest !== expected || promotion?.state.stage !== 'promoted' ||
+          promotion.state.manifest_sha256 !== head.state.manifest_sha256 ||
+          promotion.canonicalPrevious !== restore || prior?.state.stage !== 'promoted' ||
+          prior.channel !== 'canonical' || priorHead?.digest !== restore) return response(null, 409);
+        // Restore only the exact immutable capsule replaced by this failed promotion.
+        // The failed build stays withdrawn; no build revision or evidence is rewound.
+        await txn.put('canonical', prior);
+        return response(JSON.stringify({ digest: restore }), 201);
+      });
+    }
     if (request.method === 'POST' && path === '/guard/publish') {
       let incoming: { capsule: Capsule; state: Predicate };
       try {
-        // Bounded streaming prevents an authenticated bad client exhausting the isolate.
-        const reader = request.body?.getReader();
-        if (!reader) throw new Error();
-        const chunks: Uint8Array[] = []; let size = 0;
-        while (true) {
-          const part = await reader.read(); if (part.done) break;
-          size += part.value.length;
-          if (size > 2 * 1024 * 1024) { await reader.cancel(); return response(null, 413); }
-          chunks.push(part.value);
-        }
-        const bytes = new Uint8Array(size); let offset = 0;
-        for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.length; }
-        incoming = parse(JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes)));
-      } catch { return response(null, 400); }
+        incoming = parse(JSON.parse(await readBody(request, 2 * 1024 * 1024)));
+      } catch (error) { return response(null, error instanceof RangeError ? 413 : 400); }
       const { capsule, state } = incoming;
       const currentDigest = await digest(capsule.predicate);
       return this.ctx.storage.transaction(async txn => {
@@ -92,9 +121,16 @@ export class ReleaseStore {
           }
         }
         const stored: Stored = { ...capsule, digest: currentDigest, state };
+        if (state.stage === 'promoted') {
+          stored.canonicalPrevious = head?.state.stage === 'promoted' ? head.digest : null;
+          // Capture an existing canonical capsule too, including heads accepted before
+          // this archive extension was deployed.
+          if (head) await txn.put(`capsule:${head.digest}`, head);
+        }
         // One capsule contains both metadata and bundle plus the associated loader bytes.
         await txn.put(capsule.channel, stored);
         await txn.put(`build:${state.manifest_sha256}`, stored);
+        await txn.put(`capsule:${currentDigest}`, stored);
         return response(JSON.stringify({ digest: currentDigest }), 201);
       });
     }
@@ -117,7 +153,7 @@ export default {
   async fetch(request: Request, env: Environment): Promise<Response> {
     const url = new URL(request.url);
     if (url.hostname !== 'zunderlabs.com') return response(null, 404);
-    if (url.pathname === '/guard/publish' && (!env.INSTALLER_PUBLISH_TOKEN ||
+    if (['/guard/publish', '/guard/restore'].includes(url.pathname) && (!env.INSTALLER_PUBLISH_TOKEN ||
       request.headers.get('authorization') !== `Bearer ${env.INSTALLER_PUBLISH_TOKEN}`)) return response(null, 401);
     return env.RELEASE_STATE.get(env.RELEASE_STATE.idFromName('release-publication-v1')).fetch(request);
   },

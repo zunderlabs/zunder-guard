@@ -4,6 +4,10 @@
 //! that talks to the venue: Zunder's executor, Zunder Guard's core and its
 //! MCP server, the venue foundations and the market-data client.
 //!
+//! - [`action`]: the order-path actions as types (orders, cancels,
+//!   modifies, leverage and margin updates, scheduled cancels), checked
+//!   prices and cloids, encoded once in the venue's field order, and the
+//!   `/exchange` request body.
 //! - [`wire`]: an action as one [`Wire`] value, encoded as MessagePack for
 //!   the signature and as JSON for the request, so that what is signed is
 //!   what is sent.
@@ -20,6 +24,7 @@
 //! (`tests/sdk_vectors.rs`). Compiles to `wasm32-unknown-unknown` for the
 //! browser Guard.
 
+pub mod action;
 mod address;
 pub mod grid;
 mod network;

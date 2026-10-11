@@ -133,7 +133,16 @@ fn assert_licence_object(licence: &Value) {
         licence["expires_at_ms"].is_i64() || licence["expires_at_ms"].is_null(),
         "{licence}"
     );
+    assert!(
+        [PRODUCTION_RENEWAL, STAGING_RENEWAL]
+            .contains(&licence["renewal_origin"].as_str().unwrap()),
+        "{licence}"
+    );
 }
+
+/// The two renewal origins `renewal_origin` can name.
+const PRODUCTION_RENEWAL: &str = "https://zunderlabs.com/api/licence/renewal";
+const STAGING_RENEWAL: &str = "https://staging.zunderlabs.com/api/licence/renewal";
 
 /// A licence key for `ACCOUNT` signed with the public test key: valid only
 /// where the test key is trusted (never in the binary, whose built-in
@@ -326,7 +335,7 @@ fn init_pair_and_licence_show() {
     assert_eq!(
         none,
         json!({"state": "none", "licensee": null, "expires_at_ms": null,
-            "fee_free": false, "source": "file"})
+            "fee_free": false, "source": "file", "renewal_origin": PRODUCTION_RENEWAL})
     );
     // A key this binary's issuers did not sign: refused by `licence set`
     // (exit 2, config unchanged) ...
@@ -347,8 +356,44 @@ fn init_pair_and_licence_show() {
     assert_eq!(
         invalid,
         json!({"state": "invalid", "licensee": null, "expires_at_ms": null,
-            "fee_free": false, "source": "auto_update"})
+            "fee_free": false, "source": "auto_update", "renewal_origin": PRODUCTION_RENEWAL})
     );
+}
+
+/// `licence show --json`'s `renewal_origin`: where automatic renewal would
+/// ask, from the key's issuer and the config's network, whether or not it
+/// is on. Against the binary: mainnet and testnet configs without a key, or
+/// with a key no built-in issuer signed, name production. A key the
+/// staging issuer signed needs its secret, which no test holds: that case
+/// (staging on testnet, production on mainnet, through the same function
+/// the renewal client asks) is `licence_life`'s
+/// `the_licence_object_names_the_renewal_origin`, with test issuers.
+#[test]
+fn licence_show_names_the_renewal_origin() {
+    let dir = TestDir::new("cli-contract-renewal-origin");
+    let home = dir.path().join("home");
+    init_paper_home(&home);
+    let config_path = home.join("guard.toml");
+    let forged = test_licence(now_ms() + 30 * 86_400_000);
+    for network in [GuardNetwork::Mainnet, GuardNetwork::Testnet] {
+        for key in [None, Some(forged.clone())] {
+            GuardConfig::update(&config_path, |config| {
+                config.network = Some(network);
+                config.licence = key.clone();
+            })
+            .unwrap();
+            let shown = json_out(&guard(&home_args(&home, &["licence", "show", "--json"])));
+            assert_licence_object(&shown);
+            assert_eq!(
+                shown["renewal_origin"], PRODUCTION_RENEWAL,
+                "{network:?} {shown}"
+            );
+            assert_eq!(
+                shown["state"],
+                if key.is_some() { "invalid" } else { "none" }
+            );
+        }
+    }
 }
 
 /// A paper home made by `init --non-interactive`, its risk journal started

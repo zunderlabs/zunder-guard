@@ -55,7 +55,9 @@ def setup(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Any:
 
     def wallet(key: str) -> object:
         assert key == "dummy-secret"
-        return object()
+        from types import SimpleNamespace
+
+        return SimpleNamespace(address="0x" + "2" * 40)
 
     def sign(wallet: object, action: dict[str, Any], mainnet: bool) -> dict[str, int]:
         assert mainnet is False and action["amount"] == "0.180001"
@@ -123,3 +125,38 @@ def test_ambiguous_send_has_durable_marker_and_never_retries(setup: Any) -> None
 def test_amount_refuses_floats_or_outside_exact_subdollar_bound(amount: object) -> None:
     with pytest.raises(payment.PaymentError):
         payment.amount_micro(amount)
+
+
+@pytest.mark.parametrize(
+    "scenario,quoted,state",
+    [("under", 180002, "quoted"), ("over", 180000, "quoted"), ("late", 180001, "expired")],
+)
+def test_explicit_edges_are_exactly_one_micro_or_expired(
+    setup: Any, scenario: str, quoted: int, state: str
+) -> None:
+    _, order, sends, _, work = setup
+    order.update(amount_micro=quoted, state=state)
+    receipt = payment.pay("ZL-2026-000001", "0.180001", work, scenario=scenario)
+    assert receipt["scenario"] == scenario and len(sends) == 1
+
+
+@pytest.mark.parametrize("scenario", ["under", "over", "late", "blocked", "unknown"])
+def test_edge_refuses_mismatched_order_before_key_custody(setup: Any, scenario: str) -> None:
+    _, order, sends, _, work = setup
+    order["state"] = "delivered"
+    with pytest.raises(payment.PaymentError):
+        payment.pay("ZL-2026-000001", "0.180001", work, scenario=scenario)
+    assert "E2E_PAYER_HYPERLIQUID_TESTNET_KEY" in os.environ
+    assert not sends and not list(work.iterdir())
+
+
+def test_blocked_uses_only_dedicated_blocked_payer(
+    setup: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, _, sends, _, work = setup
+    monkeypatch.setenv("E2E_PAYER_BLOCKED_KEY", "dummy-secret")
+    # The unselected key remains in the parent; the child must receive only its selected key.
+    monkeypatch.delenv("E2E_PAYER_HYPERLIQUID_TESTNET_KEY")
+    receipt = payment.pay("ZL-2026-000001", "0.180001", work, scenario="blocked")
+    assert receipt["scenario"] == "blocked" and len(sends) == 1
+    assert "E2E_PAYER_BLOCKED_KEY" not in os.environ

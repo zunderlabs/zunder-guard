@@ -272,3 +272,51 @@ def test_installed_entrypoint_resolves_release_resources(tmp_path: Path) -> None
         timeout=10,
     )
     assert result.returncode == 0
+
+
+def test_failed_fee_proof_after_flat_cleanup_cannot_publish_success(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from types import SimpleNamespace
+
+    import guard_harness.builder_journey as builder
+
+    approval = tmp_path / "approval.json"
+    approval.write_text("{}")
+    approval.chmod(0o600)
+
+    def verify(argv: list[str], **kwargs: Any) -> None:
+        assets(Path(argv[-1]))
+
+    class Owner:
+        pair = SimpleNamespace(address="0x" + "1" * 40)
+
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            pass
+
+        def journey(self, *args: Any, **kwargs: Any) -> Journey:
+            assert callable(kwargs["capture_entry"])
+            return Journey(
+                Ownership(1, 2, Decimal(".0001"), Decimal(0), False),
+                Cleaned(("close",), {"flat": True}),
+                None,
+                True,
+            )
+
+    descriptor = tmp_path / "descriptor.json"
+    descriptor.write_text("{}")
+
+    def refuse(*args: Any, **kwargs: Any) -> Any:
+        assert args[2]["result"] == "passed" and args[2]["guard_stopped"] is True
+        raise ValueError("fee evidence incomplete")
+
+    monkeypatch.setattr(command, "run", verify)
+    monkeypatch.setattr(command, "Foreground", Owner)
+    monkeypatch.setattr(builder, "produce_descriptor", lambda *a, **k: descriptor)
+    monkeypatch.setattr(builder, "correlate_fee", refuse)
+    assert command.execute_release(**args(tmp_path, io.BytesIO()), builder_approval=approval) == 1
+    receipt = json.loads((tmp_path / "run/receipt.json").read_bytes())
+    assert receipt["result"] == "failed" and receipt["cleanup_complete"] is True
+    assert receipt["guard_stopped"] is True
+    assert not (tmp_path / "run/T1.predicate.json").exists()
+    assert not (tmp_path / "run/P8.predicate.json").exists()

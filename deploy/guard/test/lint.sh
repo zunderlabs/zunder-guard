@@ -54,8 +54,8 @@ fi
 step "actionlint"
 workflow_dir=$G/github/workflows
 if [ ! -d "$workflow_dir" ]; then workflow_dir=.github/workflows; fi
-$DOCKER run --rm -v "$PWD/$workflow_dir:/w:ro" -w /w rhysd/actionlint:1.7.12 -no-color release.yml publish.yml ci.yml
-echo "  ok: release.yml publish.yml ci.yml"
+$DOCKER run --rm -v "$PWD/$workflow_dir:/w:ro" -w /w rhysd/actionlint:1.7.12 -no-color release.yml verify.yml promote.yml nightly.yml monitor.yml ci.yml install-matrix.yml journey.yml
+echo "  ok: release.yml verify.yml promote.yml nightly.yml monitor.yml ci.yml install-matrix.yml journey.yml"
 
 step "hadolint"
 $DOCKER run --rm -i hadolint/hadolint:v2.15.1 hadolint --no-color - <$G/Dockerfile

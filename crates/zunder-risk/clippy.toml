@@ -1,0 +1,17 @@
+# This crate decides from the data it is given, never from the wall clock: the same candles and
+# events must give the same result in a backtest, on paper and live, and a clock read could let the
+# present leak into a decision about the past. A crate's clippy.toml replaces the workspace's, so
+# the first two settings repeat it; every crate under this rule carries the same file.
+allow-unwrap-in-tests = true
+allow-dbg-in-tests = true
+
+disallowed-methods = [
+  { path = "zunder_core::time::Timestamp::now", reason = "decisions take time from candles and events, not the wall clock" },
+  { path = "zunder_core::time::Timestamp::try_now", reason = "decisions take time from candles and events, not the wall clock" },
+  { path = "zunder_core::time::Clock::now", reason = "decisions take time from candles and events, not the wall clock" },
+  { path = "std::time::SystemTime::now", reason = "decisions take time from candles and events, not the wall clock" },
+  { path = "std::time::Instant::now", reason = "decisions take time from candles and events, not the wall clock" },
+]
+disallowed-types = [
+  { path = "zunder_core::time::SystemClock", reason = "decisions take time from candles and events, not the wall clock" },
+]

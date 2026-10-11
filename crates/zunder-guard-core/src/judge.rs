@@ -85,12 +85,14 @@ use rust_decimal::{Decimal, dec, prelude::ToPrimitive};
 use serde::Serialize;
 use zunder_core::{Side, Symbol};
 use zunder_risk::{RiskEngine, RiskState, SizeRequest, Veto};
+// Which way each price rounds, named by what it is for.
+use zunder_venue_types::{aggressive, passive, toward_position};
 
 use crate::{
     account::{AccountView, AssetInfo, AssetKind, MIN_NOTIONAL, PositionView, asset_kind},
     action::{
         Action, Builder, Cancel, Cloid, ExchangeRequest, Grouping, Modify, Order, OrderAction,
-        OrderKind, OrderRef, Px, Tif, Tpsl,
+        OrderKind, OrderRef, Protection, Px, Tif, Tpsl,
     },
     policy::{Policy, StopPolicy},
 };
@@ -307,15 +309,16 @@ fn widen_market_stops(
         let Some(asset) = ctx.account.meta.by_index(order.asset) else {
             return;
         };
-        let bound = if order.is_buy {
-            trigger
-                .checked_mul(Decimal::ONE + slippage)
-                .and_then(|price| asset.round_price(price, true))
+        // The stop's own side: rounded towards it, so the limit never
+        // lies closer to the trigger than `stop_slippage`.
+        let (stop_side, factor) = if order.is_buy {
+            (Side::Buy, Decimal::ONE + slippage)
         } else {
-            trigger
-                .checked_mul(Decimal::ONE - slippage)
-                .and_then(|price| asset.round_price(price, false))
+            (Side::Sell, Decimal::ONE - slippage)
         };
+        let bound = trigger
+            .checked_mul(factor)
+            .and_then(|price| asset.round_price(price, aggressive(stop_side)));
         let Some(bound) = bound else {
             return;
         };
@@ -460,6 +463,8 @@ fn asset<'a>(ctx: &Context<'a>, index: u32) -> Judged<&'a AssetInfo> {
 
 /// The prefix of the client order ids of the stops Guard attaches: `zg`.
 pub const GUARD_CLOID_PREFIX: &str = "0x7a67";
+/// The same prefix as bytes, for building the ids.
+const GUARD_CLOID_TAG: [u8; 2] = *b"zg";
 
 /// Whether a client order id is one of Guard's.
 /// Whether a bot's new orders carry an id with the prefix of Guard's own
@@ -493,12 +498,11 @@ fn guard_cloid(salt: &[u8], request: &ExchangeRequest) -> Cloid {
 /// A Guard cloid from its secret salt and `data`.
 fn guard_cloid_of(salt: &[u8], data: &[u8]) -> Cloid {
     let hash = crate::sign::keccak256(&[salt, data].concat());
-    let mut text = GUARD_CLOID_PREFIX.to_owned();
-    for byte in &hash[..14] {
-        text.push_str(&format!("{byte:02x}"));
-    }
-    // `0x`, 4 and 28 hex digits.
-    Cloid::from_hex_digits(text)
+    // The prefix's two bytes and 14 of the hash: `0x`, 4 and 28 hex digits.
+    let mut bytes = [0u8; 16];
+    bytes[..2].copy_from_slice(&GUARD_CLOID_TAG);
+    bytes[2..].copy_from_slice(&hash[..14]);
+    Cloid::from_bytes(bytes)
 }
 
 /// One order of an `order` action, and what Guard makes of it.
@@ -1042,15 +1046,14 @@ fn worst_fill(
     sent: &Px,
     changes: &mut Vec<String>,
 ) -> Judged<WorstFill> {
-    let bound = match side {
-        Side::Buy => mid
-            .checked_mul(Decimal::ONE + policy.entry_price_bound)
-            .and_then(|price| asset.round_price(price, false)),
-        Side::Sell => mid
-            .checked_mul(Decimal::ONE - policy.entry_price_bound)
-            .and_then(|price| asset.round_price(price, true)),
-    }
-    .ok_or_else(overflow)?;
+    let factor = match side {
+        Side::Buy => Decimal::ONE + policy.entry_price_bound,
+        Side::Sell => Decimal::ONE - policy.entry_price_bound,
+    };
+    let bound = mid
+        .checked_mul(factor)
+        .and_then(|price| asset.round_price(price, passive(side)))
+        .ok_or_else(overflow)?;
     let sent_price = sent.value();
     let worst = match side {
         Side::Buy => sent_price.min(bound),
@@ -1121,17 +1124,16 @@ fn entry_stop(
             }
             StopPolicy::Attach => {
                 let distance = policy.default_stop_distance;
-                let stop = match side {
-                    // Rounded towards the price: never looser than the
-                    // configured distance.
-                    Side::Buy => stop_reference
-                        .checked_mul(Decimal::ONE - distance)
-                        .and_then(|stop| asset.round_price(stop, true)),
-                    Side::Sell => stop_reference
-                        .checked_mul(Decimal::ONE + distance)
-                        .and_then(|stop| asset.round_price(stop, false)),
-                }
-                .ok_or_else(overflow)?;
+                let factor = match side {
+                    Side::Buy => Decimal::ONE - distance,
+                    Side::Sell => Decimal::ONE + distance,
+                };
+                // Rounded towards the price: never looser than the
+                // configured distance.
+                let stop = stop_reference
+                    .checked_mul(factor)
+                    .and_then(|stop| asset.round_price(stop, toward_position(side)))
+                    .ok_or_else(overflow)?;
                 changes.push(format!(
                     "a reduce-only stop at {stop} ({} from {stop_reference}) is attached",
                     percent(distance)
@@ -1489,7 +1491,7 @@ fn entry_quantity(
     let stop_floor = match side {
         Side::Buy => stop
             .checked_mul(Decimal::ONE - policy.stop_slippage)
-            .and_then(|price| asset.round_price(price, false))
+            .and_then(|price| asset.round_price(price, aggressive(Side::Sell)))
             .ok_or_else(overflow)?,
         Side::Sell => stop,
     };
@@ -1580,15 +1582,7 @@ fn attached_stop(
     let EntryTerms {
         asset, side, stop, ..
     } = *terms;
-    let worst_fill = match side {
-        Side::Buy => stop
-            .checked_mul(Decimal::ONE - ctx.policy.stop_slippage)
-            .and_then(|price| asset.round_price(price, false)),
-        Side::Sell => stop
-            .checked_mul(Decimal::ONE + ctx.policy.stop_slippage)
-            .and_then(|price| asset.round_price(price, true)),
-    }
-    .ok_or_else(overflow)?;
+    let worst_fill = stop_worst_fill(asset, ctx.policy, side, stop).ok_or_else(overflow)?;
     Ok(Order {
         asset: entry.asset,
         is_buy: !entry.is_buy,
@@ -2320,7 +2314,7 @@ pub fn protect_actions_with(
         let asset = account.meta.by_name(&position.coin);
         let usable = |stop: &Decimal| {
             let placed =
-                asset.and_then(|asset| asset.round_price(*stop, position.side == Side::Buy));
+                asset.and_then(|asset| asset.round_price(*stop, toward_position(position.side)));
             mid.zip(placed)
                 .is_some_and(|(mid, placed)| match position.side {
                     Side::Buy => placed < mid,
@@ -2370,6 +2364,23 @@ pub fn protect_actions_with(
     (actions, unpriced, problems)
 }
 
+/// The worst fill of a market stop at `stop` protecting a position on
+/// `position_side`: [`Policy::stop_slippage`] beyond the trigger against
+/// the position, rounded towards the aggressive side of the closing order
+/// (its limit, so rounding never keeps it from filling).
+fn stop_worst_fill(
+    asset: &AssetInfo,
+    policy: &Policy,
+    position_side: Side,
+    stop: Decimal,
+) -> Option<Decimal> {
+    let worst = match position_side {
+        Side::Buy => stop.checked_mul(Decimal::ONE - policy.stop_slippage)?,
+        Side::Sell => stop.checked_mul(Decimal::ONE + policy.stop_slippage)?,
+    };
+    asset.round_price(worst, aggressive(position_side.opposite()))
+}
+
 fn protective_stop(
     account: &AccountView,
     policy: &Policy,
@@ -2390,15 +2401,11 @@ fn protective_stop(
                 Some(_) => return None,
                 None => default,
             };
-            let stop = asset.round_price(stop, true)?;
+            let stop = asset.round_price(stop, toward_position(position.side))?;
             if stop >= mid {
                 return None;
             }
-            let worst = asset.round_price(
-                stop.checked_mul(Decimal::ONE - policy.stop_slippage)?,
-                false,
-            )?;
-            (stop, worst)
+            (stop, stop_worst_fill(asset, policy, position.side, stop)?)
         }
         Side::Sell => {
             let default = mid.checked_mul(Decimal::ONE + policy.default_stop_distance)?;
@@ -2407,13 +2414,11 @@ fn protective_stop(
                 Some(_) => return None,
                 None => default,
             };
-            let stop = asset.round_price(stop, false)?;
+            let stop = asset.round_price(stop, toward_position(position.side))?;
             if stop <= mid {
                 return None;
             }
-            let worst =
-                asset.round_price(stop.checked_mul(Decimal::ONE + policy.stop_slippage)?, true)?;
-            (stop, worst)
+            (stop, stop_worst_fill(asset, policy, position.side, stop)?)
         }
     };
     if stop <= Decimal::ZERO || worst <= Decimal::ZERO {

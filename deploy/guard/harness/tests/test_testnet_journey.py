@@ -25,6 +25,7 @@ class Scenario:
         self.writes_bound, self.close_size_bound = True, True
         self.calls: list[str] = []
         self.stopped = False
+        self.fee: dict[str, Any] = {"mode": "off"}
 
     def request(self, path: str) -> object:
         if path.startswith("/guard/events"):
@@ -39,7 +40,7 @@ class Scenario:
             "version": "1.0.0-rc.1",
             "capabilities": {"exchange_expected_mode": True},
             "risk": {"state": "active", "journal_ready": True},
-            "fee": {"mode": "off"},
+            "fee": self.fee,
             "killed": None,
             "journal_broken": False,
             "last_error": None,
@@ -158,3 +159,75 @@ def test_cleanup_transport_phase_starts_after_ambiguous_entry() -> None:
     )
     assert phases == ["entry", "cleanup"]
     assert result.cleaned is not None and not result.passed
+
+
+def builder_fee() -> dict[str, Any]:
+    return {
+        "mode": "builder",
+        "address": "0x" + "2" * 40,
+        "fee_tenths_bp": 20,
+        "charged": True,
+        "paper": False,
+        "entries_blocked": False,
+        "approval": {"state": "approved", "max_tenths_bp": 20, "error": None},
+    }
+
+
+def test_actual_approved_builder_mode_runs_same_owned_cleanup() -> None:
+    scenario = Scenario()
+    scenario.fee = builder_fee()
+    assert scenario.execute().passed
+    assert scenario.calls == ["preview_order", "place_order", "close_position"]
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("mode", "fee_free"),
+        ("address", "invalid"),
+        ("fee_tenths_bp", 21),
+        ("fee_tenths_bp", True),
+        ("charged", False),
+        ("paper", True),
+        ("entries_blocked", True),
+    ],
+)
+def test_builder_fee_mismatch_refuses_before_any_order(field: str, value: Any) -> None:
+    scenario = Scenario()
+    scenario.fee = builder_fee()
+    scenario.fee[field] = value
+    with pytest.raises(RuntimeError):
+        scenario.execute()
+    assert scenario.calls == []
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("state", "unchecked"),
+        ("state", "not_approved"),
+        ("max_tenths_bp", 19),
+        ("max_tenths_bp", True),
+        ("error", "unavailable"),
+    ],
+)
+def test_unconfirmed_approval_never_reaches_preview_or_entry(field: str, value: Any) -> None:
+    scenario = Scenario()
+    scenario.fee = builder_fee()
+    scenario.fee["approval"][field] = value
+    with pytest.raises(RuntimeError):
+        scenario.execute()
+    assert scenario.calls == []
+
+
+def test_failed_fee_observation_still_cleans_without_retry() -> None:
+    scenario = Scenario()
+
+    def fail(*args: Any) -> None:
+        raise ValueError("fee not proved")
+
+    result = scenario.execute(capture_entry=fail)
+    assert not result.passed
+    assert result.cleaned is not None and result.guard_stopped
+    assert result.failure == "entry_or_protection"
+    assert scenario.calls == ["preview_order", "place_order", "close_position"]

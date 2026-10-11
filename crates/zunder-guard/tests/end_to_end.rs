@@ -17,7 +17,7 @@ use std::{path::Path, sync::Arc};
 use futures_util::{SinkExt, StreamExt};
 use rust_decimal::{Decimal, dec};
 use serde_json::{Value, json};
-use support::MemoryVenue;
+use support::{CloseScript, MemoryVenue};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use zunder_core::Timestamp;
 use zunder_guard::{
@@ -28,7 +28,7 @@ use zunder_guard::{
     testdir::TestDir,
 };
 use zunder_guard_core::{
-    action::{Action, Grouping, OrderKind, Tpsl},
+    action::{Action, Grouping, OrderKind, Protection, Tpsl},
     auth::AuthConfig,
     licence::FeeMode,
     sign::{Address, GuardKey, SigningNetwork},
@@ -76,8 +76,14 @@ fn config(dir: &Path, paper: bool) -> GuardConfig {
 }
 
 async fn start(paper: bool) -> Running {
+    start_with(paper, |_| {}).await
+}
+
+/// [`start`] with the config changed by `edit` first.
+async fn start_with(paper: bool, edit: impl FnOnce(&mut GuardConfig)) -> Running {
     let dir = TestDir::new(if paper { "e2e-paper" } else { "e2e" });
-    let config = config(dir.path(), paper);
+    let mut config = config(dir.path(), paper);
+    edit(&mut config);
     let risk = PersistentRisk::initialise_for(
         &config.risk_journal(paper),
         config.policy.risk_limits(),
@@ -646,6 +652,238 @@ async fn a_resting_entry_whose_stop_is_refused_is_cancelled() {
     );
 }
 
+/// The venue's answer to an entry and its stop (`[entry, stop]`), with the
+/// stop's status replaced by `stop`; other answers pass unchanged.
+fn with_stop_status(stop: Value) -> impl Fn(&Value, Value) -> Value + Send + Sync + 'static {
+    move |action, mut reply| {
+        if action["type"] == "order" && action["orders"].as_array().is_some_and(|o| o.len() == 2) {
+            reply["response"]["data"]["statuses"][1] = stop.clone();
+        }
+        reply
+    }
+}
+
+async fn alert(guard: &Running) -> String {
+    let status: Value = reqwest::get(format!("{}/guard/status", guard.url))
+        .await
+        .unwrap()
+        .json_text()
+        .await;
+    status["alerts"]
+        .as_array()
+        .map(|alerts| {
+            alerts
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>()
+                .join(" | ")
+        })
+        .unwrap_or_default()
+}
+
+/// Guard's own stop for a long `qty` ETH at the 3,000 mid: 2% below it,
+/// 2,940, its limit 10% below that (2,646), reduce-only, for the whole.
+fn assert_guards_stop(action: &Action, qty: &str) {
+    let Action::Order(order) = action else {
+        panic!("{action:?}")
+    };
+    let stop = &order.orders[0];
+    assert_eq!(stop.protective_level(), Some(dec!(2940)), "{action:?}");
+    assert_eq!(stop.price.value(), dec!(2646));
+    assert!(stop.reduce_only && !stop.is_buy);
+    assert_eq!(stop.size.raw(), qty);
+    assert!(
+        stop.cloid
+            .as_ref()
+            .is_some_and(|cloid| cloid.as_str().starts_with("0x7a67"))
+    );
+}
+
+#[tokio::test]
+async fn a_filled_entry_whose_stop_status_is_unreadable_is_recorded_and_protected_at_once() {
+    let guard = start(false).await;
+    // A first round: protection has run, so only a reason to protect now
+    // (not the 30 s backstop) makes the next round within the settle
+    // window protect.
+    guard.venue_handle.sync().await;
+    // The venue fills the entry and does not place its stop, but its
+    // answer says something Guard cannot read about the stop.
+    guard.venue().refuse_stops();
+    guard
+        .venue()
+        .rewrite_replies(with_stop_status(json!({"unexpected": "shape"})));
+    let reply = post(&guard.url, "/exchange", &ccxt_market_buy("0.1", now())).await;
+    assert_eq!(reply["status"], "ok", "{reply}");
+    // Not closed on a guess (the stop may rest): leverage and entry only.
+    let received = guard.venue().received();
+    assert_eq!(received.len(), 2, "{received:?}");
+    assert_eq!(guard.venue().positions().len(), 1);
+    let text = alert(&guard).await;
+    assert!(
+        text.contains("does not confirm its stop") && text.contains("at once"),
+        "{text}"
+    );
+    // The next round, within 5 s of the send (not settled), protects: the
+    // venue's open orders hold no stop, so Guard places its own for 0.1.
+    guard.venue().accept_stops();
+    guard.venue().rewrite_replies(|_, reply| reply);
+    guard.venue_handle.sync().await;
+    let received = guard.venue().received();
+    assert_eq!(received.len(), 3, "{received:?}");
+    assert_guards_stop(&received[2].action, "0.1");
+}
+
+#[tokio::test]
+async fn an_answer_without_statuses_leaves_the_entry_unknown_and_protected_at_once() {
+    let guard = start(false).await;
+    guard.venue_handle.sync().await;
+    guard.venue().refuse_stops();
+    // An `ok` order answer without its statuses: the entry filled, the
+    // stop was refused, and Guard can tell neither.
+    guard.venue().rewrite_replies(|action, reply| {
+        if action["type"] == "order" {
+            json!({"status": "ok", "response": {"type": "order"}})
+        } else {
+            reply
+        }
+    });
+    let reply = post(&guard.url, "/exchange", &ccxt_market_buy("0.1", now())).await;
+    assert_eq!(reply["status"], "ok", "{reply}");
+    assert_eq!(guard.venue().received().len(), 2);
+    assert!(
+        alert(&guard)
+            .await
+            .contains("does not say what became of the ETH entry")
+    );
+    guard.venue().accept_stops();
+    guard.venue().rewrite_replies(|_, reply| reply);
+    guard.venue_handle.sync().await;
+    let received = guard.venue().received();
+    assert_eq!(received.len(), 3, "{received:?}");
+    assert_guards_stop(&received[2].action, "0.1");
+}
+
+#[tokio::test]
+async fn a_lost_answer_to_an_entry_is_protected_at_once() {
+    let guard = start(false).await;
+    guard.venue_handle.sync().await;
+    guard.venue().refuse_stops();
+    guard.venue().swallow_answers(true);
+    let reply = post(&guard.url, "/exchange", &ccxt_market_buy("0.1", now())).await;
+    assert_eq!(reply["code"], "venue_unreachable", "{reply}");
+    assert!(alert(&guard).await.contains("is unknown"));
+    guard.venue().swallow_answers(false);
+    guard.venue().accept_stops();
+    guard.venue_handle.sync().await;
+    let received = guard.venue().received();
+    assert_eq!(received.len(), 3, "{received:?}");
+    assert_guards_stop(&received[2].action, "0.1");
+}
+
+#[tokio::test]
+async fn a_retry_after_a_lost_entry_waits_for_it() {
+    let guard = start(false).await;
+    // The answer to the entry is lost: it may have reached the venue (here
+    // it did) and stays valid there for 30 s.
+    guard.venue().swallow_answers(true);
+    let reply = post(&guard.url, "/exchange", &ccxt_market_buy("0.1", now())).await;
+    assert_eq!(reply["code"], "venue_unreachable", "{reply}");
+    guard.venue().swallow_answers(false);
+    // The venue's account answer does not show the fill yet: judged on it
+    // alone, the retry would go.
+    guard.venue().clear_positions();
+    // The bot retries at once: refused, nothing sent (the leverage and the
+    // lost entry are all the venue took), so the position is not doubled.
+    let retry = post(&guard.url, "/exchange", &ccxt_market_buy("0.1", now())).await;
+    assert_eq!(retry["code"], "account_unreadable", "{retry}");
+    assert!(
+        retry["response"]
+            .as_str()
+            .unwrap_or("")
+            .contains("may still reach the venue"),
+        "{retry}"
+    );
+    assert_eq!(guard.venue().received().len(), 2);
+}
+
+#[tokio::test]
+async fn a_resting_entry_whose_stop_status_is_unreadable_is_cancelled() {
+    let guard = start(false).await;
+    // A GTC buy at 2,950 rests with its stop waiting, but the answer says
+    // something unreadable about the stop: an unconfirmed stop protects
+    // nothing, so the entry is cancelled (its stop goes with it).
+    guard
+        .venue()
+        .rewrite_replies(with_stop_status(json!("somethingNew")));
+    let reply = post(
+        &guard.url,
+        "/exchange",
+        &ccxt_buy("2950", "0.1", "Gtc", now()),
+    )
+    .await;
+    assert_eq!(reply["status"], "ok", "{reply}");
+    let received = guard.venue().received();
+    assert_eq!(received.len(), 3, "{received:?}");
+    assert!(matches!(&received[2].action, Action::Cancel(cancels) if cancels.len() == 1));
+    assert!(alert(&guard).await.contains("does not confirm its stop"));
+}
+
+#[tokio::test]
+async fn a_waiting_stop_counts_as_placed() {
+    let guard = start(false).await;
+    // The venue's answer for a normalTpsl entry that rests: the stop is
+    // `waitingForFill`. Placed: the entry stays, no alert.
+    guard
+        .venue()
+        .rewrite_replies(with_stop_status(json!("waitingForFill")));
+    let reply = post(
+        &guard.url,
+        "/exchange",
+        &ccxt_buy("2950", "0.1", "Gtc", now()),
+    )
+    .await;
+    assert_eq!(reply["status"], "ok", "{reply}");
+    assert_eq!(guard.venue().received().len(), 2);
+    assert_eq!(alert(&guard).await, "");
+}
+
+#[tokio::test]
+async fn the_running_sync_protects_at_once_when_an_outcome_is_unknown() {
+    // Rounds every 300 s: only the wake protects within the test.
+    let guard = start_with(false, |config| config.sync_seconds = 300).await;
+    let sync = tokio::spawn(guard.venue_handle.clone().sync_forever());
+    // The first round runs at once.
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    let account_reads = |venue: &MemoryVenue| {
+        venue
+            .info_log()
+            .iter()
+            .filter(|body| body["type"] == "clearinghouseState")
+            .count()
+    };
+    // The venue places the stop, but its answer about it is unreadable.
+    guard
+        .venue()
+        .rewrite_replies(with_stop_status(json!({"unexpected": "shape"})));
+    let before = account_reads(guard.venue());
+    let reply = post(&guard.url, "/exchange", &ccxt_market_buy("0.1", now())).await;
+    assert_eq!(reply["status"], "ok", "{reply}");
+    // The request read the account once; a round within 2 s reads it again
+    // (and finds the stop resting: nothing more is sent).
+    let mut woken = false;
+    for _ in 0..40 {
+        if account_reads(guard.venue()) >= before + 2 {
+            woken = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    sync.abort();
+    assert!(woken, "no round after the unknown outcome");
+    assert_eq!(guard.venue().received().len(), 2);
+}
+
 #[tokio::test]
 async fn the_sync_gives_an_unprotected_position_guards_stop() {
     let guard = start(false).await;
@@ -696,6 +934,148 @@ async fn an_unprotected_position_whose_stop_is_refused_is_closed() {
         status["alert"].as_str().unwrap().contains("closed at once"),
         "{status}"
     );
+}
+
+/// Guard's last-resort close of an unprotected position whose stop the
+/// venue refused (`guard/protect.rs`, `close_unprotected`): a short 0.5
+/// ETH opened elsewhere, its stop refused, the close answered as `script`
+/// says (and ETH's mid set to `mid`). Returns the venue's position in ETH
+/// afterwards (signed, "0" when flat), the status's alert, the events
+/// journaled, and the running Guard.
+async fn last_resort_close(
+    script: Option<CloseScript>,
+    mid: Option<&str>,
+) -> (String, String, Vec<Value>, Running) {
+    let guard = start(false).await;
+    guard.venue().refuse_stops();
+    guard.venue().add_position("ETH", "-0.5");
+    if let Some(mid) = mid {
+        guard.venue().set_mid("ETH", mid);
+    }
+    if let Some(script) = script {
+        guard.venue().script_close(script);
+    }
+    guard.venue_handle.sync().await;
+    let held = guard
+        .venue()
+        .positions()
+        .iter()
+        .find(|p| p["position"]["coin"] == "ETH")
+        .map_or("0".to_owned(), |p| {
+            p["position"]["szi"].as_str().unwrap().to_owned()
+        });
+    let status = guard.venue_handle.status().await;
+    let alert = status["alert"].as_str().unwrap_or_default().to_owned();
+    let events = guard
+        .venue_handle
+        .events(0)
+        .await
+        .as_array()
+        .unwrap()
+        .clone();
+    (held, alert, events, guard)
+}
+
+/// The protect round journaled its intent as sent and closed it with
+/// `done`, and `alert` went into the journal as an error record, once.
+fn assert_journaled(events: &[Value], alert: &str) {
+    let protect = events
+        .iter()
+        .find(|event| event["kind"] == "protect")
+        .unwrap_or_else(|| panic!("{events:?}"));
+    assert_eq!(protect["sent"], true, "{protect}");
+    assert_eq!(protect["coins"], json!(["ETH"]), "{protect}");
+    let seq = protect["seq"].as_u64().unwrap();
+    assert!(
+        events
+            .iter()
+            .any(|event| event["kind"] == "done" && event["intent"] == seq),
+        "{events:?}"
+    );
+    let errors = events
+        .iter()
+        .filter(|event| event["kind"] == "error" && event["text"] == alert)
+        .count();
+    assert_eq!(errors, 1, "{events:?}");
+}
+
+/// The venue received the stop (refused) and then one reduce-only IOC buy
+/// of the whole 0.5.
+fn assert_stop_then_close(guard: &Running) {
+    let received = guard.venue().received();
+    assert_eq!(received.len(), 2, "{received:?}");
+    let Action::Order(close) = &received[1].action else {
+        panic!("{:?}", received[1])
+    };
+    let order = &close.orders[0];
+    assert!(order.reduce_only && order.is_buy, "{order:?}");
+    assert!(matches!(order.kind, OrderKind::Limit { .. }), "{order:?}");
+    assert_eq!(order.size.raw(), "0.5");
+}
+
+#[tokio::test]
+async fn a_last_resort_close_that_fills_in_part_asks_for_the_rest_by_hand() {
+    let (held, alert, events, guard) =
+        last_resort_close(Some(CloseScript::Part("0.2")), None).await;
+    assert_stop_then_close(&guard);
+    // 0.5 short, 0.2 bought back.
+    assert_eq!(held, "-0.3");
+    assert_eq!(
+        alert,
+        "ETH: Guard's stop was refused; only 0.2 of 0.5 closed: close the rest by hand"
+    );
+    assert_journaled(&events, &alert);
+}
+
+#[tokio::test]
+async fn a_last_resort_close_that_does_not_fill_asks_for_a_close_by_hand() {
+    let (held, alert, events, guard) = last_resort_close(Some(CloseScript::NoFill), None).await;
+    assert_stop_then_close(&guard);
+    assert_eq!(held, "-0.5");
+    assert_eq!(
+        alert,
+        "ETH: Guard's stop was refused; the close did not fill ([Error(\"Order could not immediately match against any resting orders. asset=1\")]): close it by hand"
+    );
+    assert_journaled(&events, &alert);
+}
+
+#[tokio::test]
+async fn a_refused_last_resort_close_asks_for_a_close_by_hand() {
+    let (held, alert, events, guard) = last_resort_close(Some(CloseScript::Refuse), None).await;
+    assert_stop_then_close(&guard);
+    assert_eq!(held, "-0.5");
+    assert_eq!(
+        alert,
+        "ETH: Guard's stop was refused; the close was refused (Insufficient margin to place order (test).): close it by hand"
+    );
+    assert_journaled(&events, &alert);
+}
+
+#[tokio::test]
+async fn a_last_resort_close_that_cannot_be_sent_asks_for_a_close_by_hand() {
+    let (held, alert, events, guard) = last_resort_close(Some(CloseScript::Fail), None).await;
+    assert_stop_then_close(&guard);
+    assert_eq!(held, "-0.5");
+    assert_eq!(
+        alert,
+        "ETH: Guard's stop was refused; closing it failed: HTTP 503: service unavailable (test); close it by hand"
+    );
+    assert_journaled(&events, &alert);
+}
+
+#[tokio::test]
+async fn a_position_without_a_price_is_left_to_a_person() {
+    // No mid for ETH: neither a stop nor a close can be priced, so nothing
+    // is sent and a person is asked to close it.
+    let (held, alert, events, guard) = last_resort_close(None, Some("0")).await;
+    let received = guard.venue().received();
+    assert!(received.is_empty(), "{received:?}");
+    assert_eq!(held, "-0.5");
+    assert_eq!(
+        alert,
+        "ETH: no stop could be placed (no price, or the price is already through the stop recorded for it); ETH: no stop could be priced; no close could be priced: close it by hand"
+    );
+    assert_journaled(&events, &alert);
 }
 
 #[tokio::test]

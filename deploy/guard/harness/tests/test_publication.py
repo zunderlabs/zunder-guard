@@ -173,6 +173,7 @@ def test_receipt_matches_digest(monkeypatch: pytest.MonkeyPatch) -> None:
     class Opener:
         def open(self, request: Any, **kwargs: Any) -> Reply:
             assert kwargs["timeout"] == 45
+            assert request.get_header("User-agent") == "zunder-guard-release/1.0"
             return Reply(json.dumps({"digest": "a" * 64}).encode())
 
     monkeypatch.setattr(urllib.request, "build_opener", lambda *args: Opener())

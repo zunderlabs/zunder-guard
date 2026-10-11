@@ -13,7 +13,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from guard_harness.attestation import AttestationError
-from guard_harness.publication import Publication, _NoRedirect
+from guard_harness.publication import USER_AGENT, Publication, _NoRedirect
 
 ORIGIN = "https://zunderlabs.com"
 LIMIT = 2 * 1024 * 1024
@@ -30,7 +30,9 @@ def fetch(path: str) -> Response:
     """One bounded credential-free GET, with no redirects or retries."""
     if path not in {"/i", "/i.ps1", "/guard/release.json", "/guard/release.json.sigstore"}:
         raise AttestationError("canonical endpoint is outside C5")
-    request = urllib.request.Request(ORIGIN + path, method="GET")
+    request = urllib.request.Request(
+        ORIGIN + path, method="GET", headers={"User-Agent": USER_AGENT}
+    )
     try:
         with urllib.request.build_opener(_NoRedirect()).open(request, timeout=30) as response:
             body = response.read(LIMIT + 1)

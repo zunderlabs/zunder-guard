@@ -20,7 +20,7 @@
 
 use rust_decimal::Decimal;
 use serde::Serialize;
-use zunder_core::{Position, Symbol};
+use zunder_core::{Position, Side, Symbol};
 use zunder_hl_protocol::grid::{self, PriceGrid};
 // The protocol's rounding direction, at the path the executor and Guard use.
 pub use zunder_hl_protocol::Round;
@@ -245,6 +245,36 @@ impl InstrumentRules {
     }
 }
 
+/// Which way a stop trigger rounds: towards the position it protects (a
+/// long's stop up, a short's down), so it is never looser than the stop
+/// it was sized for.
+pub const fn toward_position(position_side: Side) -> Round {
+    match position_side {
+        Side::Buy => Round::Up,
+        Side::Sell => Round::Down,
+    }
+}
+
+/// Which way the price bound of an order that opens rounds: towards the
+/// passive side (a buy down, a sell up), so its fill is never worse than
+/// the price it was sized from.
+pub const fn passive(order_side: Side) -> Round {
+    match order_side {
+        Side::Buy => Round::Down,
+        Side::Sell => Round::Up,
+    }
+}
+
+/// Which way the worst price of an order that has to fill rounds (a stop's
+/// limit, an exit, a flatten): towards the aggressive side (a sell down, a
+/// buy up), so getting out is never blocked by a rounding step.
+pub const fn aggressive(order_side: Side) -> Round {
+    match order_side {
+        Side::Buy => Round::Up,
+        Side::Sell => Round::Down,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use rust_decimal::dec;
@@ -253,6 +283,25 @@ mod tests {
 
     fn perp(sz_decimals: u32) -> InstrumentRules {
         InstrumentRules::hyperliquid_perp(Symbol::new("TEST"), sz_decimals).unwrap()
+    }
+
+    #[test]
+    fn each_rounding_rule_rounds_its_own_way() {
+        // 123.456 on a five-figure grid (szDecimals 2: at most 4 decimals):
+        // 123.45 down, 123.46 up. A long's stop up (tighter), a short's down;
+        // a buy entry bound down, a sell's up; a sell's exit bound down, a
+        // buy's up.
+        let rules = perp(2);
+        let px = dec!(123.456);
+        let up = dec!(123.46);
+        let down = dec!(123.45);
+        let round = |direction| rules.round_price(px, direction);
+        assert_eq!(round(toward_position(Side::Buy)), Some(up));
+        assert_eq!(round(toward_position(Side::Sell)), Some(down));
+        assert_eq!(round(passive(Side::Buy)), Some(down));
+        assert_eq!(round(passive(Side::Sell)), Some(up));
+        assert_eq!(round(aggressive(Side::Sell)), Some(down));
+        assert_eq!(round(aggressive(Side::Buy)), Some(up));
     }
 
     #[test]

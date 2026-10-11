@@ -1,0 +1,655 @@
+name: install-matrix
+on:
+  workflow_call:
+    inputs:
+      tag: {type: string, required: true}
+      commit: {type: string, required: true}
+      previous_tag: {type: string, required: true}
+      previous_commit: {type: string, required: true}
+      diagnostic: {type: boolean, default: false}
+      profile: {type: string, default: all}
+  workflow_dispatch:
+    inputs:
+      tag: {type: string, required: true}
+      commit: {type: string, required: true}
+      previous_tag: {type: string, required: true}
+      previous_commit: {type: string, required: true}
+      diagnostic: {type: boolean, default: true}
+      profile: {type: choice, options: [all, nightly], default: all}
+permissions:
+  contents: read
+env:
+  INSTALL_MATRIX_PROFILE: ${{ inputs.profile }}
+jobs:
+  subjects:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      actions: read
+      packages: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: {persist-credentials: false}
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with: {python-version: '3.13'}
+      - uses: slsa-framework/slsa-verifier/actions/installer@ea584f4502babc6f60d9bc799dbbb13c1caa9ee6 # v2.7.1
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with: {cosign-release: v3.1.3}
+      - run: python -m pip install -e ./deploy/guard/harness
+      - name: Authenticate original candidate and predecessor bytes
+        shell: bash
+        env:
+          TAG: ${{ inputs.tag }}
+          SOURCE: ${{ inputs.commit }}
+          PREVIOUS_TAG: ${{ inputs.previous_tag }}
+          PREVIOUS_SOURCE: ${{ inputs.previous_commit }}
+          DIAGNOSTIC: ${{ inputs.diagnostic }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          umask 077
+          [ "$GITHUB_REPOSITORY" = zunderlabs/zunder-guard ]
+          [ "$INSTALL_MATRIX_PROFILE" = all ] || [ "$INSTALL_MATRIX_PROFILE" = nightly ]
+          if [ "$DIAGNOSTIC" != true ] && [ "$INSTALL_MATRIX_PROFILE" = all ]; then [ "$GITHUB_SHA" = "$SOURCE" ]; fi
+          CHANNEL=staging
+          if [ "$INSTALL_MATRIX_PROFILE" = nightly ]; then CHANNEL=canonical; fi
+          install -d -m 700 "$RUNNER_TEMP/matrix"
+          python -m guard_harness.native_release --tag "$TAG" --commit "$SOURCE" --previous-tag "$PREVIOUS_TAG" --previous-commit "$PREVIOUS_SOURCE" --work "$RUNNER_TEMP/matrix/subjects" --loader-channel "$CHANNEL"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: install-matrix-subjects
+          path: ${{ runner.temp }}/matrix/subjects
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 7
+  linux-amd64:
+    needs: subjects
+    environment: e2e
+    runs-on: ubuntu-24.04
+    timeout-minutes: 55
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: {persist-credentials: false}
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with: {python-version: '3.13'}
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with: {name: install-matrix-subjects, path: '${{ runner.temp }}/subjects'}
+      - run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-system-x86 qemu-utils
+          sudo chmod 666 /dev/kvm
+          python -m pip install -e ./deploy/guard/harness
+      - name: I1 exact staged loader in KVM with real reboot
+        shell: bash
+        env:
+          TAG: ${{ inputs.tag }}
+          PREVIOUS_TAG: ${{ inputs.previous_tag }}
+          DIAGNOSTIC: ${{ inputs.diagnostic }}
+          ACCOUNT: ${{ inputs.diagnostic && vars.E2E_PAPER_ACCOUNT || vars.E2E_TESTNET_ACCOUNT }}
+        run: |
+          set -euo pipefail
+          umask 077
+          RULES=$(python -c 'import json; print(json.load(open("deploy/guard/rules/vectors.json"))["valid"][0]["canonical"])')
+          python -m guard_harness.linux_guest --candidate "$RUNNER_TEMP/subjects/i-staging" --previous "$RUNNER_TEMP/subjects/previous/assets/install.sh" --version "$TAG" --previous-version "$PREVIOUS_TAG" --rules "$RULES" --account "$ACCOUNT" --account-network "$(if [ "$DIAGNOSTIC" = true ]; then printf mainnet; else printf testnet; fi)" --output "$RUNNER_TEMP/I1"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with: {name: 'install-matrix-I1', path: '${{ runner.temp }}/I1', if-no-files-found: error}
+  linux-arm64:
+    if: inputs.profile != 'nightly'
+    needs: subjects
+    environment: e2e
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: {persist-credentials: false}
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with: {python-version: '3.13'}
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with: {name: install-matrix-subjects, path: '${{ runner.temp }}/subjects'}
+      - run: python -m pip install -e ./deploy/guard/harness
+      - name: I2 native arm64 restart lifecycle
+        shell: bash
+        env:
+          TAG: ${{ inputs.tag }}
+          PREVIOUS_TAG: ${{ inputs.previous_tag }}
+          DIAGNOSTIC: ${{ inputs.diagnostic }}
+          ACCOUNT: ${{ inputs.diagnostic && vars.E2E_PAPER_ACCOUNT || vars.E2E_TESTNET_ACCOUNT }}
+        run: |
+          set -euo pipefail
+          umask 077
+          RULES=$(python -c 'import json; print(json.load(open("deploy/guard/rules/vectors.json"))["valid"][0]["canonical"])')
+          MARKER=$(python -c 'import secrets; print(secrets.token_hex(16))')
+          printf '%s' "$MARKER" | sudo tee /etc/zunder-native-disposable >/dev/null
+          CURRENT=$(sha256sum "$RUNNER_TEMP/subjects/i-staging" | cut -d' ' -f1)
+          PREVIOUS=$(sha256sum "$RUNNER_TEMP/subjects/previous/assets/install.sh" | cut -d' ' -f1)
+          sudo -E env PYTHONPATH="$PWD/deploy/guard/harness/src" "$(command -v python)" -m guard_harness.linux_lifecycle --installer "$RUNNER_TEMP/subjects/i-staging" --installer-sha256 "$CURRENT" --previous-installer "$RUNNER_TEMP/subjects/previous/assets/install.sh" --previous-installer-sha256 "$PREVIOUS" --version "$TAG" --previous-version "$PREVIOUS_TAG" --rules "$RULES" --account "$ACCOUNT" --account-network "$(if [ "$DIAGNOSTIC" = true ]; then printf mainnet; else printf testnet; fi)" --output "$RUNNER_TEMP/I2" --marker "$MARKER" --phase all-no-reboot
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with: {name: 'install-matrix-I2', path: '${{ runner.temp }}/I2', if-no-files-found: error}
+  native:
+    needs: subjects
+    environment: e2e
+    concurrency:
+      group: guard-e2e-testnet
+      cancel-in-progress: false
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {os: macos-15, shell: sh, row: I3, variant: macos}
+          - {os: windows-2022, shell: powershell.exe, row: I4, variant: windows2022-ps51}
+          - {os: windows-2022, shell: pwsh.exe, row: I4, variant: windows2022-ps7}
+          - {os: windows-2025, shell: powershell.exe, row: I4, variant: windows2025-ps51}
+          - {os: windows-2025, shell: pwsh.exe, row: I4, variant: windows2025-ps7}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 55
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: {persist-credentials: false}
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with: {python-version: '3.13'}
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with: {name: install-matrix-subjects, path: '${{ runner.temp }}/subjects'}
+      - name: Install harness
+        shell: bash
+        run: python -m pip install -e ./deploy/guard/harness
+      - name: Released-byte paper and read-only native testnet lifecycles
+        shell: bash
+        env:
+          TAG: ${{ inputs.tag }}
+          SOURCE: ${{ inputs.commit }}
+          PREVIOUS_TAG: ${{ inputs.previous_tag }}
+          PREVIOUS_SOURCE: ${{ inputs.previous_commit }}
+          ACCOUNT: ${{ vars.E2E_TESTNET_ACCOUNT }}
+          WALLET_FRAME: ${{ secrets.E2E_TESTNET_API_WALLET_KEY }}
+          NATIVE_SHELL: ${{ matrix.shell }}
+          DIAGNOSTIC: ${{ inputs.diagnostic }}
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json, os, pathlib, subprocess, sys
+          root = pathlib.Path(os.environ['RUNNER_TEMP']) / 'native-evidence'
+          root.mkdir(mode=0o700)
+          identities = dict(release_commit=os.environ['SOURCE'], harness_commit=os.environ['GITHUB_SHA'], diagnostic=os.environ['DIAGNOSTIC'] == 'true', release_ready=False)
+          (root/'identities.json').write_text(json.dumps(identities)+'\n')
+          key = os.environ.pop('WALLET_FRAME').strip().encode()+b'\n'
+          common = ['--tag', os.environ['TAG'], '--commit', os.environ['SOURCE'], '--previous-tag', os.environ['PREVIOUS_TAG'], '--previous-commit', os.environ['PREVIOUS_SOURCE'], '--account', os.environ['ACCOUNT'], '--assets', str(pathlib.Path(os.environ['RUNNER_TEMP'])/'subjects'), '--shell', os.environ['NATIVE_SHELL']]
+          subprocess.run([sys.executable, '-m', 'guard_harness.native_paper', *common, '--work', str(root/'paper')], check=True)
+          subprocess.run([sys.executable, '-m', 'guard_harness.native_testnet', *common, '--work', str(root/'testnet')], input=key, check=True)
+          PY
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: install-matrix-${{ matrix.variant }}
+          path: |
+            ${{ runner.temp }}/native-evidence/identities.json
+            ${{ runner.temp }}/native-evidence/**/*.receipt.json
+            ${{ runner.temp }}/native-evidence/**/receipt.json
+            ${{ runner.temp }}/native-evidence/**/*.log
+            ${{ runner.temp }}/native-evidence/**/mainnet/M2/*.json
+          if-no-files-found: error
+          retention-days: 14
+  docker:
+    needs: subjects
+    environment: e2e
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    permissions:
+      contents: read
+      actions: read
+      packages: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: {persist-credentials: false}
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with: {python-version: '3.13'}
+      - uses: slsa-framework/slsa-verifier/actions/installer@ea584f4502babc6f60d9bc799dbbb13c1caa9ee6 # v2.7.1
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with: {cosign-release: v3.1.3}
+      - run: python -m pip install -e ./deploy/guard/harness
+      - name: I5 signed digest Docker and Compose paper lifecycle
+        shell: bash
+        env:
+          TAG: ${{ inputs.tag }}
+          SOURCE: ${{ inputs.commit }}
+          PREVIOUS_TAG: ${{ inputs.previous_tag }}
+          PREVIOUS_SOURCE: ${{ inputs.previous_commit }}
+          ACCOUNT: ${{ vars.E2E_TESTNET_ACCOUNT }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          umask 077
+          python -m guard_harness.docker_run --tag "$TAG" --commit "$SOURCE" --previous-tag "$PREVIOUS_TAG" --previous-commit "$PREVIOUS_SOURCE" --account "$ACCOUNT" --work "$RUNNER_TEMP/I5"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with: {name: 'install-matrix-I5', path: '${{ runner.temp }}/I5', if-no-files-found: error}
+  native-admission:
+    if: ${{ !inputs.diagnostic && inputs.profile != 'nightly' }}
+    needs: [subjects, native]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
+      attestations: write
+    strategy:
+      matrix: {row: [I3, I4]}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: {persist-credentials: false}
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with: {python-version: '3.13'}
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with: {pattern: 'install-matrix-*', path: '${{ runner.temp }}/matrix-evidence'}
+      - run: python -m pip install -e ./deploy/guard/harness
+      - name: Admit only the complete native row at the exact released source
+        shell: bash
+        env:
+          SOURCE: ${{ inputs.commit }}
+          ROW: ${{ matrix.row }}
+        run: |
+          set -euo pipefail
+          [ "$GITHUB_SHA" = "$SOURCE" ]
+          python - <<'PY'
+          import os, pathlib
+          from guard_harness.native_evidence import VARIANTS
+          root = pathlib.Path(os.environ['RUNNER_TEMP'])/'matrix-evidence'
+          for variant in VARIANTS[os.environ['ROW']]:
+              (root/('install-matrix-'+variant)).rename(root/variant)
+          PY
+          python -m guard_harness.native_evidence --row "$ROW" --evidence "$RUNNER_TEMP/matrix-evidence" --manifest "$RUNNER_TEMP/matrix-evidence/install-matrix-subjects/candidate/assets/release-manifest.json" --commit "$SOURCE" --output "$RUNNER_TEMP/$ROW.predicate.json"
+      - name: Attest the full row on the original immutable build manifest
+        id: evidence
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-path: ${{ runner.temp }}/matrix-evidence/install-matrix-subjects/candidate/assets/release-manifest.json
+          predicate-type: https://zunderlabs.com/guard/journey/v1
+          predicate-path: ${{ runner.temp }}/${{ matrix.row }}.predicate.json
+      - name: Collect the signed native evidence bundle
+        shell: bash
+        env:
+          BUNDLE: ${{ steps.evidence.outputs.bundle-path }}
+          ROW: ${{ matrix.row }}
+        run: |
+          set -euo pipefail
+          cp "$BUNDLE" "$RUNNER_TEMP/$ROW.sigstore.json"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: journey-${{ matrix.row }}-evidence
+          path: |
+            ${{ runner.temp }}/${{ matrix.row }}.predicate.json
+            ${{ runner.temp }}/${{ matrix.row }}.sigstore.json
+          if-no-files-found: error
+  aws-stack:
+    if: inputs.profile != 'nightly'
+    needs: subjects
+    environment: aws-sandbox
+    runs-on: ubuntu-24.04
+    timeout-minutes: 80
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: {persist-credentials: false}
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with: {python-version: '3.13'}
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with: {name: install-matrix-subjects, path: '${{ runner.temp }}/subjects'}
+      - name: Require explicit sandbox role, region and funded public mainnet read account
+        shell: bash
+        env:
+          ROLE: ${{ vars.CFN_SANDBOX_ROLE_ARN }}
+          REGION: ${{ vars.CFN_SANDBOX_REGION }}
+          EXECUTION_ROLE: ${{ vars.CFN_SANDBOX_EXEC_ROLE_ARN }}
+          PAPER_ACCOUNT: ${{ vars.E2E_PAPER_ACCOUNT }}
+        run: |
+          set -euo pipefail
+          [ -n "$ROLE" ] && [ -n "$REGION" ] && [ -n "$EXECUTION_ROLE" ]
+          [[ $PAPER_ACCOUNT =~ ^0x[0-9a-fA-F]{40}$ ]]
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ vars.CFN_SANDBOX_ROLE_ARN }}
+          aws-region: ${{ vars.CFN_SANDBOX_REGION }}
+          role-session-name: zunder-e2e-${{ github.run_id }}
+          role-duration-seconds: 7200
+          mask-aws-account-id: true
+      - run: python -m pip install -e ./deploy/guard/harness
+      - name: I7 signed public template, paper bot, reboot, upgrade and owned cleanup
+        shell: bash
+        env:
+          TAG: ${{ inputs.tag }}
+          SOURCE: ${{ inputs.commit }}
+          DIAGNOSTIC: ${{ inputs.diagnostic }}
+          PREVIOUS_TAG: ${{ inputs.previous_tag }}
+          PREVIOUS_SOURCE: ${{ inputs.previous_commit }}
+          ROLE: ${{ vars.CFN_SANDBOX_ROLE_ARN }}
+          REGION: ${{ vars.CFN_SANDBOX_REGION }}
+          EXECUTION_ROLE: ${{ vars.CFN_SANDBOX_EXEC_ROLE_ARN }}
+          PAPER_ACCOUNT: ${{ vars.E2E_PAPER_ACCOUNT }}
+        run: |
+          set -euo pipefail
+          umask 077
+          RULES=$(python -c 'import json; print(json.load(open("deploy/guard/rules/vectors.json"))["valid"][0]["canonical"])')
+          python -m guard_harness.aws_lifecycle --tag "$TAG" --commit "$SOURCE" --previous-tag "$PREVIOUS_TAG" --previous-commit "$PREVIOUS_SOURCE" --account "$PAPER_ACCOUNT" --rules "$RULES" --role "$ROLE" --execution-role "$EXECUTION_ROLE" --region "$REGION" --assets "$RUNNER_TEMP/subjects" --work "$RUNNER_TEMP/I7"
+      - name: Prepare I7 predicate only after full lifecycle and confirmed cleanup
+        if: ${{ !inputs.diagnostic && inputs.profile != 'nightly' }}
+        shell: bash
+        env:
+          SOURCE: ${{ inputs.commit }}
+        run: |
+          set -euo pipefail
+          [ "$GITHUB_SHA" = "$SOURCE" ]
+          python - <<'PY'
+          import hashlib, json, os, pathlib
+          root = pathlib.Path(os.environ['RUNNER_TEMP'])
+          receipt = json.loads((root/'I7/aws.receipt.json').read_bytes())
+          if receipt.get('result') != 'passed' or receipt.get('cleanup_complete') is not True or receipt.get('commit') != os.environ['SOURCE'] or receipt.get('harness_commit') != os.environ['SOURCE'] or receipt.get('diagnostic') is not False:
+              raise SystemExit('I7 full lifecycle/cleanup has not passed')
+          manifest = (root/'subjects/candidate/assets/release-manifest.json').read_bytes()
+          predicate = dict(schema=1,journey='I7',commit=os.environ['SOURCE'],manifest_sha256=hashlib.sha256(manifest).hexdigest(),result='passed',tier='e2e',coverage=receipt['coverage']+['owned-stack-and-retained-volume-cleanup'])
+          (root/'I7/I7.predicate.json').write_text(json.dumps(predicate)+'\n')
+          PY
+      - name: Attest I7 on the immutable released build manifest
+        id: evidence
+        if: ${{ !inputs.diagnostic && inputs.profile != 'nightly' }}
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-path: ${{ runner.temp }}/subjects/candidate/assets/release-manifest.json
+          predicate-type: https://zunderlabs.com/guard/journey/v1
+          predicate-path: ${{ runner.temp }}/I7/I7.predicate.json
+      - name: Retain official I7 signed evidence
+        if: ${{ !inputs.diagnostic && inputs.profile != 'nightly' }}
+        shell: bash
+        env:
+          BUNDLE: ${{ steps.evidence.outputs.bundle-path }}
+        run: cp "$BUNDLE" "$RUNNER_TEMP/I7/I7.sigstore.json"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: journey-I7-evidence
+          path: |
+            ${{ runner.temp }}/I7/aws.receipt.json
+            ${{ runner.temp }}/I7/I7.predicate.json
+            ${{ runner.temp }}/I7/I7.sigstore.json
+            ${{ runner.temp }}/I7/*.log
+            ${{ runner.temp }}/I7/mainnet/M1/*.json
+            ${{ runner.temp }}/I7/mainnet/M1/*.log
+          if-no-files-found: warn
+          retention-days: 14
+
+  linux-mainnet:
+    if: inputs.profile != 'nightly'
+    needs: subjects
+    environment: e2e
+    strategy:
+      fail-fast: false
+      matrix: {mode: [native, container]}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: {persist-credentials: false}
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with: {python-version: '3.13'}
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with: {name: install-matrix-subjects, path: '${{ runner.temp }}/subjects'}
+      - run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-system-x86 qemu-utils
+          sudo chmod 666 /dev/kvm
+          python -m pip install -e ./deploy/guard/harness
+      - name: M1 protected staged native/container userRole refusal in KVM
+        shell: bash
+        env:
+          TAG: ${{ inputs.tag }}
+          SOURCE: ${{ inputs.commit }}
+          PREVIOUS_TAG: ${{ inputs.previous_tag }}
+          ACCOUNT: ${{ vars.E2E_PAPER_ACCOUNT }}
+          DIAGNOSTIC: ${{ inputs.diagnostic }}
+          MODE: ${{ matrix.mode }}
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import hashlib, json, os, pathlib, subprocess, sys, tarfile
+          from guard_harness.native_release import Release
+          from guard_harness.testnet_run import ROOT
+          base=pathlib.Path(os.environ['RUNNER_TEMP'])
+          release=Release(os.environ['TAG'],os.environ['SOURCE'],base/'subjects/candidate/assets')
+          rules=json.loads((ROOT/'rules/vectors.json').read_bytes())['valid'][0]['canonical']
+          manifest=release.asset('release-manifest.json')
+          distribution=json.loads(manifest)['distribution']['docker']
+          image=distribution['image']+'@'+distribution['digest']
+          output=base/'linux-mainnet'
+          words=[sys.executable,'-m','guard_harness.linux_guest','--mainnet-refusals-only',
+                 '--candidate',str(base/'subjects/i-staging'),'--previous',str(base/'subjects/previous/assets/install.sh'),
+                 '--version',os.environ['TAG'],'--previous-version',os.environ['PREVIOUS_TAG'],
+                 '--rules',rules,'--account',os.environ['ACCOUNT'],'--output',str(output),'--mode',os.environ['MODE'],
+                 '--release-tag',os.environ['TAG'],'--release-commit',os.environ['SOURCE'],
+                 '--harness-commit',os.environ['GITHUB_SHA'],
+                 '--manifest-sha256',hashlib.sha256(manifest).hexdigest(),
+                 '--binary-sha256',hashlib.sha256(release.binary('linux-amd64')).hexdigest()]
+          if os.environ['MODE']=='container': words += ['--release-image',image]
+          if os.environ['DIAGNOSTIC']=='true': words += ['--diagnostic']
+          try:
+              subprocess.run(words,check=True)
+          finally:
+              route='linux-container-native' if os.environ['MODE']=='container' else 'linux-systemd'
+              target=base/'mainnet/M1'
+              target.mkdir(parents=True,exist_ok=True)
+              receipt=output/'mainnet-refusal.json'
+              if receipt.exists(): (target/(route+'.json')).write_bytes(receipt.read_bytes())
+              archive=output/'guest-evidence.tar.gz'
+              if archive.exists():
+                  with tarfile.open(archive) as captured:
+                      member=captured.getmember('evidence/unapproved-wallet.log')
+                      if not member.isfile() or member.size>262144: raise SystemExit('refusal log shape refused')
+                      stream=captured.extractfile(member)
+                      if stream is None: raise SystemExit('refusal log unavailable')
+                      (target/(route+'.log')).write_bytes(stream.read())
+          PY
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: install-matrix-M1-linux-${{ matrix.mode }}
+          path: |
+            ${{ runner.temp }}/mainnet/M1/*.json
+            ${{ runner.temp }}/mainnet/M1/*.log
+          if-no-files-found: warn
+          retention-days: 14
+  native-mainnet:
+    if: inputs.profile != 'nightly'
+    needs: subjects
+    environment: e2e
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {os: macos-15, shell: sh, variant: macos}
+          - {os: windows-2022, shell: powershell.exe, variant: windows}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: {persist-credentials: false}
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with: {python-version: '3.13'}
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with: {name: install-matrix-subjects, path: '${{ runner.temp }}/subjects'}
+      - shell: bash
+        run: |
+          python -m pip install -e ./deploy/guard/harness
+          if [ "$RUNNER_OS" = Windows ]; then python -m pip install pywinpty==3.0.5; fi
+      - name: M1 actual hidden-terminal unapproved wallet refusal, no orders
+        shell: bash
+        env:
+          TAG: ${{ inputs.tag }}
+          SOURCE: ${{ inputs.commit }}
+          PREVIOUS_TAG: ${{ inputs.previous_tag }}
+          PREVIOUS_SOURCE: ${{ inputs.previous_commit }}
+          ACCOUNT: ${{ vars.E2E_PAPER_ACCOUNT }}
+          NATIVE_SHELL: ${{ matrix.shell }}
+          DIAGNOSTIC: ${{ inputs.diagnostic }}
+        run: |
+          set -euo pipefail
+          python -m guard_harness.native_testnet --mode mainnet-refusal --tag "$TAG" --commit "$SOURCE" --previous-tag "$PREVIOUS_TAG" --previous-commit "$PREVIOUS_SOURCE" --account "$ACCOUNT" --assets "$RUNNER_TEMP/subjects" --shell "$NATIVE_SHELL" --work "$RUNNER_TEMP/mainnet/M1"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: install-matrix-M1-${{ matrix.variant }}
+          path: |
+            ${{ runner.temp }}/mainnet/M1/*.json
+            ${{ runner.temp }}/mainnet/M1/*.log
+          if-no-files-found: warn
+          retention-days: 14
+  mainnet-setup:
+    if: inputs.profile != 'nightly'
+    needs: subjects
+    environment: e2e
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {os: ubuntu-24.04, variant: linux, target: linux-amd64}
+          - {os: windows-2022, variant: windows, target: windows-amd64}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: {persist-credentials: false}
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with: {python-version: '3.13'}
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with: {name: install-matrix-subjects, path: '${{ runner.temp }}/subjects'}
+      - shell: bash
+        run: python -m pip install -e ./deploy/guard/harness
+      - name: Actual released-byte no-key mainnet setup refusals
+        shell: bash
+        env:
+          TAG: ${{ inputs.tag }}
+          SOURCE: ${{ inputs.commit }}
+          DIAGNOSTIC: ${{ inputs.diagnostic }}
+          TARGET: ${{ matrix.target }}
+          ACCOUNT: ${{ vars.E2E_PAPER_ACCOUNT }}
+        run: |
+          set -euo pipefail
+          umask 077
+          if [ "$DIAGNOSTIC" != true ]; then [ "$GITHUB_SHA" = "$SOURCE" ]; fi
+          python - <<'PY'
+          import json, os, pathlib
+          from guard_harness.mainnet_refusals import execute
+          from guard_harness.native_release import Release
+          from guard_harness.testnet_run import ROOT
+          base=pathlib.Path(os.environ['RUNNER_TEMP'])
+          release=Release(os.environ['TAG'],os.environ['SOURCE'],base/'subjects/candidate/assets')
+          binary=base/('refusal-subject.exe' if os.environ['TARGET']=='windows-amd64' else 'refusal-subject')
+          binary.write_bytes(release.binary(os.environ['TARGET']))
+          binary.chmod(0o700)
+          rules=json.loads((ROOT/'rules/vectors.json').read_bytes())['valid'][0]['canonical']
+          try:
+              execute(release,binary,account=os.environ['ACCOUNT'],rules=rules,work=base/'refusals/M2',harness_commit=os.environ['GITHUB_SHA'],diagnostic=os.environ['DIAGNOSTIC']=='true')
+              if os.environ['TARGET']=='linux-amd64':
+                  from guard_harness.mainnet_attack import execute as attacks, containers
+                  attacks(release,binary,account=os.environ['ACCOUNT'],rules=rules,work=base/'attack-refusals')
+                  from guard_harness.runner import run
+                  manifest=json.loads(release.asset('release-manifest.json'))
+                  image=manifest['distribution']['docker']['image']+'@'+manifest['distribution']['docker']['digest']
+                  run(['docker','pull',image],log=base/'image-pull.log',timeout=300,sensitive_output=True,stdin=b'')
+                  containers(release,image=image,home=base/'attack-refusals/attack-home',work=base/'container-refusals',account=os.environ['ACCOUNT'])
+          finally:
+              import shutil
+              target=base/'mainnet-cases/M2'
+              target.mkdir(parents=True,exist_ok=True)
+              for directory in (base/'refusals/M2',base/'attack-refusals/M2',base/'container-refusals/M2'):
+                  for source in directory.glob('*'):
+                      if source.is_file() and source.suffix in ('.json','.log'):
+                          if (target/source.name).exists(): raise SystemExit('ambiguous M2 case')
+                          shutil.copyfile(source,target/source.name)
+              descriptor=base/'attack-refusals/attack-fixture.json'
+              if descriptor.exists(): shutil.copyfile(descriptor,target/descriptor.name)
+          PY
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: mainnet-setup-${{ matrix.variant }}
+          path: |
+            ${{ runner.temp }}/mainnet-cases/M2/*.json
+            ${{ runner.temp }}/mainnet-cases/M2/*.log
+          if-no-files-found: error
+          retention-days: 14
+  mainnet-admission:
+    if: ${{ always() && !inputs.diagnostic && inputs.profile != 'nightly' && needs.subjects.result == 'success' }}
+    needs: [subjects, native, docker, mainnet-setup, native-mainnet, linux-mainnet, aws-stack]
+    strategy:
+      fail-fast: false
+      matrix: {row: [M1, M2]}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: {persist-credentials: false}
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with: {python-version: '3.13'}
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with: {name: install-matrix-subjects, path: '${{ runner.temp }}/subjects'}
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        if: matrix.row == 'M2'
+        with: {pattern: 'mainnet-setup-*', merge-multiple: true, path: '${{ runner.temp }}/observations/M2'}
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        if: matrix.row == 'M2'
+        with: {name: install-matrix-macos, path: '${{ runner.temp }}/macos'}
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        if: matrix.row == 'M1'
+        with: {pattern: 'install-matrix-M1-*', path: '${{ runner.temp }}/M1-routes'}
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        if: matrix.row == 'M1'
+        with: {name: journey-I7-evidence, path: '${{ runner.temp }}/aws'}
+      - run: python -m pip install -e ./deploy/guard/harness
+      - name: Fail closed unless every platform observation completed
+        shell: bash
+        env:
+          TAG: ${{ inputs.tag }}
+          SOURCE: ${{ inputs.commit }}
+          ROW: ${{ matrix.row }}
+        run: |
+          set -euo pipefail
+          [ "$GITHUB_SHA" = "$SOURCE" ]
+          python - <<'PY'
+          import os, pathlib, shutil
+          base=pathlib.Path(os.environ['RUNNER_TEMP'])
+          row=os.environ['ROW']
+          target=base/'observations'/row
+          target.mkdir(parents=True,exist_ok=True)
+          sources=((base/'macos').glob('**/mainnet/M2/*') if row=='M2' else
+                   list((base/'M1-routes').rglob('*')) + list((base/'aws').glob('**/mainnet/M1/*')))
+          for source in sources:
+              if source.is_file() and source.suffix in ('.json','.log'):
+                  destination=target/source.name
+                  if destination.exists(): raise SystemExit('ambiguous platform observations')
+                  shutil.copyfile(source,destination)
+          PY
+          python -m guard_harness.mainnet_evidence --row "$ROW" --tag "$TAG" --commit "$SOURCE" --assets "$RUNNER_TEMP/subjects/candidate/assets" --evidence "$RUNNER_TEMP/observations" --output "$RUNNER_TEMP/$ROW"
+      - id: evidence
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-path: ${{ runner.temp }}/subjects/candidate/assets/release-manifest.json
+          predicate-type: https://zunderlabs.com/guard/journey/v1
+          predicate-path: ${{ runner.temp }}/${{ matrix.row }}/${{ matrix.row }}.predicate.json
+      - shell: bash
+        env:
+          BUNDLE: ${{ steps.evidence.outputs.bundle-path }}
+          ROW: ${{ matrix.row }}
+        run: cp "$BUNDLE" "$RUNNER_TEMP/$ROW/$ROW.sigstore.json"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with: {name: 'journey-${{ matrix.row }}-evidence', path: '${{ runner.temp }}/${{ matrix.row }}', if-no-files-found: warn}

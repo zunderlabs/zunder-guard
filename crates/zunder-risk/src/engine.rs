@@ -870,6 +870,146 @@ mod tests {
         assert_eq!(engine().size_entry(&request), Ok(dec!(16)));
     }
 
+    // The widest limits Guard accepts since the decision of 11 Oct 2026
+    // ("Guard's maximum bounds widened"): 25% per trade, 100% open risk, 50x,
+    // a 50% daily loss stop and a 90% drawdown halt. Every number below is
+    // worked out by hand from those limits and an equity of 2,000.
+    fn widest() -> RiskEngine {
+        let limits = RiskLimits {
+            risk_per_trade: dec!(0.25),
+            max_open_risk: dec!(1),
+            max_leverage: dec!(50),
+            daily_loss_stop: dec!(0.5),
+            drawdown_stop: dec!(0.9),
+            max_trading_equity_usd: None,
+        };
+        RiskEngine::new(limits, at(0), dec!(2000)).unwrap()
+    }
+
+    #[test]
+    fn at_the_widest_limits_the_stop_still_sizes() {
+        // 25% of 2,000 is 500; a 2-wide stop gives 250 units, worth 25,000
+        // (12.5x), inside the 50x room of 100,000.
+        assert_eq!(
+            widest().size_entry(&long(dec!(100), dec!(98))),
+            Ok(dec!(250))
+        );
+        // Costs count: 500 / (2 + 0.5) = 200.
+        let request = SizeRequest {
+            round_trip_cost: dec!(0.5),
+            ..long(dec!(100), dec!(98))
+        };
+        assert_eq!(widest().size_entry(&request), Ok(dec!(200)));
+        // A stop 0.1 away: risk alone would allow 500 / 0.1 = 5,000 units
+        // (500,000); 50x of 2,000 is 100,000, so 1,000 units.
+        assert_eq!(
+            widest().size_entry(&long(dec!(100), dec!(99.9))),
+            Ok(dec!(1000))
+        );
+        // A short from a stop above: 500 / 4 = 125.
+        let short = SizeRequest {
+            side: Side::Sell,
+            ..long(dec!(100), dec!(104))
+        };
+        assert_eq!(widest().size_entry(&short), Ok(dec!(125)));
+    }
+
+    #[test]
+    fn at_the_widest_limits_open_risk_and_leverage_still_run_out() {
+        // 100% open risk is 2,000. With 1,500 at risk, 500 is left: a full
+        // trade, 250 units at a 2-wide stop.
+        let request = SizeRequest {
+            open_risk: dec!(1500),
+            ..long(dec!(100), dec!(98))
+        };
+        assert_eq!(widest().size_entry(&request), Ok(dec!(250)));
+        // With 1,900 at risk, 100 is left: 50 units.
+        let request = SizeRequest {
+            open_risk: dec!(1900),
+            ..long(dec!(100), dec!(98))
+        };
+        assert_eq!(widest().size_entry(&request), Ok(dec!(50)));
+        // With 2,000 at risk nothing is left: four full trades and the
+        // budget is gone; the whole equity at the stops is the most.
+        let request = SizeRequest {
+            open_risk: dec!(2000),
+            ..long(dec!(100), dec!(98))
+        };
+        assert_eq!(widest().size_entry(&request), Err(Veto::OpenRiskExhausted));
+        // 50x of 2,000 is 100,000. With 99,000 open, 1,000 of room at 100
+        // is 10 units; with 100,000 open, none.
+        let request = SizeRequest {
+            open_notional: dec!(99000),
+            ..long(dec!(100), dec!(99.9))
+        };
+        assert_eq!(widest().size_entry(&request), Ok(dec!(10)));
+        let request = SizeRequest {
+            open_notional: dec!(100000),
+            ..long(dec!(100), dec!(99.9))
+        };
+        assert_eq!(widest().size_entry(&request), Err(Veto::LeverageExhausted));
+        // Absurd inputs at the widest limits are vetoes, not panics.
+        let request = SizeRequest {
+            equity: Decimal::MAX,
+            ..long(dec!(100), dec!(99.9))
+        };
+        let mut engine = widest();
+        engine.observe(at(HOUR), Decimal::MAX);
+        assert_eq!(engine.size_entry(&request), Err(Veto::Overflow));
+    }
+
+    #[test]
+    fn at_the_widest_limits_the_daily_stop_fires_at_half() {
+        let mut engine = widest();
+        // 50% of 2,000 is 1,000: 1,001 is a loss of 0.4995, not yet.
+        assert_eq!(engine.observe(at(HOUR), dec!(1001)), RiskState::Active);
+        assert_eq!(
+            engine.observe(at(2 * HOUR), dec!(1000)),
+            RiskState::HaltedForDay { day: 0 }
+        );
+        assert_eq!(
+            engine.size_entry(&long(dec!(100), dec!(98))),
+            Err(Veto::HaltedForDay)
+        );
+        assert_eq!(engine.observe(at(DAY), dec!(1000)), RiskState::Active);
+    }
+
+    #[test]
+    fn at_the_widest_limits_the_drawdown_halt_fires_at_ninety_percent() {
+        let mut engine = widest();
+        // Falls of just under 50% a day, so the daily stop never fires
+        // first. Peak 2,000; 90% below it is 200.
+        // Day 0: 2,000 -> 1,001, a day loss of 0.4995.
+        assert_eq!(engine.observe(at(HOUR), dec!(1001)), RiskState::Active);
+        // Day 1: 1,001 -> 501, a day loss of 500 / 1,001 = 0.4995;
+        // drawdown 1,499 / 2,000 = 0.7495.
+        assert_eq!(engine.observe(at(DAY), dec!(501)), RiskState::Active);
+        // Day 2: 501 -> 251, a day loss of 250 / 501 = 0.499; drawdown
+        // 0.8745.
+        assert_eq!(engine.observe(at(2 * DAY), dec!(251)), RiskState::Active);
+        // Day 3: 251 -> 201: drawdown 1,799 / 2,000 = 0.8995, a day loss of
+        // 50 / 251 = 0.199. Not yet.
+        assert_eq!(engine.observe(at(3 * DAY), dec!(201)), RiskState::Active);
+        // 200: drawdown 1,800 / 2,000 = 0.9 exactly. Stopped until a review.
+        assert_eq!(
+            engine.observe(at(3 * DAY + HOUR), dec!(200)),
+            RiskState::Stopped {
+                at: at(3 * DAY + HOUR),
+                drawdown: dec!(0.9)
+            }
+        );
+        assert!(matches!(
+            engine.observe(at(4 * DAY), dec!(2500)),
+            RiskState::Stopped { .. }
+        ));
+        // A wiped-out account still stops: a 100% drawdown is beyond 90%.
+        let mut engine = widest();
+        assert!(matches!(
+            engine.observe(at(HOUR), dec!(0)),
+            RiskState::Stopped { .. }
+        ));
+    }
+
     // The equity cap (`max_trading_equity_usd`). Every number below is
     // worked out by hand from the default
     // frame (2% per trade, 6% open risk, 5x, 6% daily, 25% drawdown) and a

@@ -1,7 +1,8 @@
 // Copyright 2026 Orcastrate UG (haftungsbeschränkt)
 // SPDX-License-Identifier: Elastic-2.0
-//! The `/exchange` requests a bot sends, decoded strictly, and encoded
-//! again in the venue's field order.
+//! The `/exchange` requests a bot sends, decoded strictly into
+//! `zunder-hl-protocol`'s action model, which encodes them again in the
+//! venue's field order.
 //!
 //! Decoded: `order` (with grouping `na`, `normalTpsl` or `positionTpsl`
 //! and an optional builder), `cancel`, `cancelByCloid`, `modify`,
@@ -18,13 +19,13 @@
 //! because that text is what it signed ([`Action::to_wire`] reproduces the
 //! bot's hash input), and are parsed as exact decimals for judging.
 
-use std::{fmt, str::FromStr};
+use std::fmt;
 
 use rust_decimal::{Decimal, dec};
 use serde_json::{Map, Value};
 use thiserror::Error;
 
-use crate::{sign::Signature, wire::Wire};
+use crate::sign::Signature;
 
 /// Most orders, cancels or modifies one action may carry. Hyperliquid's
 /// own batches are far smaller in practice; this bounds the work per
@@ -113,195 +114,31 @@ fn malformed(text: impl Into<String>) -> DecodeError {
     DecodeError::Malformed(text.into())
 }
 
-/// A price or size: the exact text sent and its value.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Px {
-    raw: String,
-    value: Decimal,
-}
+// The action model and its encoding are `zunder-hl-protocol`'s, the one
+// implementation Zunder's executor, Guard and its MCP server share;
+// re-exported here at the paths Guard uses. What stays here is Guard's:
+// decoding a bot's request strictly, and what counts as protection.
+pub use zunder_hl_protocol::action::{
+    Action, Builder, Cancel, Cloid, Grouping, Modify, Order, OrderAction, OrderKind, OrderRef, Px,
+    Tif, Tpsl,
+};
 
-impl Px {
-    /// Plain decimal digits with an optional fraction, as Hyperliquid's
-    /// prices and sizes are written: no sign, no exponent, no spaces.
-    pub fn parse(raw: &str) -> Option<Self> {
-        let (whole, fraction) = match raw.split_once('.') {
-            Some((whole, fraction)) => (whole, Some(fraction)),
-            None => (raw, None),
-        };
-        let digits = |text: &str| !text.is_empty() && text.bytes().all(|b| b.is_ascii_digit());
-        if !digits(whole) || fraction.is_some_and(|fraction| !digits(fraction)) || raw.len() > 40 {
-            return None;
-        }
-        let value = Decimal::from_str(raw).ok()?;
-        Some(Self {
-            raw: raw.to_owned(),
-            value,
-        })
-    }
-
-    /// A value Guard writes itself: without trailing zeros, as the Python
-    /// SDK's `float_to_wire` normalises. `None` for a negative value or one
-    /// with more than 8 decimals.
-    pub fn from_decimal(value: Decimal) -> Option<Self> {
-        let normalized = value.normalize();
-        (normalized >= Decimal::ZERO && normalized.scale() <= 8).then(|| Self {
-            raw: normalized.to_string(),
-            value: normalized,
-        })
-    }
-
-    pub fn value(&self) -> Decimal {
-        self.value
-    }
-
-    pub fn raw(&self) -> &str {
-        &self.raw
-    }
-}
-
-impl fmt::Display for Px {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.raw)
-    }
-}
-
-/// A client order id: `0x` and 32 hex digits.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct Cloid(String);
-
-impl Cloid {
-    pub fn parse(text: &str) -> Option<Self> {
-        let digits = text.strip_prefix("0x")?;
-        (digits.len() == 32 && digits.bytes().all(|b| b.is_ascii_hexdigit()))
-            .then(|| Self(text.to_owned()))
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-
-    /// A cloid Guard built itself as `0x` and 32 hex digits.
-    pub(crate) fn from_hex_digits(text: String) -> Self {
-        debug_assert!(Self::parse(&text).is_some());
-        Self(text)
-    }
-
-    /// Lowercase, for comparing with what the venue reports.
-    pub fn normalized(&self) -> String {
-        self.0.to_ascii_lowercase()
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Tif {
-    Alo,
-    Ioc,
-    Gtc,
-}
-
-impl Tif {
-    fn name(self) -> &'static str {
-        match self {
-            Tif::Alo => "Alo",
-            Tif::Ioc => "Ioc",
-            Tif::Gtc => "Gtc",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Tpsl {
-    Tp,
-    Sl,
-}
-
-impl Tpsl {
-    fn name(self) -> &'static str {
-        match self {
-            Tpsl::Tp => "tp",
-            Tpsl::Sl => "sl",
-        }
-    }
-}
-
-/// `t` of an order.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum OrderKind {
-    Limit {
-        tif: Tif,
-    },
-    Trigger {
-        is_market: bool,
-        trigger_px: Px,
-        tpsl: Tpsl,
-    },
-}
-
-/// One order of an `order` action, or the new order of a modify.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Order {
-    pub asset: u32,
-    pub is_buy: bool,
-    pub price: Px,
-    pub size: Px,
-    pub reduce_only: bool,
-    pub kind: OrderKind,
-    pub cloid: Option<Cloid>,
-}
-
-impl Order {
-    pub fn to_wire(&self) -> Wire {
-        let kind = match &self.kind {
-            OrderKind::Limit { tif } => Wire::Map(vec![(
-                "limit",
-                Wire::Map(vec![("tif", Wire::str(tif.name()))]),
-            )]),
-            OrderKind::Trigger {
-                is_market,
-                trigger_px,
-                tpsl,
-            } => Wire::Map(vec![(
-                "trigger",
-                Wire::Map(vec![
-                    ("isMarket", Wire::Bool(*is_market)),
-                    ("triggerPx", Wire::str(trigger_px.raw())),
-                    ("tpsl", Wire::str(tpsl.name())),
-                ]),
-            )]),
-        };
-        let mut fields = vec![
-            ("a", Wire::UInt(u64::from(self.asset))),
-            ("b", Wire::Bool(self.is_buy)),
-            ("p", Wire::str(self.price.raw())),
-            ("s", Wire::str(self.size.raw())),
-            ("r", Wire::Bool(self.reduce_only)),
-            ("t", kind),
-        ];
-        if let Some(cloid) = &self.cloid {
-            fields.push(("c", Wire::str(cloid.as_str())));
-        }
-        Wire::Map(fields)
-    }
-
-    /// A stop loss: a trigger order with `tpsl: "sl"`.
-    pub fn stop_trigger(&self) -> Option<Decimal> {
-        match &self.kind {
-            OrderKind::Trigger {
-                trigger_px,
-                tpsl: Tpsl::Sl,
-                ..
-            } => Some(trigger_px.value()),
-            _ => None,
-        }
-    }
-
+/// What Guard counts as a protective stop, for an order of an action.
+pub trait Protection {
     /// The trigger at which this order, as a reduce-only market stop loss
     /// whose limit leaves room to fill ([`limit_leaves_room`]), bounds a
     /// loss. `None` for anything else: a stop-limit is no protection, since
     /// once triggered its limit may rest on the wrong side of a falling (or
     /// rising) market and never fill; it is forwarded like any reduce-only
     /// order but never counts as a stop.
-    pub fn protective_level(&self) -> Option<Decimal> {
+    fn protective_level(&self) -> Option<Decimal>;
+
+    /// A reduce-only market stop loss whatever its limit: what Guard widens.
+    fn is_market_stop(&self) -> bool;
+}
+
+impl Protection for Order {
+    fn protective_level(&self) -> Option<Decimal> {
         match &self.kind {
             OrderKind::Trigger {
                 is_market: true,
@@ -316,8 +153,7 @@ impl Order {
         }
     }
 
-    /// A reduce-only market stop loss whatever its limit: what Guard widens.
-    pub fn is_market_stop(&self) -> bool {
+    fn is_market_stop(&self) -> bool {
         self.reduce_only
             && matches!(
                 self.kind,
@@ -327,224 +163,6 @@ impl Order {
                     ..
                 }
             )
-    }
-
-    pub fn is_trigger(&self) -> bool {
-        matches!(self.kind, OrderKind::Trigger { .. })
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Grouping {
-    Na,
-    NormalTpsl,
-    PositionTpsl,
-}
-
-impl Grouping {
-    pub fn name(self) -> &'static str {
-        match self {
-            Grouping::Na => "na",
-            Grouping::NormalTpsl => "normalTpsl",
-            Grouping::PositionTpsl => "positionTpsl",
-        }
-    }
-}
-
-/// `{"b": address, "f": fee in tenths of a basis point}`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Builder {
-    /// As sent; the SDKs send it lowercase.
-    pub address: String,
-    pub fee_tenths_bp: u64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct OrderAction {
-    pub orders: Vec<Order>,
-    pub grouping: Grouping,
-    pub builder: Option<Builder>,
-}
-
-/// The order a modify or cancel names: by venue id or client id.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum OrderRef {
-    Oid(u64),
-    Cloid(Cloid),
-}
-
-impl OrderRef {
-    fn to_wire(&self) -> Wire {
-        match self {
-            OrderRef::Oid(oid) => Wire::UInt(*oid),
-            OrderRef::Cloid(cloid) => Wire::str(cloid.as_str()),
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Modify {
-    pub oid: OrderRef,
-    pub order: Order,
-}
-
-impl Modify {
-    fn to_wire(&self) -> Wire {
-        Wire::Map(vec![
-            ("oid", self.oid.to_wire()),
-            ("order", self.order.to_wire()),
-        ])
-    }
-}
-
-/// A cancel: the asset and the order, by venue id (`cancel`) or client id
-/// (`cancelByCloid`).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Cancel {
-    pub asset: u32,
-    pub order: OrderRef,
-}
-
-/// An action Guard understands.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Action {
-    Order(OrderAction),
-    /// `cancel`: every entry names an oid.
-    Cancel(Vec<Cancel>),
-    /// `cancelByCloid`: every entry names a cloid.
-    CancelByCloid(Vec<Cancel>),
-    Modify(Modify),
-    BatchModify(Vec<Modify>),
-    UpdateLeverage {
-        asset: u32,
-        is_cross: bool,
-        leverage: u32,
-    },
-    UpdateIsolatedMargin {
-        asset: u32,
-        is_buy: bool,
-        /// USD times 10^6; negative removes margin.
-        ntli: i64,
-    },
-    ScheduleCancel {
-        time: Option<u64>,
-    },
-}
-
-impl Action {
-    /// The action's `type`.
-    pub fn kind(&self) -> &'static str {
-        match self {
-            Action::Order(_) => "order",
-            Action::Cancel(_) => "cancel",
-            Action::CancelByCloid(_) => "cancelByCloid",
-            Action::Modify(_) => "modify",
-            Action::BatchModify(_) => "batchModify",
-            Action::UpdateLeverage { .. } => "updateLeverage",
-            Action::UpdateIsolatedMargin { .. } => "updateIsolatedMargin",
-            Action::ScheduleCancel { .. } => "scheduleCancel",
-        }
-    }
-
-    /// The action in Hyperliquid's field order, with the exact text of
-    /// every price and size: what the signature covers.
-    pub fn to_wire(&self) -> Wire {
-        let kind = ("type", Wire::str(self.kind()));
-        match self {
-            Action::Order(action) => {
-                let mut fields = vec![
-                    kind,
-                    (
-                        "orders",
-                        Wire::Array(action.orders.iter().map(Order::to_wire).collect()),
-                    ),
-                    ("grouping", Wire::str(action.grouping.name())),
-                ];
-                if let Some(builder) = &action.builder {
-                    fields.push((
-                        "builder",
-                        Wire::Map(vec![
-                            ("b", Wire::str(builder.address.clone())),
-                            ("f", Wire::UInt(builder.fee_tenths_bp)),
-                        ]),
-                    ));
-                }
-                Wire::Map(fields)
-            }
-            Action::Cancel(cancels) => Wire::Map(vec![
-                kind,
-                (
-                    "cancels",
-                    Wire::Array(
-                        cancels
-                            .iter()
-                            .map(|cancel| {
-                                Wire::Map(vec![
-                                    ("a", Wire::UInt(u64::from(cancel.asset))),
-                                    ("o", cancel.order.to_wire()),
-                                ])
-                            })
-                            .collect(),
-                    ),
-                ),
-            ]),
-            Action::CancelByCloid(cancels) => Wire::Map(vec![
-                kind,
-                (
-                    "cancels",
-                    Wire::Array(
-                        cancels
-                            .iter()
-                            .map(|cancel| {
-                                Wire::Map(vec![
-                                    ("asset", Wire::UInt(u64::from(cancel.asset))),
-                                    ("cloid", cancel.order.to_wire()),
-                                ])
-                            })
-                            .collect(),
-                    ),
-                ),
-            ]),
-            Action::Modify(modify) => Wire::Map(vec![
-                kind,
-                ("oid", modify.oid.to_wire()),
-                ("order", modify.order.to_wire()),
-            ]),
-            Action::BatchModify(modifies) => Wire::Map(vec![
-                kind,
-                (
-                    "modifies",
-                    Wire::Array(modifies.iter().map(Modify::to_wire).collect()),
-                ),
-            ]),
-            Action::UpdateLeverage {
-                asset,
-                is_cross,
-                leverage,
-            } => Wire::Map(vec![
-                kind,
-                ("asset", Wire::UInt(u64::from(*asset))),
-                ("isCross", Wire::Bool(*is_cross)),
-                ("leverage", Wire::UInt(u64::from(*leverage))),
-            ]),
-            Action::UpdateIsolatedMargin {
-                asset,
-                is_buy,
-                ntli,
-            } => Wire::Map(vec![
-                kind,
-                ("asset", Wire::UInt(u64::from(*asset))),
-                ("isBuy", Wire::Bool(*is_buy)),
-                ("ntli", Wire::Int(*ntli)),
-            ]),
-            Action::ScheduleCancel { time } => {
-                let mut fields = vec![kind];
-                if let Some(time) = time {
-                    fields.push(("time", Wire::UInt(*time)));
-                }
-                Wire::Map(fields)
-            }
-        }
     }
 }
 
@@ -1071,6 +689,150 @@ mod tests {
         }
     }
 
+    /// A deterministic generator (xorshift64*), so that a failure reproduces.
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 >> 12;
+            self.0 ^= self.0 << 25;
+            self.0 ^= self.0 >> 27;
+            self.0.wrapping_mul(0x2545_f491_4f6c_dd1d)
+        }
+
+        fn below(&mut self, bound: u64) -> u64 {
+            self.next() % bound
+        }
+
+        fn coin(&mut self) -> bool {
+            self.next() & 1 == 1
+        }
+    }
+
+    /// A price or size, sometimes with trailing zeros a bot may send.
+    fn random_px(rng: &mut Rng) -> Px {
+        let value = Decimal::new(rng.below(999_999_999) as i64, rng.below(9) as u32);
+        let mut text = value.to_string();
+        if rng.below(4) == 0 {
+            text.push_str(if text.contains('.') { "00" } else { ".0" });
+        }
+        Px::parse(&text).unwrap()
+    }
+
+    fn random_cloid(rng: &mut Rng) -> Cloid {
+        let text = format!("0x{:016x}{:016x}", rng.next(), rng.next());
+        Cloid::parse(&if rng.coin() {
+            text
+        } else {
+            text.to_ascii_uppercase().replacen("0X", "0x", 1)
+        })
+        .unwrap()
+    }
+
+    fn random_order(rng: &mut Rng) -> Order {
+        let kind = match rng.below(4) {
+            0 => OrderKind::Limit { tif: Tif::Gtc },
+            1 => OrderKind::Limit { tif: Tif::Ioc },
+            2 => OrderKind::Limit { tif: Tif::Alo },
+            _ => OrderKind::Trigger {
+                is_market: rng.coin(),
+                trigger_px: random_px(rng),
+                tpsl: if rng.coin() { Tpsl::Sl } else { Tpsl::Tp },
+            },
+        };
+        Order {
+            asset: [0, 1, 4, 127, 128, 255, 10_107, 110_000, u32::MAX][rng.below(9) as usize],
+            is_buy: rng.coin(),
+            price: random_px(rng),
+            size: random_px(rng),
+            reduce_only: rng.coin(),
+            kind,
+            cloid: rng.coin().then(|| random_cloid(rng)),
+        }
+    }
+
+    fn random_ref(rng: &mut Rng) -> OrderRef {
+        if rng.coin() {
+            OrderRef::Oid(rng.next() >> rng.below(64))
+        } else {
+            OrderRef::Cloid(random_cloid(rng))
+        }
+    }
+
+    /// Every action the protocol model can express, encoded and decoded
+    /// again: the same action, so the same MessagePack. What Zunder's
+    /// executor and the MCP server send is built from this model, and
+    /// Guard reads it back exactly.
+    #[test]
+    fn every_encoded_action_decodes_to_itself() {
+        let mut rng = Rng(0x5eed_0006);
+        for case in 0..1_000 {
+            let count = 1 + rng.below(4) as usize;
+            let action = match rng.below(8) {
+                0 => Action::Order(OrderAction {
+                    orders: (0..count).map(|_| random_order(&mut rng)).collect(),
+                    grouping: [Grouping::Na, Grouping::NormalTpsl, Grouping::PositionTpsl]
+                        [rng.below(3) as usize],
+                    builder: rng.coin().then(|| Builder {
+                        address: format!("0x{:040x}", rng.next()),
+                        fee_tenths_bp: rng.below(1_000),
+                    }),
+                }),
+                1 => Action::Cancel(
+                    (0..count)
+                        .map(|_| Cancel {
+                            asset: rng.below(200_000) as u32,
+                            order: OrderRef::Oid(rng.next() >> rng.below(64)),
+                        })
+                        .collect(),
+                ),
+                2 => Action::CancelByCloid(
+                    (0..count)
+                        .map(|_| Cancel {
+                            asset: rng.below(200_000) as u32,
+                            order: OrderRef::Cloid(random_cloid(&mut rng)),
+                        })
+                        .collect(),
+                ),
+                3 => Action::Modify(Modify {
+                    oid: random_ref(&mut rng),
+                    order: random_order(&mut rng),
+                }),
+                4 => Action::BatchModify(
+                    (0..count)
+                        .map(|_| Modify {
+                            oid: random_ref(&mut rng),
+                            order: random_order(&mut rng),
+                        })
+                        .collect(),
+                ),
+                5 => Action::UpdateLeverage {
+                    asset: rng.below(200_000) as u32,
+                    is_cross: rng.coin(),
+                    leverage: 1 + rng.below(100) as u32,
+                },
+                6 => Action::UpdateIsolatedMargin {
+                    asset: rng.below(200_000) as u32,
+                    is_buy: rng.coin(),
+                    ntli: (rng.next() >> rng.below(64)) as i64,
+                },
+                _ => Action::ScheduleCancel {
+                    time: rng.coin().then(|| rng.next() >> 20),
+                },
+            };
+            let wire = action.to_wire();
+            let json: Value = serde_json::from_slice(&wire.to_json().unwrap()).unwrap();
+            let decoded =
+                decode_action_value(&json).unwrap_or_else(|error| panic!("{case}: {error} {json}"));
+            assert_eq!(decoded, action, "{case}: {json}");
+            assert_eq!(
+                decoded.to_wire().to_msgpack().unwrap(),
+                wire.to_msgpack().unwrap(),
+                "{case}"
+            );
+        }
+    }
+
     #[test]
     fn fund_movements_and_permissions_are_refused_by_name() {
         for kind in [
@@ -1218,18 +980,5 @@ mod tests {
             decode_envelope(&misspelt),
             Err(DecodeError::Malformed(_))
         ));
-    }
-
-    #[test]
-    fn px_parses_only_plain_decimals() {
-        assert_eq!(Px::parse("0.0147").unwrap().value(), dec!(0.0147));
-        for bad in [
-            "", ".5", "5.", "-1", "+1", "1e3", "1,5", " 1", "1 ", "0x10", "NaN",
-        ] {
-            assert!(Px::parse(bad).is_none(), "{bad}");
-        }
-        assert_eq!(Px::from_decimal(dec!(1670.10)).unwrap().raw(), "1670.1");
-        assert_eq!(Px::from_decimal(dec!(100.000)).unwrap().raw(), "100");
-        assert!(Px::from_decimal(dec!(0.000000001)).is_none());
     }
 }

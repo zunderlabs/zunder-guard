@@ -405,9 +405,10 @@ impl AssetInfo {
 
     /// `price` on the venue's grid (`zunder-hl-protocol`'s [`PriceGrid`]
     /// for a perp: five significant figures, `6 - szDecimals` decimals),
-    /// rounded up or down; `None` for a price of zero or less.
-    pub fn round_price(&self, price: Decimal, up: bool) -> Option<Decimal> {
-        let direction = if up { Round::Up } else { Round::Down };
+    /// rounded in `direction` (named by what the price is for:
+    /// `zunder_venue_types::{toward_position, passive, aggressive}`); `None`
+    /// for a price of zero or less.
+    pub fn round_price(&self, price: Decimal, direction: Round) -> Option<Decimal> {
         PriceGrid::new(
             PERP_MAX_DECIMALS.saturating_sub(self.sz_decimals),
             PRICE_SIG_FIGS,
@@ -656,6 +657,14 @@ impl OpenOrderView {
         }
     }
 
+    /// Whether this order is a stop that protects a position in `coin` on
+    /// `position_side`: a protective market stop ([`Self::protective_level`])
+    /// on the closing side. The rule Guard judges by, and the agent kit
+    /// shows and pre-checks by.
+    pub fn stops_position(&self, coin: &str, position_side: Side) -> bool {
+        self.coin == coin && self.side == position_side.opposite() && self.is_protective_stop()
+    }
+
     /// An order that could open or grow a position.
     pub fn is_opening(&self) -> bool {
         !self.reduce_only && !self.is_position_tpsl
@@ -680,6 +689,36 @@ impl OpenOrderView {
             Side::Sell => triggers.min(),
         }
     }
+}
+
+/// The stop that bounds the loss of a position of `qty` in `coin` on
+/// `side` among the resting `orders` (top-level orders: a child waiting
+/// for its entry protects no position), ignoring those in `except`, with
+/// one more stop loss `extra` (`(trigger, size)`): the rule of
+/// [`AccountView::covering_stop`], for callers that hold the orders but no
+/// view (the agent kit).
+pub fn covering_stop_among<'a>(
+    coin: &str,
+    side: Side,
+    qty: Decimal,
+    orders: impl IntoIterator<Item = &'a OpenOrderView>,
+    except: &[u64],
+    extra: Option<(Decimal, Decimal)>,
+) -> Option<Decimal> {
+    let stops = orders
+        .into_iter()
+        .filter(|order| !except.contains(&order.oid) && order.stops_position(coin, side))
+        .filter_map(|order| {
+            order.protective_level().map(|px| CoverStop {
+                trigger: px,
+                size: (!order.is_position_tpsl).then_some(order.qty),
+                first_part_only: false,
+            })
+        })
+        .chain(extra.map(|(trigger, qty)| CoverStop::sized(trigger, qty)));
+    // Tightest first, the size-weighted trigger rounded towards the looser
+    // side (`zunder_risk::covering_stop`).
+    zunder_risk::covering_stop(side, qty, stops)
 }
 
 /// One dex's margin account, as `clearinghouseState` with its `dex` shows
@@ -951,26 +990,14 @@ impl AccountView {
         extra: Option<(Decimal, Decimal)>,
     ) -> Option<Decimal> {
         let position = self.position(coin)?;
-        let stops = self
-            .open_orders
-            .iter()
-            .filter(|order| {
-                order.coin == coin
-                    && !except.contains(&order.oid)
-                    && order.is_protective_stop()
-                    && order.side == position.side.opposite()
-            })
-            .filter_map(|order| {
-                order.protective_level().map(|px| CoverStop {
-                    trigger: px,
-                    size: (!order.is_position_tpsl).then_some(order.qty),
-                    first_part_only: false,
-                })
-            })
-            .chain(extra.map(|(trigger, qty)| CoverStop::sized(trigger, qty)));
-        // Tightest first, the size-weighted trigger rounded towards the
-        // looser side (`zunder_risk::covering_stop`).
-        zunder_risk::covering_stop(position.side, position.qty, stops)
+        covering_stop_among(
+            coin,
+            position.side,
+            position.qty,
+            &self.open_orders,
+            except,
+            extra,
+        )
     }
 
     /// The venue's side for the risk engine: every position with the stop
@@ -1285,6 +1312,13 @@ fn parse_order(value: &Value, depth: u32) -> Result<OpenOrderView, InfoError> {
             .unwrap_or(false),
         children,
     })
+}
+
+/// One order of a `frontendOpenOrders` answer, with its waiting children:
+/// read as Guard reads it (prices and sizes strings, an order type it does
+/// not know never a stop loss).
+pub fn parse_open_order(value: &Value) -> Result<OpenOrderView, InfoError> {
+    parse_order(value, 0)
 }
 
 fn parse_open_orders(value: &Value) -> Result<Vec<OpenOrderView>, InfoError> {
@@ -1870,13 +1904,28 @@ pub(crate) mod tests {
     fn prices_round_to_five_significant_figures_and_the_decimal_limit() {
         let meta = Meta::parse(&meta_json()).unwrap();
         let btc = meta.by_name("BTC").unwrap(); // szDecimals 5: 1 price decimal
-        assert_eq!(btc.round_price(dec!(61234.56), false), Some(dec!(61234)));
-        assert_eq!(btc.round_price(dec!(61234.56), true), Some(dec!(61235)));
-        assert_eq!(btc.round_price(dec!(123456.7), false), Some(dec!(123456)));
+        assert_eq!(
+            btc.round_price(dec!(61234.56), Round::Down),
+            Some(dec!(61234))
+        );
+        assert_eq!(
+            btc.round_price(dec!(61234.56), Round::Up),
+            Some(dec!(61235))
+        );
+        assert_eq!(
+            btc.round_price(dec!(123456.7), Round::Down),
+            Some(dec!(123456))
+        );
         let sol = meta.by_name("SOL").unwrap(); // szDecimals 2: 4 decimals
-        assert_eq!(sol.round_price(dec!(150.123456), false), Some(dec!(150.12)));
-        assert_eq!(sol.round_price(dec!(1.2345678), true), Some(dec!(1.2346)));
-        assert_eq!(sol.round_price(dec!(0), true), None);
+        assert_eq!(
+            sol.round_price(dec!(150.123456), Round::Down),
+            Some(dec!(150.12))
+        );
+        assert_eq!(
+            sol.round_price(dec!(1.2345678), Round::Up),
+            Some(dec!(1.2346))
+        );
+        assert_eq!(sol.round_price(dec!(0), Round::Up), None);
         assert_eq!(sol.round_qty_down(dec!(1.239)), dec!(1.23));
         assert_eq!(sol.qty_step(), dec!(0.01));
         assert_eq!(meta.by_index(3).unwrap().max_leverage, 3);

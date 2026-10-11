@@ -47,6 +47,7 @@ use zunder_guard::{
     testdir::TestDir,
 };
 use zunder_guard_core::{
+    action::Protection,
     auth::AuthConfig,
     licence::FeeMode,
     policy::{Markets, Policy},
@@ -1565,6 +1566,232 @@ async fn a_withdrawal_never_halts_and_a_loss_still_does() {
     running.guard.sync().await;
     let status = running.guard.status().await;
     assert_eq!(status["risk"]["state"], "halted_for_day", "{status}");
+}
+
+/// An entry whose answer was lost may still reach the venue until it
+/// expires (30 s): every new entry, on any coin, waits until 15 s after that
+/// (Guard's clock may run ahead of the venue's, and the venue's view may lag
+/// a fill) and until a complete sync read begun after the send, at least
+/// that late and showing the venue's time past the expiry.
+#[tokio::test]
+async fn entries_wait_for_a_lost_entry_to_expire_with_margin_and_be_read() {
+    let running = start("stream-lost-entry", false).await;
+    let venue = running.guard.upstream();
+    running.guard.sync().await;
+    let mut nonce = running.clock.now_ms();
+    let mut signed_now = |body: &Value| {
+        nonce = nonce.max(running.clock.now_ms()) + 1;
+        resigned(body, nonce)
+    };
+    venue.swallow_answers(true);
+    let entry = order(1, true, "3000", "0.1", false);
+    // The lost entry expires 30 s after Guard took it, at about t0 + 30,000.
+    let t0 = running.clock.now_ms();
+    let reply = post(&running.url, &signed_now(&entry)).await;
+    assert_eq!(reply["code"], "venue_unreachable", "{reply}");
+    venue.swallow_answers(false);
+    let retry = post(&running.url, &signed_now(&entry)).await;
+    assert_eq!(retry["code"], "account_unreadable", "{retry}");
+    // BTC waits too: open risk counts every coin, and the lost ETH entry's
+    // is not in the view.
+    let btc = order(0, true, "60000", "0.001", false);
+    let reply = post(&running.url, &signed_now(&btc)).await;
+    assert_eq!(reply["code"], "account_unreadable", "{reply}");
+    // Expired 5 s ago and read since: still within the 15 s margin.
+    running.clock.advance(35_100);
+    running.guard.sync().await;
+    let retry = post(&running.url, &signed_now(&entry)).await;
+    assert_eq!(retry["code"], "account_unreadable", "{retry}");
+    // 15 s past the expiry, but the last complete read began before that.
+    running.clock.advance(10_000);
+    let retry = post(&running.url, &signed_now(&entry)).await;
+    assert_eq!(retry["code"], "account_unreadable", "{retry}");
+    // A read that leaves a dex Guard manages unread (xyz) is no complete
+    // read: still held.
+    venue.fail_reads("xyz");
+    running.guard.sync().await;
+    let retry = post(&running.url, &signed_now(&entry)).await;
+    assert_eq!(retry["code"], "account_unreadable", "{retry}");
+    venue.restore_reads("xyz");
+    // The venue's own time held at t0 + 34,000, about 4 s past the expiry
+    // (Guard's clock running ahead): within the 5 s its view may lag a
+    // fill, so still held.
+    venue.hold_account_time(Some(i64::try_from(t0 + 34_000).unwrap()));
+    running.guard.sync().await;
+    let retry = post(&running.url, &signed_now(&entry)).await;
+    assert_eq!(retry["code"], "account_unreadable", "{retry}");
+    assert!(
+        retry["response"]
+            .as_str()
+            .unwrap_or("")
+            .contains("venue's time"),
+        "{retry}"
+    );
+    venue.hold_account_time(None);
+    // A complete sync read begun now, its venue time past the expiry,
+    // resolves it, on every coin.
+    running.guard.sync().await;
+    let reply = post(&running.url, &signed_now(&btc)).await;
+    assert_ne!(reply["code"], "account_unreadable", "{reply}");
+}
+
+/// The venue's account answer lags a fill: the round woken by an unknown
+/// outcome does not see it. Every round protects until one whose read began
+/// 5 s after the send, so the next round within that window protects the
+/// fill (on a frozen clock: neither settled nor 30 s overdue).
+#[tokio::test]
+async fn an_early_round_on_a_view_that_does_not_show_the_fill_keeps_protection_due() {
+    let running = start("stream-early-round", false).await;
+    let venue = running.guard.upstream();
+    running.clock.freeze();
+    running.guard.sync().await;
+    venue.refuse_stops();
+    venue.rewrite_replies(|action, mut reply| {
+        if action["type"] == "order" && action["orders"].as_array().is_some_and(|o| o.len() == 2) {
+            reply["response"]["data"]["statuses"][1] = json!({"unexpected": "shape"});
+        }
+        reply
+    });
+    let entry = order(1, true, "3000", "0.1", false);
+    let reply = post(&running.url, &resigned(&entry, running.clock.now_ms() + 1)).await;
+    assert_eq!(reply["status"], "ok", "{reply}");
+    venue.accept_stops();
+    venue.rewrite_replies(|_, reply| reply);
+    let sent = venue.received().len();
+    venue.clear_positions();
+    running.guard.sync().await;
+    assert_eq!(venue.received().len(), sent, "nothing to protect yet");
+    running.clock.advance(3_000);
+    venue.add_position_at("ETH", "0.1", "3000");
+    running.guard.sync().await;
+    let received = venue.received();
+    assert_eq!(received.len(), sent + 1, "{received:?}");
+    let zunder_guard_core::action::Action::Order(order) = &received[sent].action else {
+        panic!("{:?}", received[sent])
+    };
+    // Guard's own stop: 2% below the 3,000 mid, for the whole 0.1.
+    assert_eq!(order.orders[0].protective_level(), Some(dec!(2940)));
+    assert_eq!(order.orders[0].size.raw(), "0.1");
+}
+
+/// A ledger entry Guard cannot account for whose amount cannot be read (a
+/// type it does not know without a USD amount, a transfer without its fee):
+/// reported by name, and new positions refused until the end of the UTC day
+/// it was seen, from the socket and from the read over HTTP alike. One of a
+/// type Guard does not know with a USD amount is applied as money in, never
+/// a trading gain: its effect cannot be reconstructed, so the day halts. One
+/// older than the risk journal's horizon is in the equity Guard started
+/// from: neither.
+#[tokio::test]
+async fn a_ledger_entry_guard_cannot_account_for_is_money_in_or_refuses_entries() {
+    const DAY_MS: u64 = 86_400_000;
+    let running = start("stream-unaccounted", true).await;
+    let venue = running.guard.upstream();
+    running.guard.sync().await;
+    // From 1970: long before the horizon.
+    venue.ledger_entry_at(json!({"type": "welcomeBonus", "usdc": "5"}), 1_000, false);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    running.clock.advance(1_100);
+    running.guard.sync().await;
+    let status = running.guard.status().await;
+    assert!(status["risk"]["ledger_unaccounted"].is_null(), "{status}");
+    let reply = post(&running.url, &order(1, true, "3000", "0.1", false)).await;
+    assert_ne!(reply["code"], "account_unreadable", "{reply}");
+    // Now, on the socket: a type Guard does not know, with no USD amount.
+    let now = running.clock.now_ms();
+    venue.ledger_entry_at(json!({"type": "activateDexAbstraction"}), now as i64, false);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    running.clock.advance(1_100);
+    running.guard.sync().await;
+    let status = running.guard.status().await;
+    let text = status["risk"]["ledger_unaccounted"].as_str().unwrap_or("");
+    assert!(text.contains("activateDexAbstraction"), "{status}");
+    let until = status["risk"]["entries_refused_until_ms"].as_u64().unwrap();
+    let today = running.clock.now_ms() / DAY_MS;
+    assert_eq!(until, (today + 1) * DAY_MS);
+    assert!(
+        status["alerts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|alert| alert
+                .as_str()
+                .unwrap_or("")
+                .contains("activateDexAbstraction")),
+        "{status}"
+    );
+    let reply = post(&running.url, &order(1, true, "3000", "0.1", false)).await;
+    assert_eq!(reply["code"], "account_unreadable", "{reply}");
+    assert!(
+        reply["response"]
+            .as_str()
+            .unwrap_or("")
+            .contains("activateDexAbstraction"),
+        "{reply}"
+    );
+    // A reduce-only order still goes on (judged, not refused for it).
+    let reply = post(&running.url, &order(1, false, "2900", "0.1", true)).await;
+    assert_ne!(reply["code"], "account_unreadable", "{reply}");
+    // Read over HTTP only (the periodic read, 5 minutes on): a transfer
+    // out without its fee, named too.
+    let now = running.clock.now_ms();
+    venue.ledger_entry_at(
+        json!({"type": "internalTransfer", "usdc": "5", "user": ACCOUNT,
+            "destination": "0x0000000000000000000000000000000000000001"}),
+        now as i64,
+        true,
+    );
+    running.clock.advance(300_100);
+    running.guard.sync().await;
+    let status = running.guard.status().await;
+    let text = status["risk"]["ledger_unaccounted"].as_str().unwrap_or("");
+    assert!(
+        text.contains("internalTransfer") && text.contains("fee"),
+        "{status}"
+    );
+    // A type Guard does not know with a USD amount, read over HTTP (the
+    // periodic read; the socket reconnects after the clock's jumps): money
+    // in, so the 5 cannot pass as a gain; the account's value at it cannot
+    // be reconstructed, so the day halts once a view shows it.
+    assert_eq!(status["risk"]["state"], "active", "{status}");
+    let now = running.clock.now_ms();
+    venue.ledger_entry_at(
+        json!({"type": "welcomeBonus", "usdc": "5"}),
+        now as i64,
+        true,
+    );
+    running.clock.advance(300_100);
+    running.guard.sync().await;
+    for _ in 0..2 {
+        running.clock.advance(2_100);
+        running.guard.sync().await;
+    }
+    let status = running.guard.status().await;
+    assert_eq!(
+        status["risk"]["state"], "halted_for_day",
+        "{} {}",
+        status["risk"], status["stream"]
+    );
+    assert!(
+        status["alerts"].as_array().unwrap().iter().any(|alert| {
+            let text = alert.as_str().unwrap_or("");
+            text.contains("welcomeBonus") && text.contains("money in")
+        }),
+        "{status}"
+    );
+    // The day over (the later entry's, should the read have crossed
+    // midnight), entries are no longer refused for them.
+    let until = status["risk"]["entries_refused_until_ms"]
+        .as_u64()
+        .unwrap()
+        .max(until);
+    let left = until.saturating_sub(running.clock.now_ms());
+    running.clock.advance(left + 1);
+    let status = running.guard.status().await;
+    assert!(
+        status["risk"]["entries_refused_until_ms"].is_null(),
+        "{status}"
+    );
 }
 
 /// A one-second wick, held, counts when it goes (it was trading: a

@@ -54,12 +54,18 @@ def amount_micro(value: object) -> int:
     return int(amount)
 
 
-def admit_order(order_number: str, amount: str, work: Path, network: str) -> tuple[str, int]:
+def admit_order(
+    order_number: str, amount: str, work: Path, network: str, *, scenario: str = "exact"
+) -> tuple[str, int]:
     """Recheck C4 status and authenticated order before taking custody of the payer key.
 
     `work` is a fresh private directory. An exclusive attempt marker persists before any send;
     neither success nor failure permits retrying this order in that directory.
     """
+    if scenario not in {"exact", "under", "over", "late", "blocked"}:
+        raise PaymentError("unsupported staging payment scenario")
+    if scenario != "exact" and network != "hyperliquid":
+        raise PaymentError("edge scenarios are restricted to Hyperliquid testnet")
     if network not in {"hyperliquid", "arbitrum", "base"}:
         raise PaymentError("unsupported testnet purchase network")
     _private(work, directory=True)
@@ -106,10 +112,11 @@ def admit_order(order_number: str, amount: str, work: Path, network: str) -> tup
         headers={**headers, "Authorization": "Bearer " + token},
     )
     if (
-        order.get("state") != "quoted"
+        order.get("state") != ("expired" if scenario == "late" else "quoted")
         or order.get("network") != network
         or type(order.get("amount_micro")) is not int
-        or order["amount_micro"] != micro
+        or not 0 < order["amount_micro"] < 1_000_000
+        or micro != order["amount_micro"] + {"under": -1, "over": 1}.get(scenario, 0)
         or order.get("key_issued") is not False
     ):
         raise PaymentError("exact unpaid testnet order required")
@@ -127,10 +134,15 @@ def record(work: Path, name: str, value: dict[str, object]) -> None:
         raise PaymentError("payment already attempted; reconcile order, never retry") from None
 
 
-def pay(order_number: str, amount: str, work: Path) -> dict[str, object]:
-    destination, micro = admit_order(order_number, amount, work, "hyperliquid")
+def pay(
+    order_number: str, amount: str, work: Path, *, scenario: str = "exact"
+) -> dict[str, object]:
+    destination, micro = admit_order(order_number, amount, work, "hyperliquid", scenario=scenario)
     # Consume once, never retain the key in a subprocess environment or receipt.
-    key = os.environ.pop("E2E_PAYER_HYPERLIQUID_TESTNET_KEY", "")
+    key_name = (
+        "E2E_PAYER_BLOCKED_KEY" if scenario == "blocked" else "E2E_PAYER_HYPERLIQUID_TESTNET_KEY"
+    )
+    key = os.environ.pop(key_name, "")
     if not key:
         raise PaymentError("dedicated testnet payer key required")
     try:
@@ -148,6 +160,8 @@ def pay(order_number: str, amount: str, work: Path) -> dict[str, object]:
         "network": "hyperliquid",
         "amount_micro": micro,
         "nonce": nonce,
+        "scenario": scenario,
+        "payer": wallet.address.lower(),
     }
     record(work, "payment-attempt.json", attempt)
     response = request(TESTNET, headers={"Content-Type": "application/json"}, data=body)
@@ -168,9 +182,12 @@ def main() -> int:
     parser.add_argument("--order", required=True)
     parser.add_argument("--amount", required=True)
     parser.add_argument("--work", required=True, type=Path)
+    parser.add_argument(
+        "--scenario", choices=["exact", "under", "over", "late", "blocked"], default="exact"
+    )
     args = parser.parse_args()
     try:
-        pay(args.order, args.amount, args.work)
+        pay(args.order, args.amount, args.work, scenario=args.scenario)
         print("Hyperliquid testnet payment accepted; follow C4 order and inbox to completion")
         return 0
     except Exception:

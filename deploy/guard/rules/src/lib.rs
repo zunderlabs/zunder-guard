@@ -20,9 +20,9 @@
 //!
 //! Defaults are the reconciled schema v1 (6 Oct 2026), equal to the Guard core's
 //! `Policy::default()`. The bounds are the Guard core's (`zunder_guard_core::policy`, the
-//! `…_BOUNDS` constants), read from there; the upper bounds of the `zunder-risk` fields never
-//! exceed `RiskLimits::aggressive()`, so a rules string can never loosen what `zunder-risk`
-//! allows. [`Rules::to_policy`] and [`Rules::from_policy`] map rules onto Guard's policy.
+//! `…_BOUNDS` constants), read from there, so a rules string never goes beyond what Guard's
+//! policy accepts (maxima widened by decision on 11 Oct 2026; on mainnet the mainnet ceiling
+//! still applies). [`Rules::to_policy`] and [`Rules::from_policy`] map rules onto Guard's policy.
 //!
 //! The TypeScript twin is `../zr1.ts`; both pass the same `../vectors.json`, and
 //! `../schema-v1.json` documents the same defaults and bounds (a test keeps them equal).
@@ -718,16 +718,17 @@ mod tests {
     }
 
     #[test]
-    fn upper_bounds_never_exceed_the_aggressive_frame() {
-        // RiskLimits::aggressive(): 5% per trade, 20% open, 10x, 15% daily, 50% drawdown
-        // (recorded 5 Oct 2026). A position may use at most the 10x cap: 1000%.
+    fn upper_bounds_are_guard_cores_policy_bounds() {
+        // The maxima decided on 11 Oct 2026 ("Guard's maximum bounds
+        // widened"): 50x, 25% per trade, 100% open risk, 50% daily, 90% drawdown, a position up
+        // to the 50x cap: 5000%; the stop and liquidation distances unchanged at 50%.
         let max = |f| bounds_of(f).map(|b| b.max);
-        assert_eq!(max(Field::MaxLeverage), Some(dec!(10)));
-        assert_eq!(max(Field::MaxLossAtStopPct), Some(dec!(5)));
-        assert_eq!(max(Field::MaxOpenRiskPct), Some(dec!(20)));
-        assert_eq!(max(Field::DailyLossStopPct), Some(dec!(15)));
-        assert_eq!(max(Field::DrawdownHaltPct), Some(dec!(50)));
-        assert_eq!(max(Field::MaxPositionPct), Some(dec!(1000)));
+        assert_eq!(max(Field::MaxLeverage), Some(dec!(50)));
+        assert_eq!(max(Field::MaxLossAtStopPct), Some(dec!(25)));
+        assert_eq!(max(Field::MaxOpenRiskPct), Some(dec!(100)));
+        assert_eq!(max(Field::DailyLossStopPct), Some(dec!(50)));
+        assert_eq!(max(Field::DrawdownHaltPct), Some(dec!(90)));
+        assert_eq!(max(Field::MaxPositionPct), Some(dec!(5000)));
         assert_eq!(max(Field::MinLiqDistancePct), Some(dec!(50)));
         assert_eq!(max(Field::DefaultStopDistancePct), Some(dec!(50)));
         let mut top = Rules::default();
@@ -738,13 +739,27 @@ mod tests {
         assert_eq!(top.validate(), Err(RulesError::LiquidationNotBeyondStop));
         top.set_number(Field::DefaultStopDistancePct, dec!(49.9999));
         assert_eq!(top.validate(), Ok(()));
+        // A rules string at the schema's maxima is a policy Guard core accepts, so the schema
+        // never goes beyond Guard core's bounds; the engine accepts its limits.
+        let base = zunder_guard_core::policy::Policy::default();
+        let policy = top
+            .to_policy(&base)
+            .expect("within Guard core's policy bounds");
+        assert_eq!(policy.validate(), Ok(()));
         let limits = top.risk_limits();
-        assert_eq!(limits.risk_per_trade, dec!(0.05));
-        assert_eq!(limits.max_open_risk, dec!(0.2));
-        assert_eq!(limits.max_leverage, dec!(10));
-        assert_eq!(limits.daily_loss_stop, dec!(0.15));
-        assert_eq!(limits.drawdown_stop, dec!(0.5));
+        assert_eq!(limits.risk_per_trade, dec!(0.25));
+        assert_eq!(limits.max_open_risk, dec!(1));
+        assert_eq!(limits.max_leverage, dec!(50));
+        assert_eq!(limits.daily_loss_stop, dec!(0.5));
+        assert_eq!(limits.drawdown_stop, dec!(0.9));
         assert_eq!(limits.validate(), Ok(()));
+        // One step beyond any maximum is beyond Guard core's bounds too.
+        for b in number_bounds() {
+            let mut over = top.clone();
+            over.set_number(b.field, b.max + dec!(0.0001));
+            assert_eq!(over.validate().map_err(|e| e.code()), Err("out_of_range"));
+            assert!(over.to_policy(&base).is_err(), "{:?}", b.field);
+        }
     }
 
     #[test]

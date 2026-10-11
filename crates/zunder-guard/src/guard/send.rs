@@ -13,7 +13,7 @@ use thiserror::Error;
 use zunder_core::Symbol;
 use zunder_guard_core::{
     account::{AccountView, AssetKind, asset_kind, confirms_isolated, requests},
-    action::Action,
+    action::{Action, Protection},
     event::EventBody,
     judge::Forward,
     licence,
@@ -28,8 +28,9 @@ use crate::{
 };
 
 use super::{
-    AttachedStops, Guard, Inner, Intent, Mode,
+    AttachedStops, Guard, Inner, Intent, Mode, PendingEntry,
     clock::{Clock, stamp},
+    observe::SETTLE_MS,
     protect::RestingEntry,
     reason::ReasonCode,
     recovery::INTENT_COVERS_MS,
@@ -63,6 +64,17 @@ impl SendError {
     /// Refused by the venue's HTTP status (a 4xx, such as 429): not placed.
     pub(super) fn refused_by_status(&self) -> bool {
         matches!(self, SendError::Venue(UpstreamError::Status { status, .. }) if (400..500).contains(status))
+    }
+
+    /// The action may have reached the venue and done something nobody can
+    /// tell: no answer, an answer that is not JSON, or a server error.
+    pub(super) fn may_have_reached(&self) -> bool {
+        match self {
+            SendError::NoAnswer(_) => true,
+            SendError::Venue(UpstreamError::NotJson(_) | UpstreamError::NoAnswer(_)) => true,
+            SendError::Venue(UpstreamError::Status { .. }) => !self.refused_by_status(),
+            _ => false,
+        }
     }
 }
 
@@ -315,6 +327,69 @@ fn reduces_risk(action: &Action) -> bool {
 }
 
 impl<U: Upstream, C: Clock> Guard<U, C> {
+    /// A send whose outcome is unknown (no answer, or one that does not say
+    /// what became of an order or its stop): journaled, an alert, and the
+    /// background sync woken to protect every open position at once,
+    /// settled or not, from the venue's own open orders. An unconfirmed
+    /// stop never counts as protection.
+    /// `oid`: an order the alert stays for while it rests.
+    pub(super) fn outcome_unknown(
+        &self,
+        inner: &mut Inner,
+        now: u64,
+        text: &str,
+        oid: Option<u64>,
+    ) {
+        inner.protection.at_next_sync = true;
+        // The venue's view may not show what the send did for up to
+        // SETTLE_MS: every round protects until one reads after that, on
+        // the monotonic clock (a step of the time of day cannot end it).
+        let settled = self.clock.monotonic_ms().saturating_add(SETTLE_MS);
+        inner.protection.until = Some(inner.protection.until.map_or(settled, |u| u.max(settled)));
+        self.protect_soon.notify_one();
+        Self::add_alert(inner, now, text, oid);
+        inner
+            .journal
+            .append(
+                stamp(now),
+                EventBody::Error {
+                    text: text.to_owned(),
+                },
+            )
+            .ok();
+    }
+
+    /// An entry on `coin` whose outcome is unknown may still reach the
+    /// venue until it expires at `expires_ms` (Guard's clock): every new
+    /// entry, on any coin, waits until it is resolved
+    /// (`PendingEntry::resolved`), as Zunder's own session holds every
+    /// entry while one may still arrive.
+    fn entry_may_arrive(&self, inner: &mut Inner, coin: &str, expires_ms: u64) {
+        inner.sends.unknown_entries.push(PendingEntry {
+            coin: coin.to_owned(),
+            expires_ms,
+            sent_mono: self.clock.monotonic_ms(),
+        });
+    }
+
+    /// Why a new entry waits: an earlier entry whose outcome is unknown may
+    /// still arrive ([`Self::entry_may_arrive`]), whatever its coin (the
+    /// open-risk budget counts every coin).
+    pub(super) fn pending_entry_refusal(inner: &Inner, now: u64) -> Option<String> {
+        let read = inner.sync.last_complete;
+        inner
+            .sends
+            .unknown_entries
+            .iter()
+            .find(|pending| !pending.resolved(now, read.as_ref()))
+            .map(|pending| {
+                format!(
+                    "an earlier {} entry whose outcome is unknown (its answer was lost or unreadable) may still reach the venue until {} (epoch ms): new entries wait until Guard's clock is 15 s past that and a complete read of every dex Guard manages, begun after the send and that late, shows the venue's time more than 5 s past it",
+                    pending.coin, pending.expires_ms
+                )
+            })
+    }
+
     fn next_nonce(inner: &mut Inner, now: u64) -> u64 {
         inner.sends.last_nonce = now.max(inner.sends.last_nonce.saturating_add(1));
         inner.sends.last_nonce
@@ -604,7 +679,22 @@ impl<U: Upstream, C: Clock> Guard<U, C> {
             Err(error @ SendError::FeeNotApproved(_)) => {
                 return ReasonCode::FeeNotApproved.reply(&error.to_string());
             }
-            Err(error) => return ReasonCode::VenueUnreachable.reply(&error.to_string()),
+            Err(error) => {
+                if error.may_have_reached() {
+                    if let Some(entry) = &forward.entry {
+                        self.entry_may_arrive(inner, &entry.coin, expires);
+                    }
+                    self.outcome_unknown(
+                        inner,
+                        now,
+                        &format!(
+                            "what the venue did with decision {decision} is unknown ({error}); Guard protects every open position at once"
+                        ),
+                        None,
+                    );
+                }
+                return ReasonCode::VenueUnreachable.reply(&error.to_string());
+            }
         };
 
         // A modify the venue refused may have cancelled the order it was to
@@ -639,7 +729,22 @@ impl<U: Upstream, C: Clock> Guard<U, C> {
                 )
                 .ok();
         }
-        let statuses = order_statuses(&reply).unwrap_or_default();
+        // Refused whole (`{"status": "err"}`): nothing was placed. An `ok`
+        // order answer without one readable status per order sent, or an
+        // answer of no known shape, leaves the outcome unknown.
+        let refused_whole = reply.get("status").and_then(Value::as_str) == Some("err");
+        let read = order_statuses(&reply);
+        let unreadable = match (&forward.action, &read) {
+            (Action::Order(sent), Ok(statuses)) => {
+                statuses.len() != sent.orders.len()
+                    || statuses
+                        .iter()
+                        .any(|status| matches!(status, OrderStatus::Other(_)))
+            }
+            (Action::Order(_), Err(_)) => !refused_whole,
+            _ => false,
+        };
+        let statuses = read.unwrap_or_default();
         // The venue refused the entry for its builder field: the approval
         // is gone (`send_one` noted it), and none of its orders was placed.
         if forward.entry.is_some()
@@ -652,17 +757,55 @@ impl<U: Upstream, C: Clock> Guard<U, C> {
         {
             return ReasonCode::FeeNotApproved.reply(&format!("{text} (the venue: {reply})"));
         }
+        if unreadable && forward.entry.is_none() {
+            self.outcome_unknown(
+                inner,
+                now,
+                &format!(
+                    "the venue's answer to decision {decision} cannot be read, so what it placed is unknown: {reply}; Guard protects every open position at once"
+                ),
+                None,
+            );
+        }
         if let (Some(entry), Action::Order(sent)) = (&forward.entry, &forward.action) {
-            // Protected when some stop sent with the entry was not refused.
-            let protected = sent
+            // Protected only when the venue confirms a stop sent with the
+            // entry (it rests, waits for the fill or filled); one whose
+            // status is missing or unreadable is no protection.
+            let stops: Vec<usize> = sent
                 .orders
                 .iter()
                 .enumerate()
                 .filter(|(_, order)| order.protective_level().is_some())
-                .any(|(index, _)| {
-                    !matches!(statuses.get(index), Some(OrderStatus::Error(_)) | None)
-                });
+                .map(|(index, _)| index)
+                .collect();
+            let protected = stops
+                .iter()
+                .any(|index| statuses.get(*index).is_some_and(OrderStatus::placed));
+            let stop_unknown = stops
+                .iter()
+                .any(|index| matches!(statuses.get(*index), Some(OrderStatus::Other(_)) | None));
             match statuses.first() {
+                // The fill is known and no stop is confirmed, but one may
+                // rest: recorded, and protected at once by the sync, which
+                // reads the venue's open orders (never closed on a guess).
+                Some(OrderStatus::Filled { total, average, .. }) if !protected && stop_unknown => {
+                    let recorded = inner.risk.record_entry(
+                        stamp(now),
+                        Symbol::new(&entry.coin),
+                        entry.side,
+                        *total,
+                        *average,
+                        entry.stop,
+                    );
+                    let mut text = format!(
+                        "the {} entry filled ({total} at {average}) but the venue's answer does not confirm its stop: {reply}; Guard protects the position at once",
+                        entry.coin
+                    );
+                    if let Err(error) = recorded {
+                        text.push_str(&format!(" (the fill could not be recorded: {error})"));
+                    }
+                    self.outcome_unknown(inner, now, &text, None);
+                }
                 Some(OrderStatus::Filled { total, average, .. }) if protected => {
                     let recorded = inner.risk.record_entry(
                         stamp(now),
@@ -753,26 +896,60 @@ impl<U: Upstream, C: Clock> Guard<U, C> {
                     // A resting order may have filled in part: protect what
                     // filled at the next sync, settled or not.
                     inner.protection.at_next_sync = true;
-                    let text = match cancelled {
-                        Ok(()) => format!(
-                            "the {} entry {oid} rested but its stop was refused: cancelled",
+                    let why = if stop_unknown {
+                        "the venue's answer does not confirm its stop"
+                    } else {
+                        "its stop was refused"
+                    };
+                    let (text, failed) = match cancelled {
+                        Ok(()) => (
+                            format!("the {} entry {oid} rested but {why}: cancelled", entry.coin),
+                            false,
+                        ),
+                        Err(error) => (
+                            format!(
+                                "the {} entry {oid} rests but {why}, and cancelling it failed: {error}; cancel it by hand",
+                                entry.coin
+                            ),
+                            true,
+                        ),
+                    };
+                    // One alert: the unknown outcome's, kept while the
+                    // order rests when its cancel failed.
+                    if stop_unknown {
+                        self.outcome_unknown(
+                            inner,
+                            now,
+                            &format!("{text} ({reply})"),
+                            failed.then_some(*oid),
+                        );
+                    } else {
+                        if failed {
+                            Self::add_alert(inner, now, &text, Some(*oid));
+                        }
+                        inner
+                            .journal
+                            .append(stamp(now), EventBody::Error { text })
+                            .ok();
+                    }
+                }
+                // Refused, as was the whole action: nothing was placed.
+                Some(OrderStatus::Error(_)) => {}
+                None if refused_whole => {}
+                // The entry's status is missing or cannot be read: it may
+                // have filled, with or without its stop, or still arrive.
+                _ => {
+                    self.entry_may_arrive(inner, &entry.coin, expires);
+                    self.outcome_unknown(
+                        inner,
+                        now,
+                        &format!(
+                            "the venue's answer does not say what became of the {} entry: {reply}; Guard protects every open position at once",
                             entry.coin
                         ),
-                        Err(error) => {
-                            let text = format!(
-                                "the {} entry {oid} rests without its stop, and cancelling it failed: {error}; cancel it by hand",
-                                entry.coin
-                            );
-                            Self::add_alert(inner, now, &text, Some(*oid));
-                            text
-                        }
-                    };
-                    inner
-                        .journal
-                        .append(stamp(now), EventBody::Error { text })
-                        .ok();
+                        None,
+                    );
                 }
-                _ => {}
             }
         }
         // Guard's own stop goes only once the bot's replacement rests.

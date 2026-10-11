@@ -200,6 +200,49 @@ impl LicenceIssuers {
     pub fn is_empty(&self) -> bool {
         self.keys().next().is_none()
     }
+
+    /// Which of these keys signed `key`, by its signature alone (its end,
+    /// accounts and features aside): the production key first. `None`
+    /// for a key neither signed (forged, malformed, or the staging
+    /// issuer's where it does not count, as on mainnet).
+    pub fn signer(&self, key: &str) -> Option<Issuer> {
+        let signed = |public_key: &Option<[u8; 32]>| {
+            public_key
+                .as_ref()
+                .is_some_and(|public_key| signed_payload(key, public_key).is_ok())
+        };
+        if signed(&self.production) {
+            Some(Issuer::Production)
+        } else if signed(&self.testnet) {
+            Some(Issuer::Staging)
+        } else {
+            None
+        }
+    }
+
+    /// Only `issuer`'s key of these (none if it is not among them). It
+    /// never adds a key.
+    pub const fn only(self, issuer: Issuer) -> Self {
+        match issuer {
+            Issuer::Production => Self {
+                production: self.production,
+                testnet: None,
+            },
+            Issuer::Staging => Self {
+                production: None,
+                testnet: self.testnet,
+            },
+        }
+    }
+}
+
+/// Who signed a licence key: Orcastrate's production issuer
+/// ([`LICENCE_PUBLIC_KEY`]) or the staging issuer
+/// ([`TESTNET_LICENCE_PUBLIC_KEY`], testnet only).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Issuer {
+    Production,
+    Staging,
 }
 
 /// Decode 64 hex digits (optionally `0x`-prefixed) at compile time; a
@@ -453,8 +496,8 @@ impl Licence {
     }
 }
 
-/// Verify `key` against `public_key` at `now_ms`.
-pub fn verify(key: &str, public_key: &[u8; 32], now_ms: i64) -> Result<Licence, LicenceError> {
+/// The payload of `key` if `public_key` signed it, read no further.
+fn signed_payload(key: &str, public_key: &[u8; 32]) -> Result<Vec<u8>, LicenceError> {
     let key = key.trim();
     if key.len() > MAX_KEY_LEN {
         return Err(LicenceError::TooLong);
@@ -472,6 +515,12 @@ pub fn verify(key: &str, public_key: &[u8; 32], now_ms: i64) -> Result<Licence, 
     verifying
         .verify_strict(&payload, &signature)
         .map_err(|_| LicenceError::Forged)?;
+    Ok(payload)
+}
+
+/// Verify `key` against `public_key` at `now_ms`.
+pub fn verify(key: &str, public_key: &[u8; 32], now_ms: i64) -> Result<Licence, LicenceError> {
+    let payload = signed_payload(key, public_key)?;
     let payload: Terms = serde_json::from_slice(&payload).map_err(|_| LicenceError::Malformed)?;
     if now_ms >= payload.expires_at_ms {
         return Err(LicenceError::Expired {
@@ -1728,6 +1777,51 @@ mod tests {
             address: "0x00000000000000000000000000000000000000bb".into(),
             fee_tenths_bp: 20,
         }
+    }
+
+    /// The signer of a key, by its signature alone (what Guard's renewal
+    /// picks its origin from): expired keys and keys for other accounts
+    /// still name their issuer; the staging issuer only where it counts.
+    #[test]
+    fn the_signer_is_read_from_the_signature_alone() {
+        let production = SigningKey::from_bytes(&[11u8; 32]);
+        let staging = SigningKey::from_bytes(&[12u8; 32]);
+        let stranger = SigningKey::from_bytes(&[13u8; 32]);
+        let keys = |network| {
+            LicenceIssuers::for_test(
+                network,
+                Some(production.verifying_key().to_bytes()),
+                Some(staging.verifying_key().to_bytes()),
+            )
+        };
+        let testnet = keys(FeeNetwork::Testnet);
+        let mainnet = keys(FeeNetwork::Mainnet);
+        let expired = r#"{"licensee":"Example GmbH","expires_at_ms":1790000000000,"features":["fee_free"],"accounts":["0x00000000000000000000000000000000000000aa"]}"#;
+        for payload in [FEE_FREE, expired] {
+            let by_production = sign_payload(&production, payload);
+            let by_staging = sign_payload(&staging, payload);
+            assert_eq!(testnet.signer(&by_production), Some(Issuer::Production));
+            assert_eq!(testnet.signer(&by_staging), Some(Issuer::Staging));
+            assert_eq!(mainnet.signer(&by_production), Some(Issuer::Production));
+            // On mainnet the staging issuer is not in the set at all.
+            assert_eq!(mainnet.signer(&by_staging), None);
+            assert_eq!(testnet.signer(&sign_payload(&stranger, payload)), None);
+        }
+        for junk in ["", "zgl1_", "zgl1_abc.def", "not a key"] {
+            assert_eq!(testnet.signer(junk), None, "{junk}");
+        }
+        // `only` keeps one issuer's key and never adds one.
+        let by_staging = sign_payload(&staging, FEE_FREE);
+        let by_production = sign_payload(&production, FEE_FREE);
+        let staging_only = testnet.only(Issuer::Staging);
+        assert_eq!(staging_only.keys().count(), 1);
+        assert_eq!(staging_only.signer(&by_staging), Some(Issuer::Staging));
+        assert_eq!(staging_only.signer(&by_production), None);
+        assert!(verify_issued(&by_production, &staging_only, NOW).is_err());
+        let production_only = testnet.only(Issuer::Production);
+        assert_eq!(production_only.signer(&by_staging), None);
+        assert!(verify_issued(&by_production, &production_only, NOW).is_ok());
+        assert!(mainnet.only(Issuer::Staging).is_empty());
     }
 
     /// Testnet licences (`docs/guard.md`, "Automation", "Testnet licences"): a key the

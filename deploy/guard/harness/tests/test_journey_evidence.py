@@ -18,7 +18,9 @@ def inputs(tmp_path: Path) -> tuple[Path, dict[str, evidence.JourneyBundle]]:
     for journey in GATE_JOURNEYS:
         bundle = tmp_path / f"{journey}.json"
         bundle.write_text(journey)
-        bundles[journey] = evidence.JourneyBundle(bundle, f"https://example.com/{journey}")
+        bundles[journey] = evidence.JourneyBundle(
+            bundle, "https://github.com/zunderlabs/zunder-guard/actions/runs/123/attempts/2"
+        )
     return subject, bundles
 
 
@@ -38,6 +40,7 @@ def install_verifier(
         row = bundle.read_text()
         assert subject != original and kwargs["predicate_type"] == evidence.PREDICATE_TYPE
         assert kwargs["commit"] == "b" * 40 and kwargs["tag"] == "v1.0.0"
+        assert kwargs["expected_run_id"] == "123" and kwargs["expected_run_attempt"] == "2"
         workflow = kwargs["workflow"]
         if row.startswith("I") or row in {"M1", "M2"}:
             assert workflow == "install-matrix.yml"
@@ -157,22 +160,32 @@ def test_untrusted_reference_refused(
 
 
 @pytest.mark.parametrize("wrong_reference", [False, True])
+@pytest.mark.parametrize("workflow", ["verify.yml", "promote.yml"])
 def test_gate_checks_lifecycle_against_same_manifest_and_authenticated_references(
     inputs: tuple[Path, dict[str, evidence.JourneyBundle]],
     monkeypatch: pytest.MonkeyPatch,
     wrong_reference: bool,
+    workflow: str,
 ) -> None:
     expected = inputs[0].read_bytes()
     install_verifier(monkeypatch, inputs[0], replace_original=True)
-    previous = VerifiedState({"stage": "staged"}, hashlib.sha256(expected).hexdigest())
+    previous = VerifiedState(
+        {"stage": "staged" if workflow == "verify.yml" else "gated"},
+        hashlib.sha256(expected).hexdigest(),
+    )
 
     def state(subject: Path, *args: Any, **kwargs: Any) -> VerifiedState:
         assert subject.read_bytes() == expected
         assert kwargs["previous"] is previous and kwargs["verified_journeys"] == GATE_JOURNEYS
+        expected_run = ("123", "2") if workflow == "verify.yml" else (None, None)
+        assert (kwargs["expected_run_id"], kwargs["expected_run_attempt"]) == expected_run
         refs = {row: bundle.reference for row, bundle in inputs[1].items()}
         if wrong_reference:
             refs["P1"] = "https://example.com/unverified-other-bundle"
-        return VerifiedState({"stage": "gated", "evidence": refs}, previous.manifest_sha256)
+        return VerifiedState(
+            {"stage": "gated" if workflow == "verify.yml" else "promoted", "evidence": refs},
+            previous.manifest_sha256,
+        )
 
     monkeypatch.setattr(evidence, "authenticate_state", state)
 
@@ -186,7 +199,7 @@ def test_gate_checks_lifecycle_against_same_manifest_and_authenticated_reference
             state_schema=Path("state-schema.json"),
             commit="b" * 40,
             tag="v1.0.0",
-            workflow="verify.yml",
+            workflow=workflow,
             previous=previous,
             logs=inputs[0].parent / "logs",
         )
@@ -195,4 +208,38 @@ def test_gate_checks_lifecycle_against_same_manifest_and_authenticated_reference
         with pytest.raises(AttestationError, match="lifecycle references"):
             gate()
     else:
-        assert gate().predicate["stage"] == "gated"
+        assert gate().predicate["stage"] == ("gated" if workflow == "verify.yml" else "promoted")
+
+
+@pytest.mark.parametrize("other", ["124/attempts/2", "123/attempts/3"])
+def test_mixed_run_references_cannot_be_a_complete_gate(
+    inputs: tuple[Path, dict[str, evidence.JourneyBundle]],
+    other: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    inputs[1]["P1"] = evidence.JourneyBundle(
+        inputs[1]["P1"].bundle, "https://github.com/zunderlabs/zunder-guard/actions/runs/" + other
+    )
+    monkeypatch.setattr(evidence, "verify_predicate", lambda *args, **kwargs: pytest.fail())
+    with pytest.raises(AttestationError, match="one exact run and attempt"):
+        authenticate(inputs)
+
+
+@pytest.mark.parametrize("run_id,attempt", [("124", "2"), ("123", "3")])
+def test_requested_gate_run_cannot_be_replaced_by_consistent_other_run_references(
+    inputs: tuple[Path, dict[str, evidence.JourneyBundle]],
+    run_id: str,
+    attempt: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(evidence, "verify_predicate", lambda *args, **kwargs: pytest.fail())
+    with pytest.raises(AttestationError, match="different requested run or attempt"):
+        evidence.authenticate_journeys(
+            inputs[0],
+            inputs[1],
+            commit="b" * 40,
+            tag="v1.0.0",
+            logs=inputs[0].parent / "logs",
+            expected_run_id=run_id,
+            expected_run_attempt=attempt,
+        )

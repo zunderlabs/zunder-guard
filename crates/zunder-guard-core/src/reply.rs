@@ -9,6 +9,7 @@ use std::collections::BTreeMap;
 use rust_decimal::Decimal;
 use serde_json::{Value, json};
 use zunder_core::Side;
+use zunder_venue_types::aggressive;
 
 use crate::{
     account::AccountView,
@@ -16,7 +17,7 @@ use crate::{
     judge::Decision,
     policy::Policy,
     sign::{GuardKey, Network},
-    wire::{Wire, minimal_hex},
+    wire::exchange_request,
 };
 
 /// The body of a request to `/exchange` for `action`, signed with `key`
@@ -32,21 +33,9 @@ pub fn signed_request(
 ) -> Option<Vec<u8>> {
     let wire = action.to_wire();
     let signature = key.sign_l1_action(network, &wire, nonce, expires_after)?;
-    let request = Wire::Map(vec![
-        ("action", wire),
-        ("nonce", Wire::UInt(nonce)),
-        (
-            "signature",
-            Wire::Map(vec![
-                ("r", Wire::str(minimal_hex(&signature.r))),
-                ("s", Wire::str(minimal_hex(&signature.s))),
-                ("v", Wire::UInt(u64::from(signature.v))),
-            ]),
-        ),
-        ("vaultAddress", Wire::Null),
-        ("expiresAfter", expires_after.map_or(Wire::Null, Wire::UInt)),
-    ]);
-    request.to_json().ok()
+    exchange_request(wire, nonce, &signature, expires_after)
+        .to_json()
+        .ok()
 }
 
 /// A refusal as Hyperliquid answers one (`{"status": "err", "response":
@@ -128,8 +117,24 @@ pub enum OrderStatus {
     Resting {
         oid: u64,
     },
+    /// A TP/SL child the venue took and keeps waiting (`waitingForFill`
+    /// while its entry rests, `waitingForTrigger` once it filled): placed.
+    Waiting(String),
     Error(String),
+    /// A status Guard cannot read (a `filled` without its numbers, a shape
+    /// it does not know): what became of the order is unknown, as
+    /// Zunder's own executor treats such an answer (outcome unknown).
     Other(String),
+}
+
+impl OrderStatus {
+    /// The venue took the order: it rests, waits or filled.
+    pub fn placed(&self) -> bool {
+        matches!(
+            self,
+            OrderStatus::Filled { .. } | OrderStatus::Resting { .. } | OrderStatus::Waiting(_)
+        )
+    }
 }
 
 /// The statuses of an `ok` order reply, in the forwarded order; `Err`
@@ -173,6 +178,8 @@ pub fn order_statuses(venue: &Value) -> Result<Vec<OrderStatus>, String> {
                 OrderStatus::Resting { oid }
             } else if let Some(error) = status.get("error").and_then(Value::as_str) {
                 OrderStatus::Error(error.to_owned())
+            } else if let Some(text @ ("waitingForFill" | "waitingForTrigger")) = status.as_str() {
+                OrderStatus::Waiting(text.to_owned())
             } else {
                 OrderStatus::Other(status.to_string())
             }
@@ -203,6 +210,22 @@ pub fn action_ok(venue: &Value) -> Result<(), String> {
     }
 }
 
+/// The worst price of an order on `closing` that gets out of a position:
+/// [`Policy::exit_slippage`] beyond the mid against it, rounded towards the
+/// aggressive side, so rounding never blocks the close.
+fn exit_bound(
+    asset: &crate::account::AssetInfo,
+    policy: &Policy,
+    closing: Side,
+    mid: Decimal,
+) -> Option<Decimal> {
+    let bound = match closing {
+        Side::Sell => mid.checked_mul(Decimal::ONE - policy.exit_slippage)?,
+        Side::Buy => mid.checked_mul(Decimal::ONE + policy.exit_slippage)?,
+    };
+    asset.round_price(bound, aggressive(closing))
+}
+
 /// A reduce-only IOC order closing `qty` of the position on `side` in
 /// `coin`, bounded at [`Policy::exit_slippage`] from the mid: what Guard
 /// sends when an entry filled but its stop was refused. `None` without a
@@ -217,14 +240,7 @@ pub fn close_action(
     let asset = account.meta.by_name(coin)?;
     let mid = account.mid(coin)?;
     let closing = side.opposite();
-    let bound = match closing {
-        Side::Sell => mid
-            .checked_mul(Decimal::ONE - policy.exit_slippage)
-            .and_then(|price| asset.round_price(price, false)),
-        Side::Buy => mid
-            .checked_mul(Decimal::ONE + policy.exit_slippage)
-            .and_then(|price| asset.round_price(price, true)),
-    }?;
+    let bound = exit_bound(asset, policy, closing, mid)?;
     Some(Action::Order(OrderAction {
         orders: vec![Order {
             asset: asset.index,
@@ -294,14 +310,7 @@ pub fn flatten_actions(account: &AccountView, policy: &Policy) -> (Vec<Action>, 
             continue;
         }
         let closing = position.side.opposite();
-        let bound = match closing {
-            Side::Sell => mid
-                .checked_mul(Decimal::ONE - policy.exit_slippage)
-                .and_then(|price| asset.round_price(price, false)),
-            Side::Buy => mid
-                .checked_mul(Decimal::ONE + policy.exit_slippage)
-                .and_then(|price| asset.round_price(price, true)),
-        };
+        let bound = exit_bound(asset, policy, closing, mid);
         let (Some(price), Some(size)) = (
             bound.and_then(Px::from_decimal),
             Px::from_decimal(position.qty),
@@ -418,6 +427,33 @@ mod tests {
     }
 
     #[test]
+    fn statuses_tell_placed_refused_and_unreadable_apart() {
+        let venue = json!({"status": "ok", "response": {"type": "order", "data": {"statuses": [
+            {"resting": {"oid": 5}},
+            "waitingForFill",
+            "waitingForTrigger",
+            {"error": "Order could not be placed."},
+            // A fill whose numbers are not decimal strings, a fill without
+            // its id, and a shape Guard does not know: unreadable.
+            {"filled": {"totalSz": 0.5, "avgPx": "3000", "oid": 6}},
+            {"filled": {"totalSz": "0.5", "avgPx": "3000"}},
+            "somethingNew",
+        ]}}});
+        let statuses = order_statuses(&venue).unwrap();
+        let placed: Vec<bool> = statuses.iter().map(OrderStatus::placed).collect();
+        assert_eq!(placed, [true, true, true, false, false, false, false]);
+        assert_eq!(statuses[1], OrderStatus::Waiting("waitingForFill".into()));
+        assert!(matches!(statuses[3], OrderStatus::Error(_)));
+        assert!(
+            statuses[4..]
+                .iter()
+                .all(|status| matches!(status, OrderStatus::Other(_)))
+        );
+        // An `ok` answer without statuses cannot be read either.
+        assert!(order_statuses(&json!({"status": "ok", "response": {"type": "order"}})).is_err());
+    }
+
+    #[test]
     fn flattening_cancels_entries_and_closes_at_a_bounded_price() {
         let meta = Meta::parse(&meta_json()).unwrap();
         let account = AccountView {
@@ -454,5 +490,28 @@ mod tests {
         );
         assert_eq!(close.price.value(), dec!(2860));
         assert_eq!(close.size.value(), dec!(0.5));
+        // A short's close buys, bounded 5% above the mid: 3,010.55 * 1.05 =
+        // 3,161.0775, rounded up (aggressive) to 3,161.1, not down to
+        // 3,161.0; the same from `close_action`.
+        let mut short = account.clone();
+        short.positions[0].side = Side::Sell;
+        let (actions, _) = flatten_actions(&short, &Policy::default());
+        let Action::Order(order) = &actions[0] else {
+            panic!("{actions:?}")
+        };
+        assert!(order.orders[0].is_buy);
+        assert_eq!(order.orders[0].price.value(), dec!(3161.1));
+        let Some(Action::Order(close)) =
+            close_action(&short, &Policy::default(), "ETH", Side::Sell, dec!(0.5))
+        else {
+            panic!()
+        };
+        assert_eq!(close.orders[0].price.value(), dec!(3161.1));
+        let Some(Action::Order(close)) =
+            close_action(&account, &Policy::default(), "ETH", Side::Buy, dec!(0.5))
+        else {
+            panic!()
+        };
+        assert_eq!(close.orders[0].price.value(), dec!(2860));
     }
 }

@@ -716,13 +716,6 @@ class Dispatch(unittest.TestCase):
 
     def test_release_assets_are_manifest_covered_and_required(self):
         render = (SOURCE / 'packaging/render.sh').read_text()
-        wrapper = (SOURCE / 'github/verify-release.sh').read_text()
-        asset_call = 'bash "$HERE/verify-release-assets.sh" "$1" "$2"'
-        native_call = 'python3 -B "$HERE/native-readiness.py" verify "$1" "$2"'
-        self.assertIn('set -euo pipefail', wrapper)
-        self.assertIn(asset_call, wrapper)
-        self.assertIn(native_call, wrapper)
-        self.assertLess(wrapper.index(asset_call), wrapper.index(native_call))
         verify = (SOURCE / 'github/verify-release-assets.sh').read_text()
         for name in ('install-container.py', 'container-operations.py', 'container-supervisor.py',
                      'zunder-guard-setup-guardian.service', 'zunder-guard-container.service'):
@@ -736,7 +729,7 @@ class Bootstrap(unittest.TestCase):
     def test_signature_hash_and_manifest_fail_closed_before_helper(self):
         text = (SOURCE / 'install.sh').read_text()
         embedded = text.split("<<'CONTAINER_BOOTSTRAP'\n", 1)[1].split('\nCONTAINER_BOOTSTRAP', 1)[0]
-        for case in ('valid', 'testnet', 'signature', 'tamper', 'duplicate', 'missing', 'verifier'):
+        for case in ('valid', 'testnet', 'paper', 'paper-tamper', 'paper-signature', 'signature', 'tamper', 'duplicate', 'missing', 'verifier'):
             with self.subTest(case=case), tempfile.TemporaryDirectory() as folder:
                 base = Path(folder)
                 incoming = base / 'incoming'; incoming.mkdir()
@@ -744,6 +737,8 @@ class Bootstrap(unittest.TestCase):
                 assets = ['install-container.py', 'container-supervisor.py', 'container-operations.py',
                           'zunder-guard-container.service', 'zunder-guard-setup-guardian.service',
                           'zunder-guard-' + version + '.image.txt']
+                if case.startswith('paper'):
+                    assets = ['install-container-paper.py', 'zunder-guard-' + version + '.image.txt']
                 for name in assets: (incoming / name).write_bytes(b'verified synthetic asset')
                 lines = [hashlib.sha256((incoming / name).read_bytes()).hexdigest() + '  ' + name for name in assets]
                 if case == 'duplicate': lines.append(lines[0])
@@ -753,7 +748,7 @@ class Bootstrap(unittest.TestCase):
                 (incoming / 'container-cosign').write_bytes(b'synthetic-verifier')
                 pin = hashlib.sha256(b'synthetic-verifier').hexdigest()
                 if case == 'verifier': pin = 'f' * 64
-                if case == 'tamper': (incoming / assets[0]).write_text('different bytes')
+                if case in ('tamper', 'paper-tamper'): (incoming / assets[0]).write_text('different bytes')
                 destination = base / 'bin'; destination.mkdir()
                 # Test-only placement and ownership seam: no privileged tools or verifier executed.
                 code = embedded.replace("pathlib.Path('/var/lib/zunder-guard-install')", 'pathlib.Path(' + repr(str(base / 'stage')) + ')')
@@ -777,16 +772,22 @@ class Bootstrap(unittest.TestCase):
                         self.assertIn('--non-interactive', argv)
                         self.assertIn('--key-stdin', argv)
                         self.assertNotIn(synthetic.decode().strip(), repr(argv) + repr(kwargs['env']))
-                    status = 1 if case == 'signature' and 'verify-blob' in argv else 0
+                    if case == 'paper' and argv[0] == '/usr/bin/python3':
+                        self.assertEqual(kwargs['stdin'], subprocess.DEVNULL)
+                        self.assertTrue(argv[2].endswith('install-container-paper.py'))
+                        self.assertIn('--account-network', argv)
+                        self.assertNotIn('--key-stdin', argv)
+                    status = 1 if case in ('signature', 'paper-signature') and 'verify-blob' in argv else 0
                     return subprocess.CompletedProcess(argv, status)
                 args = ['bootstrap', str(incoming), pin, version, '', '', '', '', '', '', 'mainnet', '0', '0']
                 if case == 'testnet': args[-3:] = ['testnet', '1', '1']
-                args += ['0', '0', '', '']
+                if case.startswith('paper'): args[-3:] = ['paper', '1', '0']
+                args += ['0', '0', '', '', 'testnet' if case.startswith('paper') else '']
                 with patch('sys.argv', args), patch('sys.stdin', private_input), patch('subprocess.run', side_effect=fake_run), patch('resource.setrlimit'):
                     with self.assertRaises(SystemExit) as result: exec(compile(code, 'real-bootstrap', 'exec'), {})
                 helper_calls = [argv for argv in commands if argv[0] == '/usr/bin/python3']
-                self.assertEqual(bool(helper_calls), case in ('valid', 'testnet'))
-                if case in ('valid', 'testnet'): self.assertEqual(result.exception.code, 0)
+                self.assertEqual(bool(helper_calls), case in ('valid', 'testnet', 'paper'))
+                if case in ('valid', 'testnet', 'paper'): self.assertEqual(result.exception.code, 0)
                 else: self.assertNotEqual(result.exception.code, 0)
                 if case != 'verifier':
                     verifier = commands[0]

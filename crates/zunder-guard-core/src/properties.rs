@@ -27,7 +27,7 @@ use crate::{
     account::{AccountView, AssetKind, Book, Leverage, OpenOrderView, PositionView, asset_kind},
     action::{
         Action, Cancel, ExchangeRequest, Grouping, Modify, Order, OrderAction, OrderKind, OrderRef,
-        Px, Tif, Tpsl,
+        Protection, Px, Tif, Tpsl,
     },
     auth::tests::{START, authenticator, client_key, signed},
     judge::{Context, HIP3_BOOK_SHARE, Verdict, judge, tests as fixtures},
@@ -71,13 +71,35 @@ fn random_decimal(rng: &mut Rng, low: Decimal, high: Decimal, scale: u32) -> Dec
 }
 
 fn policy(rng: &mut Rng) -> Policy {
-    let max_loss_at_stop = random_decimal(rng, dec!(0.002), dec!(0.05), 3);
-    let max_leverage = Decimal::from(rng.u32(1..=10));
+    // One policy in four reaches into the bounds widened on 11 Oct 2026
+    // (up to 25% at the stop, 100% open risk, 50x, 50% daily, 90%
+    // drawdown); the others stay near the defaults, where most bots run.
+    let wide = rng.u8(..4) == 0;
+    let (top_loss, top_leverage, top_open) = if wide {
+        (dec!(0.25), 50, dec!(1))
+    } else {
+        (dec!(0.05), 10, dec!(0.2))
+    };
+    let max_loss_at_stop = random_decimal(rng, dec!(0.002), top_loss, 3);
+    let max_leverage = Decimal::from(rng.u32(1..=top_leverage));
     let default_stop_distance = random_decimal(rng, dec!(0.005), dec!(0.1), 3);
+    let (daily_loss_stop, drawdown_halt) = if wide {
+        (
+            random_decimal(rng, dec!(0.01), dec!(0.5), 2),
+            random_decimal(rng, dec!(0.05), dec!(0.9), 2),
+        )
+    } else {
+        (
+            Policy::default().daily_loss_stop,
+            Policy::default().drawdown_halt,
+        )
+    };
     let policy = Policy {
         max_leverage,
         max_loss_at_stop,
-        max_open_risk: (max_loss_at_stop * Decimal::from(rng.u32(1..=5))).min(dec!(0.2)),
+        max_open_risk: (max_loss_at_stop * Decimal::from(rng.u32(1..=5))).min(top_open),
+        daily_loss_stop,
+        drawdown_halt,
         stop: if rng.bool() {
             StopPolicy::Attach
         } else {

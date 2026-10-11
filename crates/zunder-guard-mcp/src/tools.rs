@@ -20,6 +20,7 @@ use rust_decimal::Decimal;
 use serde_json::{Value, json};
 use zunder_core::Side;
 use zunder_hl_protocol::Network;
+use zunder_venue_types::aggressive;
 
 use crate::{
     contract::{
@@ -1164,7 +1165,7 @@ impl Server {
             };
             // On the grid, rounded towards the price: never looser than asked.
             let long = position.side == Side::Buy;
-            let Some(new_stop) = market.round_price(wanted, long) else {
+            let Some(new_stop) = preview::round_stop(&market, position.side, wanted) else {
                 return Err(Outcome::fail(
                     "invalid_arguments",
                     "new_stop cannot be put on the venue's price grid; nothing was sent",
@@ -1309,15 +1310,7 @@ impl Server {
                 ));
             }
             let closing = position.side.opposite();
-            let price = match closing {
-                Side::Sell => mid
-                    .checked_mul(Decimal::ONE - EXIT_SLIPPAGE)
-                    .and_then(|price| market.round_price(price, false)),
-                Side::Buy => mid
-                    .checked_mul(Decimal::ONE + EXIT_SLIPPAGE)
-                    .and_then(|price| market.round_price(price, true)),
-            };
-            let Some(price) = price else {
+            let Some(price) = exit_price(&market, closing, mid) else {
                 return Err(Outcome::fail(
                     "no_price",
                     "the close cannot be priced; nothing was sent",
@@ -1643,6 +1636,18 @@ fn rate_limited(wait_ms: u64) -> Outcome {
     .with("sent", json!(false))
 }
 
+/// The limit of a reduce-only IOC close on `closing`: [`EXIT_SLIPPAGE`]
+/// beyond the mid against it, rounded towards the aggressive side, so
+/// rounding never keeps it from filling.
+fn exit_price(market: &Market, closing: Side, mid: Decimal) -> Option<Decimal> {
+    let factor = match closing {
+        Side::Sell => Decimal::ONE - EXIT_SLIPPAGE,
+        Side::Buy => Decimal::ONE + EXIT_SLIPPAGE,
+    };
+    let price = mid.checked_mul(factor)?;
+    market.round_price(price, aggressive(closing))
+}
+
 /// A reduce-only stop-market order protecting a `side` position (or entry)
 /// at `trigger`, worst fill 10% beyond the trigger.
 fn stop_wire(
@@ -1653,14 +1658,13 @@ fn stop_wire(
     cloid: Option<String>,
 ) -> Option<OrderWire> {
     let closing = position_side.opposite();
-    let worst = match closing {
-        Side::Sell => trigger
-            .checked_mul(Decimal::ONE - STOP_WORST_PRICE)
-            .and_then(|price| market.round_price(price, false))?,
-        Side::Buy => trigger
-            .checked_mul(Decimal::ONE + STOP_WORST_PRICE)
-            .and_then(|price| market.round_price(price, true))?,
+    let factor = match closing {
+        Side::Sell => Decimal::ONE - STOP_WORST_PRICE,
+        Side::Buy => Decimal::ONE + STOP_WORST_PRICE,
     };
+    let worst = trigger
+        .checked_mul(factor)
+        .and_then(|price| market.round_price(price, aggressive(closing)))?;
     Some(OrderWire {
         asset: market.asset,
         is_buy: closing == Side::Buy,
@@ -1761,7 +1765,37 @@ fn exchange_outcome(reply: &Value, decision: Option<Value>, action: &Action) -> 
 
 #[cfg(test)]
 mod tests {
+    use rust_decimal::dec;
+
     use super::*;
+
+    fn btc() -> Market {
+        venue::parse_meta(&json!({"universe": [{"name": "BTC", "szDecimals": 5}]}))
+            .unwrap()
+            .remove(0)
+    }
+
+    #[test]
+    fn stops_and_closes_round_towards_the_aggressive_side() {
+        // BTC prices are whole dollars here (five figures). A long's stop
+        // at 58,801 sells as low as 58,801 * 0.9 = 52,920.9: down to 52,920
+        // (up would be 52,921); a short's at 61,201 buys as high as 67,321.1:
+        // up to 67,322 (down: 67,321).
+        let long = stop_wire(&btc(), Side::Buy, dec!(58801), dec!(0.1), None).unwrap();
+        assert_eq!((long.price.as_str(), long.is_buy), ("52920", false));
+        let short = stop_wire(&btc(), Side::Sell, dec!(61201), dec!(0.1), None).unwrap();
+        assert_eq!((short.price.as_str(), short.is_buy), ("67322", true));
+        // A close 5% beyond a mid of 60,000.5: a sell at 57,000.475, down to
+        // 57,000; a buy at 63,000.525, up to 63,001.
+        assert_eq!(
+            exit_price(&btc(), Side::Sell, dec!(60000.5)),
+            Some(dec!(57000))
+        );
+        assert_eq!(
+            exit_price(&btc(), Side::Buy, dec!(60000.5)),
+            Some(dec!(63001))
+        );
+    }
 
     #[test]
     fn exactly_the_order_tools_refuse_null() {

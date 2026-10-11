@@ -226,9 +226,9 @@ pub fn minimal_hex(bytes: &[u8; 32]) -> String {
 /// trailing zeros, the way the Python SDK's `float_to_wire` normalises.
 /// `None` for a negative number or one with more than 8 decimals, which the
 /// SDK refuses too.
+/// The same rule as [`crate::action::Px::from_decimal`], as text.
 pub fn decimal(value: Decimal) -> Option<String> {
-    let normalized = value.normalize();
-    (normalized >= Decimal::ZERO && normalized.scale() <= 8).then(|| normalized.to_string())
+    crate::action::Px::from_decimal(value).map(|px| px.raw().to_owned())
 }
 
 #[cfg(test)]

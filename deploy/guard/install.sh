@@ -58,6 +58,7 @@ Usage: sh install.sh [options]
   --non-interactive     no prompts; then --rules and --network are required, and for testnet or
                         mainnet also --account and --key-file (mainnet: --confirm-mainnet too)
   --network NAME        paper (default when asked), testnet or mainnet
+  --account-network N   paper account read network: mainnet (default) or testnet
   --account 0x…         Hyperliquid account address
   --key-file PATH       file holding the API wallet key (read by this script, never echoed)
   --key-stdin           protected managed TESTNET only: private framed stdin, no prompts
@@ -94,15 +95,16 @@ Usage: sh install.sh [options]
 EOF
 }
 
-RULES="" NETWORK="" ACCOUNT="" KEY_FILE="" KEY_STDIN=0 CONFIRM="" CAP="" PREFIX="" LISTEN="" SHARE="" LICENCE="" NONINTERACTIVE=0 NO_SERVICE=0 FORCE=0 INSTALL_ONLY=0 SETUP_OPTIONS=0 CONTAINER=0 VOLUME="" SERVICE_INSTANCE="" PREPARE_IMAGE=0 PREPARED_IMAGE=0 REGISTRY_AUTH="" SOURCE_COMMIT="" UNINSTALL=0
+RULES="" NETWORK="" ACCOUNT_NETWORK="" ACCOUNT="" KEY_FILE="" KEY_STDIN=0 CONFIRM="" CAP="" PREFIX="" LISTEN="" SHARE="" LICENCE="" NONINTERACTIVE=0 NO_SERVICE=0 FORCE=0 INSTALL_ONLY=0 SETUP_OPTIONS=0 CONTAINER=0 VOLUME="" SERVICE_INSTANCE="" PREPARE_IMAGE=0 PREPARED_IMAGE=0 REGISTRY_AUTH="" SOURCE_COMMIT="" UNINSTALL=0
 while [ $# -gt 0 ]; do
   case "$1" in
-    --rules | --network | --account | --key-file | --confirm-mainnet | --equity-cap | --prefix | --listen | --ip-share | --licence | --volume | --service-instance | --registry-auth-dir | --source-commit)
+    --rules | --network | --account-network | --account | --key-file | --confirm-mainnet | --equity-cap | --prefix | --listen | --ip-share | --licence | --volume | --service-instance | --registry-auth-dir | --source-commit)
       [ $# -ge 2 ] || die "$1 needs a value"
       [ "$1" = --prefix ] || SETUP_OPTIONS=1
       case "$1" in
         --rules) RULES=$2 ;;
         --network) NETWORK=$2 ;;
+        --account-network) ACCOUNT_NETWORK=$2 ;;
         --account) ACCOUNT=$2 ;;
         --key-file) KEY_FILE=$2 ;;
         --confirm-mainnet) CONFIRM=$2 ;;
@@ -133,10 +135,20 @@ while [ $# -gt 0 ]; do
   esac
 done
 
+# Paper container removal uses its previously authenticated installed management script.
+if [ "$UNINSTALL$CONTAINER" = 11 ] && [ "$NETWORK" = paper ]; then
+  if [ -n "$RULES$ACCOUNT_NETWORK$ACCOUNT$KEY_FILE$CONFIRM$CAP$PREFIX$LISTEN$SHARE$LICENCE$VOLUME$REGISTRY_AUTH$SOURCE_COMMIT$SERVICE_INSTANCE" ] \
+    || [ "$KEY_STDIN$FORCE$INSTALL_ONLY$PREPARE_IMAGE$PREPARED_IMAGE" != 00000 ]; then
+    die "paper container uninstall accepts no setup input"
+  fi
+  [ "$(id -u)" -eq 0 ] || die "paper container uninstall requires root"
+  exec /usr/bin/python3 -I /usr/local/libexec/zunder-guard-container-paper/install.py --uninstall
+fi
+
 # Uninstall is entirely local: never download, initialize, read a key or start Guard.
 if [ "$UNINSTALL" -eq 1 ]; then
   [ "$(uname -s)" = Linux ] || die "--uninstall supports native Linux only"
-  if ! { [ -z "$RULES$NETWORK$ACCOUNT$KEY_FILE$CONFIRM$CAP$LISTEN$SHARE$LICENCE$VOLUME$REGISTRY_AUTH$SOURCE_COMMIT" ] \
+  if ! { [ -z "$RULES$NETWORK$ACCOUNT_NETWORK$ACCOUNT$KEY_FILE$CONFIRM$CAP$LISTEN$SHARE$LICENCE$VOLUME$REGISTRY_AUTH$SOURCE_COMMIT" ] \
     && [ "$KEY_STDIN$FORCE$INSTALL_ONLY$CONTAINER$PREPARE_IMAGE$PREPARED_IMAGE" = 000000 ]; }; then
     die "--uninstall accepts only prefix, no-service, non-interactive or service-instance"
   fi
@@ -254,11 +266,15 @@ if [ -n "$SERVICE_INSTANCE" ]; then
 fi
 
 if [ "$CONTAINER" -eq 1 ]; then
+  [ "$NETWORK" = paper ] || [ -z "$ACCOUNT_NETWORK" ] || die "container sending setup refuses --account-network"
   PATH=/usr/sbin:/usr/bin:/sbin:/bin
   export PATH
-  case "$NETWORK" in mainnet | testnet) ;; *) die "--container requires --network mainnet or testnet" ;; esac
+  case "$NETWORK" in paper | mainnet | testnet) ;; *) die "--container requires explicit paper, mainnet or testnet" ;; esac
   [ "$INSTALL_ONLY$NO_SERVICE$FORCE" = 000 ] || die "container mode requires managed setup"
-  if [ "$NETWORK" = mainnet ]; then
+  if [ "$NETWORK" = paper ]; then
+    [ "$NONINTERACTIVE$KEY_STDIN" = 10 ] || die "paper container requires non-interactive setup without a key"
+    [ -z "$CAP$SHARE$LICENCE$VOLUME" ] || die "paper container currently accepts account and rules only"
+  elif [ "$NETWORK" = mainnet ]; then
     [ "$NONINTERACTIVE$KEY_STDIN" = 00 ] || die "mainnet container setup retains interactive confirmation and hidden input"
   else
     [ "$NONINTERACTIVE$KEY_STDIN" = 00 ] || [ "$NONINTERACTIVE$KEY_STDIN" = 11 ] \
@@ -287,6 +303,10 @@ fi
 case "$RULES" in "" | zr1_*) ;; *) die "a rules string starts with zr1_" ;; esac
 case "$RULES" in *[!A-Za-z0-9_-]*) die "the rules string contains characters base64url does not use" ;; esac
 case "$NETWORK" in "" | paper | testnet | mainnet) ;; *) die "--network is paper, testnet or mainnet" ;; esac
+case "$ACCOUNT_NETWORK" in "" | mainnet | testnet) ;; *) die "--account-network is mainnet or testnet" ;; esac
+if [ -n "$ACCOUNT_NETWORK" ] && [ "$NETWORK" != paper ]; then
+  die "--account-network requires explicit paper mode"
+fi
 case "$LISTEN" in
   "" | 127.* | localhost:* | "[::1]":*) ;;
   *) say "WARNING: --listen $LISTEN is reachable from other machines. Anyone who reaches it can send orders signed with a paired client key. Firewall it to your bot's address." ;;
@@ -374,7 +394,9 @@ if [ "$CONTAINER" -eq 1 ]; then
   [ "$OS" = linux ] || die "--container requires Linux systemd and local Docker"
   [ -x /usr/bin/python3 ] || die "Python 3.11 or newer is required for container installation"
   /usr/bin/python3 -I -c 'import sys; sys.exit(sys.version_info < (3, 11))' || die "Python 3.11 or newer is required"
-  for asset in SHA256SUMS SHA256SUMS.sigstore.json install-container.py container-supervisor.py container-operations.py zunder-guard-container.service zunder-guard-setup-guardian.service "zunder-guard-$VERSION.image.txt"; do
+  CONTAINER_ASSETS="install-container.py container-supervisor.py container-operations.py zunder-guard-container.service zunder-guard-setup-guardian.service"
+  if [ "$NETWORK" = paper ]; then CONTAINER_ASSETS="install-container-paper.py"; fi
+  for asset in SHA256SUMS SHA256SUMS.sigstore.json $CONTAINER_ASSETS "zunder-guard-$VERSION.image.txt"; do
     fetch "$asset" "$BASE_URL/$asset"
   done
   fetch container-cosign "$COSIGN_URL/cosign-linux-$ARCH"
@@ -389,7 +411,7 @@ if [ "$CONTAINER" -eq 1 ]; then
 import hashlib, os, pathlib, re, resource, shutil, stat, subprocess, sys, tempfile
 resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
 os.umask(0o077)
-source, pinned, version, volume, account, rules, cap, share, licence, network, noninteractive, key_stdin, prepare_image, prepared_image, registry_auth, source_commit = sys.argv[1:]
+source, pinned, version, volume, account, rules, cap, share, licence, network, noninteractive, key_stdin, prepare_image, prepared_image, registry_auth, source_commit, account_network = sys.argv[1:]
 if not re.fullmatch(r'v[0-9]+\.[0-9]+\.[0-9]+(-rc\.[1-9][0-9]*)?', version):
     raise SystemExit('Invalid release version')
 env = {'PATH': '/usr/sbin:/usr/bin:/sbin:/bin', 'HOME': '/root', 'LANG': 'C.UTF-8'}
@@ -410,6 +432,8 @@ stage = pathlib.Path(tempfile.mkdtemp(prefix='release-', dir=base))
 assets = ['install-container.py', 'container-supervisor.py', 'container-operations.py',
           'zunder-guard-container.service', 'zunder-guard-setup-guardian.service',
           'zunder-guard-' + version + '.image.txt']
+if network == 'paper':
+    assets = ['install-container-paper.py', 'zunder-guard-' + version + '.image.txt']
 try:
     for name in ['SHA256SUMS', 'SHA256SUMS.sigstore.json', 'container-cosign', *assets]:
         target = stage / name
@@ -457,15 +481,23 @@ try:
     elif prepared_image == '1':
         options += ['--prepared-image', '--source-commit', source_commit]
     if noninteractive == '1':
-        if network != 'testnet' or key_stdin != '1':
-            raise SystemExit('Unattended container setup is protected testnet only')
-        options += ['--non-interactive', '--key-stdin']
+        if network == 'paper' and key_stdin == '0':
+            options += ['--non-interactive']
+        elif network == 'testnet' and key_stdin == '1':
+            options += ['--non-interactive', '--key-stdin']
+        else:
+            raise SystemExit('Unattended sending setup is protected testnet only')
     for name, value in [('volume', volume), ('account', account), ('rules', rules),
                         ('equity-cap', cap), ('ip-share', share), ('licence', licence)]:
         if value:
             options += ['--' + name, value]
-    command = ['/usr/bin/python3', '-I', str(stage / 'install-container.py'), *options]
-    if prepare_image == '1':
+    installer_name = 'install-container-paper.py' if network == 'paper' else 'install-container.py'
+    if account_network:
+        if network != 'paper':
+            raise SystemExit('Account read network is paper only')
+        options += ['--account-network', account_network]
+    command = ['/usr/bin/python3', '-I', str(stage / installer_name), *options]
+    if prepare_image == '1' or network == 'paper':
         result = subprocess.run(command, stdin=subprocess.DEVNULL, env=env, check=False)
     elif key_stdin == '1':
         result = subprocess.run(command, stdin=sys.stdin.buffer, env=env, check=False)
@@ -480,7 +512,7 @@ CONTAINER_BOOTSTRAP
   # Code is public and signed; stdin remains the caller's private pipe across
   # sudo. No credential is placed in argv/environment or an extra inherited FD.
   $CONTAINER_SUDO /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME=/root LANG=C.UTF-8 \
-    /usr/bin/python3 -I -c "$CONTAINER_BOOTSTRAP_CODE" "$TMP" "$COSIGN_SHA256" "$VERSION" "$VOLUME" "$ACCOUNT" "$RULES" "$CAP" "$SHARE" "$LICENCE" "$NETWORK" "$NONINTERACTIVE" "$KEY_STDIN" "$PREPARE_IMAGE" "$PREPARED_IMAGE" "$REGISTRY_AUTH" "$SOURCE_COMMIT"
+    /usr/bin/python3 -I -c "$CONTAINER_BOOTSTRAP_CODE" "$TMP" "$COSIGN_SHA256" "$VERSION" "$VOLUME" "$ACCOUNT" "$RULES" "$CAP" "$SHARE" "$LICENCE" "$NETWORK" "$NONINTERACTIVE" "$KEY_STDIN" "$PREPARE_IMAGE" "$PREPARED_IMAGE" "$REGISTRY_AUTH" "$SOURCE_COMMIT" "$ACCOUNT_NETWORK"
   exit $?
 fi
 
@@ -735,6 +767,7 @@ fi
 # once, to check it with the venue and record its address, and never stores. Without the unit
 # the binary asks for the key itself and stores it the way it does on that system (testnet).
 set -- init
+[ -n "$ACCOUNT_NETWORK" ] && set -- "$@" --account-network "$ACCOUNT_NETWORK"
 [ -n "$RULES" ] && set -- "$@" --rules "$RULES"
 [ "$SERVICE" -eq 1 ] && set -- "$@" --no-key
 [ -n "$NO_MAINNET" ] && set -- "$@" --refuse-mainnet "$NO_MAINNET"

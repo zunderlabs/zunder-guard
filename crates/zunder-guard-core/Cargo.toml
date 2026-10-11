@@ -26,6 +26,9 @@ zunder-core.workspace = true
 # The Hyperliquid protocol: MessagePack, signing, addresses, the price grid.
 zunder-hl-protocol.workspace = true
 zunder-risk.workspace = true
+# The rounding rules shared with Zunder's own executor and the agent kit
+# (`toward_position`, `passive`, `aggressive`).
+zunder-venue-types.workspace = true
 
 [dev-dependencies]
 fastrand.workspace = true

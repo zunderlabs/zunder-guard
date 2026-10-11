@@ -15,7 +15,7 @@ use zunder_guard_core::{
     account::{AccountView, requests},
     event::EventBody,
     flow_value,
-    ledger::ledger_flow,
+    ledger::{LedgerFlow, LedgerProblem, Treated, classify, ledger_flow},
 };
 use zunder_venue::{Flow, FlowOutcome};
 
@@ -70,6 +70,11 @@ const LEDGER_READ_MS: u64 = 3_000;
 /// at most.
 const LEDGER_PAGE_LEN: usize = 500;
 const LEDGER_PAGES: usize = 4;
+/// How many ledger entries Guard could not account for it remembers, to
+/// report each once.
+pub(super) const UNACCOUNTED_KEPT: usize = 256;
+/// A UTC day in milliseconds.
+const DAY_MS: u64 = 86_400_000;
 
 fn fresh_flow_view(times: &BTreeMap<String, i64>, previous: &BTreeMap<String, i64>) -> bool {
     !times.is_empty()
@@ -436,10 +441,20 @@ impl<U: Upstream, C: Clock> Guard<U, C> {
                 .map(|dex| dex.name.clone())
                 .collect()
         };
-        let mut flows: Vec<_> = entries
-            .iter()
-            .filter_map(|update| ledger_flow(update, inner.account, &dexes))
-            .collect();
+        // Every entry is checked as a reconstruction checks it; one Guard
+        // cannot account for is reported, never skipped as no flow.
+        let mut flows = Vec::new();
+        for update in entries {
+            match classify(update, inner.account, &dexes) {
+                Ok(Some(flow)) => flows.push(flow),
+                Ok(None) => {}
+                Err(problem) => {
+                    if let Some(flow) = Self::unaccounted(inner, now, &problem) {
+                        flows.push(flow);
+                    }
+                }
+            }
+        }
         flows.sort_by_key(|flow| flow.time_ms);
         let deadline = self.flow_read_deadline(inner, 3_000);
         let mut weight = 0;
@@ -470,6 +485,86 @@ impl<U: Upstream, C: Clock> Guard<U, C> {
             }
         }
         Self::note_flows(inner, now);
+    }
+
+    /// A ledger entry Guard cannot account for (`ledger::classify`): it may
+    /// have moved money into or out of the account, by an amount Guard does
+    /// not know. Fail closed, as for a flow whose value is unknown
+    /// (`docs/guard.md`, "Deposits and withdrawals", "When it is unknown"):
+    /// journaled and an alert, once per entry, and new positions refused
+    /// until the end of the UTC day it was seen; exits and protection go on.
+    /// An entry older than everything the risk journal replays from
+    /// ([`PersistentRisk::flows_from_ms`]) is in the equity it started from
+    /// already: journaled only.
+    fn unaccounted(inner: &mut Inner, now: u64, problem: &LedgerProblem) -> Option<LedgerFlow> {
+        let old = problem
+            .time_ms
+            .is_some_and(|time| time < inner.risk.flows_from_ms());
+        // Applied as money in (the flow applies once: by its id).
+        let inflow = match &problem.treated {
+            Treated::Inflow(flow) if !old => Some(flow.as_ref().clone()),
+            _ => None,
+        };
+        if inner.ledger.unaccounted_seen.contains(&problem.id) {
+            return inflow;
+        }
+        inner.ledger.unaccounted_seen.push_back(problem.id.clone());
+        while inner.ledger.unaccounted_seen.len() > UNACCOUNTED_KEPT {
+            inner.ledger.unaccounted_seen.pop_front();
+        }
+        let text = if old {
+            format!(
+                "the account's ledger has an entry Guard cannot account for ({problem}), from before the risk journal's horizon: it is in the equity Guard started from"
+            )
+        } else if let Treated::Inflow(flow) = &problem.treated {
+            let text = format!(
+                "the account's ledger has an entry Guard cannot account for ({problem}): applied as money in ({} USDC), never as a trading gain; its effect on the account cannot be reconstructed, so under the flow rules the day halts",
+                flow.amount
+            );
+            Self::add_alert(inner, now, &text, None);
+            text
+        } else {
+            let until = now
+                .saturating_div(DAY_MS)
+                .saturating_add(1)
+                .saturating_mul(DAY_MS);
+            let until = inner
+                .ledger
+                .unaccounted
+                .as_ref()
+                .map_or(until, |(_, before)| until.max(*before));
+            let what = match &problem.treated {
+                // A type Guard does not know: that the account paid it rests
+                // on field names Guard cannot vouch for.
+                Treated::LeftAsLoss(amount) => format!(
+                    "it reads as paid by the account ({amount} USDC) and stays in the equity as a loss, but its type is unknown"
+                ),
+                _ => "how much it moved cannot be read".to_owned(),
+            };
+            let text = format!(
+                "the account's ledger has an entry Guard cannot account for ({problem}): {what}, so new positions are refused until the end of the UTC day; exits and protection go on, and the stops count the equity as it shows. Compare the account's history with the equity"
+            );
+            inner.ledger.unaccounted = Some((text.clone(), until));
+            Self::add_alert(inner, now, &text, None);
+            text
+        };
+        inner
+            .journal
+            .append(stamp(now), EventBody::Error { text })
+            .ok();
+        inflow
+    }
+
+    /// Why new positions are refused for a ledger entry Guard cannot
+    /// account for, while they are (until the end of the UTC day it was
+    /// seen).
+    pub(super) fn unaccounted_refusal(inner: &Inner, now: u64) -> Option<String> {
+        inner
+            .ledger
+            .unaccounted
+            .as_ref()
+            .filter(|(_, until)| now < *until)
+            .map(|(text, _)| text.clone())
     }
 
     /// Optional reconstruction shares passthrough's existing admission
@@ -540,7 +635,7 @@ impl<U: Upstream, C: Clock> Guard<U, C> {
         if fills.len() >= 500 || funding.len() >= 500 || ledger.len() >= 500 {
             return None;
         }
-        if !flow_value::valid_ledger(ledger) {
+        if !flow_value::valid_ledger(ledger, inner.account, dexes) {
             return None;
         }
         if fills

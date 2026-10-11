@@ -307,10 +307,12 @@ impl GuardConfig {
         // TOML diagnostics can include the source line and secret values.
         let table: toml::Table =
             toml::from_str(text).map_err(|_| ConfigError::Parse("invalid TOML syntax".into()))?;
-        if let Some(key) = first_value(&table, &|value| matches!(value, toml::Value::Float(_))) {
+        // Floats and dates refused wherever they are, as by every Zunder
+        // config (`zunder-config`).
+        if let Some(key) = zunder_config::first_float(&table) {
             return Err(ConfigError::Float(key));
         }
-        if let Some(key) = first_value(&table, &|value| matches!(value, toml::Value::Datetime(_))) {
+        if let Some(key) = zunder_config::first_datetime(&table) {
             return Err(ConfigError::Date(key));
         }
         let config: Self = table.try_into().map_err(|_: toml::de::Error| {
@@ -616,25 +618,6 @@ impl GuardConfig {
             },
             account: self.account()?.to_hex(),
         })
-    }
-}
-
-fn first_value(table: &toml::Table, matches: &dyn Fn(&toml::Value) -> bool) -> Option<String> {
-    table
-        .iter()
-        .find_map(|(key, value)| first_in(value, matches).map(|path| format!("{key}{path}")))
-}
-
-fn first_in(value: &toml::Value, matches: &dyn Fn(&toml::Value) -> bool) -> Option<String> {
-    if matches(value) {
-        return Some(String::new());
-    }
-    match value {
-        toml::Value::Table(table) => first_value(table, matches).map(|path| format!(".{path}")),
-        toml::Value::Array(items) => items.iter().enumerate().find_map(|(index, item)| {
-            first_in(item, matches).map(|path| format!("[{index}]{path}"))
-        }),
-        _ => None,
     }
 }
 

@@ -1,10 +1,11 @@
-"""Publish only an authenticated staged genesis to an empty installer-store head."""
+"""Publish an authenticated staged genesis with an atomic channel-head comparison."""
 
 import argparse
 import json
 import os
 from pathlib import Path
 
+from guard_harness.channel_head import read as read_head
 from guard_harness.publication import prepare, publish
 from guard_harness.staged_subjects import _private
 from guard_harness.testnet_run import ROOT, _read, _receipt
@@ -36,6 +37,12 @@ def execute(*, tag: str, commit: str, work: Path, bundle: Path) -> None:
     with captured_bundle.open("xb") as stream:
         captured_bundle.chmod(0o600)
         stream.write(captured)
+    # This read supplies only the opaque CAS token. It cannot admit incoming bytes:
+    # prepare independently authenticates the new build and lifecycle below. A
+    # stale response loses the atomic comparison and never causes another POST.
+    expected, head = read_head("staging")
+    if head is not None and head.get("manifest_sha256") == received.get("manifest_sha256"):
+        raise ValueError("build already staged; reconcile its existing lifecycle")
     publication = prepare(
         work / "assets",
         state,
@@ -46,7 +53,7 @@ def execute(*, tag: str, commit: str, work: Path, bundle: Path) -> None:
         tag=tag,
         workflow="verify.yml",
         previous=None,
-        expected=None,
+        expected=expected,
         journeys={},
         logs=work / "publication-logs",
     )

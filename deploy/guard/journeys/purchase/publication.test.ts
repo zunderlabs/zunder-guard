@@ -113,3 +113,72 @@ test('superseded staging builds cannot gate or promote over the current head', a
   expect((await publish(capsule(2, original, 'gated', current))).status).toBe(409);
   expect((await runtime.dispatchFetch('https://zunderlabs.com/guard/release-staging.json')).headers.get('x-zunder-state-sha256')).toBe(current);
 });
+
+function restore(expected: string | null, target: string | null, authenticated = true) {
+  return runtime.dispatchFetch('https://zunderlabs.com/guard/restore', { method: 'POST',
+    headers: authenticated ? { authorization: `Bearer ${secret}` } : {},
+    body: JSON.stringify({ expected, restore: target }) });
+}
+async function promoteBuild(build: string, staging: string | null, canonical: string | null) {
+  const proposal = (revision: number, previous: string | null, stage: string, expected: string | null) => {
+    const value = capsule(revision, previous, stage, expected);
+    value.predicate = value.predicate.replace('a'.repeat(64), build.repeat(64));
+    value.unix = `${build}-unix-${revision}`; value.windows = `${build}-windows-${revision}`;
+    return value;
+  };
+  const first = await publishDigest(proposal(1, null, 'staged', staging));
+  const gate = await publishDigest(proposal(2, first, 'gated', first));
+  const value = proposal(3, gate, 'promoted', canonical);
+  const promoted = await publishDigest(value);
+  return { gate, promoted, value,
+    withdrawal: () => proposal(4, promoted, 'withdrawn', promoted) };
+}
+test('authenticated rollback restores exact prior capsule without resurrecting failed build', async () => {
+  const old = await promoteBuild('a', null, null);
+  const next = await promoteBuild('b', old.gate, old.promoted);
+  const withdrawal = await publishDigest(next.withdrawal());
+  expect((await restore(withdrawal, old.promoted, false)).status).toBe(401);
+  expect((await restore(next.promoted, old.promoted)).status).toBe(409);
+  const results = await Promise.all([restore(withdrawal, old.promoted), restore(withdrawal, old.promoted)]);
+  expect(results.map(value => value.status).sort()).toEqual([201, 409]);
+  for (const [path, body] of [['/i', old.value.unix], ['/i.ps1', old.value.windows],
+    ['/guard/release.json', old.value.predicate], ['/guard/release.json.sigstore', old.value.bundle]]) {
+    const read = await runtime.dispatchFetch(`https://zunderlabs.com${path}`);
+    expect(read.status).toBe(200); expect(await read.text()).toBe(body);
+    expect(read.headers.get('x-zunder-state-sha256')).toBe(old.promoted);
+  }
+  expect((await publish(next.value)).status).toBe(409);
+});
+test('restore admits only the exact prior head recorded by the failed promotion', async () => {
+  const first = await promoteBuild('a', null, null);
+  const second = await promoteBuild('b', first.gate, first.promoted);
+  const third = await promoteBuild('c', second.gate, second.promoted);
+  const withdrawn = await publishDigest(third.withdrawal());
+  expect((await restore(withdrawn, first.promoted)).status).toBe(409);
+  expect((await restore(withdrawn, 'd'.repeat(64))).status).toBe(409);
+  expect((await restore(withdrawn, third.gate)).status).toBe(409);
+  expect((await restore(withdrawn, second.promoted)).status).toBe(201);
+});
+test('first promotion has no rollback target and remains truthfully withdrawn', async () => {
+  const first = await promoteBuild('a', null, null);
+  expect((await restore(first.promoted, first.promoted)).status).toBe(409);
+  const withdrawn = await publishDigest(first.withdrawal());
+  expect((await restore(withdrawn, null)).status).toBe(400);
+  expect((await restore(null, first.promoted)).status).toBe(400);
+  expect((await restore(withdrawn, first.promoted)).status).toBe(409);
+  expect((await runtime.dispatchFetch('https://zunderlabs.com/i')).status).toBe(410);
+});
+test('a withdrawn prior channel is never a rollback target', async () => {
+  const first = await promoteBuild('a', null, null);
+  const oldWithdrawal = await publishDigest(first.withdrawal());
+  const next = await promoteBuild('b', first.gate, oldWithdrawal);
+  const withdrawn = await publishDigest(next.withdrawal());
+  expect((await restore(withdrawn, first.promoted)).status).toBe(409);
+});
+test('restore payloads are bounded and cannot accept caller replacement bytes', async () => {
+  expect((await runtime.dispatchFetch('https://zunderlabs.com/guard/restore', { method: 'POST',
+    headers: { authorization: `Bearer ${secret}` },
+    body: JSON.stringify({ expected: 'a'.repeat(64), restore: 'b'.repeat(64), unix: 'replacement' }) })).status).toBe(400);
+  expect((await runtime.dispatchFetch('https://zunderlabs.com/guard/restore', { method: 'POST',
+    headers: { authorization: `Bearer ${secret}` }, body: 'x'.repeat(1025) })).status).toBe(413);
+});

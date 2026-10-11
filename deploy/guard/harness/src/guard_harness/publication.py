@@ -17,6 +17,8 @@ from guard_harness.release_state import canonical_bytes
 from guard_harness.runner import run
 from guard_harness.state_verifier import VerifiedState, authenticate_state
 
+USER_AGENT = "zunder-guard-release/1.0"
+
 
 @dataclass(frozen=True)
 class Publication:
@@ -166,7 +168,11 @@ def publish(publication: Publication, *, token: str) -> str:
         "https://zunderlabs.com/guard/publish",
         data=publication.body,
         method="POST",
-        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+            "User-Agent": USER_AGENT,
+        },
     )
     try:
         with urllib.request.build_opener(_NoRedirect()).open(request, timeout=45) as response:

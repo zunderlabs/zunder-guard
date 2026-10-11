@@ -1,4 +1,4 @@
-# Canonical private source. Stage and run implemented journeys; no complete release gate yet.
+# Canonical private source. Only complete authenticated runtime evidence can admit a release.
 name: verify
 on:
   workflow_dispatch:
@@ -18,6 +18,9 @@ concurrency:
   cancel-in-progress: false
 jobs:
   staging:
+    outputs:
+      previous_tag: ${{ steps.predecessor.outputs.previous_tag }}
+      previous_commit: ${{ steps.predecessor.outputs.previous_commit }}
     name: Authenticate and publish initial staged state
     runs-on: ubuntu-24.04
     timeout-minutes: 35
@@ -63,6 +66,12 @@ jobs:
           umask 077
           install -d -m 700 "$RUNNER_TEMP/guard-release"
           python -m guard_harness.staged_state --tag "$TAG" --commit "$SOURCE" --work "$RUNNER_TEMP/guard-release/staging"
+      - name: Select published predecessor for upgrade coverage
+        id: predecessor
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+        run: python -m guard_harness.predecessor --tag "$TAG" --work "$RUNNER_TEMP/guard-release/staging"
       - name: Attest staged state on its immutable build manifest
         id: state
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
@@ -174,6 +183,31 @@ jobs:
             ${{ steps.state.outputs.bundle-path }}
           if-no-files-found: warn
           retention-days: 7
+      - name: Retain exact staged lifecycle chain for the gate
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: state-chain-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/guard-release/staging/staged.predicate.json
+            ${{ runner.temp }}/guard-release/staging/staged.sigstore.json
+          if-no-files-found: error
+          retention-days: 7
+
+  install-matrix:
+    needs: staging
+    permissions:
+      contents: read
+      actions: read
+      packages: read
+      id-token: write
+      attestations: write
+    uses: ./.github/workflows/install-matrix.yml
+    with:
+      tag: ${{ inputs.tag }}
+      commit: ${{ inputs.commit }}
+      previous_tag: ${{ needs.staging.outputs.previous_tag }}
+      previous_commit: ${{ needs.staging.outputs.previous_commit }}
+      diagnostic: false
 
   journeys:
     name: Released trading and purchase journeys
@@ -189,3 +223,91 @@ jobs:
       tag: ${{ inputs.tag }}
       commit: ${{ inputs.commit }}
     # Each called job obtains only its own e2e environment secrets.
+
+  gate:
+    name: Authenticate every required journey and publish gated state
+    needs: [staging, install-matrix, journeys]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    environment: promote
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: {ref: '${{ inputs.commit }}', persist-credentials: false}
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with: {python-version: '3.13'}
+      - uses: slsa-framework/slsa-verifier/actions/installer@ea584f4502babc6f60d9bc799dbbb13c1caa9ee6 # v2.7.1
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with: {cosign-release: v3.1.3}
+      - run: python -m pip install -e ./deploy/guard/harness
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: ${{ runner.temp }}/gate-evidence
+      - name: Independently verify staged bytes and all signed journey evidence
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+          SOURCE: ${{ inputs.commit }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          install -d -m 700 "$RUNNER_TEMP/guard-gate"
+          python -m guard_harness.staged_state --tag "$TAG" --commit "$SOURCE" --work "$RUNNER_TEMP/guard-gate/release"
+          cp "$RUNNER_TEMP/gate-evidence/state-chain-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT/"staged.*.json "$RUNNER_TEMP/guard-gate/release/"
+          python -m guard_harness.gate_state --tag "$TAG" --commit "$SOURCE" --work "$RUNNER_TEMP/guard-gate/release" \
+            --evidence "$RUNNER_TEMP/gate-evidence" --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT"
+      - name: Attest gated successor on the immutable build manifest
+        id: gated
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-path: ${{ runner.temp }}/guard-gate/release/assets/release-manifest.json
+          predicate-type: https://zunderlabs.com/guard/release-state/v1
+          predicate-path: ${{ runner.temp }}/guard-gate/release/gated.predicate.json
+      - name: Reauthenticate and compare-and-swap the staging head
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INSTALLER_PUBLISH_TOKEN: ${{ secrets.INSTALLER_PUBLISH_TOKEN }}
+          TAG: ${{ inputs.tag }}
+          SOURCE: ${{ inputs.commit }}
+          BUNDLE: ${{ steps.gated.outputs.bundle-path }}
+        run: |
+          python -m guard_harness.gate_publish --tag "$TAG" --commit "$SOURCE" --work "$RUNNER_TEMP/guard-gate/release" \
+            --evidence "$RUNNER_TEMP/gate-evidence" --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" --bundle "$BUNDLE"
+      - name: Retain signed complete gate and sanitized verification logs
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: complete-gate-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/guard-gate/release/staged.predicate.json
+            ${{ runner.temp }}/guard-gate/release/staged.sigstore.json
+            ${{ runner.temp }}/guard-gate/release/gated.predicate.json
+            ${{ runner.temp }}/guard-gate/release/gated.sigstore.json
+            ${{ runner.temp }}/guard-gate/release/gate-publication.json
+            ${{ runner.temp }}/guard-gate/release/gate-logs/
+            ${{ runner.temp }}/guard-gate/release/gate-publication-logs/
+            ${{ runner.temp }}/guard-gate/release/assets.log
+          if-no-files-found: warn
+          retention-days: 7
+
+  promote:
+    name: Promote complete stable gate and smoke canonical installs
+    needs: gate
+    if: ${{ !contains(inputs.tag, '-rc.') }}
+    permissions:
+      contents: write
+      actions: read
+      packages: write
+      id-token: write
+      attestations: write
+    uses: ./.github/workflows/promote.yml
+    with:
+      tag: ${{ inputs.tag }}
+      commit: ${{ inputs.commit }}
+      run_id: ${{ format('{0}', github.run_id) }}
+      attempt: ${{ format('{0}', github.run_attempt) }}

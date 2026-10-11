@@ -157,8 +157,12 @@ pub const MAX_MARKETS: usize = 32;
 /// `min_inclusive`) and at most `max`. As fractions (2% is 0.02), the
 /// leverage as a multiple. These are the rules schema v1's bounds: the
 /// rules crate (`deploy/guard/rules`, `zr1.ts`, `schema-v1.json`) reads them
-/// from here. The upper bounds of the risk engine's five never exceed
-/// `RiskLimits::aggressive()`.
+/// from here. They are what a person may configure, not what Guard
+/// recommends: the defaults are [`Policy::guard_defaults`], and on mainnet
+/// [`Policy::within_mainnet_ceiling`] still caps every rule. The upper
+/// bounds were widened by decision on 11 Oct 2026 ("Guard's maximum bounds
+/// widened"); they stay within what `RiskLimits::validate`
+/// accepts (fractions at most 1, leverage at most 100).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RuleBound {
     pub min: Decimal,
@@ -176,8 +180,8 @@ const fn open_to(max: Decimal, text: &'static str) -> RuleBound {
     }
 }
 
-pub const MAX_LEVERAGE_BOUNDS: RuleBound = open_to(dec!(10), "above 0 and at most 10");
-pub const MAX_LOSS_AT_STOP_BOUNDS: RuleBound = open_to(dec!(0.05), "above 0 and at most 0.05");
+pub const MAX_LEVERAGE_BOUNDS: RuleBound = open_to(dec!(50), "above 0 and at most 50");
+pub const MAX_LOSS_AT_STOP_BOUNDS: RuleBound = open_to(dec!(0.25), "above 0 and at most 0.25");
 pub const DEFAULT_STOP_DISTANCE_BOUNDS: RuleBound = open_to(dec!(0.5), "above 0 and at most 0.5");
 pub const MIN_LIQUIDATION_DISTANCE_BOUNDS: RuleBound = RuleBound {
     min: dec!(0.01),
@@ -185,21 +189,24 @@ pub const MIN_LIQUIDATION_DISTANCE_BOUNDS: RuleBound = RuleBound {
     max: dec!(0.5),
     text: "between 0.01 and 0.5",
 };
-pub const MAX_POSITION_OF_ACCOUNT_BOUNDS: RuleBound = open_to(dec!(10), "above 0 and at most 10");
-pub const MAX_OPEN_RISK_BOUNDS: RuleBound = open_to(dec!(0.2), "above 0 and at most 0.2");
-pub const DAILY_LOSS_STOP_BOUNDS: RuleBound = open_to(dec!(0.15), "above 0 and at most 0.15");
-pub const DRAWDOWN_HALT_BOUNDS: RuleBound = open_to(dec!(0.5), "above 0 and at most 0.5");
+pub const MAX_POSITION_OF_ACCOUNT_BOUNDS: RuleBound = open_to(dec!(50), "above 0 and at most 50");
+pub const MAX_OPEN_RISK_BOUNDS: RuleBound = open_to(dec!(1), "above 0 and at most 1");
+pub const DAILY_LOSS_STOP_BOUNDS: RuleBound = open_to(dec!(0.5), "above 0 and at most 0.5");
+pub const DRAWDOWN_HALT_BOUNDS: RuleBound = open_to(dec!(0.9), "above 0 and at most 0.9");
 
 /// The policy. See the module documentation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Policy {
     /// Total position value over equity, and (its whole part, at least 1x)
-    /// the highest isolated leverage Guard sets or lets a bot set. Above 0,
-    /// at most 10, four decimals.
+    /// the highest isolated leverage Guard sets or lets a bot set (never
+    /// above the coin's own `maxLeverage` on the venue, nor where the
+    /// liquidation would not clear the stop). Above 0, at most 50, four
+    /// decimals.
     pub max_leverage: Decimal,
     /// Loss at the stop per trade, fees and slippage included, as a
-    /// fraction of equity: the risk engine's `risk_per_trade`. Up to 0.05.
+    /// fraction of equity: the risk engine's `risk_per_trade`. Up to 0.25,
+    /// at most `max_open_risk`.
     pub max_loss_at_stop: Decimal,
     pub stop: StopPolicy,
     /// The default stop distance: where Guard puts the stop of an entry
@@ -211,16 +218,16 @@ pub struct Policy {
     /// fraction of the price. 0.01 to 0.5; also at least beyond the stop.
     pub min_liquidation_distance: Decimal,
     /// Most value of one position as a fraction of equity (2 is 200%).
-    /// Above 0, at most 10 and `max_leverage`.
+    /// Above 0, at most 50 and `max_leverage`.
     pub max_position_of_account: Decimal,
     /// Risk to the stops of all positions and resting entries together,
-    /// as a fraction of equity. Up to 0.2, at least `max_loss_at_stop`.
+    /// as a fraction of equity. Up to 1, at least `max_loss_at_stop`.
     pub max_open_risk: Decimal,
     /// Loss since the start of the UTC day that halts and flattens until
-    /// the next day. Up to 0.15.
+    /// the next day. Above 0 (it cannot be switched off), up to 0.5.
     pub daily_loss_stop: Decimal,
     /// Fall from the equity peak that halts and flattens until a person's
-    /// review. Up to 0.5.
+    /// review. Above 0 (it cannot be switched off), up to 0.9.
     pub drawdown_halt: Decimal,
     pub markets: Markets,
     /// The most an entry's limit price may lie beyond the mid price, as a
@@ -783,19 +790,27 @@ mod tests {
     fn every_bound_refuses_just_beyond_it() {
         type Set = fn(&mut Policy, Decimal);
         let cases: Vec<(Set, Decimal, Decimal)> = vec![
-            // The rules schema v1's bounds (10x and the aggressive frame).
-            (|p, v| p.max_leverage = v, dec!(0), dec!(10.0001)),
-            (|p, v| p.max_loss_at_stop = v, dec!(0), dec!(0.050001)),
+            // The rules schema v1's bounds, widened on 11 Oct 2026: 50x,
+            // 25% at the stop, 50x per position, 100% open risk, 50% daily,
+            // 90% drawdown. Zero is refused for every one of them: no rule
+            // can be switched off.
+            (|p, v| p.max_leverage = v, dec!(0), dec!(50.0001)),
+            (|p, v| p.max_loss_at_stop = v, dec!(0), dec!(0.250001)),
             (|p, v| p.default_stop_distance = v, dec!(0), dec!(0.500001)),
             (
                 |p, v| p.min_liquidation_distance = v,
                 dec!(0.009999),
                 dec!(0.500001),
             ),
+            // At the default 5x a position cap above 5 is refused by the
+            // leverage cap; the bound of 50 itself is checked in
+            // `a_policy_at_every_maximum_is_valid_and_one_step_beyond_is_not`.
             (|p, v| p.max_position_of_account = v, dec!(0), dec!(5.01)),
-            (|p, v| p.max_open_risk = v, dec!(0), dec!(0.200001)),
-            (|p, v| p.daily_loss_stop = v, dec!(0), dec!(0.150001)),
-            (|p, v| p.drawdown_halt = v, dec!(0), dec!(0.500001)),
+            (|p, v| p.max_open_risk = v, dec!(0), dec!(1.000001)),
+            (|p, v| p.daily_loss_stop = v, dec!(0), dec!(0.500001)),
+            (|p, v| p.drawdown_halt = v, dec!(0), dec!(0.900001)),
+            (|p, v| p.daily_loss_stop = v, dec!(-0.01), dec!(1)),
+            (|p, v| p.drawdown_halt = v, dec!(-0.01), dec!(1)),
             // More than four decimal places in percent.
             (
                 |p, v| p.max_loss_at_stop = v,
@@ -838,6 +853,221 @@ mod tests {
             ..Policy::default()
         };
         assert!(matches!(policy.validate(), Err(PolicyError::Risk(_))));
+    }
+
+    /// Every rule at its widened maximum (decided 11 Oct 2026): 50x, 25% at
+    /// the stop, 5,000% per position, 100% open risk, 50% daily, 90%
+    /// drawdown.
+    fn at_the_maxima() -> Policy {
+        Policy {
+            max_leverage: dec!(50),
+            max_loss_at_stop: dec!(0.25),
+            max_position_of_account: dec!(50),
+            max_open_risk: dec!(1),
+            daily_loss_stop: dec!(0.5),
+            drawdown_halt: dec!(0.9),
+            ..Policy::default()
+        }
+    }
+
+    #[test]
+    fn the_widened_maxima_are_exactly_the_decided_ones() {
+        // The decision of 11 Oct 2026, "Guard's maximum bounds widened".
+        let maxima = [
+            (MAX_LEVERAGE_BOUNDS, dec!(50)),
+            (MAX_LOSS_AT_STOP_BOUNDS, dec!(0.25)),
+            (MAX_POSITION_OF_ACCOUNT_BOUNDS, dec!(50)),
+            (MAX_OPEN_RISK_BOUNDS, dec!(1)),
+            (DAILY_LOSS_STOP_BOUNDS, dec!(0.5)),
+            (DRAWDOWN_HALT_BOUNDS, dec!(0.9)),
+        ];
+        for (bound, max) in maxima {
+            assert_eq!(bound.max, max, "{}", bound.text);
+            // Above zero, never at it: no rule can be switched off.
+            assert_eq!(bound.min, Decimal::ZERO, "{}", bound.text);
+            assert!(!bound.min_inclusive, "{}", bound.text);
+            assert_eq!(
+                bound.text,
+                format!("above 0 and at most {}", max.normalize()),
+                "the text states the bound"
+            );
+        }
+        // Unchanged: the default stop distance and the liquidation distance.
+        assert_eq!(DEFAULT_STOP_DISTANCE_BOUNDS.max, dec!(0.5));
+        assert_eq!(MIN_LIQUIDATION_DISTANCE_BOUNDS.min, dec!(0.01));
+        const { assert!(MIN_LIQUIDATION_DISTANCE_BOUNDS.min_inclusive) };
+        assert_eq!(MIN_LIQUIDATION_DISTANCE_BOUNDS.max, dec!(0.5));
+        // The engine accepts every one of them: fractions up to 1, leverage
+        // up to 100 (`RiskLimits::validate`).
+        assert_eq!(at_the_maxima().risk_limits().validate(), Ok(()));
+    }
+
+    #[test]
+    fn a_policy_at_every_maximum_is_valid_and_one_step_beyond_is_not() {
+        let top = at_the_maxima();
+        assert_eq!(top.validate(), Ok(()));
+        // The smallest step a rules code can write beyond each maximum: four
+        // decimals in the leverage, four in percent (six as a fraction).
+        type Set = fn(&mut Policy, Decimal);
+        let beyond: [(Set, Decimal, &str); 6] = [
+            (|p, v| p.max_leverage = v, dec!(50.0001), "max_leverage"),
+            (
+                |p, v| p.max_loss_at_stop = v,
+                dec!(0.250001),
+                "max_loss_at_stop",
+            ),
+            // The position cap above 50 with the leverage cap at 50.
+            (
+                |p, v| p.max_position_of_account = v,
+                dec!(50.000001),
+                "max_position_of_account",
+            ),
+            (|p, v| p.max_open_risk = v, dec!(1.000001), "max_open_risk"),
+            (
+                |p, v| p.daily_loss_stop = v,
+                dec!(0.500001),
+                "daily_loss_stop",
+            ),
+            (|p, v| p.drawdown_halt = v, dec!(0.900001), "drawdown_halt"),
+        ];
+        for (set, value, field) in beyond {
+            let mut policy = top.clone();
+            set(&mut policy, value);
+            let result = policy.validate();
+            assert!(
+                matches!(
+                    result,
+                    Err(PolicyError::OutOfBounds { field: f, .. }) if f == field
+                ),
+                "{field} = {value}: {result:?}"
+            );
+        }
+        // A position cap of 50 still needs a leverage cap of 50.
+        let policy = Policy {
+            max_leverage: dec!(49),
+            ..top.clone()
+        };
+        assert!(matches!(
+            policy.validate(),
+            Err(PolicyError::OutOfBounds {
+                field: "max_position_of_account",
+                bounds: "at most max_leverage",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn the_non_negotiables_hold_at_the_widened_bounds() {
+        let top = at_the_maxima();
+        // Loss at the stop at most the open risk: 25% per trade with 20%
+        // open risk is refused by the engine's own check.
+        let policy = Policy {
+            max_open_risk: dec!(0.2),
+            ..top.clone()
+        };
+        assert!(matches!(
+            policy.validate(),
+            Err(PolicyError::Risk(
+                RiskConfigError::OpenRiskBelowTradeRisk { .. }
+            ))
+        ));
+        // 25% per trade with exactly 25% open risk is one trade: allowed.
+        let policy = Policy {
+            max_open_risk: dec!(0.25),
+            ..top.clone()
+        };
+        assert_eq!(policy.validate(), Ok(()));
+        // The liquidation still lies beyond the attached stop.
+        let policy = Policy {
+            default_stop_distance: dec!(0.10),
+            ..top.clone()
+        };
+        assert!(matches!(
+            policy.validate(),
+            Err(PolicyError::OutOfBounds {
+                field: "min_liquidation_distance",
+                ..
+            })
+        ));
+        // The daily loss stop and the drawdown halt cannot be switched off:
+        // zero or a negative value is refused, and leaving them out of a
+        // config gives the default (`#[serde(default)]`), not "off".
+        for (field, value) in [
+            ("daily_loss_stop", dec!(0)),
+            ("daily_loss_stop", dec!(-0.5)),
+            ("drawdown_halt", dec!(0)),
+            ("drawdown_halt", dec!(-0.9)),
+        ] {
+            let mut policy = top.clone();
+            if field == "daily_loss_stop" {
+                policy.daily_loss_stop = value;
+            } else {
+                policy.drawdown_halt = value;
+            }
+            let result = policy.validate();
+            assert!(
+                matches!(
+                    result,
+                    Err(PolicyError::OutOfBounds { field: f, .. }) if f == field
+                ),
+                "{field} = {value}: {result:?}"
+            );
+        }
+        let read: Policy = toml_like(
+            r#"{"max_leverage": "50", "max_loss_at_stop": "0.25", "max_open_risk": "1"}"#,
+        );
+        assert_eq!(read.daily_loss_stop, guard_defaults::DAILY_LOSS_STOP);
+        assert_eq!(read.drawdown_halt, guard_defaults::DRAWDOWN_HALT);
+        assert_eq!(read.validate(), Ok(()));
+        // Every entry has a stop: the stop policy is attach or refuse, and
+        // nothing else reads.
+        for word in ["none", "off", "optional", ""] {
+            let json = format!(r#"{{"stop": "{word}"}}"#);
+            assert!(serde_json::from_str::<Policy>(&json).is_err(), "{word}");
+        }
+        assert!(serde_json::from_str::<Policy>(r#"{"stop": null}"#).is_err());
+        // Mainnet is untouched by the wider bounds: the ceiling is still the
+        // bot's default frame, and every widened value is refused there.
+        assert_eq!(top.within_mainnet_ceiling(), Err("max_leverage"));
+        assert_eq!(
+            Policy::mainnet_ceiling().risk_limits(),
+            RiskLimits::default()
+        );
+        for (policy, field) in [
+            (
+                Policy {
+                    max_loss_at_stop: dec!(0.25),
+                    max_open_risk: dec!(1),
+                    ..Policy::default()
+                },
+                "max_loss_at_stop",
+            ),
+            (
+                Policy {
+                    max_open_risk: dec!(1),
+                    ..Policy::default()
+                },
+                "max_open_risk",
+            ),
+            (
+                Policy {
+                    daily_loss_stop: dec!(0.5),
+                    ..Policy::default()
+                },
+                "daily_loss_stop",
+            ),
+            (
+                Policy {
+                    drawdown_halt: dec!(0.9),
+                    ..Policy::default()
+                },
+                "drawdown_halt",
+            ),
+        ] {
+            assert_eq!(policy.validate(), Ok(()), "{field}");
+            assert_eq!(policy.within_mainnet_ceiling(), Err(field));
+        }
     }
 
     #[test]

@@ -115,6 +115,7 @@ The toolchain is pinned in `rust-toolchain.toml`.
 | `crates/zunder-guard-mcp` | The MCP server behind `zunder-guard mcp` |
 | `crates/zunder-risk` | The risk engine that sizes every entry and can veto anything |
 | `crates/zunder-core`, `crates/zunder-venue-types`, `crates/zunder-venue` | Shared types; instrument rules, the network choice and mainnet consent; the Hyperliquid transport and the risk journal that Guard builds on |
+| `crates/zunder-config` | The checks every config shares: floats and dates refused wherever they are |
 | `deploy/guard/rules` | The `zr1_` rules code (Rust and TypeScript, shared test vectors) |
 | `deploy/guard` | Loader, installer, image, systemd unit, deployment templates, release tooling |
 | `tests/redteam` | A black-box red-team suite that attacks a running Guard |

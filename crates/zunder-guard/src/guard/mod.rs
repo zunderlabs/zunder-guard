@@ -288,6 +288,61 @@ struct Sends {
     /// Client ids Guard gave so far (with the salt, what makes the next
     /// one unique).
     client_ids: u64,
+    /// Entries whose outcome is unknown that may still reach the venue
+    /// (`Guard::entry_may_arrive`): held until each is resolved.
+    unknown_entries: Vec<PendingEntry>,
+}
+
+/// How long after its expiry an entry whose outcome is unknown still
+/// holds new entries: the 15 s recovery allows for Guard's clock running
+/// ahead of the venue's (`recovery.rs`), above the settle window in which
+/// the venue's view may not show a fill yet.
+pub(super) const ENTRY_EXPIRY_MARGIN_MS: u64 = 15_000;
+const _: () = assert!(ENTRY_EXPIRY_MARGIN_MS > observe::SETTLE_MS);
+
+/// An entry whose outcome is unknown (its answer lost or unreadable): on
+/// `coin`, valid on the venue until `expires_ms` (Guard's clock), sent by
+/// `sent_mono` (Guard's monotonic clock).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingEntry {
+    coin: String,
+    expires_ms: u64,
+    sent_mono: u64,
+}
+
+/// A complete read of the account a sync round made: when it began, on
+/// Guard's clock and on its monotonic clock, and the venue's time of its
+/// account answers (the oldest dex's), when they carry one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CompleteRead {
+    wall: u64,
+    mono: u64,
+    venue_ms: Option<i64>,
+}
+
+impl PendingEntry {
+    /// It can no longer arrive, and the account has been read since: Guard's
+    /// clock at `now` is [`ENTRY_EXPIRY_MARGIN_MS`] past its expiry, and the
+    /// complete read `read` began after it was sent (monotonic clock),
+    /// at least that margin past its expiry (Guard's clock), and shows the
+    /// venue's time more than the settle window past its expiry, when the
+    /// answers carry it (the venue's view may lag a fill on its own clock
+    /// too).
+    fn resolved(&self, now: u64, read: Option<&CompleteRead>) -> bool {
+        let after = self.expires_ms.saturating_add(ENTRY_EXPIRY_MARGIN_MS);
+        let expired_at_venue = |venue: i64| {
+            self.expires_ms
+                .checked_add(observe::SETTLE_MS)
+                .and_then(|settled| i64::try_from(settled).ok())
+                .is_some_and(|settled| venue > settled)
+        };
+        now >= after
+            && read.is_some_and(|read| {
+                read.mono > self.sent_mono
+                    && read.wall >= after
+                    && read.venue_ms.is_none_or(expired_at_venue)
+            })
+    }
 }
 
 /// An intent on disk (a decision to send, a protection, a flattening, an
@@ -324,8 +379,14 @@ struct Protection {
     /// When the background sync last protected the positions.
     last_ms: Option<u64>,
     /// Protect at the next sync whether settled or not (an entry was just
-    /// cancelled and may have filled in part).
+    /// cancelled and may have filled in part, or what a send did is
+    /// unknown).
     at_next_sync: bool,
+    /// After a send whose outcome is unknown: `at_next_sync` stays set
+    /// until a round whose complete read began at or after this time
+    /// (Guard's monotonic clock: the send plus the settle window), so that a
+    /// view that does not show the send yet does not use it up.
+    until: Option<u64>,
 }
 
 /// Deposits and withdrawals: the account's ledger, and the views the risk
@@ -349,6 +410,13 @@ struct Ledger {
     /// How many flows were applied, and the last one that was not.
     flows_applied: u64,
     flow_note: Option<String>,
+    /// The last ledger entry Guard could not account for (an unknown type,
+    /// a malformed entry), and until when (Guard's clock, epoch ms: the end
+    /// of the UTC day it was seen) it refuses new positions for it.
+    unaccounted: Option<(String, u64)>,
+    /// The ids of the entries reported so, the newest
+    /// [`observe::UNACCOUNTED_KEPT`]: each is reported once.
+    unaccounted_seen: VecDeque<String>,
 }
 
 /// How the background sync's last rounds read the account.
@@ -366,6 +434,10 @@ struct SyncRounds {
     /// How many times the last sync round read the account (1, or 2 when a
     /// send overtook its first read), for the status.
     last_reads: u8,
+    /// The newest complete read of the account a sync round made (by when
+    /// it began on the monotonic clock): what resolves an entry whose
+    /// outcome is unknown (`PendingEntry::resolved`).
+    last_complete: Option<CompleteRead>,
 }
 
 /// The sweep of the perp dexes Guard does not manage.
@@ -441,6 +513,9 @@ pub struct Guard<U, C = SystemClock> {
     hold_started: tokio::sync::Notify,
     /// Broadcast deadline changes to every read already in flight.
     hold_changed: tokio::sync::Notify,
+    /// Wakes the background sync at once: a send's outcome is unknown, so
+    /// what it left open is protected now, not at the next round.
+    protect_soon: tokio::sync::Notify,
 }
 
 /// How many requests were judged from the stream and how many after an
@@ -601,6 +676,7 @@ impl<U: Upstream, C: Clock> Guard<U, C> {
             recovering: AtomicBool::new(false),
             hold_started: tokio::sync::Notify::new(),
             hold_changed: tokio::sync::Notify::new(),
+            protect_soon: tokio::sync::Notify::new(),
         }))
     }
 
@@ -654,6 +730,44 @@ impl<U: Upstream, C: Clock> Guard<U, C> {
         if let Err(error) = inner.journal.close().await {
             eprintln!("zunder-guard: closing the decision journal: {error}");
         }
+    }
+}
+
+#[cfg(test)]
+mod pending_entry_tests {
+    use super::{CompleteRead, PendingEntry};
+
+    /// An entry sent at monotonic 1,000 that expires at 130,000 on Guard's
+    /// clock: the hold ends at 130,000 + 15,000 = 145,000, for a read begun
+    /// after monotonic 1,000, at or after 145,000, whose venue time (if any)
+    /// is past 130,000 + 5,000 = 135,000.
+    #[test]
+    fn a_lost_entry_resolves_only_when_every_condition_holds() {
+        let pending = PendingEntry {
+            coin: "ETH".into(),
+            expires_ms: 130_000,
+            sent_mono: 1_000,
+        };
+        let read = |wall: u64, mono: u64, venue_ms: Option<i64>| CompleteRead {
+            wall,
+            mono,
+            venue_ms,
+        };
+        let good = read(145_000, 2_000, Some(135_001));
+        assert!(pending.resolved(145_000, Some(&good)));
+        // Guard's clock 1 ms short of the margin.
+        assert!(!pending.resolved(144_999, Some(&good)));
+        // No complete read at all.
+        assert!(!pending.resolved(200_000, None));
+        // A read begun before the send (monotonic), however late its wall
+        // start reads (a time of day stepped forward).
+        assert!(!pending.resolved(200_000, Some(&read(200_000, 1_000, Some(150_000)))));
+        // A read begun after the send but 1 ms before the margin's end.
+        assert!(!pending.resolved(200_000, Some(&read(144_999, 2_000, Some(150_000)))));
+        // The venue's time at 135,000: not past expiry plus the settle window.
+        assert!(!pending.resolved(200_000, Some(&read(145_000, 2_000, Some(135_000)))));
+        // Answers without the venue's time: Guard's clock decides.
+        assert!(pending.resolved(145_000, Some(&read(145_000, 2_000, None))));
     }
 }
 

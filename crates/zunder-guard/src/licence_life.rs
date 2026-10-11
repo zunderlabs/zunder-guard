@@ -12,26 +12,90 @@
 //! - Automatic renewal, **off unless the user switches it on**
 //!   (`licence_auto_update` with `licence_renewal_token`): while the key is
 //!   missing or within [`RENEW_WITHIN_DAYS`] of its end, Guard asks
-//!   Orcastrate's licence service ([`RENEWAL_URL`]) for the licence's
-//!   newest key, at most every [`RETRY_MS`], and writes it into
-//!   `guard.toml` when it verifies for this account and runs longer
+//!   Orcastrate's licence service for the licence's newest key, at most
+//!   every [`RETRY_MS`], and writes it into `guard.toml` when it verifies
+//!   for this account, comes from the same issuer and runs longer
 //!   ([`renew_once`]). The request carries the renewal token and the
 //!   account address, nothing else. Off, Guard calls nobody but the venue.
+//! - Where it asks ([`RenewalOrigin`]) follows from the licence key in
+//!   `guard.toml`, never from the config or a caller: a key the staging
+//!   issuer signed (counted on testnet only) renews at the staging
+//!   checkout ([`STAGING_RENEWAL_URL`]); any other key, or none, at
+//!   production ([`RENEWAL_URL`]). Both URLs are compiled in, and the
+//!   request follows no redirect, so the renewal token reaches no other
+//!   origin.
 
 use std::{future::Future, path::Path};
 
 use serde::Serialize;
 use serde_json::{Value, json};
 use zunder_guard_core::{
-    licence::{self, FeeNetwork, Licence, LicenceError, LicenceIssuers},
+    licence::{self, FeeNetwork, Issuer, Licence, LicenceError, LicenceIssuers},
     sign::Address,
 };
 
 use crate::config::{GuardConfig, GuardNetwork};
 
 /// Orcastrate's licence service: the newest key of a licence, for its
-/// renewal token and one of its accounts.
+/// renewal token and one of its accounts. Licences of the production
+/// issuer renew here.
 pub const RENEWAL_URL: &str = "https://zunderlabs.com/api/licence/renewal";
+/// The staging checkout's licence service: the same route, for licences the
+/// staging issuer signed, which count on testnet only.
+pub const STAGING_RENEWAL_URL: &str = "https://staging.zunderlabs.com/api/licence/renewal";
+
+/// Where a licence renews: decided by [`renewal_origin`] from the licence
+/// key itself, each a compiled-in URL.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RenewalOrigin {
+    /// [`RENEWAL_URL`]: production licences, and any config without a key
+    /// that verifies.
+    Production,
+    /// [`STAGING_RENEWAL_URL`]: licences the staging issuer signed, on a
+    /// testnet config.
+    Staging,
+}
+
+impl RenewalOrigin {
+    /// The URL a renewal request goes to.
+    pub const fn url(self) -> &'static str {
+        match self {
+            Self::Production => RENEWAL_URL,
+            Self::Staging => STAGING_RENEWAL_URL,
+        }
+    }
+
+    /// The host, for messages.
+    pub const fn host(self) -> &'static str {
+        match self {
+            Self::Production => "zunderlabs.com",
+            Self::Staging => "staging.zunderlabs.com",
+        }
+    }
+
+    /// The issuer whose keys this origin hands out; a key from it signed
+    /// by the other issuer is refused.
+    pub const fn issuer(self) -> Issuer {
+        match self {
+            Self::Production => Issuer::Production,
+            Self::Staging => Issuer::Staging,
+        }
+    }
+}
+
+/// Where the licence `key` renews, with `issuers` the keys that count on
+/// the config's network ([`issuers_for`], or [`LicenceIssuers::on`]): the
+/// staging checkout only for a key the staging issuer signed (its
+/// signature alone decides; an expired key or one for other accounts
+/// still renews where it came from); production for every other key and
+/// for none. On mainnet the staging issuer is not among `issuers`, so a
+/// mainnet config always renews at production.
+pub fn renewal_origin(key: Option<&str>, issuers: &LicenceIssuers) -> RenewalOrigin {
+    match key.and_then(|key| issuers.signer(key)) {
+        Some(Issuer::Staging) => RenewalOrigin::Staging,
+        Some(Issuer::Production) | None => RenewalOrigin::Production,
+    }
+}
 /// A renewal is asked for this many days before the key ends (when the
 /// first reminder goes out, `licence::WARN_DAYS`).
 pub const RENEW_WITHIN_DAYS: i64 = 14;
@@ -175,10 +239,17 @@ pub struct LicenceView {
     /// Whether the key, valid now, waives the builder fee.
     pub fee_free: bool,
     pub source: LicenceSource,
+    /// Where automatic renewal would ask for this key, whether or not it
+    /// is switched on: [`renewal_origin`]'s URL, the same function the
+    /// renewal client uses (a staging issuer's key on a testnet config:
+    /// staging; anything else, an unverifiable key or none included:
+    /// production).
+    pub renewal_origin: &'static str,
 }
 
 /// The [`LicenceView`] of `key` for `account` at `now_ms`, checked
-/// against `issuers`; `auto_update`: the config's `licence_auto_update`.
+/// against `issuers` (those of the config's network: [`issuers_for`]);
+/// `auto_update`: the config's `licence_auto_update`.
 pub fn view(
     key: Option<&str>,
     issuers: &LicenceIssuers,
@@ -218,6 +289,7 @@ pub fn view(
         expires_at_ms,
         fee_free,
         source,
+        renewal_origin: renewal_origin(key, issuers).url(),
     }
 }
 
@@ -393,8 +465,9 @@ pub enum Renewal {
 }
 
 /// Look at the config at `path` and, when renewal is on and due, ask the
-/// licence service through `post` (the body; the answer's HTTP status and
-/// JSON) and write a newer key into the config file.
+/// licence service through `post` (where, from [`renewal_origin`], and the
+/// body; the answer's HTTP status and JSON) and write a newer key into the
+/// config file. Only a key of the origin's own issuer is taken.
 pub async fn renew_once<F, Fut>(
     path: &Path,
     issuers: &LicenceIssuers,
@@ -402,7 +475,7 @@ pub async fn renew_once<F, Fut>(
     post: F,
 ) -> Result<Renewal, RenewalError>
 where
-    F: FnOnce(Value) -> Fut,
+    F: FnOnce(RenewalOrigin, Value) -> Fut,
     Fut: Future<Output = Result<(u16, Value), String>>,
 {
     let config =
@@ -420,10 +493,15 @@ where
     if !due {
         return Ok(Renewal::NotDue);
     }
-    let (status, body) = post(request_body(token, account))
+    // The origin follows the key in the file, never the caller; and the
+    // answer must come from that origin's issuer.
+    let origin = renewal_origin(config.licence.as_deref(), issuers);
+    let answer_issuers = issuers.only(origin.issuer());
+    let (status, body) = post(origin, request_body(token, account))
         .await
         .map_err(RenewalError::Request)?;
-    let Some((key, licence)) = judge_answer(status, &body, end, issuers, account, now_ms)? else {
+    let Some((key, licence)) = judge_answer(status, &body, end, &answer_issuers, account, now_ms)?
+    else {
         return Ok(Renewal::NotYet);
     };
     let mut installed = false;
@@ -535,12 +613,16 @@ mod tests {
     const STAGING_SEED: [u8; 32] = [21u8; 32];
 
     fn staging_key(expires_at_ms: i64) -> String {
+        staging_key_for(expires_at_ms, ACCOUNT)
+    }
+
+    fn staging_key_for(expires_at_ms: i64, account: &str) -> String {
         issue(
             &Terms {
                 licensee: "Staging Test".into(),
                 expires_at_ms,
                 features: vec!["fee_free".into()],
-                accounts: vec![ACCOUNT.into()],
+                accounts: vec![account.into()],
                 builder: None,
             },
             &STAGING_SEED,
@@ -562,6 +644,7 @@ mod tests {
                 expires_at_ms: Some(NOW + 30 * DAY),
                 fee_free: true,
                 source: LicenceSource::File,
+                renewal_origin: RENEWAL_URL,
             }
         );
         let expired = key("Old", NOW - 1, &[ACCOUNT]);
@@ -573,6 +656,7 @@ mod tests {
                 expires_at_ms: Some(NOW - 1),
                 fee_free: false,
                 source: LicenceSource::AutoUpdate,
+                renewal_origin: RENEWAL_URL,
             }
         );
         let other = key(
@@ -601,7 +685,8 @@ mod tests {
         // The JSON names, exactly as `docs/guard.md` ("Automation") has them.
         assert_eq!(
             serde_json::to_value(view(None, &public, account(), NOW, true)).unwrap(),
-            json!({"state": "none", "licensee": null, "expires_at_ms": null, "fee_free": false, "source": "auto_update"})
+            json!({"state": "none", "licensee": null, "expires_at_ms": null, "fee_free": false, "source": "auto_update",
+                "renewal_origin": "https://zunderlabs.com/api/licence/renewal"})
         );
         for (state, text) in [
             (LicenceState::Valid, "valid"),
@@ -703,7 +788,7 @@ mod tests {
             &path,
             &both(FeeNetwork::Testnet),
             NOW,
-            move |_| async move { Ok((200, json!({"key": renewed}))) },
+            move |_, _| async move { Ok((200, json!({"key": renewed}))) },
         ));
         assert!(
             result
@@ -715,6 +800,87 @@ mod tests {
             GuardConfig::load(&path).unwrap().licence.as_deref(),
             Some(near.as_str())
         );
+    }
+
+    /// `licence show --json`'s `renewal_origin` (the automation licence
+    /// object): the renewal client's own origin for the key, on the
+    /// config's network: a staging key on testnet gives staging; a
+    /// production key, no key or an unverifiable key gives production; on
+    /// mainnet always production.
+    #[test]
+    fn the_licence_object_names_the_renewal_origin() {
+        let staging_public = zunder_guard_core::licence::public_key_of(&STAGING_SEED);
+        let both = |network| {
+            LicenceIssuers::for_test(network, Some(test_key::public()), Some(staging_public))
+        };
+        let staged = staging_key(NOW + 30 * DAY);
+        let produced = key("x", NOW + 30 * DAY, &[ACCOUNT]);
+        let expired_staged = staging_key(NOW - DAY);
+        let staging = "https://staging.zunderlabs.com/api/licence/renewal";
+        let production = "https://zunderlabs.com/api/licence/renewal";
+        for (key, network, state, origin) in [
+            (
+                Some(staged.as_str()),
+                FeeNetwork::Testnet,
+                LicenceState::Valid,
+                staging,
+            ),
+            (
+                Some(produced.as_str()),
+                FeeNetwork::Testnet,
+                LicenceState::Valid,
+                production,
+            ),
+            (None, FeeNetwork::Testnet, LicenceState::None, production),
+            (
+                Some("zgl1_nonsense"),
+                FeeNetwork::Testnet,
+                LicenceState::Invalid,
+                production,
+            ),
+            // Expired but signed by the staging issuer: renews where it came from.
+            (
+                Some(expired_staged.as_str()),
+                FeeNetwork::Testnet,
+                LicenceState::Expired,
+                staging,
+            ),
+            // Mainnet: the staging key does not count; always production.
+            (
+                Some(staged.as_str()),
+                FeeNetwork::Mainnet,
+                LicenceState::Invalid,
+                production,
+            ),
+            (
+                Some(produced.as_str()),
+                FeeNetwork::Mainnet,
+                LicenceState::Valid,
+                production,
+            ),
+            (None, FeeNetwork::Mainnet, LicenceState::None, production),
+        ] {
+            let seen = view(key, &both(network), account(), NOW, false);
+            assert_eq!(
+                (seen.state, seen.renewal_origin),
+                (state, origin),
+                "{key:?} {network:?}"
+            );
+            // The same function the renewal client asks.
+            assert_eq!(
+                seen.renewal_origin,
+                renewal_origin(key, &both(network)).url()
+            );
+        }
+        // `view_of`, with the built-in issuers of the config's network.
+        for network in [GuardNetwork::Testnet, GuardNetwork::Mainnet] {
+            let config = GuardConfig {
+                network: Some(network),
+                account: Some(ACCOUNT.into()),
+                ..GuardConfig::default()
+            };
+            assert_eq!(view_of(&config, NOW).unwrap().renewal_origin, production);
+        }
     }
 
     #[test]
@@ -854,9 +1020,18 @@ mod tests {
     }
 
     fn write_config(dir: &Path, licence: Option<&str>, auto: bool) -> std::path::PathBuf {
+        write_config_on(dir, GuardNetwork::Testnet, licence, auto)
+    }
+
+    fn write_config_on(
+        dir: &Path,
+        network: GuardNetwork,
+        licence: Option<&str>,
+        auto: bool,
+    ) -> std::path::PathBuf {
         let path = dir.join("guard.toml");
         let config = GuardConfig {
-            network: Some(crate::config::GuardNetwork::Testnet),
+            network: Some(network),
             account: Some(ACCOUNT.into()),
             licence: licence.map(str::to_owned),
             licence_auto_update: auto,
@@ -888,7 +1063,8 @@ mod tests {
         let public = keys();
         let near = key("x", NOW + 3 * DAY, &[ACCOUNT]);
         let newer = key("x", NOW + 368 * DAY, &[ACCOUNT]);
-        let never = |_: Value| async { Err::<(u16, Value), String>("asked".into()) };
+        let never =
+            |_: RenewalOrigin, _: Value| async { Err::<(u16, Value), String>("asked".into()) };
         // Off: nothing asked.
         let path = write_config(dir.path(), Some(&near), false);
         assert_eq!(
@@ -908,7 +1084,7 @@ mod tests {
         let asked = std::sync::Arc::new(std::sync::Mutex::new(None));
         let answer = newer.clone();
         let seen = asked.clone();
-        let result = runtime().block_on(renew_once(&path, &public, NOW, move |body| {
+        let result = runtime().block_on(renew_once(&path, &public, NOW, move |_, body| {
             *seen.lock().unwrap() = Some(body);
             async move { Ok((200, json!({"ok": true, "key": answer}))) }
         }));
@@ -930,7 +1106,7 @@ mod tests {
         let path = write_config(dir.path(), Some(&near), true);
         let same = near.clone();
         assert_eq!(
-            runtime().block_on(renew_once(&path, &public, NOW, move |_| async move {
+            runtime().block_on(renew_once(&path, &public, NOW, move |_, _| async move {
                 Ok((200, json!({"key": same})))
             })),
             Ok(Renewal::NotYet)
@@ -942,7 +1118,7 @@ mod tests {
         // A refusal is an error, the config unchanged.
         assert!(
             runtime()
-                .block_on(renew_once(&path, &public, NOW, |_| async {
+                .block_on(renew_once(&path, &public, NOW, |_, _| async {
                     Ok((404, json!({"ok": false})))
                 }))
                 .is_err()
@@ -961,7 +1137,7 @@ mod tests {
         let reply_key = key("x", NOW + 30 * DAY, &[ACCOUNT]);
         let manual = key("x", NOW + 365 * DAY, &[ACCOUNT]);
         let path = write_config(dir.path(), Some(&near), true);
-        let result = runtime().block_on(renew_once(&path, &public, NOW, |_| async {
+        let result = runtime().block_on(renew_once(&path, &public, NOW, |_, _| async {
             GuardConfig::update(&path, |config| config.licence = Some(manual.clone())).unwrap();
             Ok((200, json!({"key": reply_key})))
         }));
@@ -969,7 +1145,7 @@ mod tests {
         assert_eq!(GuardConfig::load(&path).unwrap().licence, Some(manual));
 
         let path = write_config(dir.path(), Some(&near), true);
-        let result = runtime().block_on(renew_once(&path, &public, NOW, |_| async {
+        let result = runtime().block_on(renew_once(&path, &public, NOW, |_, _| async {
             GuardConfig::update(&path, |config| config.licence_auto_update = false).unwrap();
             Ok((200, json!({"key": reply_key})))
         }));
@@ -977,5 +1153,168 @@ mod tests {
         let config = GuardConfig::load(&path).unwrap();
         assert!(!config.licence_auto_update);
         assert_eq!(config.licence.as_deref(), Some(near.as_str()));
+    }
+
+    /// Where a renewal goes follows the licence key in `guard.toml`, never
+    /// the caller: a key the staging issuer signed renews at staging (on a
+    /// testnet config, where it counts), every other key and none at
+    /// production; a mainnet config always at production. And each origin's
+    /// answer is taken only when its own issuer signed it, so a staging
+    /// licence never posts to production, nor a production one to staging.
+    #[test]
+    fn a_licence_renews_only_where_it_was_issued() {
+        // The compiled-in URLs: https, the same route, two hosts.
+        assert_eq!(
+            RenewalOrigin::Production.url(),
+            "https://zunderlabs.com/api/licence/renewal"
+        );
+        assert_eq!(
+            RenewalOrigin::Staging.url(),
+            "https://staging.zunderlabs.com/api/licence/renewal"
+        );
+        for origin in [RenewalOrigin::Production, RenewalOrigin::Staging] {
+            assert_eq!(
+                origin.url(),
+                format!("https://{}/api/licence/renewal", origin.host())
+            );
+        }
+
+        let staging_public = zunder_guard_core::licence::public_key_of(&STAGING_SEED);
+        let both = |network| {
+            LicenceIssuers::for_test(network, Some(test_key::public()), Some(staging_public))
+        };
+        let testnet = both(FeeNetwork::Testnet);
+        let mainnet = both(FeeNetwork::Mainnet);
+        let staged = staging_key(NOW + 3 * DAY);
+        let produced = key("x", NOW + 3 * DAY, &[ACCOUNT]);
+        let other = "0x0000000000000000000000000000000000000001";
+        for (key, issuers, origin) in [
+            (Some(staged.as_str()), &testnet, RenewalOrigin::Staging),
+            (Some(produced.as_str()), &testnet, RenewalOrigin::Production),
+            // The staging issuer does not count on mainnet.
+            (Some(staged.as_str()), &mainnet, RenewalOrigin::Production),
+            (Some(produced.as_str()), &mainnet, RenewalOrigin::Production),
+            // No key, or one neither issuer signed: production, as before.
+            (None, &testnet, RenewalOrigin::Production),
+            (Some("zgl1_nonsense"), &testnet, RenewalOrigin::Production),
+        ] {
+            assert_eq!(renewal_origin(key, issuers), origin, "{key:?}");
+        }
+        // The signature alone decides: an expired staging key, or one for
+        // other accounts, still renews at staging.
+        for staged in [
+            staging_key(NOW - DAY),
+            staging_key_for(NOW + 3 * DAY, other),
+        ] {
+            assert_eq!(
+                renewal_origin(Some(&staged), &testnet),
+                RenewalOrigin::Staging
+            );
+        }
+
+        let dir = crate::testdir::TestDir::new("licence-renewal-origin");
+        let run = |path: &Path, answer: String| {
+            let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let seen = asked.clone();
+            let result =
+                runtime().block_on(renew_once(path, &testnet, NOW, move |origin, body| {
+                    seen.lock().unwrap().push((origin, body));
+                    async move { Ok((200, json!({"ok": true, "key": answer}))) }
+                }));
+            let asked = asked.lock().unwrap().clone();
+            (result, asked)
+        };
+        let request = json!({"token": TOKEN, "account": ACCOUNT});
+
+        // A staging licence on testnet: asked at staging only, with the
+        // token and the account; its newer staging key is written.
+        let newer_staged = staging_key(NOW + 10 * DAY);
+        let path = write_config(dir.path(), Some(&staged), true);
+        let (result, asked) = run(&path, newer_staged.clone());
+        assert_eq!(
+            result,
+            Ok(Renewal::Renewed {
+                licensee: "Staging Test".into(),
+                expires_at_ms: NOW + 10 * DAY
+            })
+        );
+        assert_eq!(asked, vec![(RenewalOrigin::Staging, request.clone())]);
+        assert_eq!(
+            GuardConfig::load(&path).unwrap().licence.as_deref(),
+            Some(newer_staged.as_str())
+        );
+        // Staging answering with a production key: refused, nothing written.
+        let newer_produced = key("x", NOW + 368 * DAY, &[ACCOUNT]);
+        let path = write_config(dir.path(), Some(&staged), true);
+        let (result, asked) = run(&path, newer_produced.clone());
+        assert!(
+            matches!(result, Err(RenewalError::KeyNotUsed(_))),
+            "{result:?}"
+        );
+        assert_eq!(asked, vec![(RenewalOrigin::Staging, request.clone())]);
+        assert_eq!(
+            GuardConfig::load(&path).unwrap().licence.as_deref(),
+            Some(staged.as_str())
+        );
+
+        // A production licence on testnet: asked at production only; a
+        // staging key in its answer is refused, its own issuer's taken.
+        let path = write_config(dir.path(), Some(&produced), true);
+        let (result, asked) = run(&path, newer_staged.clone());
+        assert!(
+            matches!(result, Err(RenewalError::KeyNotUsed(_))),
+            "{result:?}"
+        );
+        assert_eq!(asked, vec![(RenewalOrigin::Production, request.clone())]);
+        assert_eq!(
+            GuardConfig::load(&path).unwrap().licence.as_deref(),
+            Some(produced.as_str())
+        );
+        let (result, asked) = run(&path, newer_produced.clone());
+        assert!(matches!(result, Ok(Renewal::Renewed { .. })), "{result:?}");
+        assert_eq!(asked, vec![(RenewalOrigin::Production, request.clone())]);
+
+        // A redirect is not followed (`post_renewal`'s client) and arrives
+        // here as its status: an error, nothing written.
+        let path = write_config(dir.path(), Some(&staged), true);
+        for status in [301_u16, 302, 303, 307, 308] {
+            let answer = newer_staged.clone();
+            let result =
+                runtime().block_on(renew_once(&path, &testnet, NOW, move |_, _| async move {
+                    Ok((status, json!({"key": answer})))
+                }));
+            assert_eq!(result, Err(RenewalError::Status(status)));
+        }
+        assert_eq!(
+            GuardConfig::load(&path).unwrap().licence.as_deref(),
+            Some(staged.as_str())
+        );
+
+        // Without a key that verifies: production, as before.
+        let path = write_config(dir.path(), None, true);
+        let (_, asked) = run(&path, newer_produced.clone());
+        assert_eq!(asked, vec![(RenewalOrigin::Production, request.clone())]);
+
+        // Mainnet: a staging key does not count, so it renews at
+        // production, and a staging key from there is refused.
+        let path = write_config_on(dir.path(), GuardNetwork::Mainnet, Some(&staged), true);
+        let (result, asked) = run(&path, newer_staged.clone());
+        assert!(
+            matches!(result, Err(RenewalError::KeyNotUsed(_))),
+            "{result:?}"
+        );
+        assert_eq!(asked, vec![(RenewalOrigin::Production, request.clone())]);
+        assert_eq!(
+            GuardConfig::load(&path).unwrap().licence.as_deref(),
+            Some(staged.as_str())
+        );
+
+        // Off by default: nobody is asked, whichever the key.
+        for licence in [&staged, &produced] {
+            let path = write_config(dir.path(), Some(licence), false);
+            let (result, asked) = run(&path, newer_staged.clone());
+            assert_eq!(result, Ok(Renewal::Off));
+            assert!(asked.is_empty());
+        }
     }
 }

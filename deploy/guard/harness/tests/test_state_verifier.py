@@ -45,12 +45,14 @@ def authenticate(
     monkeypatch: pytest.MonkeyPatch,
     *,
     previous: verifier.VerifiedState | None = None,
+    expected_run: tuple[str | None, str | None] = (None, None),
 ) -> verifier.VerifiedState:
     manifest, served, predicate = files
 
     def verified(*args: Any, **kwargs: Any) -> VerifiedPredicate:
         assert args[0].read_bytes() == manifest.read_bytes()  # Verify the captured subject bytes.
         assert kwargs["commit"] == COMMIT and kwargs["tag"] == "v1.0.0"
+        assert (kwargs["expected_run_id"], kwargs["expected_run_attempt"]) == expected_run
         return VerifiedPredicate(predicate, "verify.yml", COMMIT)
 
     monkeypatch.setattr(verifier, "verify_predicate", verified)
@@ -66,6 +68,8 @@ def authenticate(
         previous=previous,
         verified_journeys=GATE_JOURNEYS,
         log=served.parent / "verify.log",
+        expected_run_id=expected_run[0],
+        expected_run_attempt=expected_run[1],
     )
 
 
@@ -152,3 +156,11 @@ def test_download_path_replacement_cannot_change_verified_snapshot(
         log=served.parent / "verify.log",
     )
     assert result.manifest_sha256 == hashlib.sha256(original).hexdigest()
+
+
+def test_lifecycle_forwarding_binds_expected_run_and_attempt(
+    files: tuple[Path, Path, dict[str, Any]], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    assert (
+        authenticate(files, monkeypatch, expected_run=("123", "2")).predicate["stage"] == "staged"
+    )

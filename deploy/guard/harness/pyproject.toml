@@ -36,3 +36,8 @@ known-first-party = ["guard_harness"]
 [[tool.mypy.overrides]]
 module = ["hyperliquid.*"]
 ignore_missing_imports = true
+
+# pywinpty is pinned and installed only on the native Windows hosted runners.
+[[tool.mypy.overrides]]
+module = ["winpty"]
+ignore_missing_imports = true

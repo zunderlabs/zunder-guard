@@ -24,6 +24,7 @@ def test_admission_precedes_one_post_and_only_confirmed_post_has_receipt(
     bundle = tmp_path / "action.bundle"
     bundle.write_bytes(b"authenticated elsewhere by gh")
     monkeypatch.setenv("INSTALLER_PUBLISH_TOKEN", "fixture-credential")
+    monkeypatch.setattr(staging_publish, "read_head", lambda channel: (None, None))
     calls: list[str] = []
 
     def authenticate(*args: Any, **kwargs: Any) -> Publication:
@@ -102,3 +103,55 @@ def test_bundle_limit_refuses_before_any_verification_or_post(
     with pytest.raises(ValueError, match="bundle size"):
         staging_publish.execute(tag="v1.0.0", commit="b" * 40, work=tmp_path, bundle=bundle)
     assert not (tmp_path / "staged.sigstore.json").exists()
+
+
+def test_successor_release_compares_existing_channel_head(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    tmp_path.chmod(0o700)
+    state = tmp_path / "staged.predicate.json"
+    state.write_text(
+        json.dumps(
+            {"stage": "staged", "revision": 1, "previous": None, "manifest_sha256": "b" * 64}
+        )
+    )
+    state.chmod(0o600)
+    bundle = tmp_path / "bundle.json"
+    bundle.write_bytes(b"bundle")
+    monkeypatch.setenv("INSTALLER_PUBLISH_TOKEN", "fixture")
+    monkeypatch.setattr(
+        staging_publish, "read_head", lambda channel: ("a" * 64, {"manifest_sha256": "c" * 64})
+    )
+
+    def authenticate(*args: Any, **kwargs: Any) -> Publication:
+        assert kwargs["expected"] == "a" * 64 and kwargs["previous"] is None
+        return Publication(b"capsule", "b" * 64)
+
+    monkeypatch.setattr(staging_publish, "prepare", authenticate)
+    monkeypatch.setattr(staging_publish, "publish", lambda publication, token: publication.digest)
+    staging_publish.execute(tag="v1.0.0-rc.4", commit="b" * 40, work=tmp_path, bundle=bundle)
+    assert (tmp_path / "publication.json").exists()
+
+
+def test_same_build_genesis_is_not_replayed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    tmp_path.chmod(0o700)
+    state = tmp_path / "staged.predicate.json"
+    state.write_text(
+        json.dumps(
+            {"stage": "staged", "revision": 1, "previous": None, "manifest_sha256": "b" * 64}
+        )
+    )
+    state.chmod(0o600)
+    bundle = tmp_path / "bundle.json"
+    bundle.write_bytes(b"bundle")
+    monkeypatch.setenv("INSTALLER_PUBLISH_TOKEN", "fixture")
+    monkeypatch.setattr(
+        staging_publish, "read_head", lambda channel: ("a" * 64, {"manifest_sha256": "b" * 64})
+    )
+    monkeypatch.setattr(
+        staging_publish, "prepare", lambda *args, **kwargs: pytest.fail("replay admitted")
+    )
+    with pytest.raises(ValueError, match="already staged"):
+        staging_publish.execute(tag="v1.0.0-rc.4", commit="b" * 40, work=tmp_path, bundle=bundle)

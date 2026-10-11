@@ -1,15 +1,16 @@
 [workspace]
 resolver = "3"
-members = ["crates/zunder-core", "crates/zunder-guard", "crates/zunder-guard-core", "crates/zunder-guard-mcp", "crates/zunder-hl-protocol", "crates/zunder-risk", "crates/zunder-venue", "crates/zunder-venue-types", "deploy/guard/rules", "tests/redteam"]
+members = ["crates/zunder-config", "crates/zunder-core", "crates/zunder-guard", "crates/zunder-guard-core", "crates/zunder-guard-mcp", "crates/zunder-hl-protocol", "crates/zunder-risk", "crates/zunder-venue", "crates/zunder-venue-types", "deploy/guard/rules", "tests/redteam"]
 
 [workspace.package]
-version = "1.0.0-rc.3"
+version = "1.0.0-rc.4"
 edition = "2024"
 rust-version = "1.97"
 publish = false
 
 [workspace.dependencies]
 # Our crates first, then third-party crates under permissive licences only (deny.toml).
+zunder-config = { path = "crates/zunder-config" }
 zunder-core = { path = "crates/zunder-core" }
 zunder-guard-core = { path = "crates/zunder-guard-core" }
 zunder-guard = { path = "crates/zunder-guard" }
@@ -76,6 +77,19 @@ unwrap_used = "deny"
 # Dependencies are optimised even in debug builds: Decimal arithmetic at
 # opt-level 0 makes backtest-heavy tests several times slower.
 [profile.dev.package."*"]
+opt-level = 3
+
+# Tests only: the crates under the flow model's property tests (thousands of
+# journal writes and risk-engine steps per property) optimised as well; with
+# the journals in memory, about ten times faster at the same coverage. Overflow
+# checks and debug assertions stay on; `cargo build` and clippy are unchanged.
+[profile.test.package.zunder-venue]
+opt-level = 3
+
+[profile.test.package.zunder-risk]
+opt-level = 3
+
+[profile.test.package.zunder-core]
 opt-level = 3
 
 [profile.release]

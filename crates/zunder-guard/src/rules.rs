@@ -72,8 +72,19 @@ mod tests {
         );
         // Refused: bad codes, out of bounds, the stop beyond the liquidation distance, the
         // removed requireStop field. Nothing is clamped.
+        // The widened maximum (11 Oct 2026) reads; one above it does not.
+        let at_most = format!(
+            "zr1_{}",
+            base64::Engine::encode(
+                &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+                r#"{"v":1,"maxLeverage":50,"maxPositionPct":5000}"#
+            )
+        );
+        let wide = decode(&at_most, &Policy::default()).unwrap();
+        assert_eq!(wide.max_leverage, dec!(50));
+        assert_eq!(wide.max_position_of_account, dec!(50));
         for json in [
-            r#"{"v":1,"maxLeverage":11}"#,
+            r#"{"v":1,"maxLeverage":51}"#,
             r#"{"v":1,"defaultStopDistancePct":10}"#,
             r#"{"v":1,"requireStop":true}"#,
         ] {

@@ -30,7 +30,7 @@ use zunder_guard::{
     upstream::{Upstream, UpstreamError},
 };
 use zunder_guard_core::{
-    action::{Action, OrderKind, decode_request},
+    action::{Action, OrderKind, Protection, decode_request},
     sign::{Address, SigningNetwork, action_hash, agent_digest, recover_signer},
 };
 
@@ -120,6 +120,23 @@ impl Clock for VenueClock {
 /// A check run on every action the venue receives, before it acts on it.
 type Check = std::sync::Arc<dyn Fn(&Value) + Send + Sync>;
 
+/// What the venue answers instead of its own answer to an action (the
+/// action's JSON, the answer it would give): a garbled or partial answer.
+type Rewrite = std::sync::Arc<dyn Fn(&Value, Value) -> Value + Send + Sync>;
+
+#[derive(Clone, Default)]
+struct ReplyRewrite(Option<Rewrite>);
+
+impl std::fmt::Debug for ReplyRewrite {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(if self.0.is_some() {
+            "ReplyRewrite(set)"
+        } else {
+            "ReplyRewrite(none)"
+        })
+    }
+}
+
 #[derive(Clone, Default)]
 struct Hook(Option<Check>);
 
@@ -136,6 +153,7 @@ impl std::fmt::Debug for Hook {
 #[derive(Debug, Default, Clone)]
 struct State {
     before_send: Hook,
+    rewrite: ReplyRewrite,
     equity: String,
     mids: Value,
     positions: Vec<Value>,
@@ -243,6 +261,28 @@ struct State {
     /// dropped); how many reads waited so.
     dex_hold: Option<(String, tokio::sync::watch::Receiver<bool>)>,
     dex_hold_waits: usize,
+    /// How the venue answers the next close (a reduce-only IOC order),
+    /// instead of filling it in full ([`MemoryVenue::script_close`]).
+    close_script: Option<CloseScript>,
+    /// Info request types whose read panics (a bug in what handles it,
+    /// [`MemoryVenue::panic_on_info`]).
+    panic_on_info: Vec<String>,
+}
+
+/// How the venue answers Guard's next close, a reduce-only IOC order
+/// ([`MemoryVenue::script_close`]).
+#[derive(Debug, Clone)]
+pub enum CloseScript {
+    /// Only this much of it fills (the book was thin): the position shrinks
+    /// by that much, and the answer's `totalSz` says so.
+    Part(&'static str),
+    /// Nothing fills: the IOC found nothing to match, and the venue answers
+    /// the order's status with an error, as Hyperliquid does.
+    NoFill,
+    /// The venue refuses the action whole (`status: err`).
+    Refuse,
+    /// No readable answer: an HTTP 503, nothing taken.
+    Fail,
 }
 
 /// Coins the main dex lists after BTC, ETH and SOL when asked to
@@ -367,6 +407,16 @@ impl MemoryVenue {
         self.state.lock().unwrap().failing.push(dex.to_owned());
     }
 
+    /// Make a dex's `clearinghouseState` answer again after
+    /// [`MemoryVenue::fail_reads`].
+    pub fn restore_reads(&self, dex: &str) {
+        self.state
+            .lock()
+            .unwrap()
+            .failing
+            .retain(|failing| failing != dex);
+    }
+
     /// Make a dex's open orders carry a coin of another dex.
     pub fn garble_orders(&self, dex: &str) {
         self.state.lock().unwrap().garbled.push(dex.to_owned());
@@ -398,6 +448,15 @@ impl MemoryVenue {
     /// Run `hook` on every action received, before acting on it.
     pub fn before_send(&self, hook: impl Fn(&Value) + Send + Sync + 'static) {
         self.state.lock().unwrap().before_send = Hook(Some(std::sync::Arc::new(hook)));
+    }
+
+    /// Act on every action as before, but answer what `rewrite` makes of
+    /// the answer (given the action's JSON): an answer Guard cannot read.
+    pub fn rewrite_replies(
+        &self,
+        rewrite: impl Fn(&Value, Value) -> Value + Send + Sync + 'static,
+    ) {
+        self.state.lock().unwrap().rewrite = ReplyRewrite(Some(std::sync::Arc::new(rewrite)));
     }
 
     /// The next `reads` reads of `orderStatus` answer `unknownOid` (the
@@ -462,6 +521,21 @@ impl MemoryVenue {
 
     pub fn refuse_stops(&self) {
         self.state.lock().unwrap().refuse_stops = true;
+    }
+
+    /// Answer the next close (a reduce-only IOC order) as `script` says.
+    pub fn script_close(&self, script: CloseScript) {
+        self.state.lock().unwrap().close_script = Some(script);
+    }
+
+    /// Make every info read of type `kind` (`orderStatus`, say) panic in
+    /// the task that reads it.
+    pub fn panic_on_info(&self, kind: &str) {
+        self.state
+            .lock()
+            .unwrap()
+            .panic_on_info
+            .push(kind.to_owned());
     }
 
     fn coin(asset: u64) -> &'static str {
@@ -746,6 +820,15 @@ impl MemoryVenue {
 
 impl Upstream for MemoryVenue {
     async fn info(&self, body: &Value) -> Result<Value, UpstreamError> {
+        // Checked with the lock released before panicking, so that the
+        // venue stays readable afterwards.
+        let panics = {
+            let state = self.state.lock().unwrap();
+            body["type"]
+                .as_str()
+                .is_some_and(|kind| state.panic_on_info.iter().any(|on| on == kind))
+        };
+        assert!(!panics, "test: the venue's {} read panics", body["type"]);
         let held = {
             let mut state = self.state.lock().unwrap();
             let held = state
@@ -1074,6 +1157,47 @@ impl Upstream for MemoryVenue {
         if let Some(hook) = &state.before_send.0 {
             hook(&json["action"]);
         }
+        let closes = matches!(&request.action, Action::Order(order)
+            if order.orders.iter().any(|placed| placed.reduce_only
+                && matches!(placed.kind, OrderKind::Limit { tif: zunder_guard_core::action::Tif::Ioc })));
+        let script = if closes {
+            state.close_script.take()
+        } else {
+            None
+        };
+        let mut action = request.action.clone();
+        match script {
+            None => {}
+            Some(CloseScript::Part(part)) => {
+                if let Action::Order(order) = &mut action {
+                    for placed in &mut order.orders {
+                        placed.size =
+                            zunder_guard_core::action::Px::from_decimal(part.parse().unwrap())
+                                .unwrap();
+                    }
+                }
+            }
+            Some(CloseScript::NoFill) => {
+                return Ok(
+                    json!({"status": "ok", "response": {"type": "order", "data": {"statuses": [
+                        {"error": "Order could not immediately match against any resting orders. asset=1"}
+                    ]}}}),
+                );
+            }
+            Some(CloseScript::Refuse) => {
+                return Ok(
+                    json!({"status": "err", "response": "Insufficient margin to place order (test)."}),
+                );
+            }
+            Some(CloseScript::Fail) => {
+                return Err(UpstreamError::Status {
+                    status: 503,
+                    body: "service unavailable (test)".into(),
+                });
+            }
+        }
+        let mut request = request;
+        request.action = action;
         let reply = self.apply(&mut state, &request.action);
         // What the venue's socket reports of it: each order it rested or
         // filled (and a fill), each order a cancel took; nothing for a
@@ -1151,6 +1275,9 @@ impl Upstream for MemoryVenue {
         }
         if state.swallow && matches!(request.action, Action::Order(_)) {
             return Err(UpstreamError::NoAnswer("test: the answer was lost".into()));
+        }
+        if let Some(rewrite) = &state.rewrite.0 {
+            return Ok(rewrite(&json["action"], reply));
         }
         Ok(reply)
     }
@@ -1244,6 +1371,18 @@ impl MemoryVenue {
         } else {
             json!({"type": "deposit", "usdc": amount.normalize().to_string()})
         };
+        state.ledger.push((
+            json!({"time": time, "hash": format!("0x{n:064x}"), "delta": delta}),
+            !quiet,
+        ));
+    }
+
+    /// A ledger entry of `delta` booked at `time`, moving no money in the
+    /// venue (a type Guard does not know, a malformed one): reported on
+    /// the socket unless `quiet`.
+    pub fn ledger_entry_at(&self, delta: Value, time: i64, quiet: bool) {
+        let mut state = self.state.lock().unwrap();
+        let n = state.ledger.len();
         state.ledger.push((
             json!({"time": time, "hash": format!("0x{n:064x}"), "delta": delta}),
             !quiet,

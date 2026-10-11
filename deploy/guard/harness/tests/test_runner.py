@@ -81,3 +81,37 @@ def test_stdin_secret_is_redacted_from_both_streams(tmp_path: Path) -> None:
     assert secret not in result.output
     assert secret not in result.log.read_text()
     assert "[REDACTED]" in result.output
+
+
+@pytest.mark.parametrize("timeout", [False, True])
+def test_private_stdout_retains_only_redacted_stderr(tmp_path: Path, timeout: bool) -> None:
+    code = (
+        "import sys,time\nprint('new-pair-key',flush=True)\n"
+        "print(sys.stdin.read()+' stderr-failure',file=sys.stderr,flush=True)\n"
+        + ("time.sleep(30)" if timeout else "raise SystemExit(9)")
+    )
+    log = tmp_path / "private.log"
+    with pytest.raises(RunError):
+        run(
+            [sys.executable, "-c", code],
+            log=log,
+            timeout=0.2 if timeout else 5,
+            sensitive_stdout=True,
+            stdin=b"synthetic-private",
+            secrets=["synthetic-private"],
+        )
+    retained = log.read_text()
+    assert "new-pair-key" not in retained
+    assert "synthetic-private" not in retained
+    assert "[REDACTED] stderr-failure" in retained
+
+
+def test_all_private_output_takes_precedence(tmp_path: Path) -> None:
+    result = run(
+        [sys.executable, "-c", "import sys;print('secret',file=sys.stderr)"],
+        log=tmp_path / "private.log",
+        timeout=5,
+        sensitive_stdout=True,
+        sensitive_output=True,
+    )
+    assert result.log.read_text() == "[sensitive command output withheld]\n"
