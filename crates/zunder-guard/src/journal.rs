@@ -2396,8 +2396,10 @@ mod crash_tests {
         assert!(matches!(result, Err(JournalError::Broken(_))), "{result:?}");
         assert!(journal.is_broken());
         let waited = started.elapsed();
+        // Guard's clock counts whole milliseconds, so the deadline can fall up to one
+        // millisecond before `Instant` says the full wait has passed (CI saw 1.9996 s).
         assert!(
-            waited >= std::time::Duration::from_millis(ACK_DEADLINE_MS)
+            waited >= std::time::Duration::from_millis(ACK_DEADLINE_MS - 1)
                 && waited < std::time::Duration::from_millis(ACK_DEADLINE_MS + 1_000),
             "{waited:?}"
         );

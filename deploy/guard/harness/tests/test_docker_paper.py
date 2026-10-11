@@ -18,6 +18,7 @@ class FakeDocker:
         self.logs = logs
         self.inspections = 0
         self.address = ""
+        self.image = ""
 
     def remove(self, name: str) -> None:
         self.command("rm", "--force", name)
@@ -27,6 +28,7 @@ class FakeDocker:
         output = ""
         if "--publish" in args:
             self.address = args[args.index("--publish") + 1].rsplit(":", 1)[0]
+            self.image = args[-4]
         if args[-2:] == ("pair", "--json"):
             output = json.dumps({"client_address": "0x" + "1" * 40, "client_key": "0x" + "2" * 64})
         elif args[0] == "port":
@@ -35,6 +37,8 @@ class FakeDocker:
             output = "PID COMMAND\n12001 docker-init\n12002 zunder-guard\n"
         elif args[:3] == ("inspect", "--format", "{{.Id}}"):
             output = "a" * 64
+        elif args[:3] == ("inspect", "--format", "{{.Config.Image}}"):
+            output = self.image
         elif args[0] == "inspect":
             output = str(self.inspections if self.crash_recovers else 0)
             self.inspections += 1
@@ -104,6 +108,67 @@ def test_crash_without_restart_never_gets_a_passing_receipt(
     assert FakeDocker.calls[-1][0][:2] == ("volume", "rm")
 
 
+@pytest.mark.parametrize("failure", ["", "image", "journal", "pairing"])
+def test_upgrade_keeps_state_and_client_and_refuses_incomplete_upgrade(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    failure: str,
+) -> None:
+    install_fakes(monkeypatch)
+    old, new = "sha256:" + "a" * 64, "sha256:" + "b" * 64
+    original = FakeDocker.command
+    trips = 0
+
+    def command(self: FakeDocker, *args: str, sensitive: bool = False) -> RunResult:
+        result = original(self, *args, sensitive=sensitive)
+        if args[:3] == ("inspect", "--format", "{{.Config.Image}}") and failure == "image":
+            return RunResult(0, old, result.log)
+        return result
+
+    def round_trip(guard: Any, pair: Any) -> list[Decision]:
+        nonlocal trips
+        trips += 1
+        if trips == 2 and failure == "pairing":
+            raise PaperError("retained pairing refused")
+        assert pair.key == "0x" + "2" * 64
+        return [Decision(100, 1, "allow", "allowed")]
+
+    monkeypatch.setattr(FakeDocker, "command", command)
+    monkeypatch.setattr(container, "round_trip", round_trip)
+    if failure == "journal":
+        monkeypatch.setattr(FakeGuard, "request", lambda *args: [])
+    work = tmp_path / "run"
+    if failure:
+        with pytest.raises(PaperError):
+            container.lifecycle(new, "0x" + "1" * 40, work=work, previous_image=old)
+        assert not (work / "receipt.json").exists()
+    else:
+        container.lifecycle(new, "0x" + "1" * 40, work=work, previous_image=old)
+        receipt = json.loads((work / "receipt.json").read_bytes())
+        assert receipt["previous_image"] == old and receipt["image"] == new
+        assert {"upgrade", "upgrade-journal", "upgrade-pairing"} <= set(receipt["checks"])
+        assert trips == 2
+    init = [args for args, _ in FakeDocker.calls if "init" in args]
+    pair = [args for args, _ in FakeDocker.calls if args[-2:] == ("pair", "--json")]
+    assert len(init) == len(pair) == 1 and old in init[0] and old in pair[0]
+    launches = [args for args, _ in FakeDocker.calls if "--publish" in args]
+    assert launches[0][-4] == old and all(args[-4] == new for args in launches[1:])
+    mounts = [args[args.index("--mount") + 1] for args in launches]
+    assert len(set(mounts)) == 1
+    assert FakeDocker.calls[-1][0][:2] == ("volume", "rm")
+
+
+@pytest.mark.parametrize(
+    "old", ["latest", "sha256:" + "a" * 64, "ghcr.io/zunderlabs/zunder-guard@sha256:" + "a" * 64]
+)
+def test_upgrade_refuses_mutable_or_identical_previous_image(old: str, tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="previous image"):
+        container.lifecycle(
+            "sha256:" + "a" * 64, "0x" + "1" * 40, work=tmp_path / "run", previous_image=old
+        )
+    assert not (tmp_path / "run").exists()
+
+
 @pytest.mark.parametrize(
     "image", ["latest", "ghcr.io/zunderlabs/zunder-guard:v1.0.0", "sha256:short"]
 )
@@ -127,8 +192,12 @@ def test_unknown_create_and_cleanup_failures_never_leave_passing_receipt(
         return result
 
     monkeypatch.setattr(FakeDocker, "command", broken)
-    with pytest.raises(RuntimeError, match="ambiguous"):
+    with pytest.raises((RuntimeError, ExceptionGroup)) as caught:
         container.lifecycle("sha256:" + "a" * 64, "0x" + "1" * 40, work=tmp_path / "run")
+    error = caught.value
+    errors = error.exceptions if isinstance(error, ExceptionGroup) else (error,)
+    assert len(errors) == (2 if failed == ("rm", "--force") else 1)
+    assert all(isinstance(item, RuntimeError) and "ambiguous" in str(item) for item in errors)
     assert FakeDocker.calls[-1][0][:2] == ("volume", "rm")
     assert not (tmp_path / "run/receipt.json").exists()
 
@@ -264,3 +333,49 @@ def test_lost_journal_after_crash_or_reinstall_refuses_receipt(
     if lost_at == 3:
         assert launches[0] == launches[1]
     assert FakeDocker.calls[-1][0][:2] == ("volume", "rm")
+
+
+def test_init_and_cleanup_failures_are_retained_and_volume_cleanup_still_runs(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    install_fakes(monkeypatch)
+    original = FakeDocker.command
+
+    def fail(self: FakeDocker, *args: str, sensitive: bool = False) -> RunResult:
+        result = original(self, *args, sensitive=sensitive)
+        if "init" in args:
+            raise PaperError("initial setup refused")
+        if args[0] == "logs":
+            raise PaperError("container logs unavailable")
+        if args[0] == "rm":
+            raise PaperError("container removal unconfirmed")
+        return result
+
+    monkeypatch.setattr(FakeDocker, "command", fail)
+    with pytest.raises(ExceptionGroup) as caught:
+        container.lifecycle("sha256:" + "a" * 64, "0x" + "1" * 40, work=tmp_path / "run")
+    assert [str(error) for error in caught.value.exceptions] == [
+        "initial setup refused",
+        "container logs unavailable",
+        "container removal unconfirmed",
+    ]
+    assert FakeDocker.calls[-1][0][:2] == ("volume", "rm")
+    assert not (tmp_path / "run/receipt.json").exists()
+
+
+def test_final_cleanup_failure_alone_refuses_passing_receipt(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    install_fakes(monkeypatch)
+    original = FakeDocker.command
+
+    def fail(self: FakeDocker, *args: str, sensitive: bool = False) -> RunResult:
+        result = original(self, *args, sensitive=sensitive)
+        if args[:2] == ("volume", "rm"):
+            raise PaperError("owned volume removal unconfirmed")
+        return result
+
+    monkeypatch.setattr(FakeDocker, "command", fail)
+    with pytest.raises(PaperError, match="owned volume removal"):
+        container.lifecycle("sha256:" + "a" * 64, "0x" + "1" * 40, work=tmp_path / "run")
+    assert not (tmp_path / "run/receipt.json").exists()

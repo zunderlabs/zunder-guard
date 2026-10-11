@@ -2,7 +2,10 @@
 // SPDX-License-Identifier: Elastic-2.0
 //! Time as integer milliseconds. There are no time zones: everything is UTC.
 
-use std::fmt;
+use std::{
+    fmt,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use serde::{Deserialize, Serialize};
 
@@ -23,6 +26,26 @@ impl Timestamp {
 
     pub const fn as_millis(self) -> i64 {
         self.0
+    }
+
+    /// The system clock. A clock set before 1970 reads as the epoch, which
+    /// is easy to spot and which a venue refuses as a nonce: failing safe
+    /// rather than signing garbage. Use [`Timestamp::try_now`] to refuse
+    /// such a clock instead.
+    ///
+    /// For programs, never for code that has to be deterministic: a
+    /// strategy, the risk engine, the decision loop and the simulator take
+    /// their time from the candles or from a [`Clock`] they are given. It
+    /// panics on `wasm32-unknown-unknown`, which has no system clock.
+    pub fn now() -> Self {
+        Self::try_now().unwrap_or(Self(0))
+    }
+
+    /// The system clock, or `None` when it is set before 1970. A reading
+    /// past `i64::MAX` milliseconds saturates.
+    pub fn try_now() -> Option<Self> {
+        let elapsed = SystemTime::now().duration_since(UNIX_EPOCH).ok()?;
+        Some(Self(i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX)))
     }
 
     /// Whole days since the epoch. Daily risk windows roll when this changes.
@@ -47,6 +70,22 @@ impl Timestamp {
             return None;
         }
         days.checked_mul(Self::MS_PER_DAY).map(Self)
+    }
+}
+
+/// Where the current time comes from. Code that reads the time through a
+/// `Clock` can be tested with a fixed or moving one.
+pub trait Clock: Send + Sync {
+    fn now(&self) -> Timestamp;
+}
+
+/// The system clock ([`Timestamp::now`]).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SystemClock;
+
+impl Clock for SystemClock {
+    fn now(&self) -> Timestamp {
+        Timestamp::now()
     }
 }
 
@@ -104,6 +143,15 @@ mod tests {
     use super::*;
 
     const DAY: i64 = Timestamp::MS_PER_DAY;
+
+    #[test]
+    fn the_system_clock_reads_after_2020() {
+        // 2020-01-01T00:00:00Z; any host running this is later.
+        let earliest = Timestamp::from_millis(1_577_836_800_000);
+        assert!(Timestamp::now() > earliest);
+        assert!(Timestamp::try_now().is_some_and(|now| now > earliest));
+        assert!(SystemClock.now() > earliest);
+    }
 
     #[test]
     fn epoch_is_first_of_january_1970() {

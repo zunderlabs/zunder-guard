@@ -46,7 +46,10 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: guard-cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          # Cargo revalidates fingerprints; fallback never crosses toolchains or jobs.
+          key: guard-cargo-v2-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            guard-cargo-v2-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('rust-toolchain.toml') }}-
       - run: cargo fmt --all -- --check
       - name: Release dependencies must exclude test-only features
         shell: bash
@@ -85,7 +88,10 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: guard-cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          # Cargo revalidates fingerprints; fallback never crosses toolchains or jobs.
+          key: guard-cargo-v2-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            guard-cargo-v2-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('rust-toolchain.toml') }}-
       - run: cargo clippy --locked --all-targets -p zunder-venue -p zunder-venue-types -p zunder-guard-core -p zunder-guard-mcp -p zunder-guard-rules -p zunder-guard -p zunder-redteam -- -D warnings
       # The full model runs 4,000 histories per property on Linux. Windows
       # exercises 400 per property on its native filesystem, including the
@@ -241,7 +247,10 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: guard-cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          # Cargo revalidates fingerprints; fallback never crosses toolchains or jobs.
+          key: guard-cargo-v2-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            guard-cargo-v2-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('rust-toolchain.toml') }}-
       - name: Require exactly one selected flow test
         shell: bash
         run: python deploy/guard/github/check-flow-selection.py "$FLOW_TEST"
@@ -293,7 +302,10 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: guard-cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          # Cargo revalidates fingerprints; fallback never crosses toolchains or jobs.
+          key: guard-cargo-v2-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            guard-cargo-v2-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('rust-toolchain.toml') }}-
       - name: Require exactly one selected flow test
         shell: bash
         run: python deploy/guard/github/check-flow-selection.py "$FLOW_TEST"
@@ -415,7 +427,10 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: guard-cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          # Cargo revalidates fingerprints; fallback never crosses toolchains or jobs.
+          key: guard-cargo-v2-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            guard-cargo-v2-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('rust-toolchain.toml') }}-
       - name: Typecheck and lint native broker, CLI and synthetic fixture
         run: |
           set +e

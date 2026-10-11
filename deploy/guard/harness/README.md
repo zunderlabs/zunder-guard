@@ -302,3 +302,23 @@ This job publishes unavailable staged state only. The complete install/journey g
 release head reconciliation, hosted channel evidence and promotion still need integration; a green
 staging job is not S3. The workflow must be present in a new RC's source before it can attest
 that RC. It cannot retrospectively attest an older RC from a newer workflow commit.
+
+`canonical_readback.check` consumes the authenticated `Publication` returned by
+`publication.prepare` for a promoted state. It reads only the four canonical C5 release
+endpoints and compares every header and body to that captured publication: both loader
+bytes, the lifecycle predicate and its bundle. Redirects, non-200 answers, changed bytes or
+mixed publication revisions fail without retries. The transport uses no credentials and
+bounds each response to 2 MiB. This check does not discover or authenticate a promotion
+chain itself; the monitor and promotion caller must retain that verified chain and complete
+journey evidence before calling it. Hosted scheduling, alerts and rollback wiring remain
+required before claiming P9 or canonical smoke coverage.
+
+`guard_harness.docker_run` accepts `--previous-tag` and `--previous-commit` together
+to exercise upgrades. The preceding published release must have an older version and
+distinct source and image bytes. Both complete release admissions finish before Docker
+pulls either image. Plain Docker and Compose initialize and pair on the old image, then
+reuse the same state volume and loopback port with the candidate's signed distribution
+payload. The candidate must retain every old decision and accept another round trip from
+the old client before restart, crash recovery and reinstall checks proceed. A passing
+receipt includes both immutable release identities. This remains keyless paper coverage;
+testnet lifecycle and hosted I5 attestation are separate requirements.

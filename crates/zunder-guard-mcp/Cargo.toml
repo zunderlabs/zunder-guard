@@ -36,8 +36,10 @@ zunder-core.workspace = true
 zunder-hl-protocol.workspace = true
 # The rules code's bounds (`contract.rs`): the risk engine's own validation.
 zunder-risk.workspace = true
-# Address parsing and Hyperliquid's price and size grid (`InstrumentRules`).
+# Owner-only key files and address parsing.
 zunder-venue.workspace = true
+# Hyperliquid's price and size grid (`InstrumentRules`).
+zunder-venue-types.workspace = true
 
 [dev-dependencies]
 # Holding this server's action builders to Guard core's encoding (`sign.rs`).

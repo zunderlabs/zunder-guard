@@ -29,5 +29,3 @@ pub use risk_store::{
     JournalError, JournalEvent, JournalRecord, JournalScope, PersistentRisk, RiskObservation,
     RiskSession, RiskStoreError, RiskSync, SessionRisk, StoreErrorOf, SyncOf, ViewSync,
 };
-// At the paths the MCP server reads them from.
-pub use zunder_venue_types::{InstrumentRules, Round};

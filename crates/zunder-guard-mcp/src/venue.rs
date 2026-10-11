@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use rust_decimal::Decimal;
 use serde_json::{Value, json};
 use zunder_core::{Side, Symbol};
-use zunder_venue::{InstrumentRules, Round};
+use zunder_venue_types::{InstrumentRules, Round};
 
 use crate::{contract::decimal_value, sanitize};
 

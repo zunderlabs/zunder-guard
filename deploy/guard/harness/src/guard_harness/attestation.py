@@ -58,8 +58,8 @@ def verify_predicate(
             str(bundle),
             "--repo",
             REPOSITORY,
-            "--signer-workflow",
-            f"{REPOSITORY}/.github/workflows/{workflow}",
+            # gh makes signer-workflow and certificate identity mutually exclusive.
+            # The anchored SAN policy below binds both the workflow and allowed ref.
             "--cert-identity-regex",
             "^" + identity,
             "--cert-oidc-issuer",

@@ -11,8 +11,9 @@ use crate::time::Timestamp;
 
 /// Instrument name as the venue spells it, e.g. `BTC` for the Hyperliquid BTC perp.
 ///
-/// Cheap to clone: the name is shared, not copied.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+/// Cheap to clone: the name is shared, not copied. Ordered and serialised as
+/// its name.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct Symbol(Arc<str>);
 
@@ -32,9 +33,54 @@ impl From<&str> for Symbol {
     }
 }
 
+impl From<String> for Symbol {
+    fn from(name: String) -> Self {
+        Self(Arc::from(name))
+    }
+}
+
+impl AsRef<str> for Symbol {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::ops::Deref for Symbol {
+    type Target = str;
+
+    fn deref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl PartialEq<Symbol> for str {
+    fn eq(&self, other: &Symbol) -> bool {
+        *self == *other.0
+    }
+}
+
+impl PartialEq<Symbol> for &str {
+    fn eq(&self, other: &Symbol) -> bool {
+        **self == *other.0
+    }
+}
+
+impl PartialEq<str> for Symbol {
+    fn eq(&self, other: &str) -> bool {
+        *self.0 == *other
+    }
+}
+
+impl PartialEq<&str> for Symbol {
+    fn eq(&self, other: &&str) -> bool {
+        *self.0 == **other
+    }
+}
+
 impl fmt::Display for Symbol {
+    /// The name, padded and aligned like a `str` (`{:<14}`).
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
+        f.pad(&self.0)
     }
 }
 
@@ -331,5 +377,11 @@ mod tests {
         assert_eq!(Symbol::new("BTC"), Symbol::from("BTC"));
         assert_ne!(Symbol::new("BTC"), Symbol::new("ETH"));
         assert_eq!(Symbol::new("BTC").to_string(), "BTC");
+        assert_eq!(Symbol::from(String::from("BTC")), Symbol::new("BTC"));
+        assert!(Symbol::new("BTC") == "BTC");
+        assert!("BTC" == Symbol::new("BTC"));
+        assert_eq!(Some(Symbol::new("BTC")).as_deref(), Some("BTC"));
+        assert!(Symbol::new("BTC") < Symbol::new("ETH"));
+        assert_eq!(format!("[{:<5}]", Symbol::new("BTC")), "[BTC  ]");
     }
 }

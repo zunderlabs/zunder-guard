@@ -13,24 +13,36 @@ TAG, COMMIT = "v1.0.0", "b" * 40
 IMAGE = "ghcr.io/zunderlabs/zunder-guard@sha256:" + "a" * 64
 
 
-def fixture_assets(path: Path, change: str = "") -> None:
+def fixture_assets(
+    path: Path,
+    change: str = "",
+    *,
+    tag: str = TAG,
+    commit: str = COMMIT,
+    image: str = IMAGE,
+) -> None:
     path.mkdir(mode=0o700)
     build = json.loads((ROOT / "release/examples/build-v2.json").read_text())
-    build["distribution"]["docker"]["digest"] = "sha256:" + "a" * 64
-    descriptor = IMAGE.replace("a" * 64, "c" * 64) if change == "descriptor" else IMAGE
+    build.update(tag=tag, version=tag[1:], commit=commit)
+    build["signing"]["identity"] = build["signing"]["identity"].replace(TAG, tag)
+    build["distribution"]["aws_template"]["url"] = build["distribution"]["aws_template"][
+        "url"
+    ].replace(TAG, tag)
+    build["distribution"]["docker"]["digest"] = image.split("@", 1)[1]
+    descriptor = image.replace("a" * 64, "c" * 64) if change == "descriptor" else image
     compose = (
-        (ROOT / "compose.yaml").read_text().replace("ghcr.io/zunderlabs/zunder-guard:latest", IMAGE)
+        (ROOT / "compose.yaml").read_text().replace("ghcr.io/zunderlabs/zunder-guard:latest", image)
     )
     if change == "compose":
         compose = compose.replace("a" * 64, "c" * 64)
     payloads = {
-        f"zunder-guard-{TAG}.image.txt": (descriptor + "\n").encode(),
+        f"zunder-guard-{tag}.image.txt": (descriptor + "\n").encode(),
         "compose.yaml": compose.encode(),
     }
     build["assets"] = {
         name: {
             "sha256": hashlib.sha256(data).hexdigest(),
-            "url": f"https://github.com/zunderlabs/zunder-guard/releases/download/{TAG}/{name}",
+            "url": f"https://github.com/zunderlabs/zunder-guard/releases/download/{tag}/{name}",
         }
         for name, data in payloads.items()
     }
@@ -42,7 +54,7 @@ def fixture_assets(path: Path, change: str = "") -> None:
         "".join(f"{hashlib.sha256(data).hexdigest()}  {name}\n" for name, data in payloads.items())
     )
     (path / ".verified-release-source.json").write_text(
-        json.dumps({"tag": TAG, "source": "c" * 40 if change == "source" else COMMIT})
+        json.dumps({"tag": tag, "source": "c" * 40 if change == "source" else commit})
     )
     if change == "tampered":
         (path / "compose.yaml").write_text("changed")
@@ -111,3 +123,100 @@ def test_runtime_requires_verifier_and_both_cleanup_results(
         assert receipt["release_ready"] is False
         assert receipt["image"] == IMAGE
         assert "fixture-token" not in json.dumps(receipt)
+
+
+@pytest.mark.parametrize("failure", ["", "previous-verifier", "same-image"])
+def test_both_upgrade_subjects_admitted_before_any_docker_operation(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    failure: str,
+) -> None:
+    tmp_path.chmod(0o700)
+    old_tag, old_commit = "v1.0.0-rc.1", "d" * 40
+    old_image = IMAGE.replace("a" * 64, "e" * 64)
+    calls: list[str] = []
+
+    def runner(argv: list[str], **kwargs: Any) -> RunResult:
+        if argv[0] == "bash":
+            candidate = argv[2] == TAG
+            calls.append("verify-current" if candidate else "verify-previous")
+            if not candidate and failure == "previous-verifier":
+                raise RuntimeError("previous admission refused")
+            fixture_assets(
+                Path(argv[3]),
+                tag=argv[2],
+                commit=COMMIT if candidate else old_commit,
+                image=IMAGE if candidate or failure == "same-image" else old_image,
+            )
+        else:
+            assert calls[:2] == ["verify-current", "verify-previous"]
+            calls.append("pull")
+            assert argv[:2] == ["docker", "pull"] and "GH_TOKEN" not in kwargs["env"]
+        return RunResult(0, "", kwargs["log"])
+
+    def lifecycle(image: str, account: str, **kwargs: Any) -> None:
+        calls.append("compose" if kwargs.get("compose") else "docker")
+        assert image == IMAGE and kwargs["previous_image"] == old_image
+        if kwargs.get("compose"):
+            assert (
+                kwargs["previous_compose"].read_bytes()
+                == (kwargs["work"].parent / "previous-assets/compose.yaml").read_bytes()
+            )
+
+    monkeypatch.setattr(docker_run, "run", runner)
+    monkeypatch.setattr(docker_run, "lifecycle", lifecycle)
+    work = tmp_path / "run"
+    if failure:
+        with pytest.raises((ValueError, RuntimeError)):
+            docker_run.execute(
+                tag=TAG,
+                commit=COMMIT,
+                account="0x" + "1" * 40,
+                work=work,
+                previous_tag=old_tag,
+                previous_commit=old_commit,
+            )
+        assert calls == ["verify-current", "verify-previous"]
+        assert not (work / "receipt.json").exists()
+    else:
+        docker_run.execute(
+            tag=TAG,
+            commit=COMMIT,
+            account="0x" + "1" * 40,
+            work=work,
+            previous_tag=old_tag,
+            previous_commit=old_commit,
+        )
+        assert calls == ["verify-current", "verify-previous", "pull", "pull", "docker", "compose"]
+        receipt = json.loads((work / "receipt.json").read_bytes())
+        assert receipt["previous_release"]["tag"] == old_tag
+        assert receipt["previous_release"]["commit"] == old_commit
+        assert receipt["release_ready"] is False
+
+
+@pytest.mark.parametrize(
+    "tag,commit",
+    [
+        ("v1.0.0-rc.1", None),
+        (None, "d" * 40),
+        (TAG, "d" * 40),
+        ("v1.0.1", "d" * 40),
+        ("v1.0.0-rc.1", COMMIT),
+        ("bad", "d" * 40),
+    ],
+)
+def test_previous_identity_must_be_complete_older_and_distinct(
+    tmp_path: Path,
+    tag: str | None,
+    commit: str | None,
+) -> None:
+    with pytest.raises(ValueError):
+        docker_run.execute(
+            tag=TAG,
+            commit=COMMIT,
+            account="0x" + "1" * 40,
+            work=tmp_path / "run",
+            previous_tag=tag,
+            previous_commit=commit,
+        )
+    assert not (tmp_path / "run").exists()

@@ -112,10 +112,27 @@ def _journal(guard: LocalGuard, decisions: Sequence[Decision]) -> None:
         raise PaperError("container lifecycle lost paper decision journal")
 
 
-def lifecycle(image: str, account: str, *, work: Path, compose: Path | None = None) -> None:
+def lifecycle(
+    image: str,
+    account: str,
+    *,
+    work: Path,
+    compose: Path | None = None,
+    previous_image: str | None = None,
+    previous_compose: Path | None = None,
+) -> None:
     """No venue key. A caller must verify release/cosign binding before E2E admission."""
     if not re.fullmatch(r"(?:ghcr\.io/zunderlabs/zunder-guard@)?sha256:[0-9a-f]{64}", image):
         raise ValueError("immutable image identity required")
+    if previous_image is not None and (
+        not re.fullmatch(
+            r"(?:ghcr\.io/zunderlabs/zunder-guard@)?sha256:[0-9a-f]{64}", previous_image
+        )
+        or previous_image.split("@")[-1] == image.split("@")[-1]
+    ):
+        raise ValueError("distinct immutable previous image required")
+    if (previous_compose is not None) != (compose is not None and previous_image is not None):
+        raise ValueError("previous Compose subject required only for a Compose upgrade")
     if not re.fullmatch(r"0x[0-9a-fA-F]{40}", account) or work.exists():
         raise ValueError("public read account and fresh workspace required")
     work.mkdir(mode=0o700)
@@ -128,9 +145,14 @@ def lifecycle(image: str, account: str, *, work: Path, compose: Path | None = No
         reservation.bind(("127.0.0.1", 0))
         host_port = reservation.getsockname()[1]
     expected_address = f"127.0.0.1:{host_port}"
+    initial_image = previous_image or image
+    initial_compose = previous_compose or compose
     docker = (
-        Docker(work) if compose is None else Compose(work, compose, image, name, volume, host_port)
+        Docker(work)
+        if initial_compose is None
+        else Compose(work, initial_compose, initial_image, name, volume, host_port)
     )
+    failures: list[BaseException] = []
     try:
         docker.command("volume", "create", volume)
         rules = json.loads((ROOT / "rules/vectors.json").read_bytes())["valid"][0]["canonical"]
@@ -138,7 +160,7 @@ def lifecycle(image: str, account: str, *, work: Path, compose: Path | None = No
             "run",
             "--rm",
             *mounted,
-            image,
+            initial_image,
             "init",
             "--non-interactive",
             "--network",
@@ -152,11 +174,13 @@ def lifecycle(image: str, account: str, *, work: Path, compose: Path | None = No
             rules,
             sensitive=True,
         )
-        paired = docker.command("run", "--rm", *mounted, image, "pair", "--json", sensitive=True)
+        paired = docker.command(
+            "run", "--rm", *mounted, initial_image, "pair", "--json", sensitive=True
+        )
         value = decode_json(paired.output, PAIR_SCHEMA)
         pair = Pair(value["client_address"], value["client_key"])
         docker.secrets = (pair.key, account)
-        launch = (
+        launch: tuple[str, ...] = (
             "run",
             "-d",
             "--name",
@@ -176,7 +200,7 @@ def lifecycle(image: str, account: str, *, work: Path, compose: Path | None = No
             f"{expected_address}:8547",
             "--env",
             "ZUNDER_GUARD_LISTEN=0.0.0.0:8547",
-            image,
+            initial_image,
             "run",
             "--network",
             "paper",
@@ -188,6 +212,33 @@ def lifecycle(image: str, account: str, *, work: Path, compose: Path | None = No
         guard = LocalGuard("http://" + address)
         first = _ready(guard)
         decisions = round_trip(guard, pair)
+        if previous_image is not None:
+            # Stop the old version before switching images. Retain its state volume,
+            # pairing and config; neither init nor pair is repeated by the candidate.
+            docker.command("logs", name)
+            docker.remove(name)
+            upgrade_logs = work / "upgrade"
+            upgrade_logs.mkdir(mode=0o700)
+            docker = (
+                Docker(upgrade_logs)
+                if compose is None
+                else Compose(upgrade_logs, compose, image, name, volume, host_port)
+            )
+            docker.secrets = (pair.key, account)
+            launch = tuple(image if arg == initial_image else arg for arg in launch)
+            docker.command(*launch)
+            if docker.command("port", name, "8547/tcp").output.strip() != expected_address:
+                raise PaperError("upgraded container loopback port refused")
+            if (
+                docker.command("inspect", "--format", "{{.Config.Image}}", name).output.strip()
+                != image
+            ):
+                raise PaperError("upgraded container image differs from candidate")
+            first = _ready(guard, after=int(str(first["started_at_ms"])))
+            _journal(guard, decisions)
+            # The old client must still sign successfully using retained config;
+            # journal presence alone cannot prove pairing survived the upgrade.
+            decisions = [*decisions, *round_trip(guard, pair)]
         last_seq = decisions[-1].seq
         docker.command("restart", name)
         restarted = _ready(guard, after=int(str(first["started_at_ms"])))
@@ -225,15 +276,24 @@ def lifecycle(image: str, account: str, *, work: Path, compose: Path | None = No
             raise PaperError("reinstalled container loopback port refused")
         _ready(guard, after=int(str(recovered["started_at_ms"])))
         _journal(guard, decisions)
+    except BaseException as error:
+        failures.append(error)
     finally:
-        # UUID ownership is established before any start; paper has no venue exposure.
-        try:
-            docker.command("logs", name)
-        finally:
+        # Attempt every owned cleanup even when an earlier step failed. Preserve the
+        # lifecycle failure alongside cleanup diagnostics instead of replacing its cause.
+        for cleanup in (
+            lambda: docker.command("logs", name),
+            lambda: docker.remove(name),
+            lambda: docker.command("volume", "rm", volume),
+        ):
             try:
-                docker.remove(name)
-            finally:
-                docker.command("volume", "rm", volume)
+                cleanup()
+            except BaseException as error:
+                failures.append(error)
+    if len(failures) == 1:
+        raise failures[0]
+    if failures:
+        raise BaseExceptionGroup("paper lifecycle and cleanup failures", failures)
 
     (work / "receipt.json").write_text(
         json.dumps(
@@ -241,7 +301,11 @@ def lifecycle(image: str, account: str, *, work: Path, compose: Path | None = No
                 "mode": "paper",
                 "channel": "docker" if compose is None else "compose",
                 "image": image,
-                "checks": [
+                "previous_image": previous_image,
+                "checks": (
+                    ["upgrade", "upgrade-journal", "upgrade-pairing"] if previous_image else []
+                )
+                + [
                     "init",
                     "pair",
                     "health",

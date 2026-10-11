@@ -1,4 +1,5 @@
 import json
+import re
 from pathlib import Path
 from typing import Any
 
@@ -27,6 +28,21 @@ def install_verifier(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, response: 
         assert argv[:3] == ["gh", "attestation", "verify"]
         # These are the verifier's trust boundaries, not a workflow text assertion.
         assert argv[argv.index("--repo") + 1] == attestation.REPOSITORY
+        identity = argv[argv.index("--cert-identity-regex") + 1]
+        assert "--signer-workflow" not in argv
+        assert "--signer-repo" not in argv
+        assert "--cert-identity" not in argv
+        base = f"https://github.com/{attestation.REPOSITORY}/.github/workflows/verify.yml@"
+        assert re.fullmatch(identity, base + "refs/tags/v1.0.0")
+        assert re.fullmatch(identity, base + "refs/heads/main")
+        for refused in (
+            base + "refs/heads/preview/topic",
+            base + "refs/tags/v1.0.1",
+            base + "refs/tags/v1.0.0-extra",
+            base.replace("verify.yml", "release.yml") + "refs/tags/v1.0.0",
+            base.replace("zunderlabs", "other-owner") + "refs/tags/v1.0.0",
+        ):
+            assert re.fullmatch(identity, refused) is None
         assert argv[argv.index("--source-digest") + 1] == "a" * 40
         assert "--deny-self-hosted-runners" in argv
         assert argv[argv.index("--predicate-type") + 1] == TYPE
