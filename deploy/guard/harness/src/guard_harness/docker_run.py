@@ -5,9 +5,11 @@ import hashlib
 import json
 import os
 import re
+import sys
 from pathlib import Path
 
 from guard_harness.docker_paper import lifecycle
+from guard_harness.docker_testnet import lifecycle as testnet_lifecycle
 from guard_harness.runner import run
 from guard_harness.staged_subjects import _private
 from guard_harness.testnet_run import ROOT, verified_asset
@@ -55,6 +57,10 @@ def execute(
     work: Path,
     previous_tag: str | None = None,
     previous_commit: str | None = None,
+    api_wallet: str | None = None,
+    testnet_key: bytes | None = None,
+    testnet_account: str | None = None,
+    diagnostic: bool = False,
 ) -> None:
     if (
         not re.fullmatch(r"v\d+\.\d+\.\d+(?:-rc\.[1-9]\d*)?", tag)
@@ -70,6 +76,16 @@ def execute(
         or previous_commit == commit
     ):
         raise ValueError("previous release must precede the candidate on distinct source bytes")
+    if (api_wallet is None) != (testnet_key is None):
+        raise ValueError("Testnet wallet and private stdin key required together")
+    if testnet_key is not None and (
+        previous_tag is None
+        or testnet_account is None
+        or not re.fullmatch(r"0x[0-9a-fA-F]{40}", testnet_account)
+        or not re.fullmatch(rb"[0-9a-fA-F]{64}\n", testnet_key)
+        or os.environ.get("GUARD_C6_SERIALIZED") != "1"
+    ):
+        raise ValueError("framed key, Testnet account, predecessor and C6 serialization required")
     _private(work.parent, directory=True)
     if not work.is_absolute() or work.exists() or work.is_symlink():
         raise ValueError("fresh private Docker workspace required")
@@ -150,9 +166,30 @@ def execute(
                 previous_image=previous_image,
                 previous_compose=previous_compose,
             )
+        if testnet_key is not None:
+            assert api_wallet is not None and testnet_account is not None
+            assert previous_image is not None and previous_tag is not None
+            for channel, source, predecessor in (
+                ("docker", None, None),
+                ("compose", compose, previous_compose),
+            ):
+                testnet_lifecycle(
+                    image,
+                    testnet_account,
+                    api_wallet=api_wallet,
+                    key=testnet_key,
+                    work=work / (channel + "-testnet"),
+                    previous_image=previous_image,
+                    version=tag.removeprefix("v"),
+                    previous_version=previous_tag.removeprefix("v"),
+                    compose=source,
+                    previous_compose=predecessor,
+                )
         (work / "receipt.json").write_text(
             json.dumps(
                 {
+                    "harness_commit": os.environ.get("GITHUB_SHA"),
+                    "diagnostic": diagnostic or os.environ.get("GITHUB_SHA") != commit,
                     "tag": tag,
                     "commit": commit,
                     "manifest_sha256": digest,
@@ -166,7 +203,8 @@ def execute(
                         "manifest_sha256": previous_digest,
                         "image": previous_image,
                     },
-                    "checks": ["signed-release", "docker-paper", "compose-paper"],
+                    "checks": ["signed-release", "docker-paper", "compose-paper"]
+                    + (["docker-testnet", "compose-testnet"] if testnet_key is not None else []),
                     "release_ready": False,
                 }
             )
@@ -183,7 +221,17 @@ def main() -> None:
     parser.add_argument("--work", type=Path, required=True)
     parser.add_argument("--previous-tag")
     parser.add_argument("--previous-commit")
-    execute(**vars(parser.parse_args()))
+    parser.add_argument("--api-wallet")
+    parser.add_argument("--testnet-account")
+    parser.add_argument("--testnet-key-stdin", action="store_true")
+    parser.add_argument("--diagnostic", action="store_true")
+    args = vars(parser.parse_args())
+    if args.pop("testnet_key_stdin"):
+        key = sys.stdin.buffer.read(68)
+        if key.startswith(b"0x"):
+            key = key[2:]
+        args["testnet_key"] = key
+    execute(**args)
 
 
 if __name__ == "__main__":

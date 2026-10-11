@@ -220,3 +220,76 @@ def test_previous_identity_must_be_complete_older_and_distinct(
             previous_commit=commit,
         )
     assert not (tmp_path / "run").exists()
+
+
+@pytest.mark.parametrize("failure", ["", "testnet-runtime", "previous-verifier"])
+def test_testnet_both_channels_require_authenticated_previous_subjects(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, failure: str
+) -> None:
+    tmp_path.chmod(0o700)
+    monkeypatch.setenv("GUARD_C6_SERIALIZED", "1")
+    monkeypatch.setenv("GITHUB_SHA", COMMIT)
+    key = ("0" * 63 + "1\n").encode()
+    calls: list[str] = []
+    previous_tag, previous_commit = "v0.9.0", "c" * 40
+    previous_image = IMAGE.replace("a" * 64, "d" * 64)
+
+    def runner(argv: list[str], **kwargs: Any) -> RunResult:
+        assert "E2E_TESTNET_API_WALLET_KEY" not in kwargs["env"]
+        assert key.decode().strip() not in str(argv)
+        if argv[0] == "bash":
+            tag = argv[2]
+            calls.append(tag)
+            if tag == previous_tag and failure == "previous-verifier":
+                raise RuntimeError("prior auth refused")
+            fixture_assets(
+                Path(argv[3]),
+                tag=tag,
+                commit=COMMIT if tag == TAG else previous_commit,
+                image=IMAGE if tag == TAG else previous_image,
+            )
+        return RunResult(0, "", kwargs["log"])
+
+    def paper(image: str, account: str, **kwargs: Any) -> None:
+        assert calls[:2] == [TAG, previous_tag]
+        calls.append(kwargs["work"].name)
+
+    def testnet(image: str, account: str, **kwargs: Any) -> None:
+        assert calls[:2] == [TAG, previous_tag]
+        assert account == "0x" + "e" * 40 and kwargs["key"] == key
+        assert kwargs["previous_image"] == previous_image
+        assert kwargs["version"] == TAG[1:] and kwargs["previous_version"] == previous_tag[1:]
+        calls.append(kwargs["work"].name)
+        if kwargs["compose"] is not None:
+            assert (
+                kwargs["compose"].read_bytes()
+                == (tmp_path / "run/assets/compose.yaml").read_bytes()
+            )
+        if failure == "testnet-runtime":
+            raise RuntimeError("actual lifecycle refused")
+
+    monkeypatch.setattr(docker_run, "run", runner)
+    monkeypatch.setattr(docker_run, "lifecycle", paper)
+    monkeypatch.setattr(docker_run, "testnet_lifecycle", testnet)
+    args: dict[str, Any] = dict(
+        tag=TAG,
+        commit=COMMIT,
+        account="0x" + "f" * 40,
+        work=tmp_path / "run",
+        previous_tag=previous_tag,
+        previous_commit=previous_commit,
+        testnet_account="0x" + "e" * 40,
+        api_wallet="0x" + "b" * 40,
+        testnet_key=key,
+    )
+    if failure:
+        with pytest.raises(RuntimeError):
+            docker_run.execute(**args)
+        assert not (tmp_path / "run/receipt.json").exists()
+    else:
+        docker_run.execute(**args)
+        receipt = json.loads((tmp_path / "run/receipt.json").read_text())
+        assert receipt["checks"][-2:] == ["docker-testnet", "compose-testnet"]
+        assert receipt["harness_commit"] == COMMIT and receipt["diagnostic"] is False
+        assert receipt["release_ready"] is False  # Admission belongs to the independent adapter.
+        assert calls[-2:] == ["docker-testnet", "compose-testnet"]

@@ -139,6 +139,13 @@ def staged_loader(
     return output
 
 
+def diagnostic_mode() -> bool:
+    value = os.environ.get("DIAGNOSTIC", "false")
+    if value not in {"true", "false"}:
+        raise ProcessError("explicit diagnostic boolean required")
+    return value == "true"
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ("tag", "commit", "previous-tag", "previous-commit"):
@@ -146,6 +153,7 @@ def main() -> None:
     parser.add_argument("--work", type=Path, required=True)
     parser.add_argument("--loader-channel", choices=("staging", "canonical"), default="staging")
     args = parser.parse_args()
+    diagnostic = diagnostic_mode()
     if not args.work.is_absolute() or args.work.exists() or args.previous_tag == args.tag:
         raise ProcessError("fresh workspace and distinct predecessor required")
     args.work.mkdir(mode=0o700)
@@ -160,6 +168,7 @@ def main() -> None:
             current, windows=True, output=args.work / "i-staging.ps1", channel=args.loader_channel
         )
         values = {
+            "diagnostic": diagnostic,
             "loader_channel": args.loader_channel,
             "harness_commit": os.environ.get("GITHUB_SHA", ""),
             "tag": args.tag,

@@ -276,6 +276,8 @@ def lifecycle(
             raise PaperError("reinstalled container loopback port refused")
         _ready(guard, after=int(str(recovered["started_at_ms"])))
         _journal(guard, decisions)
+        # A reused volume alone cannot prove the old client still authenticates.
+        _journal(guard, round_trip(guard, pair))
     except BaseException as error:
         failures.append(error)
     finally:
@@ -298,6 +300,12 @@ def lifecycle(
     (work / "receipt.json").write_text(
         json.dumps(
             {
+                "schema": 1,
+                "result": "passed",
+                "cleanup_complete": True,
+                "state_preserved": True,
+                "pairing_preserved": True,
+                "journal_preserved": True,
                 "mode": "paper",
                 "channel": "docker" if compose is None else "compose",
                 "image": image,
@@ -318,6 +326,8 @@ def lifecycle(
                     "crash-journal",
                     "reinstall",
                     "reinstall-journal",
+                    "reinstall-pairing",
+                    "cleanup",
                 ],
                 "last_decision_seq": last_seq,
             }

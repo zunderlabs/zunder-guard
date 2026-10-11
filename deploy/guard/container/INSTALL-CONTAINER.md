@@ -111,3 +111,20 @@ licence must also be active. Reinstallation preserves configuration, pairings, j
 risk stops. Missing or halted state is refused; no automatic journal reset or risk resume exists.
 The same durable activation gate, encrypted credentials, root ownership checks and independent
 owned-container guardian apply to Testnet. Failure leaves activation inhibited.
+
+## Local protected uninstall
+
+Run the authenticated release installer with `--uninstall --container --network testnet`
+(or explicit `mainnet`). This delegates to the installed supervisor without downloads,
+key input or venue calls. Uninstall requires an exact managed receipt and owned loaded
+services, the installer lock, no incomplete transaction, and completed setup operations.
+The runtime is stopped and its immutable owned container removed before the guardian is
+stopped; the guardian lock and operation history are checked again before removing units
+and helpers. Uncertain setup cleanup preserves software and restarts only the guardian.
+
+Only the two owned unit files, their exact activation drop-in and three installed helper
+files are removed. The named volume, encrypted credential, private supervisor configuration,
+managed receipt, completed operation history and root-only runtime lock data are retained.
+Shared immutable image cache is retained as recovery material. A refused uninstall never
+removes another container, a volume, an image or a credential. A daemon-reload failure keeps
+helpers for a retry; missing owned unit files are admitted only through the same receipt.

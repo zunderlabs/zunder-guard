@@ -82,6 +82,8 @@ Usage: sh install.sh [options]
   --source-commit SHA   explicit independently verified source for prepared-image phases
   --volume NAME         explicit named volume for container setup (default zunder-guard-data)
   --uninstall           Linux: stop/unregister the native service and remove binary/notices;
+                        --container --network MODE removes owned protected services/helpers;
+                        named volume and encrypted/private recovery data are retained
                         keep config, journals, pairings, credentials and service user
                         --no-service removes files only; stop foreground Guard first
   --install-only        verify and replace binary/notices only; no setup or service changes
@@ -143,6 +145,18 @@ if [ "$UNINSTALL$CONTAINER" = 11 ] && [ "$NETWORK" = paper ]; then
   fi
   [ "$(id -u)" -eq 0 ] || die "paper container uninstall requires root"
   exec /usr/bin/python3 -I /usr/local/libexec/zunder-guard-container-paper/install.py --uninstall
+fi
+
+# Protected container removal is local and uses the admitted installed helper only.
+if [ "$UNINSTALL$CONTAINER" = 11 ]; then
+  case "$NETWORK" in testnet | mainnet) ;; *) die "protected container uninstall requires explicit testnet or mainnet network" ;; esac
+  if [ -n "$RULES$ACCOUNT_NETWORK$ACCOUNT$KEY_FILE$CONFIRM$CAP$PREFIX$LISTEN$SHARE$LICENCE$VOLUME$REGISTRY_AUTH$SOURCE_COMMIT$SERVICE_INSTANCE" ] \
+    || [ "$KEY_STDIN$FORCE$INSTALL_ONLY$PREPARE_IMAGE$PREPARED_IMAGE$NO_SERVICE" != 000000 ]; then
+    die "protected container uninstall accepts no setup input"
+  fi
+  [ "$(uname -s)" = Linux ] || die "protected container uninstall requires Linux"
+  [ "$(id -u)" -eq 0 ] || die "protected container uninstall requires root"
+  exec /usr/bin/python3 -I /usr/local/libexec/zunder-guard-container/supervisor.py uninstall --network "$NETWORK"
 fi
 
 # Uninstall is entirely local: never download, initialize, read a key or start Guard.

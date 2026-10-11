@@ -54,7 +54,9 @@ fi
 step "actionlint"
 workflow_dir=$G/github/workflows
 if [ ! -d "$workflow_dir" ]; then workflow_dir=.github/workflows; fi
-$DOCKER run --rm -v "$PWD/$workflow_dir:/w:ro" -w /w rhysd/actionlint:1.7.12 -no-color release.yml verify.yml promote.yml nightly.yml monitor.yml ci.yml install-matrix.yml journey.yml
+python3 "$G/test/workflow-concurrency.py" "$workflow_dir"/*.yml
+# GitHub queue:max (May 2026) is valid; pinned actionlint predates that key.
+$DOCKER run --rm -v "$PWD/$workflow_dir:/w:ro" -w /w rhysd/actionlint:1.7.12 -ignore '^unexpected key "queue" for "concurrency" section\.' -no-color release.yml verify.yml promote.yml nightly.yml monitor.yml ci.yml install-matrix.yml journey.yml
 echo "  ok: release.yml verify.yml promote.yml nightly.yml monitor.yml ci.yml install-matrix.yml journey.yml"
 
 step "hadolint"

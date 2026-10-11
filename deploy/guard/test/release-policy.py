@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 import shutil
+import runpy
 from pathlib import Path
 import subprocess
 import tempfile
@@ -28,6 +29,24 @@ REF = 'ghcr.io/zunderlabs/zunder-guard@sha256:' + 'b' * 64
 SERVICE_ASSETS = ['install-windows-service.ps1', 'install-macos-service.sh', 'install-container.py', 'container-supervisor.py',
                   'container-operations.py', 'zunder-guard-container.service',
                   'zunder-guard-setup-guardian.service']
+
+
+class WorkflowQueue(unittest.TestCase):
+    def test_shared_queue_keeps_every_pending_job_without_interrupting_protection(self):
+        validate = runpy.run_path(str(SCRIPT.parent.parent / "test/workflow-concurrency.py"))["validate"]
+        validate(list(WORKFLOWS.glob("*.yml")))
+        for patch_value in ({"queue": "single"}, {"queue": "invalid"}, {"cancel-in-progress": True}):
+            with tempfile.TemporaryDirectory() as directory:
+                paths = []
+                for source in WORKFLOWS.glob("*.yml"):
+                    document = yaml.safe_load(source.read_text())
+                    if source.name == "install-matrix.yml":
+                        document["jobs"]["native"]["concurrency"].update(patch_value)
+                    target = Path(directory) / source.name
+                    target.write_text(yaml.safe_dump(document))
+                    paths.append(target)
+                with self.assertRaises(ValueError):
+                    validate(paths)
 
 
 class PublicationGate(unittest.TestCase):

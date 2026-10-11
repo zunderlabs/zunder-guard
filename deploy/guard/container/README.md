@@ -65,12 +65,25 @@ licence must report `fee.mode` as `fee_free`. Pay-per-order entries require
 <https://zunderlabs.com/approve> using that account's main wallet on Hyperliquid Mainnet.
 A running service alone is not proof that entries are ready.
 
-To stop and retire the runtime supervisor:
+To uninstall the protected Testnet or mainnet service, use the authenticated installer
+already downloaded for this installation (replace `testnet` with `mainnet` for that mode):
 
 ```sh
-sudo systemctl stop zunder-guard-container.service
-sudo systemctl disable zunder-guard-container.service
+sudo sh install.sh --uninstall --container --network testnet --non-interactive
 ```
+
+This local route downloads nothing and reads no wallet key. It authenticates the managed
+receipt against both installed software and systemd's loaded services, refuses incomplete
+installer transactions or unresolved setup operations, and stops the owned runtime before
+stopping the cleanup guardian. It unregisters both services and removes their owned helpers
+and activation condition. A foreign service, helper, drop-in or volume user is refused.
+
+The named Docker volume (configuration, pairings and journals), encrypted credential,
+`/etc/zunder-guard-container` configuration/managed receipt/operation history, and root-only
+runtime lock data remain for recovery. Shared cached immutable Docker images also remain;
+no image or volume is deleted. Reinstall with the same named volume and account using a new
+authenticated release; never recreate its journals or automatically resume a risk halt.
+Stopping/disabling a supervisor alone is a pause and does not uninstall its software.
 
 Keep the named volume and journals for recovery. Credential and volume deletion are separate
 explicit decisions; never start two Guards against the same journal. Do not remove the setup

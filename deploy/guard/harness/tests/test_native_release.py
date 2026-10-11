@@ -8,8 +8,25 @@ import pytest
 from test_testnet_run import COMMIT, NAME, TAG, assets
 
 from guard_harness.native_paper import LifecycleError, retained, verify_retained
-from guard_harness.native_release import Release, archive_binary
+from guard_harness.native_release import Release, archive_binary, diagnostic_mode
 from guard_harness.testnet_process import ProcessError
+
+
+@pytest.mark.parametrize("value,expected", [("false", False), ("true", True)])
+def test_diagnostic_identity_preserves_explicit_boolean(
+    monkeypatch: pytest.MonkeyPatch, value: str, expected: bool
+) -> None:
+    monkeypatch.setenv("DIAGNOSTIC", value)
+    assert diagnostic_mode() is expected
+
+
+@pytest.mark.parametrize("value", ["", "True", "0", "False", "invalid"])
+def test_diagnostic_identity_refuses_ambiguous_values(
+    monkeypatch: pytest.MonkeyPatch, value: str
+) -> None:
+    monkeypatch.setenv("DIAGNOSTIC", value)
+    with pytest.raises(ProcessError, match="diagnostic boolean"):
+        diagnostic_mode()
 
 
 def test_snapshot_binds_exact_source_manifest_and_payload(tmp_path: Path) -> None:
@@ -68,16 +85,16 @@ def test_archive_refuses_paths_or_missing_binary(windows: bool, name: str) -> No
 
 
 def test_journal_prefix_and_exact_pairing_configuration(tmp_path: Path) -> None:
-    for name in ("guard.toml", "risk.jsonl", "decisions.jsonl"):
+    for name in ("guard.toml", "risk-paper.jsonl", "decisions-paper.jsonl"):
         (tmp_path / name).write_bytes(b"original\n")
     before = retained(tmp_path)
-    (tmp_path / "risk.jsonl").write_bytes(b"original\nappended\n")
+    (tmp_path / "risk-paper.jsonl").write_bytes(b"original\nappended\n")
     verify_retained(before, tmp_path)
     (tmp_path / "guard.toml").write_bytes(b"lost pairing")
     with pytest.raises(LifecycleError, match="configuration"):
         verify_retained(before, tmp_path)
     (tmp_path / "guard.toml").write_bytes(b"original\n")
-    (tmp_path / "risk.jsonl").write_bytes(b"replacement\n")
+    (tmp_path / "risk-paper.jsonl").write_bytes(b"replacement\n")
     with pytest.raises(LifecycleError, match="journal"):
         verify_retained(before, tmp_path)
 

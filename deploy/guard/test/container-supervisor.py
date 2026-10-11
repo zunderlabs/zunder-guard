@@ -611,5 +611,350 @@ class NativeHarnessBoundaryTests(unittest.TestCase):
                         self.assertNotIn(key.decode().strip(), str(error.exception))
 
 
+
+
+class UninstallTests(unittest.TestCase):
+    """Ownership/lifecycle boundary fixtures, not native systemd/Docker evidence."""
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.base = self.root / 'state'
+        self.base.mkdir(mode=0o700)
+        (self.base / 'docker-config').mkdir(mode=0o700)
+        (self.base / 'operations').mkdir(mode=0o700)
+        self.lib = self.root / 'lib'
+        self.lib.mkdir()
+        self.units = self.root / 'units'
+        self.units.mkdir()
+        self.runtime = self.root / 'runtime'
+        self.runtime.mkdir(mode=0o700)
+        self.helper = self.lib / 'supervisor.py'
+        self.helper.write_bytes(SOURCE.read_bytes())
+        self.operations = self.lib / 'operations.py'
+        self.operations.write_bytes(SOURCE.with_name('operations.py').read_bytes())
+        self.unit = self.units / supervisor.UNIT
+        self.unit.write_bytes(SOURCE.with_name(supervisor.UNIT).read_bytes())
+        self.guardian = self.units / supervisor.GUARDIAN
+        self.guardian.write_bytes(SOURCE.with_name(supervisor.GUARDIAN).read_bytes())
+        self.unit_source = self.lib / supervisor.UNIT
+        self.unit_source.write_bytes(self.unit.read_bytes())
+        self.config = dict(image=IMAGE, tag='v1.0.0', volume='existing-data', account=ACCOUNT,
+                           instance=INSTANCE, mode='testnet')
+        self.write(self.base / 'config.json', self.config)
+        self.write(self.base / 'credential.cred', 'synthetic encrypted recovery data')
+        assets = [self.unit, self.guardian, self.unit_source, self.operations, self.helper]
+        self.receipt = dict(version=1, account=ACCOUNT, volume='existing-data', mode='testnet',
+            allowed_files={str(p): [hashlib.sha256(p.read_bytes()).hexdigest()] for p in assets},
+            config_refs=[{k: self.config[k] for k in ('account', 'volume', 'tag', 'image', 'mode')}])
+        self.write(self.base / 'managed-install.json', self.receipt)
+        self.assets = assets
+        self.host = FakeHost()
+        self.states = {supervisor.UNIT: 'loaded', supervisor.GUARDIAN: 'loaded'}
+        self.guardian_enabled = 'enabled'
+        self.guardian_active = 'active'
+        self.foreign_fragment = False
+        self.foreign_command = False
+        self.fail_reload = False
+        for attr, value in [('BASE', self.base), ('RUNTIME', self.runtime),
+                            ('HELPER', self.helper), ('UNIT_PATH', self.unit), ('UNIT_SOURCE', self.unit_source)]:
+            self.addCleanup(patch.stopall)
+            patch.object(supervisor, attr, value).start()
+        patch.object(supervisor, 'trusted', lambda *args, **kwargs: None).start()
+        # Root path ownership is independently tested by BoundaryTests. This fixture runs
+        # without root; preserve actual nonblocking flock behavior and bounded private files.
+        patch.object(supervisor, 'private_lock', self.lock).start()
+        patch.object(supervisor, 'execute', self.execute).start()
+        patch.object(supervisor, 'service_inactive', lambda unit: None).start()
+
+    def write(self, path, value):
+        path.write_text(json.dumps(value))
+        path.chmod(0o600)
+
+    def lock(self, path):
+        descriptor = os.open(path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+        try:
+            supervisor.fcntl.flock(descriptor, supervisor.fcntl.LOCK_EX | supervisor.fcntl.LOCK_NB)
+        except BaseException:
+            os.close(descriptor)
+            raise
+        return descriptor
+
+    def execute(self, argv, *, data=None):
+        self.assertIsNone(data)
+        if argv[0] != supervisor.SYSTEMCTL:
+            return self.host.execute(argv, data=data)
+        self.host.calls.append(list(argv))
+        if argv[1] == 'show':
+            unit = argv[2]
+            prop = argv[3].removeprefix('--property=')
+            if prop == 'ActiveState':
+                return self.guardian_active.encode()
+            if prop == 'UnitFileState':
+                return self.guardian_enabled.encode()
+            if prop == 'LoadState':
+                return self.states[unit].encode()
+            if prop == 'FragmentPath':
+                return (('/foreign.service' if self.foreign_fragment else str(self.units / unit))
+                        if self.states[unit] == 'loaded' else '').encode()
+            if prop == 'DropInPaths':
+                return b''
+            if prop == 'ExecStart':
+                helper = self.helper if unit == supervisor.UNIT else self.operations
+                command = ['/usr/bin/python3', str(helper), 'run'] if unit == supervisor.UNIT else ['/usr/bin/python3', '-I', str(helper)]
+                if self.foreign_command is True or self.foreign_command == unit:
+                    command[-1] = '/foreign-command'
+                return ('{ path=/usr/bin/python3 ; argv[]=' + ' '.join(command) + ' ; }').encode()
+            raise AssertionError(prop)
+        if argv[1] in ('start', 'stop') and argv[2] == supervisor.GUARDIAN:
+            self.guardian_active = 'active' if argv[1] == 'start' else 'inactive'
+        if argv[1] == 'disable':
+            supervisor.require((self.units / argv[2]).exists(), 'missing unit cannot be disabled')
+        if argv[1] in ('enable', 'disable') and argv[2] == supervisor.GUARDIAN:
+            self.guardian_enabled = 'enabled' if argv[1] == 'enable' else 'disabled'
+        if argv[1] == 'daemon-reload':
+            supervisor.require(not self.fail_reload, 'reload fixture failed')
+            for unit in self.states:
+                if not (self.units / unit).exists():
+                    self.states[unit] = 'not-found'
+        return b''
+
+    def uninstall(self):
+        with contextlib.redirect_stdout(io.StringIO()):
+            supervisor.uninstall('testnet')
+
+    def test_owned_uninstall_removes_only_software_retains_private_data(self):
+        original = {p: p.read_bytes() for p in self.base.rglob('*') if p.is_file()}
+        self.host.container()
+        self.uninstall()
+        self.assertFalse(any(p.exists() for p in self.assets))
+        self.assertFalse(self.lib.exists())
+        self.assertFalse(self.host.containers)
+        self.assertEqual(set(self.states.values()), {'not-found'})
+        for path, data in original.items():
+            self.assertEqual(path.read_bytes(), data)
+        calls = self.host.calls
+        self.assertIn([supervisor.SYSTEMCTL, 'disable', supervisor.GUARDIAN], calls)
+        self.assertFalse(any('pull' in call or 'run' in call or 'encrypt' in call for call in calls))
+        self.assertFalse(any(call[5:7] == ['volume', 'rm'] for call in calls))
+
+    def test_foreign_software_loaded_fragment_command_and_dropin_refuse_before_stop(self):
+        for failure in ('hash', 'fragment', 'command', 'dropin', 'config-ref'):
+            with self.subTest(failure=failure):
+                original = self.operations.read_bytes()
+                dropin_dir = self.unit.with_name(supervisor.UNIT + '.d')
+                if failure == 'hash':
+                    self.operations.write_bytes(b'foreign')
+                elif failure == 'fragment':
+                    self.foreign_fragment = True
+                elif failure == 'command':
+                    self.foreign_command = True
+                elif failure == 'dropin':
+                    dropin_dir.mkdir()
+                    (dropin_dir / 'foreign.conf').write_text('foreign')
+                else:
+                    changed = copy.deepcopy(self.receipt)
+                    changed['config_refs'][0]['image'] = IMAGE.replace('a' * 64, 'f' * 64)
+                    self.write(self.base / 'managed-install.json', changed)
+                with self.assertRaises(supervisor.Refused):
+                    self.uninstall()
+                self.assertTrue(all(p.exists() for p in self.assets))
+                self.assertFalse(any(call[1] == 'stop' for call in self.host.calls))
+                self.operations.write_bytes(original)
+                self.foreign_fragment = self.foreign_command = False
+                if dropin_dir.exists():
+                    (dropin_dir / 'foreign.conf').unlink()
+                    dropin_dir.rmdir()
+                self.write(self.base / 'managed-install.json', self.receipt)
+
+    def test_gate_foreign_volume_and_failed_docker_read_preserve_software(self):
+        gate = self.base / 'install-transaction.json'
+        for failure in ('gate', 'foreign-container', 'docker-down'):
+            with self.subTest(failure=failure):
+                if failure == 'gate':
+                    self.write(gate, {'phase': 'incomplete'})
+                elif failure == 'foreign-container':
+                    self.host.container(Name='/someone-else')
+                else:
+                    self.host.daemon_down = True
+                with self.assertRaises(supervisor.Refused):
+                    self.uninstall()
+                self.assertTrue(all(p.exists() for p in self.assets))
+                self.assertFalse(any(call[1] == 'stop' for call in self.host.calls))
+                if gate.exists():
+                    gate.unlink()
+                self.host.containers.clear()
+                self.host.daemon_down = False
+
+    def test_unresolved_and_legacy_ambiguous_operation_refuses_guardian_stop(self):
+        path = self.base / 'operations' / ('a' * 32)
+        path.mkdir(mode=0o700)
+        self.write(path / 'record.json', dict(version=2, operation=path.name, image=IMAGE,
+            volume='existing-data', boot=str(supervisor.uuid.UUID(int=0)), created=1.0))
+        for outcome in ('missing', 'legacy', 'ambiguous-create', 'malformed'):
+            with self.subTest(outcome=outcome):
+                done = path / 'done.json'
+                if outcome != 'missing':
+                    self.write(done, {'version': 1 if outcome == 'legacy' else 2,
+                                     'outcome': 'never-dispatched'})
+                if outcome == 'ambiguous-create':
+                    self.write(path / 'create.json', {})
+                if outcome == 'malformed':
+                    done.write_text('not-json')
+                with self.assertRaises((supervisor.Refused, ValueError)):
+                    self.uninstall()
+                self.assertTrue(all(p.exists() for p in self.assets))
+                self.assertFalse(any(call[1] == 'stop' for call in self.host.calls))
+                for name in ('done.json', 'create.json'):
+                    if (path / name).exists():
+                        (path / name).unlink()
+
+    def test_post_guardian_uncertainty_restarts_only_cleanup_guardian(self):
+        calls = 0
+        def pending():
+            nonlocal calls
+            calls += 1
+            return [] if calls < 3 else [Path('unresolved')]
+        with patch.object(supervisor, 'uninstall_pending', pending):
+            with self.assertRaises(supervisor.Refused):
+                self.uninstall()
+        self.assertTrue(all(p.exists() for p in self.assets))
+        self.assertIn([supervisor.SYSTEMCTL, 'start', supervisor.GUARDIAN], self.host.calls)
+        self.assertNotIn([supervisor.SYSTEMCTL, 'start', supervisor.UNIT], self.host.calls)
+
+    def test_late_uncertainty_restores_original_guardian_boot_state(self):
+        for original in ('enabled', 'disabled'):
+            with self.subTest(original=original):
+                self.guardian_enabled = original
+                calls = 0
+                def pending():
+                    nonlocal calls
+                    calls += 1
+                    return [] if calls < 3 else [Path('late-pending')]
+                with patch.object(supervisor, 'uninstall_pending', pending):
+                    with self.assertRaises(supervisor.Refused):
+                        self.uninstall()
+                self.assertEqual(self.guardian_enabled, original)
+                self.assertEqual(self.guardian_active, 'active')
+                self.assertTrue(all(p.exists() for p in self.assets))
+                self.assertIn([supervisor.SYSTEMCTL, 'start', supervisor.GUARDIAN], self.host.calls)
+                self.assertNotIn([supervisor.SYSTEMCTL, 'start', supervisor.UNIT], self.host.calls)
+
+    def test_recovery_never_starts_changed_guardian_helper_or_loaded_command(self):
+        for failure in ('operations-hash', 'guardian-command', 'runtime-only'):
+            with self.subTest(failure=failure):
+                original = self.operations.read_bytes()
+                admission = supervisor.uninstall_admit
+                count = 0
+                mutated_at = 0
+                def admit(config, *, guardian_only=False):
+                    nonlocal count, mutated_at
+                    if not guardian_only:
+                        count += 1
+                        if count == 2:
+                            mutated_at = len(self.host.calls)
+                            if failure == 'operations-hash':
+                                self.operations.write_bytes(b'altered root helper')
+                            else:
+                                self.foreign_command = (supervisor.GUARDIAN if failure == 'guardian-command'
+                                                        else supervisor.UNIT)
+                    return admission(config, guardian_only=guardian_only)
+                with patch.object(supervisor, 'uninstall_admit', admit):
+                    with self.assertRaises(supervisor.Refused):
+                        self.uninstall()
+                recovery = self.host.calls[mutated_at:]
+                if failure == 'runtime-only':
+                    self.assertIn([supervisor.SYSTEMCTL, 'enable', supervisor.GUARDIAN], recovery)
+                    self.assertIn([supervisor.SYSTEMCTL, 'start', supervisor.GUARDIAN], recovery)
+                else:
+                    self.assertFalse(any(call[1] in ('enable', 'start') for call in recovery))
+                self.assertTrue(all(p.exists() for p in self.assets))
+                self.assertNotIn([supervisor.SYSTEMCTL, 'start', supervisor.UNIT], recovery)
+                self.operations.write_bytes(original)
+                self.foreign_command = False
+                self.guardian_enabled = 'enabled'
+                self.guardian_active = 'active'
+
+    def test_installer_lock_blocks_without_reading_or_stopping(self):
+        lock = self.lock(self.base / 'installer.lock')
+        try:
+            with self.assertRaises(BlockingIOError):
+                self.uninstall()
+            self.assertFalse(self.host.calls)
+        finally:
+            os.close(lock)
+
+    def test_partial_service_removal_retry_keeps_helpers_until_confirmed_reload(self):
+        self.fail_reload = True
+        with self.assertRaises(supervisor.Refused):
+            self.uninstall()
+        self.assertFalse(self.unit.exists() or self.guardian.exists())
+        self.assertTrue(self.helper.exists() and self.operations.exists())
+        self.fail_reload = False
+        self.uninstall()
+        self.assertFalse(any(p.exists() for p in self.assets))
+
+    def test_unloaded_guardian_dropin_and_broken_create_symlink_refuse(self):
+        directory = self.guardian.with_name(supervisor.GUARDIAN + '.d')
+        directory.mkdir()
+        foreign = directory / 'foreign.conf'
+        foreign.write_text('unloaded foreign directive')
+        with self.assertRaises(supervisor.Refused):
+            self.uninstall()
+        self.assertTrue(all(p.exists() for p in self.assets))
+        foreign.unlink()
+        directory.rmdir()
+        path = self.base / 'operations' / ('a' * 32)
+        path.mkdir(mode=0o700)
+        self.write(path / 'record.json', dict(version=2, operation=path.name, image=IMAGE,
+            volume='existing-data', boot=str(supervisor.uuid.UUID(int=0)), created=1.0))
+        self.write(path / 'done.json', {'version': 2, 'outcome': 'never-dispatched'})
+        (path / 'create.json').symlink_to(path / 'missing-create')
+        with self.assertRaises(supervisor.Refused):
+            self.uninstall()
+        self.assertFalse(any(call[1] == 'stop' for call in self.host.calls))
+
+    def test_completed_operation_history_preserved(self):
+        path = self.base / 'operations' / ('a' * 32)
+        path.mkdir(mode=0o700)
+        self.write(path / 'record.json', dict(version=2, operation=path.name, image=IMAGE,
+            volume='existing-data', boot=str(supervisor.uuid.UUID(int=0)), created=1.0))
+        self.write(path / 'done.json', {'version': 2, 'outcome': 'removed', 'id': ID})
+        self.write(path / 'id.json', ID)
+        before = {p: p.read_bytes() for p in path.iterdir()}
+        self.uninstall()
+        for p, content in before.items():
+            self.assertEqual(p.read_bytes(), content)
+
+
+
+class UninstallDelegationTests(unittest.TestCase):
+    def test_early_local_bridge_requires_explicit_network_and_no_setup_input(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            tools = root / 'bin'
+            tools.mkdir()
+            for name, response in [('uname', 'Linux'), ('id', '0')]:
+                tool = tools / name
+                tool.write_text('#!/bin/sh\nprintf "%s\\n" "' + response + '"\n')
+                tool.chmod(0o700)
+            helper = root / 'supervisor.py'
+            helper.write_text('import sys\nprint(" ".join(sys.argv[1:]))\n')
+            script = root / 'install.sh'
+            installer = SOURCE.parents[1] / 'install.sh'
+            script.write_text(installer.read_text().replace('/usr/local/libexec/zunder-guard-container/supervisor.py', str(helper)))
+            env = {'PATH': str(tools) + os.pathsep + os.environ['PATH']}
+            for mode in ('testnet', 'mainnet'):
+                result = subprocess.run(['sh', str(script), '--uninstall', '--container', '--network', mode, '--non-interactive'],
+                    env=env, stdin=subprocess.DEVNULL, capture_output=True, check=False)
+                self.assertEqual(result.returncode, 0, result.stderr.decode())
+                self.assertEqual(result.stdout.decode().strip(), 'uninstall --network ' + mode)
+            for extras in ([], ['--network', 'paper', '--key-stdin'], ['--network', 'testnet', '--key-stdin'],
+                           ['--network', 'testnet', '--volume', 'other-data'], ['--network', 'mainnet', '--no-service']):
+                result = subprocess.run(['sh', str(script), '--uninstall', '--container', *extras], env=env,
+                    stdin=subprocess.DEVNULL, capture_output=True, check=False)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertNotIn(b'uninstall --network', result.stdout)
+
 if __name__ == '__main__':
     unittest.main()

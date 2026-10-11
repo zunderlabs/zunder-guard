@@ -1691,12 +1691,10 @@ fn recent_decisions_quote_guard_and_leave_requests_out() {
 
 #[test]
 fn an_unreachable_guard_is_reported_plainly() {
-    // A port nothing listens on: bind, note it, close it.
-    let port = std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port();
+    // Port 1 is privileged: no test (and no unprivileged process) can listen there, so the
+    // connection is refused every time. A port bound and closed again could be taken by a
+    // mock Guard of a test running in parallel.
+    let port = 1;
     let mut server = zunder_guard_mcp::tools::Server::new(
         zunder_guard_mcp::tools::Config {
             network: Mode::Testnet,

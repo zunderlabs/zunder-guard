@@ -5,6 +5,7 @@ installer or substituted binary can stand in for the predecessor.
 """
 
 import json
+import platform
 import re
 import time
 from pathlib import Path
@@ -200,6 +201,32 @@ class ContainerLifecycle(NativeLifecycle):
         require(not names, "uninstall left managed container")
         record.update(
             stage="passed",
+            schema=1,
+            result="passed",
+            mode="paper",
+            route="container",
+            architecture={"x86_64": "amd64", "aarch64": "arm64"}.get(platform.machine()),
+            reboot_required=require_reboot,
+            cleanup_complete=True,
+            state_preserved=True,
+            pairing_preserved=True,
+            journal_preserved=True,
+            coverage=[
+                "install",
+                "health",
+                "pair",
+                "paper-allow-resize-veto",
+                "restart",
+                "crash-recovery",
+                "journal-history",
+                "upgrade",
+                "reinstall",
+                "state-retained",
+                "pairing-retained",
+                "uninstall",
+                "cleanup",
+            ]
+            + (["kernel-reboot"] if require_reboot else []),
             reboot_boot_id=boot,
             preserved_state=before,
             version=self.inputs.version,

@@ -52,7 +52,17 @@ def configuration(original: str) -> str:
     return text
 
 
-def execute(release: Release, binary: Path, *, account: str, rules: str, work: Path) -> None:
+def execute(
+    release: Release,
+    binary: Path,
+    *,
+    account: str,
+    rules: str,
+    work: Path,
+    account_network: str = "mainnet",
+) -> None:
+    if account_network not in {"mainnet", "testnet"}:
+        raise MatrixError("paper constructor account network refused")
     if (
         binary.is_symlink()
         or hashlib.sha256(binary.read_bytes()).digest()
@@ -73,7 +83,7 @@ def execute(release: Release, binary: Path, *, account: str, rules: str, work: P
             "--network",
             "paper",
             "--account-network",
-            "mainnet",
+            account_network,
             "--account",
             account,
             "--rules",

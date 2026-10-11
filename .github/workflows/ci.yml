@@ -585,8 +585,10 @@ jobs:
           retention-days: 7
       - name: actionlint
         run: |
+          python3 deploy/guard/test/workflow-concurrency.py .github/workflows/*.yml
+          # Validate queue semantics above; actionlint predates GitHub queue:max.
           docker run --rm -v "$PWD:/repo:ro" -w /repo rhysd/actionlint:1.7.12 \
-            -shellcheck= .github/workflows/*.yml
+            -ignore '^unexpected key "queue" for "concurrency" section\.' -shellcheck= .github/workflows/*.yml
 
   image:
     runs-on: ubuntu-24.04

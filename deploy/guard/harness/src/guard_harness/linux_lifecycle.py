@@ -8,6 +8,7 @@ import argparse
 import hashlib
 import json
 import os
+import platform
 import re
 import time
 from collections.abc import Callable
@@ -267,6 +268,32 @@ class NativeLifecycle:
             )
         record.update(
             stage="passed",
+            schema=1,
+            result="passed",
+            mode="paper",
+            route="native",
+            architecture={"x86_64": "amd64", "aarch64": "arm64"}.get(platform.machine()),
+            reboot_required=require_reboot,
+            cleanup_complete=True,
+            state_preserved=True,
+            pairing_preserved=True,
+            journal_preserved=True,
+            coverage=[
+                "install",
+                "health",
+                "pair",
+                "paper-allow-resize-veto",
+                "restart",
+                "crash-recovery",
+                "journal-history",
+                "upgrade",
+                "reinstall",
+                "state-retained",
+                "pairing-retained",
+                "uninstall",
+                "cleanup",
+            ]
+            + (["kernel-reboot"] if require_reboot else []),
             reboot_boot_id=boot,
             preserved_state=before,
             version=self.inputs.version,

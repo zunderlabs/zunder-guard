@@ -27,7 +27,7 @@ def digest(path: Path) -> str:
 
 
 def retained(home: Path) -> dict[str, bytes]:
-    required = ("guard.toml", "risk.jsonl", "decisions.jsonl")
+    required = ("guard.toml", "risk-paper.jsonl", "decisions-paper.jsonl")
     if any(not (home / name).is_file() for name in required):
         raise LifecycleError("configuration or journal missing")
     return {name: (home / name).read_bytes() for name in required}

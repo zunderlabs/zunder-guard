@@ -46,6 +46,7 @@ jobs:
     concurrency:
       group: guard-e2e-testnet
       cancel-in-progress: false
+      queue: max
     permissions:
       contents: read
       actions: read
@@ -209,6 +210,7 @@ jobs:
     concurrency:
       group: guard-e2e-testnet
       cancel-in-progress: false
+      queue: max
     permissions:
       contents: read
       actions: read

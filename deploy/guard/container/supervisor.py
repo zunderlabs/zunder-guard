@@ -6,6 +6,7 @@ Install only verified release bytes. This helper never initializes or resets Gua
 import argparse
 import fcntl
 import getpass
+import hashlib
 import importlib.util
 import json
 import os
@@ -153,7 +154,7 @@ def inspect_owned(identifier, config):
     return obj
 
 
-def cleanup(config):
+def owned_containers(config):
     # Name resolution never authorizes deletion. Inspect/reinspect the immutable ID.
     named = ids('name=^/' + NAME + '$')
     require(len(named) <= 1, 'Ambiguous supervisor container name.')
@@ -163,6 +164,11 @@ def cleanup(config):
             'Another container owns this instance or volume; stop and resolve it first.')
     for identifier in named:
         inspect_owned(identifier, config)
+    return named
+
+
+def cleanup(config):
+    for identifier in owned_containers(config):
         inspect_owned(identifier, config)
         docker('container', 'stop', '--time', '45', identifier)
         # --rm may already have removed it. Listing errors are not absence.
@@ -336,6 +342,271 @@ def install(args):
     print('Supervisor installed and enabled, but STOPPED. Review the ' + sending_mode(config) + ' journal and start explicitly.')
 
 
+GUARDIAN = 'zunder-guard-setup-guardian.service'
+
+
+def private_lock(path):
+    if path.exists() or path.is_symlink():
+        trusted(path)
+    fd = os.open(path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    try:
+        info = os.fstat(fd)
+        require(stat.S_ISREG(info.st_mode) and info.st_uid == 0 and info.st_nlink == 1
+                and stat.S_IMODE(info.st_mode) == 0o600, 'Private uninstall lock required.')
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def private_json(path):
+    trusted(path)
+    info = path.stat()
+    require(info.st_nlink == 1 and stat.S_IMODE(info.st_mode) == 0o600
+            and 0 < info.st_size <= 1024 * 1024, 'Bounded private recovery record required.')
+    return json.loads(path.read_bytes())
+
+
+def uninstall_pending():
+    # Equivalent to operations.pending/terminal, kept local so partially removed owned
+    # helpers never become a missing-module fallback or an inferred successful cleanup.
+    registry = BASE / 'operations'
+    trusted(registry, directory=True)
+    require(stat.S_IMODE(registry.stat().st_mode) == 0o700, 'Private operation history required.')
+    pending = []
+    for path in registry.iterdir():
+        if path.name == 'guardian.lock':
+            trusted(path)
+            continue
+        require(re.fullmatch('[a-f0-9]{32}', path.name), 'Unknown operation history entry.')
+        trusted(path, directory=True)
+        done_path = path / 'done.json'
+        if not done_path.exists() and not done_path.is_symlink():
+            pending.append(path)
+            continue
+        done = private_json(done_path)
+        record = private_json(path / 'record.json')
+        require(isinstance(done, dict) and isinstance(record, dict), 'Malformed operation history.')
+        fields = {'operation', 'image', 'volume', 'boot', 'created'}
+        require(set(record) in (fields, fields | {'version'}) and record.get('version') in (None, 2),
+                'Malformed operation record identity.')
+        for name, pattern in [('operation', '[a-f0-9]{32}'), ('image', IMAGE_RE),
+                              ('volume', VOLUME_RE), ('boot', '[a-f0-9-]{36}')]:
+            require(isinstance(record[name], str) and re.fullmatch(pattern, record[name]),
+                    'Malformed operation identity.')
+        require(record['operation'] == path.name and type(record['created']) in (int, float)
+                and 0 <= record['created'] < float('inf'), 'Malformed operation directory/clock.')
+        terminal = False
+        if done.get('version') == 2:
+            if done.get('outcome') == 'never-dispatched':
+                terminal = (record.get('version') == 2 and not (path / 'create.json').exists()
+                            and not (path / 'create.json').is_symlink())
+            elif done.get('outcome') == 'removed' and (path / 'id.json').exists():
+                identifier = private_json(path / 'id.json')
+                terminal = (isinstance(identifier, str) and re.fullmatch('[a-f0-9]{64}', identifier)
+                            and done.get('id') == identifier)
+        if not terminal:
+            pending.append(path)
+    return pending
+
+
+def loaded_command(command, expected):
+    match = re.fullmatch(r'\{([^{}]*)\}', command.strip(), flags=re.S)
+    if not match:
+        return False
+    fields = {}
+    for part in match[1].split(';'):
+        part = part.strip()
+        if not part:
+            continue
+        name, separator, value = part.partition('=')
+        if not separator or name.strip() in fields:
+            return False
+        fields[name.strip()] = value.strip()
+    return fields.get('path') == expected[0] and fields.get('argv[]', '').split() == expected
+
+
+def service_property(unit, property):
+    return execute([SYSTEMCTL, 'show', unit, '--property=' + property, '--value']).decode().strip()
+
+
+def uninstall_assets():
+    return [UNIT_PATH, UNIT_PATH.with_name(GUARDIAN), UNIT_SOURCE,
+            HELPER.with_name('operations.py'), HELPER]
+
+
+def uninstall_admit(config, *, guardian_only=False):
+    receipt = private_json(BASE / 'managed-install.json')
+    fields = {'version', 'account', 'volume', 'allowed_files', 'config_refs'}
+    require(isinstance(receipt, dict) and set(receipt) in (fields, fields | {'mode'})
+            and receipt['version'] == 1 and sending_mode(receipt) == sending_mode(config)
+            and receipt['account'] == config['account'] and receipt['volume'] == config['volume'],
+            'Managed receipt does not bind this sending installation.')
+    assets = uninstall_assets()
+    allowed = receipt['allowed_files']
+    require(isinstance(allowed, dict) and set(allowed) == {str(p) for p in assets}
+            and all(isinstance(v, list) and v and all(isinstance(h, str)
+                and re.fullmatch('[a-f0-9]{64}', h) for h in v) for v in allowed.values()),
+            'Exact managed software identities and hashes required.')
+    refs = receipt['config_refs']
+    require(isinstance(refs, list) and any(isinstance(ref, dict)
+            and set(ref) in ({'account', 'volume', 'tag', 'image'},
+                             {'account', 'volume', 'tag', 'image', 'mode'})
+            and sending_mode(ref) == sending_mode(config)
+            and all(config.get(k) == v for k, v in ref.items()) for ref in refs),
+            'Configuration differs from managed recovery references.')
+    for path in assets:
+        if guardian_only and path not in (UNIT_PATH.with_name(GUARDIAN), HELPER.with_name('operations.py')):
+            continue
+        for parent in path.parents:
+            trusted(parent, directory=True)
+        if path.exists() or path.is_symlink():
+            trusted(path)
+            require(path.stat().st_nlink == 1
+                    and hashlib.sha256(path.read_bytes()).hexdigest() in allowed[str(path)],
+                    'Owned software hash changed; refusing uninstall.')
+    require(set(HELPER.parent.iterdir()) <= {HELPER, HELPER.with_name('operations.py'), UNIT_SOURCE},
+            'Unknown installed helper file requires separate review.')
+    dropin = UNIT_PATH.with_name(UNIT + '.d') / '10-install-transaction.conf'
+    gate = BASE / 'install-transaction.json'
+    text = ('[Unit]\n# Persist through enable, installer death and host reboot.\n'
+            'ConditionPathExists=!' + str(gate) + '\n').encode()
+    if not guardian_only:
+        if dropin.parent.exists() or dropin.parent.is_symlink():
+            trusted(dropin.parent, directory=True)
+            require(set(dropin.parent.iterdir()) <= {dropin}, 'Foreign supervisor drop-in refused.')
+    guardian_dropins = UNIT_PATH.with_name(GUARDIAN + '.d')
+    if guardian_dropins.exists() or guardian_dropins.is_symlink():
+        trusted(guardian_dropins, directory=True)
+        require(not list(guardian_dropins.iterdir()), 'Foreign guardian drop-in refused.')
+    if not guardian_only:
+        if dropin.exists() or dropin.is_symlink():
+            trusted(dropin)
+            require(dropin.read_bytes() == text, 'Activation drop-in ownership differs.')
+    states = {}
+    for unit, helper in ((UNIT, HELPER), (GUARDIAN, HELPER.with_name('operations.py'))):
+        if guardian_only and unit != GUARDIAN:
+            continue
+        fragment = service_property(unit, 'FragmentPath')
+        state = service_property(unit, 'LoadState')
+        dropins = service_property(unit, 'DropInPaths').split()
+        require(set(dropins) <= ({str(dropin)} if unit == UNIT else set()), 'Foreign loaded drop-in refused.')
+        if state == 'not-found':
+            require(not fragment and not UNIT_PATH.with_name(unit).exists(), 'Unexpected unloaded unit file.')
+        else:
+            require(state == 'loaded' and fragment == str(UNIT_PATH.with_name(unit)) and helper.exists(),
+                    'Loaded unit is not owned by this installer.')
+            expected = (['/usr/bin/python3', str(helper), 'run'] if unit == UNIT
+                        else ['/usr/bin/python3', '-I', str(helper)])
+            require(loaded_command(service_property(unit, 'ExecStart'), expected), 'Loaded command differs.')
+        states[unit] = state
+    return assets, dropin, states
+
+
+def service_inactive(unit):
+    result = subprocess.run([SYSTEMCTL, 'is-active', unit], stdin=subprocess.DEVNULL,
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=SAFE_ENV,
+                            timeout=15, check=False)
+    require(result.returncode in (3, 4) and result.stdout.strip() in (b'inactive', b'failed', b'unknown'),
+            'Owned service did not stop; uninstall refused.')
+
+
+def uninstall(network):
+    # The installer-wide lock precedes all installation/operation/configuration reads.
+    lock = private_lock(BASE / 'installer.lock')
+    guardian_lock = None
+    guardian_stopped = False
+    try:
+        directory(BASE / 'docker-config')
+        require(not list((BASE / 'docker-config').iterdir()), 'Docker configuration directory must remain empty.')
+        config = load()
+        require(sending_mode(config) == network, 'Explicit uninstall network differs.')
+        assets, dropin, states = uninstall_admit(config)
+        gate = BASE / 'install-transaction.json'
+        require(not gate.exists() and not gate.is_symlink(), 'Resolve installer transaction before uninstall.')
+        require(not uninstall_pending(), 'Resolve setup operations before uninstall; guardian remains installed.')
+        volume_exists(config)
+        owned_containers(config)  # Admission is read-only; a foreign container cannot authorize a stop.
+        missing_units = [unit for unit in (UNIT, GUARDIAN)
+                         if states[unit] == 'loaded' and not UNIT_PATH.with_name(unit).exists()]
+        if missing_units:
+            # A previous removal may have failed before daemon-reload. Missing files do
+            # not prove ownership or inactivity; require both admission and inactive readback.
+            for unit in missing_units:
+                service_inactive(unit)
+            execute([SYSTEMCTL, 'daemon-reload'])
+            assets, dropin, states = uninstall_admit(config)
+        guardian_enabled = (service_property(GUARDIAN, 'UnitFileState')
+                            if states[GUARDIAN] == 'loaded' else 'not-found')
+        require(guardian_enabled in ('enabled', 'disabled', 'not-found'),
+                'Guardian boot configuration requires separate review.')
+        if states[UNIT] == 'loaded':
+            execute([SYSTEMCTL, 'stop', UNIT])
+            execute([SYSTEMCTL, 'disable', UNIT])
+        service_inactive(UNIT)
+        cleanup(config)
+        require(not uninstall_pending(), 'Setup operations appeared; guardian remains installed.')
+        try:
+            if states[GUARDIAN] == 'loaded':
+                guardian_stopped = True  # Unknown stop outcome must also preserve recovery.
+                execute([SYSTEMCTL, 'stop', GUARDIAN])
+                execute([SYSTEMCTL, 'disable', GUARDIAN])
+            service_inactive(GUARDIAN)
+            guardian_lock = private_lock(BASE / 'operations/guardian.lock')
+            require(not uninstall_pending(), 'Setup operation cleanup remains unresolved.')
+            # Re-admit disk and loaded ownership under both locks immediately before unlinking.
+            uninstall_admit(config)
+            require(not gate.exists() and not gate.is_symlink(), 'Installer transaction appeared.')
+            require(not ids('name=^/' + NAME + '$') and not ids('volume=' + config['volume']),
+                    'Container/volume is still in use; software is preserved.')
+        except BaseException:
+            if guardian_lock is not None:
+                os.close(guardian_lock)
+                guardian_lock = None
+            if guardian_stopped:
+                try:
+                    uninstall_admit(config, guardian_only=True)
+                except BaseException:
+                    raise Refused('Guardian ownership changed; recovery is unknown and software is preserved.') from None
+                recovery_failed = False
+                try:
+                    execute([SYSTEMCTL, 'enable' if guardian_enabled == 'enabled' else 'disable', GUARDIAN])
+                    require(service_property(GUARDIAN, 'UnitFileState') == guardian_enabled,
+                            'Guardian boot recovery readback differs.')
+                except BaseException:
+                    recovery_failed = True
+                try:
+                    execute([SYSTEMCTL, 'start', GUARDIAN])  # Cleanup guardian only, never Guard.
+                    require(service_property(GUARDIAN, 'ActiveState') == 'active',
+                            'Guardian active recovery readback differs.')
+                except BaseException:
+                    recovery_failed = True
+                require(not recovery_failed, 'Guardian recovery is uncertain; resolve it explicitly.')
+            raise
+        for path in (UNIT_PATH, UNIT_PATH.with_name(GUARDIAN), dropin):
+            if path.exists():
+                path.unlink()
+        if dropin.parent.exists():
+            dropin.parent.rmdir()
+        execute([SYSTEMCTL, 'daemon-reload'])
+        for unit in (UNIT, GUARDIAN):
+            require(service_property(unit, 'LoadState') == 'not-found'
+                    and not service_property(unit, 'FragmentPath'), 'Owned service remains registered.')
+        volume_exists(config)
+        # Keep helpers through fallible service cleanup, and the running helper until last.
+        for path in assets[2:]:
+            if path.exists():
+                path.unlink()
+        HELPER.parent.rmdir()
+        require(not any(path.exists() or path.is_symlink() for path in assets), 'Owned software remains.')
+        print('Owned container services and software uninstalled. Named volume and private recovery data retained.')
+    finally:
+        if guardian_lock is not None:
+            os.close(guardian_lock)
+        os.close(lock)
+
+
 def read_key_frame(stream):
     # Exactly one LF-terminated frame; bound malformed input without consuming another frame.
     # A buffered readline may steal the next frame from a child inheriting fd 0.
@@ -415,8 +686,20 @@ def main():
     setup.add_argument('--network', choices=('mainnet', 'testnet'), default='mainnet')
     commands.add_parser('run')
     commands.add_parser('stop')
+    remove = commands.add_parser('uninstall')
+    remove.add_argument('--network', choices=('mainnet', 'testnet'), required=True)
     args = parser.parse_args()
     preflight(installing=args.command == 'install')
+    if args.command == 'uninstall':
+        for parent in BASE.parents:
+            trusted(parent, directory=True)
+        trusted(BASE, directory=True)
+        require(stat.S_IMODE(BASE.stat().st_mode) == 0o700, 'Private installation state required.')
+        trusted(Path(SYSTEMCTL))
+        for parent in Path(SYSTEMCTL).parents:
+            trusted(parent, directory=True)
+        uninstall(args.network)
+        return
     trusted(BASE.parent, directory=True)
     directory(BASE)
     directory(BASE / 'docker-config')

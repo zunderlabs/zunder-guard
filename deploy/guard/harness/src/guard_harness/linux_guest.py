@@ -8,13 +8,17 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import shlex
+import shutil
 import socket
 import subprocess
+import sys
 import tarfile
 import tempfile
 import time
 import uuid
+from contextlib import nullcontext
 from pathlib import Path
 
 from guard_harness.linux_lifecycle import require
@@ -46,6 +50,47 @@ class Guest:
 
     def remote(self, command: str, *, timeout: float = 300) -> str:
         return self.command([*self.ssh, command], timeout=timeout)
+
+    def private_remote(self, command: str, key: bytes, *, timeout: float = 1200) -> str:
+        """Encrypted SSH stdin only; never argv, environment, tar, file or diagnostic."""
+        require(re.fullmatch(rb"[0-9a-fA-F]{64}\n", key) is not None, "stdin key frame refused")
+        self.counter += 1
+        return run(
+            [*self.ssh, command],
+            stdin=key,
+            secrets=[key.decode().strip()],
+            sensitive_output=True,
+            log=self.output / f"host-{self.counter}.log",
+            timeout=timeout,
+            env=self.env,
+        ).output.strip()
+
+    def destroy_testnet(self, process: subprocess.Popen[bytes], arguments: list[str]) -> None:
+        """Unknown/hanging cleanup preserves the live guest and its private disk."""
+        try:
+            observed = json.loads(
+                self.remote(self.testnet_command(arguments) + " --phase check-flat", timeout=900)
+            )
+            require(observed == {"flat": True}, "guest cleanup flat readback differs")
+        except (RunError, ValueError, RuntimeError):
+            (self.output / "cleanup-required.json").write_text(
+                json.dumps(
+                    {
+                        "cleanup_complete": False,
+                        "disk_retained": True,
+                        "runtime_alive": process.poll() is None,
+                    }
+                )
+                + "\n"
+            )
+            raise RuntimeError("Testnet cleanup unknown; owned guest preserved") from None
+        process.terminate()
+        try:
+            process.wait(timeout=20)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=10)
+        shutil.rmtree(self.temp)
 
     def wait(self, process: subprocess.Popen[bytes], *, previous_boot: str = "") -> str:
         deadline = time.monotonic() + 900
@@ -190,7 +235,12 @@ class Guest:
         ]
 
     def exercise(
-        self, arguments: list[str], process: subprocess.Popen[bytes], *, refusals_only: bool = False
+        self,
+        arguments: list[str],
+        process: subprocess.Popen[bytes],
+        *,
+        refusals_only: bool = False,
+        testnet_key: bytes | None = None,
     ) -> None:
         self.wait(process)
         self.remote("sudo cloud-init status --wait", timeout=1200)
@@ -204,6 +254,18 @@ class Guest:
             "/opt/guard-release-harness/harness",
             timeout=600,
         )
+        if testnet_key is not None:
+            command = self.testnet_command(arguments)
+            self.private_remote(command + " --phase before-reboot", testnet_key, timeout=2400)
+            self.remote(command + " --phase check-flat", timeout=900)
+            boot = self.remote("cat /proc/sys/kernel/random/boot_id")
+            try:
+                self.remote("sudo systemctl reboot", timeout=10)
+            except RunError:
+                pass
+            self.wait(process, previous_boot=boot)
+            self.private_remote(command + " --phase after-reboot", testnet_key, timeout=2400)
+            return
         if refusals_only:
             refusal_args = []
             for flag in (
@@ -269,6 +331,17 @@ class Guest:
         self.wait(process, previous_boot=boot)
         self.remote(command + " --phase after-reboot", timeout=1200)
 
+    def testnet_command(self, arguments: list[str]) -> str:
+        return shlex.join(
+            [
+                "sudo",
+                "/opt/guard-release-harness/venv/bin/python",
+                "-m",
+                "guard_harness.linux_testnet_lifecycle",
+                *arguments,
+            ]
+        )
+
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -284,6 +357,9 @@ def main() -> None:
     parser.add_argument("--candidate-image", type=Path)
     parser.add_argument("--previous-image", type=Path)
     parser.add_argument("--mainnet-refusals-only", action="store_true")
+    parser.add_argument("--testnet-lifecycle", action="store_true")
+    parser.add_argument("--previous-binary-sha256", default="")
+    parser.add_argument("--previous-release-image", default="")
     for flag in (
         "release-tag",
         "release-commit",
@@ -295,6 +371,21 @@ def main() -> None:
     parser.add_argument("--release-image", default="")
     parser.add_argument("--diagnostic", action="store_true")
     args = parser.parse_args()
+    key = None
+    if args.testnet_lifecycle:
+        require(
+            not args.mainnet_refusals_only
+            and not args.source_paper_script
+            and not args.allow_tcg_local
+            and args.account_network == "testnet",
+            "Testnet lifecycle needs released KVM subjects and Testnet account",
+        )
+        require(
+            args.binary_sha256 is not None and bool(args.previous_binary_sha256),
+            "both released binary digests required",
+        )
+        key = sys.stdin.buffer.read(66)
+        require(re.fullmatch(rb"[0-9a-fA-F]{64}\n", key) is not None, "private host stdin required")
     if args.mainnet_refusals_only:
         require(
             all(
@@ -323,7 +414,15 @@ def main() -> None:
             "image overrides are diagnostic-only",
         )
     args.output.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix="guard-release-guest-") as folder:
+    # Testnet guests survive unknown cleanup outcomes. Never delete their encrypted
+    # custody/protection or disk solely because the harness failed.
+    folder_context = (
+        nullcontext(tempfile.mkdtemp(prefix="guard-release-testnet-"))
+        if args.testnet_lifecycle
+        else tempfile.TemporaryDirectory(prefix="guard-release-guest-")
+    )
+    with folder_context as folder:
+        Path(folder).chmod(0o700)
         guest = Guest(Path(folder), args.output)
         marker = uuid.uuid4().hex
         command = guest.prepare(marker, allow_tcg_local=args.allow_tcg_local)
@@ -392,6 +491,22 @@ def main() -> None:
             "--marker",
             marker,
         ]
+        if args.testnet_lifecycle:
+            arguments = arguments[4:]  # Sending driver uses route, never paper account mode.
+            arguments.extend(
+                [
+                    "--route",
+                    args.mode,
+                    "--binary-sha256",
+                    args.binary_sha256,
+                    "--previous-binary-sha256",
+                    args.previous_binary_sha256,
+                    "--image",
+                    args.release_image,
+                    "--previous-image",
+                    args.previous_release_image,
+                ]
+            )
         if args.mainnet_refusals_only:
             for flag, value in (
                 ("tag", args.release_tag),
@@ -429,7 +544,9 @@ def main() -> None:
                     "ubuntu@127.0.0.1:source.tar.gz",
                 ]
             )
-            guest.exercise(arguments, process, refusals_only=args.mainnet_refusals_only)
+            guest.exercise(
+                arguments, process, refusals_only=args.mainnet_refusals_only, testnet_key=key
+            )
         finally:
             # These logs are sanitized by the guest runner before collection; pairing
             # stdout and credential-bearing commands are never retained there.
@@ -460,7 +577,11 @@ def main() -> None:
                 pass
             try:
                 receipt_name = (
-                    "mainnet-refusal.json" if args.mainnet_refusals_only else "linux-lifecycle.json"
+                    "testnet-lifecycle.json"
+                    if args.testnet_lifecycle
+                    else "mainnet-refusal.json"
+                    if args.mainnet_refusals_only
+                    else "linux-lifecycle.json"
                 )
                 record = guest.remote(
                     "sudo cat /opt/guard-release-harness/evidence/" + receipt_name, timeout=10
@@ -476,12 +597,15 @@ def main() -> None:
                 (args.output / receipt_name).write_text(json.dumps(receipt, indent=2) + "\n")
             except RunError:
                 pass
-            process.terminate()
-            try:
-                process.wait(timeout=20)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait(timeout=10)
+            if args.testnet_lifecycle:
+                guest.destroy_testnet(process, arguments)
+            else:
+                process.terminate()
+                try:
+                    process.wait(timeout=20)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=10)
 
 
 if __name__ == "__main__":

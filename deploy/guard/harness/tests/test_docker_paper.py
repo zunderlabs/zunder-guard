@@ -108,7 +108,7 @@ def test_crash_without_restart_never_gets_a_passing_receipt(
     assert FakeDocker.calls[-1][0][:2] == ("volume", "rm")
 
 
-@pytest.mark.parametrize("failure", ["", "image", "journal", "pairing"])
+@pytest.mark.parametrize("failure", ["", "image", "journal", "pairing", "reinstall-pairing"])
 def test_upgrade_keeps_state_and_client_and_refuses_incomplete_upgrade(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -128,7 +128,7 @@ def test_upgrade_keeps_state_and_client_and_refuses_incomplete_upgrade(
     def round_trip(guard: Any, pair: Any) -> list[Decision]:
         nonlocal trips
         trips += 1
-        if trips == 2 and failure == "pairing":
+        if (trips == 2 and failure == "pairing") or (trips == 3 and failure == "reinstall-pairing"):
             raise PaperError("retained pairing refused")
         assert pair.key == "0x" + "2" * 64
         return [Decision(100, 1, "allow", "allowed")]
@@ -147,7 +147,9 @@ def test_upgrade_keeps_state_and_client_and_refuses_incomplete_upgrade(
         receipt = json.loads((work / "receipt.json").read_bytes())
         assert receipt["previous_image"] == old and receipt["image"] == new
         assert {"upgrade", "upgrade-journal", "upgrade-pairing"} <= set(receipt["checks"])
-        assert trips == 2
+        assert {"reinstall-pairing", "cleanup"} <= set(receipt["checks"])
+        assert receipt["result"] == "passed" and receipt["cleanup_complete"] is True
+        assert trips == 3
     init = [args for args, _ in FakeDocker.calls if "init" in args]
     pair = [args for args, _ in FakeDocker.calls if args[-2:] == ("pair", "--json")]
     assert len(init) == len(pair) == 1 and old in init[0] and old in pair[0]

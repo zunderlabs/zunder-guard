@@ -107,7 +107,7 @@ def before(
         "client_key": pair.key,
         "files": {
             name: base64.b64encode((HOME / name).read_bytes()).decode()
-            for name in ("guard.toml", "risk.jsonl", "decisions.jsonl")
+            for name in ("guard.toml", "risk-paper.jsonl", "decisions-paper.jsonl")
         },
     }
     path = BASE / "private-state.json"

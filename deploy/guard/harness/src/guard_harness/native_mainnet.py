@@ -43,6 +43,18 @@ def receipt(release: Release, route: str, log: Path, code: int, work: Path) -> N
 
 
 def exercise(release: Release, *, account: str, work: Path, shell: str) -> None:
+    if not work.is_absolute() or work.exists() or work.is_symlink():
+        raise TerminalError("fresh absolute native refusal workspace required")
+    missing: list[Path] = []
+    for parent in work.parents:
+        if parent.is_symlink():
+            raise TerminalError("native refusal workspace ancestor is a symlink")
+        if not parent.exists():
+            missing.append(parent)
+        elif not parent.is_dir():
+            raise TerminalError("native refusal workspace ancestor is not a directory")
+    for parent in reversed(missing):
+        parent.mkdir(mode=0o700)
     work.mkdir(mode=0o700)
     rules = json.loads((ROOT / "rules/vectors.json").read_bytes())["valid"][0]["canonical"]
     mac = platform.system() == "Darwin"
