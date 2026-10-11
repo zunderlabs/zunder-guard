@@ -8,8 +8,8 @@ npm test
 
 The C4 fixture binds only to loopback. Playwright tests authenticate order and inbox reads,
 cover every order-state response, reject a missing order, and check the inbox shape and timestamp
-filter with a nonempty positive control. There are no browser purchase or payment tests yet;
-fixture checks are not staging or P1–P8 acceptance evidence.
+filter with a nonempty positive control. Fixture checks are not staging or P1–P8 acceptance
+evidence; the paid browser flow is an explicit opt-in released-source test.
 
 To run the read-only contract checks against staging, supply `GUARD_STAGING_URL`,
 `GUARD_ACCESS_CLIENT_ID`, `GUARD_ACCESS_CLIENT_SECRET`, `GUARD_ORDER_TOKEN`,
@@ -44,3 +44,33 @@ release subjects first and attests successful evidence against the immutable man
 Its three nonsecret URL/domain variables live in environment `e2e`; credentials use C4 names.
 There is no local credential fallback in the workflow, and no journey credit until a real
 signed-release run succeeds. Quote logs use the sanitized terminal reporter only.
+
+`paid.test.ts` implements P1–P3 through the pricing page and business quote, a single
+Hyperliquid **testnet** (P1), Arbitrum Sepolia (P2) or Base Sepolia (P3) payment, delivered order
+and inbox polling, then licence installation via stdin on an authenticated Linux release binary.
+It requires `GUARD_PAID_JOURNEY=P1`, `P2` or `P3`, exact release
+identity/assets, covered testnet account and private work directory, plus C4 payer credentials.
+The reusable workflow verifies release assets before custody. Never retry an ambiguous payment:
+retain and reconcile its private attempt receipt. Only sanitized receipts enter artifacts.
+Browser Access defaults are cleared; the routing helper injects credentials into individual
+staging requests only and blocks redirects. Its real-browser regression runs before each hosted paid row.
+The Sepolia helper pins both RPC and signing chain IDs to the selected testnet, sends exact
+integer micro-USDC to the admitted merchant, and caps gas at 0.0002 test ETH. It refuses pending
+payer transactions before signing. A durable exclusive attempt precedes the only broadcast;
+confirmation polling never replaces, cancels or resends it. The licence receipt binds the row.
+A passing fixture or source review does not prove a paid licence was delivered or accepted.
+
+The production checkout/issuer subset of P9 is separate:
+
+```sh
+npm test -- --config monitor.config.ts
+```
+
+This config uses only C5's production origin, no staging credentials, no retries and no redirects.
+It reads branded page HTML, checks the open checkout, sends exactly three **dry-run** quotes
+using the monitor email, checks malformed renewal refusal and the issuer heartbeat. Quotes must
+have the hand-computed cents and no stored-order identity/token. Run at most once per 30 minutes;
+a failed check does not authorize an earlier retry. Default offline tests never call production.
+These checks do **not** establish complete P9: signed canonical metadata/loader authentication,
+scheduling and failure alerts still need integration. Preserve C5's required renewal HTTP status
+and `not_found` body: malformed and unknown tokens share HTTP 404, as the producer specifies.
