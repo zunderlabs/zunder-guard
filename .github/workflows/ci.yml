@@ -48,6 +48,16 @@ jobs:
             target
           key: guard-cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
       - run: cargo fmt --all -- --check
+      - name: Release dependencies must exclude test-only features
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo tree --locked --workspace --target all --prefix none \
+            --edges normal,build,features > "$RUNNER_TEMP/release-features.txt"
+          if grep -E ' feature "(test-hooks|test-util)"' "$RUNNER_TEMP/release-features.txt"; then
+            echo 'Release dependency graph enables a test-only feature.' >&2
+            exit 1
+          fi
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo test --workspace --locked -- --exact --skip the_generator_reaches_every_path --skip the_implementation_is_the_reference --skip the_implementation_is_the_reference_when_told_in_time --skip the_order_of_the_reports_does_not_matter
         env:

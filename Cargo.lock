@@ -2861,6 +2861,7 @@ dependencies = [
  "zeroize",
  "zunder-core",
  "zunder-guard-core",
+ "zunder-guard-mcp",
  "zunder-hl-protocol",
  "zunder-risk",
  "zunder-venue",

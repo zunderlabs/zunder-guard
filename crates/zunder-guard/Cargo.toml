@@ -13,8 +13,9 @@ name = "zunder-guard"
 path = "src/main.rs"
 
 [features]
-# Test hooks for the integration tests (`tests/fee.rs`); never in a release
-# build. Enabled by the dev-dependency on this crate itself below.
+# Test hooks for the integration tests (`tests/fee.rs`, the journal's and
+# the licence's hooks, `testdir`); never in a release build. Enabled by the
+# dev-dependency on this crate itself below.
 test-hooks = ["zunder-guard-core/test-hooks"]
 
 [dependencies]

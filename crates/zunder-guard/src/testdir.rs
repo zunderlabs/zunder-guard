@@ -1,7 +1,8 @@
 // Copyright 2026 Orcastrate UG (haftungsbeschränkt)
 // SPDX-License-Identifier: Elastic-2.0
 //! Scratch directories for tests, removed when dropped. Public for the
-//! integration tests; nothing else uses it.
+//! integration tests; nothing else uses it. Compiled only for tests
+//! (feature `test-hooks`, which only dev-dependencies enable).
 
 use std::{
     fs,

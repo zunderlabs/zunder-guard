@@ -7,6 +7,12 @@ rust-version.workspace = true
 publish.workspace = true
 license = "Elastic-2.0"
 
+[features]
+# `ScriptedTransport`, the transport for tests that never leaves this
+# machine, for the tests of the crates built on this one. Enabled only by
+# dev-dependencies; never in a release build.
+test-hooks = []
+
 [dependencies]
 reqwest.workspace = true
 rust_decimal.workspace = true

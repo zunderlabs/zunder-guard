@@ -27,6 +27,7 @@ pub mod server;
 pub mod service;
 pub mod statusview;
 pub mod stream;
+#[cfg(any(test, feature = "test-hooks"))]
 #[doc(hidden)]
 pub mod testdir;
 pub mod upstream;

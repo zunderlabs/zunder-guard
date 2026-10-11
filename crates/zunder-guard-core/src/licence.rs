@@ -236,7 +236,9 @@ const fn hex_digit(byte: u8) -> u8 {
 
 /// The test licence key pair: for tests only, never the production key (a
 /// test fails if [`LICENCE_PUBLIC_KEY_HEX`] is ever set to it). Its seed is
-/// public, so a key it signs proves nothing.
+/// public, so a key it signs proves nothing. Compiled only for tests
+/// (feature `test-hooks`, never in a release build).
+#[cfg(any(test, feature = "test-hooks"))]
 #[doc(hidden)]
 pub mod test_key {
     /// The test signing key's seed.

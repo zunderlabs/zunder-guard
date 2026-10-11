@@ -8,13 +8,12 @@
 //! Guard's `/exchange`. The kill switch is in neither: pulling it only ever
 //! reduces risk, and an emergency must never wait.
 
-use std::{
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    },
-    time::{SystemTime, UNIX_EPOCH},
+#[cfg(any(test, feature = "test-hooks"))]
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
 };
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// UTC epoch milliseconds.
 pub trait Clock: Send + Sync {
@@ -34,9 +33,11 @@ impl Clock for SystemClock {
 }
 
 /// A clock for tests, moved by hand.
+#[cfg(any(test, feature = "test-hooks"))]
 #[derive(Debug, Clone, Default)]
 pub struct ManualClock(Arc<AtomicU64>);
 
+#[cfg(any(test, feature = "test-hooks"))]
 impl ManualClock {
     pub fn at(ms: u64) -> Self {
         Self(Arc::new(AtomicU64::new(ms)))
@@ -47,6 +48,7 @@ impl ManualClock {
     }
 }
 
+#[cfg(any(test, feature = "test-hooks"))]
 impl Clock for ManualClock {
     fn now_ms(&self) -> u64 {
         self.0.load(Ordering::SeqCst)

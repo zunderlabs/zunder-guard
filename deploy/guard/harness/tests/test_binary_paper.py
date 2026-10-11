@@ -7,11 +7,12 @@ import socket
 import subprocess
 import time
 from pathlib import Path
+from typing import Any
 
 import pytest
 
 from guard_harness.cli import GuardCLI
-from guard_harness.mcp_client import MCP, MCPError
+from guard_harness.mcp_client import MCP, Tool
 from guard_harness.paper_bot import LocalGuard, PaperError
 from guard_harness.paper_roundtrip import round_trip
 from guard_harness.runner import run
@@ -105,11 +106,25 @@ def test_real_paper_decision_and_journal(tmp_path: Path) -> None:
                 for tool in ("account_overview", "limits"):
                     overview, is_error = mcp.tool(tool)
                     assert is_error is False and overview["ok"] is True
-                if not mcp.writes_bound:
-                    for write_tool in ("place_order", "close_position", "cancel_order"):
-                        with pytest.raises(MCPError, match="write refused"):
-                            mcp.tool(write_tool)
-                    assert mcp.entry_attempted is False
+                assert mcp.writes_bound is True
+                # The consumer pins testnet while this real Guard runs paper.
+                # Valid tool arguments must reach the producer's mode check,
+                # then refuse before signing or creating a decision event.
+                before = guard.request("/guard/events?since=0")
+                requests: tuple[tuple[Tool, dict[str, Any]], ...] = (
+                    (
+                        "place_order",
+                        {"coin": "BTC", "side": "buy", "stop": "1", "size": "0.0001"},
+                    ),
+                    ("cancel_order", {"coin": "BTC", "order_id": 1}),
+                )
+                for write_tool, arguments in requests:
+                    refused, is_error = mcp.tool(write_tool, arguments)
+                    assert is_error is True
+                    assert refused["ok"] is False
+                    assert refused["error"]["code"] == "network_mismatch"
+                    assert refused["sent"] is False
+                assert guard.request("/guard/events?since=0") == before
             assert [decision.verdict for decision in round_trip(guard, pair)] == [
                 "veto",
                 "allow",
