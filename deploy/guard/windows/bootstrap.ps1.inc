@@ -112,7 +112,7 @@ function Invoke-ZgReleaseVerifier([string]$Verifier,[string]$Bundle,[string]$Sum
   } finally { $ErrorActionPreference = $oldPreference }
 }
 function Confirm-ZgRelease([string]$Directory,[string]$Tag) {
-  if ($Tag -notmatch '^v[0-9]+\.[0-9]+\.[0-9]+$') { throw 'Exact stable release tag required.' }
+  if ($Tag -notmatch '^v[0-9]+\.[0-9]+\.[0-9]+(-rc\.[1-9][0-9]*)?$') { throw 'Exact stable or release candidate tag required.' }
   Assert-ZgPath $Directory
   $verifier = [IO.Path]::Combine($Directory,'cosign.exe')
   Assert-ZgPath $verifier

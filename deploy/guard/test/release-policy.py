@@ -19,6 +19,9 @@ import yaml
 from distribution import InstallerNotices, ReleaseRendering
 
 SCRIPT = Path(__file__).resolve().parents[1] / 'github/verify-release-assets.sh'
+WORKFLOWS = SCRIPT.parent / "workflows"
+if not WORKFLOWS.is_dir():
+    WORKFLOWS = Path(__file__).resolve().parents[3] / ".github/workflows"
 TAG = 'v1.0.0'
 SHA = 'a' * 40
 REF = 'ghcr.io/zunderlabs/zunder-guard@sha256:' + 'b' * 64
@@ -236,7 +239,7 @@ if os.environ.get('TEST_FAIL_AFTER_SLSA') == command:
             del self.env[flag]
 
     def test_windows_installer_fixture_supplies_descriptor_before_rendering(self):
-        workflow = (SCRIPT.parent / 'workflows/ci.yml').read_text()
+        workflow = (WORKFLOWS / 'ci.yml').read_text()
         self.assertLess(workflow.index('>"rel/$v/zunder-guard-$v.image.txt"'),
                         workflow.index('deploy/guard/packaging/render.sh "$v"'))
 
@@ -249,7 +252,7 @@ class HomebrewPublication(unittest.TestCase):
     """No tap write token before verified release; no owner-wide token or PAT fallback."""
 
     def setUp(self):
-        self.workflow = yaml.safe_load((SCRIPT.parent / 'workflows/publish.yml').read_text())
+        self.workflow = yaml.safe_load((WORKFLOWS / 'publish.yml').read_text())
         self.job = self.workflow['jobs']['homebrew']
         self.steps = self.job['steps']
 
@@ -527,7 +530,7 @@ class FakeCosignBinding(unittest.TestCase):
 
 class ImagePublication(unittest.TestCase):
     def test_stale_release_cannot_move_latest(self):
-        workflow = yaml.safe_load((SCRIPT.parent / 'workflows/publish.yml').read_text())
+        workflow = yaml.safe_load((WORKFLOWS / 'publish.yml').read_text())
         job = workflow['jobs']['latest']
         self.assertEqual(job['needs'], 'verify')
         self.assertEqual(job['concurrency'], {'group': 'guard-image-latest-publication', 'cancel-in-progress': False})
@@ -554,7 +557,7 @@ class ImagePublication(unittest.TestCase):
 
 class DistributionRecovery(unittest.TestCase):
     def setUp(self):
-        self.workflow = yaml.safe_load((SCRIPT.parent / 'workflows/publish.yml').read_text())
+        self.workflow = yaml.safe_load((WORKFLOWS / 'publish.yml').read_text())
         self.jobs = self.workflow['jobs']
         self.tap = yaml.safe_load((SCRIPT.parent.parent / 'packaging/homebrew/tap-verify.yml').read_text())
 

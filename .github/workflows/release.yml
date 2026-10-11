@@ -6,10 +6,9 @@
 # paths, SOURCE_DATE_EPOCH), rebuilds Linux on a fresh runner and refuses if the bytes differ,
 # packs deterministic archives, writes SBOMs and SHA256SUMS, signs SHA256SUMS with Sigstore
 # (keyless, this workflow's identity), records SLSA provenance, pushes a signed multi-arch image
-# to GHCR, and leaves a DRAFT release. A person publishes the draft; publish.yml then updates the
-# Homebrew tap, winget (when enabled) and the image's latest tag. Before anyone publishes,
-# install-smoke runs the real installers (i on Linux and macOS, i.ps1 on Windows) against the
-# signed draft's files with the real cosign, and starts Guard in paper mode.
+# to GHCR. After every build, signature, provenance and installer smoke job succeeds, publish
+# the assembled draft as a prerelease with latest=false. Canonical channel promotion requires
+# the separate full journey gate; lifecycle/installer/tap/template staging wiring follows.
 #
 # Actions are pinned by commit; slsa-github-generator must be referenced by tag (its verifier
 # requires that).
@@ -17,7 +16,7 @@ name: release
 
 on:
   push:
-    tags: ["v[0-9]+.[0-9]+.[0-9]+"]
+    tags: ["v[0-9]+.[0-9]+.[0-9]+", "v[0-9]+.[0-9]+.[0-9]+-rc.[0-9]+"]
 
 permissions: {}
 
@@ -413,3 +412,18 @@ jobs:
       registry-username: ${{ github.actor }}
     secrets:
       registry-password: ${{ secrets.GITHUB_TOKEN }}
+
+  stage-prerelease:
+    needs: [attach-provenance, install-smoke, image-provenance]
+    permissions:
+      contents: write
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Publish assembled prerelease without latest
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash deploy/guard/github/stage-prerelease.sh

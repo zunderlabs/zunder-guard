@@ -102,11 +102,12 @@ pub const LICENCE_PUBLIC_KEY: Option<[u8; 32]> = match LICENCE_PUBLIC_KEY_HEX {
 /// [`LICENCE_PUBLIC_KEY_HEX`]. A licence it signs counts **on testnet
 /// only** (and in paper mode reading a testnet account), beside the
 /// production key; on mainnet only [`LICENCE_PUBLIC_KEY`] counts
-/// ([`LicenceIssuers::built_in`]). `None` until the staging key is
-/// provisioned, by a reviewed change like the production key's. Nothing
-/// overrides it at run time: tests build their own [`LicenceIssuers`]
-/// (`LicenceIssuers::for_test`, feature `test-hooks`).
-pub const TESTNET_LICENCE_PUBLIC_KEY_HEX: Option<&str> = None;
+/// ([`LicenceIssuers::built_in`]). Set on 11 Oct 2026 to the staging
+/// issuer's key; changing it is a reviewed change like the production
+/// key's. Nothing overrides it at run time: tests build their own
+/// [`LicenceIssuers`] (`LicenceIssuers::for_test`, feature `test-hooks`).
+pub const TESTNET_LICENCE_PUBLIC_KEY_HEX: Option<&str> =
+    Some("fd343cec330501bcb32fd8f52c508cbb47a269d10bbde5ae5c4614a694bfa997");
 
 /// [`TESTNET_LICENCE_PUBLIC_KEY_HEX`] as bytes, decoded at compile time.
 pub const TESTNET_LICENCE_PUBLIC_KEY: Option<[u8; 32]> = match TESTNET_LICENCE_PUBLIC_KEY_HEX {

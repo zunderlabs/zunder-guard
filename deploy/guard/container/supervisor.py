@@ -112,7 +112,7 @@ def validate(config):
     fields = {'image', 'tag', 'volume', 'account', 'instance'}
     require(set(config) in (fields, fields | {'mode'}), 'Unexpected supervisor configuration.')
     sending_mode(config)
-    patterns = {'image': IMAGE_RE, 'tag': r'v[0-9]+\.[0-9]+\.[0-9]+',
+    patterns = {'image': IMAGE_RE, 'tag': r'v[0-9]+\.[0-9]+\.[0-9]+(-rc\.[1-9][0-9]*)?',
                 'volume': VOLUME_RE, 'account': ACCOUNT_RE, 'instance': r'[a-f0-9]{32}'}
     for field, pattern in patterns.items():
         require(isinstance(config[field], str) and re.fullmatch(pattern, config[field]),

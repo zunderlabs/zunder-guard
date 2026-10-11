@@ -12,7 +12,7 @@ from decimal import Decimal, InvalidOperation
 from typing import Any
 
 INFO = "https://api.hyperliquid-testnet.xyz/info"
-Read = Callable[[dict[str, str]], object]
+Read = Callable[[dict[str, Any]], object]
 
 
 class ScanError(RuntimeError):
@@ -126,10 +126,12 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
 
 
 class TestnetReads:
-    """Fixed public endpoint, no proxies, redirects or keys; at most 30 reads/minute.
+    """Fixed public endpoint, no proxies, redirects or keys; at most 600 weight/minute.
 
-    Every allowed info request costs at most 20 venue weight. A two-second interval (including
-    the first request) reserves at most 600 weight/minute even on failures. Sequential only.
+    Ordinary reads reserve 20 weight with two seconds before each request. A fill-history
+    request reserves 120 weight (20 plus at most 2000/20 returned-item weight) with twelve
+    seconds before it, even on failures. Sequential only. See the official API rate limits:
+    https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/rate-limits-and-user-limits
     """
 
     def __init__(
@@ -146,17 +148,47 @@ class TestnetReads:
         self.deadline = clock() + timeout
         self.opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
 
-    def __call__(self, payload: dict[str, str]) -> object:
+    def start_phase(self, *, timeout: float) -> None:
+        """New bounded stage deadline without resetting the shared request pacing."""
+        if not 10 < timeout <= 720:
+            raise ScanError("bounded scan timeout required")
+        self.deadline = self.clock() + timeout
+
+    def __call__(self, payload: dict[str, Any]) -> object:
         kind = payload.get("type")
-        fields = {"type"} if kind == "perpDexs" else {"type", "user"}
+        fields = {"type"} if kind in ("perpDexs", "meta", "allMids") else {"type", "user"}
         if kind in ("clearinghouseState", "frontendOpenOrders") and "dex" in payload:
             fields.add("dex")
-        if kind not in ("perpDexs", "userAbstraction", "clearinghouseState", "frontendOpenOrders"):
+        if kind == "orderStatus":
+            fields.add("oid")
+            if not isinstance(payload.get("oid"), str) or not re.fullmatch(
+                r"0x[0-9a-f]{32}", payload["oid"]
+            ):
+                raise ScanError("explicit cloid lookup required")
+        if kind == "userFillsByTime":
+            fields.add("startTime")
+            if type(payload.get("startTime")) is not int or payload["startTime"] <= 0:
+                raise ScanError("positive integer fill start required")
+        if kind not in (
+            "perpDexs",
+            "meta",
+            "allMids",
+            "userAbstraction",
+            "clearinghouseState",
+            "frontendOpenOrders",
+            "orderStatus",
+            "userFillsByTime",
+        ):
             raise ScanError("unsupported read-only info request")
         if set(payload) != fields:
             raise ScanError("unexpected info request fields")
+        if "user" in fields and (
+            not isinstance(payload.get("user"), str)
+            or not re.fullmatch(r"0x[0-9a-fA-F]{40}", payload["user"])
+        ):
+            raise ScanError("explicit testnet account required")
         now = self.clock()
-        wait = max(0.0, self.next_read - now)
+        wait = max(0.0, self.next_read - now) + (10 if kind == "userFillsByTime" else 0)
         if now + wait + 10 > self.deadline:
             raise ScanError("scan deadline exhausted; no incomplete flat credit")
         self.sleep(wait)

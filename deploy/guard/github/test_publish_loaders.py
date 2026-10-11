@@ -128,7 +128,10 @@ assert.equal(worker.fetch(new Request('https://other.example/i')).status,404);
 class PublicationWiringTest(unittest.TestCase):
     def setUp(self):
         import yaml
-        self.job = yaml.safe_load((Path(__file__).parent/'workflows/publish.yml').read_text())['jobs']['installers']
+        workflows = Path(__file__).parent / 'workflows'
+        if not workflows.is_dir():
+            workflows = Path(__file__).resolve().parents[3] / '.github/workflows'
+        self.job = yaml.safe_load((workflows / 'publish.yml').read_text())['jobs']['installers']
     def test_verified_serialized_protected_job(self):
         self.assertEqual(self.job['needs'], 'verify')
         self.assertEqual(self.job['environment'], 'installer-publish')

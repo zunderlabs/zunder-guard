@@ -29,10 +29,15 @@ class PublishTests(unittest.TestCase):
         self.stored = self.content
         self.public = self.content
         self.calls = []
+        self.uploaded = None
+        self.replace_source = False
 
     def aws(self, command, **kwargs):
         self.calls.append(command)
         if 'put-object' in command:
+            if self.replace_source:
+                (self.root / 'cloudformation.yaml').write_bytes(b'changed after check')
+            self.uploaded = Path(command[command.index('--body') + 1]).read_bytes()
             return subprocess.CompletedProcess(command, bool(self.upload_error), '', self.upload_error)
         self.assertIn('get-object', command)
         Path(command[-1]).write_bytes(self.stored)
@@ -45,7 +50,7 @@ class PublishTests(unittest.TestCase):
              contextlib.redirect_stdout(io.StringIO()):
             return publisher.publish(self.root, kwargs.get('tag', 'v1.2.3'),
                                      kwargs.get('bucket', 'guard-distribution'),
-                                     kwargs.get('region', 'ap-northeast-1'))
+                                     kwargs.get('region', 'ap-northeast-1'), staging=kwargs.get('staging', False))
 
     def test_success_uses_conditional_versioned_write(self):
         url = self.run_publish()
@@ -53,7 +58,51 @@ class PublishTests(unittest.TestCase):
         command = self.calls[0]
         self.assertEqual(command[command.index('--if-none-match') + 1], '*')
         self.assertNotIn('--acl', command)
-        self.assertEqual(command[command.index('--body') + 1], str(self.root / 'cloudformation.yaml'))
+        self.assertNotEqual(command[command.index('--body') + 1], str(self.root / 'cloudformation.yaml'))
+        self.assertEqual(self.uploaded, self.content)
+
+    def test_rc_staging_uses_only_its_immutable_version_key(self):
+        url = self.run_publish(tag='v1.0.0-rc.1', staging=True)
+        self.assertTrue(url.endswith('/guard/v1.0.0-rc.1/cloudformation.yaml'))
+        self.assertTrue(all(command[command.index('--key') + 1] ==
+                            'guard/v1.0.0-rc.1/cloudformation.yaml' for command in self.calls))
+
+    def test_rc_without_staging_refuses_before_upload(self):
+        with self.assertRaises(ValueError):
+            self.run_publish(tag='v1.0.0-rc.1')
+        self.assertEqual(self.calls, [])
+
+    def test_replaced_source_cannot_change_uploaded_subject(self):
+        self.replace_source = True
+        self.run_publish()
+        self.assertEqual(self.uploaded, self.content)
+
+    def test_raw_upload_error_is_withheld(self):
+        self.upload_error = 'FIXTURE-SENSITIVE-DIAGNOSTIC'
+        with self.assertRaises(RuntimeError) as error:
+            self.run_publish()
+        self.assertNotIn(self.upload_error, str(error.exception))
+
+    def test_rc_number_and_regular_template_bounds(self):
+        for tag in ['v1.0.0-rc.0', 'v1.0.0-rc.01', 'v1.0.0-rc.1/other']:
+            with self.subTest(tag=tag), self.assertRaises(ValueError):
+                self.run_publish(tag=tag, staging=True)
+        (self.root / 'cloudformation.yaml').write_bytes(b'x' * (1024 * 1024 + 1))
+        with self.assertRaises(ValueError):
+            self.run_publish(staging=True)
+        self.assertEqual(self.calls, [])
+
+    def test_symlinked_or_oversized_inventory_refuses(self):
+        checksums = self.root / 'SHA256SUMS'
+        checksums.unlink()
+        checksums.symlink_to(self.root / 'cloudformation.yaml')
+        with self.assertRaises(ValueError):
+            self.run_publish(staging=True)
+        checksums.unlink()
+        checksums.write_bytes(b'x' * 65537)
+        with self.assertRaises(ValueError):
+            self.run_publish(staging=True)
+        self.assertEqual(self.calls, [])
 
     def test_same_bytes_retry_succeeds(self):
         self.upload_error = 'An error occurred (PreconditionFailed) when calling the PutObject operation'

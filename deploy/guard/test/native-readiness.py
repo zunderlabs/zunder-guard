@@ -15,6 +15,9 @@ SOURCE = Path(__file__).resolve().parents[1] / 'github'
 spec = importlib.util.spec_from_file_location('native_readiness', SOURCE / 'native-readiness.py')
 native = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(native)
+WORKFLOWS = SOURCE / "workflows"
+if not WORKFLOWS.is_dir():
+    WORKFLOWS = Path(__file__).resolve().parents[3] / ".github/workflows"
 TAG = 'v1.0.0'
 SHA = 'a' * 40
 IMAGE = 'ghcr.io/zunderlabs/zunder-guard@sha256:' + 'b' * 64
@@ -389,7 +392,7 @@ class Wiring(unittest.TestCase):
         self.assertIn('verify-release.sh', promoter)
         self.assertNotIn('verify-release-assets.sh', promoter)
         self.assertLess(promoter.index('verify-release.sh'), promoter.index('native-readiness.py'))
-        publisher = (SOURCE / 'workflows/publish.yml').read_text()
+        publisher = (WORKFLOWS / 'publish.yml').read_text()
         self.assertIn('bash deploy/guard/github/verify-release.sh', publisher)
         self.assertNotIn('verify-release-assets.sh', publisher)
         import yaml
@@ -399,7 +402,7 @@ class Wiring(unittest.TestCase):
 
     def test_channel_gates_precede_tokens_and_writes(self):
         import yaml
-        jobs = yaml.safe_load((SOURCE / 'workflows/publish.yml').read_text())['jobs']
+        jobs = yaml.safe_load((WORKFLOWS / 'publish.yml').read_text())['jobs']
         homebrew = jobs['homebrew']['steps']
         gate = next(i for i, step in enumerate(homebrew) if '--channel homebrew' in step.get('run', ''))
         mint = next(i for i, step in enumerate(homebrew) if 'create-github-app-token' in step.get('uses', ''))

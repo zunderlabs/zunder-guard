@@ -20,7 +20,7 @@ VERSION=$1 TARGET=$2 BINARY=$3 OUT=$4
 HERE=$(cd "$(dirname "$0")" && pwd)
 ROOT=$(cd "$HERE/../../.." && pwd)
 EPOCH=${SOURCE_DATE_EPOCH:-0}
-[[ $VERSION =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "version must look like v1.2.3, got $VERSION" >&2; exit 2; }
+[[ $VERSION =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-rc\.[1-9][0-9]*)?$ ]] || { echo "version must look like v1.2.3 or v1.2.3-rc.1, got $VERSION" >&2; exit 2; }
 [ -f "$BINARY" ] || { echo "no binary at $BINARY" >&2; exit 2; }
 # The stub's version string is in its bytes; grep works for binaries of any platform.
 if grep -aq 'STUB: a packaging test double' "$BINARY" && [ "${ZUNDER_GUARD_ALLOW_STUB:-}" != "test-only" ]; then

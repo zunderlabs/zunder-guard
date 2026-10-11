@@ -1,0 +1,222 @@
+# Canonical private source; exported once to .github/workflows/journey.yml.
+name: journey
+on:
+  workflow_call:
+    inputs:
+      tag:
+        type: string
+        required: true
+      commit:
+        type: string
+        required: true
+permissions:
+  contents: read
+jobs:
+  testnet-foreground:
+    name: T1
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    environment: e2e
+    # T2 and nightly must use this same account group; never interrupt protection.
+    concurrency:
+      group: guard-e2e-testnet
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      actions: read
+      packages: read
+      id-token: write
+      attestations: write
+    steps:
+      - name: Bind the caller source before checkout or custody
+        env:
+          SOURCE: ${{ inputs.commit }}
+          TAG: ${{ inputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [ "$GITHUB_REPOSITORY" = zunderlabs/zunder-guard ]
+          [[ $SOURCE =~ ^[0-9a-f]{40}$ && $TAG =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-rc\.[1-9][0-9]*)?$ ]]
+          [ "$SOURCE" = "$GITHUB_SHA" ]
+          case "$GITHUB_REF" in refs/heads/main|"refs/tags/$TAG") ;; *) exit 1 ;; esac
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.commit }}
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.13'
+      - uses: slsa-framework/slsa-verifier/actions/installer@ea584f4502babc6f60d9bc799dbbb13c1caa9ee6 # v2.7.1
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: v3.1.3
+      - name: Install the release's harness
+        run: python -m pip install -e ./deploy/guard/harness
+      - name: Reserve cleanup against the recorded job start
+        env:
+          GH_TOKEN: ${{ github.token }}
+          JOB_PAGES: ${{ runner.temp }}/journey-jobs.json
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/$GITHUB_RUN_ATTEMPT/jobs?per_page=100" > "$JOB_PAGES"
+          python -m guard_harness.job_deadline
+      - name: Run T1 with inherited wallet stdin
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+          SOURCE: ${{ inputs.commit }}
+          E2E_ACCOUNT: ${{ vars.E2E_TESTNET_ACCOUNT }}
+          API_WALLET: ${{ vars.E2E_TESTNET_API_WALLET_ADDRESS }}
+          WALLET_INPUT: ${{ secrets.E2E_TESTNET_API_WALLET_KEY }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          set +x
+          umask 077
+          [ -n "$WALLET_INPUT" ]
+          printf '%s\n' "$WALLET_INPUT" | env -u WALLET_INPUT python -m guard_harness.testnet_run \
+            --tag "$TAG" --commit "$SOURCE" --account "$E2E_ACCOUNT" --api-wallet "$API_WALLET" \
+            --deadline "$JOURNEY_DEADLINE" --work "$RUNNER_TEMP/T1"
+      - name: Attest passing T1 against the signed immutable manifest
+        id: evidence
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-path: ${{ runner.temp }}/T1/assets/release-manifest.json
+          predicate-type: https://zunderlabs.com/guard/journey/v1
+          predicate-path: ${{ runner.temp }}/T1/T1.predicate.json
+      - name: Retain sanitized evidence on success or failure
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: T1-${{ github.run_id }}-${{ github.run_attempt }}
+          # Explicit files only: runtime includes credentials and must never be uploaded.
+          path: |
+            ${{ runner.temp }}/T1/receipt.json
+            ${{ runner.temp }}/T1/assets.log
+            ${{ runner.temp }}/T1/runtime/init.log
+            ${{ runner.temp }}/T1/runtime/pair.log
+            ${{ runner.temp }}/T1/runtime/process.log
+            ${{ runner.temp }}/T1/runtime/mcp.log
+            ${{ runner.temp }}/T1/T1.predicate.json
+            ${{ steps.evidence.outputs.bundle-path }}
+          if-no-files-found: warn
+          retention-days: 7
+
+  purchase-quotes:
+    name: ${{ matrix.journey }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    environment: e2e
+    strategy:
+      fail-fast: false
+      matrix:
+        journey: [P4, P7]
+    permissions:
+      contents: read
+      actions: read
+      packages: read
+      id-token: write
+      attestations: write
+    steps:
+      - name: Bind the caller source before staging requests
+        env:
+          SOURCE: ${{ inputs.commit }}
+          TAG: ${{ inputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [ "$GITHUB_REPOSITORY" = zunderlabs/zunder-guard ]
+          [[ $SOURCE =~ ^[0-9a-f]{40}$ && $TAG =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-rc\.[1-9][0-9]*)?$ ]]
+          [ "$SOURCE" = "$GITHUB_SHA" ]
+          case "$GITHUB_REF" in refs/heads/main|"refs/tags/$TAG") ;; *) exit 1 ;; esac
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.commit }}
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.13'
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '24'
+      - uses: slsa-framework/slsa-verifier/actions/installer@ea584f4502babc6f60d9bc799dbbb13c1caa9ee6 # v2.7.1
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: v3.1.3
+      - run: python -m pip install -e ./deploy/guard/harness
+      - run: npm ci --prefix deploy/guard/journeys
+      - name: Verify exact release subjects before purchase API requests
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+          SOURCE: ${{ inputs.commit }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          mkdir "$RUNNER_TEMP/quote-evidence"
+          bash deploy/guard/github/verify-release-assets.sh "$TAG" "$RUNNER_TEMP/quote-evidence/assets" \
+            2>&1 | tee "$RUNNER_TEMP/quote-evidence/assets.log"
+          python - <<'PY'
+          import os
+          from pathlib import Path
+          from guard_harness.testnet_run import verified_asset
+          verified_asset(Path(os.environ['RUNNER_TEMP']) / 'quote-evidence/assets', 'install.sh',
+                         tag=os.environ['TAG'], commit=os.environ['SOURCE'])
+          PY
+      - name: Run quote-only journey against real C4 staging
+        working-directory: deploy/guard/journeys
+        env:
+          JOURNEY: ${{ matrix.journey }}
+          GUARD_STAGING_URL: ${{ vars.GUARD_STAGING_URL }}
+          GUARD_INBOX_URL: ${{ vars.GUARD_INBOX_URL }}
+          GUARD_EMAIL_DOMAIN: ${{ vars.GUARD_EMAIL_DOMAIN }}
+          GUARD_ACCESS_CLIENT_ID: ${{ secrets.E2E_ACCESS_CLIENT_ID }}
+          GUARD_ACCESS_CLIENT_SECRET: ${{ secrets.E2E_ACCESS_CLIENT_SECRET }}
+          GUARD_ORDER_TOKEN: ${{ secrets.E2E_ORDER_TOKEN }}
+          GUARD_INBOX_TOKEN: ${{ secrets.E2E_INBOX_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          set +x
+          [ -n "$GUARD_STAGING_URL" ]
+          npm test -- quote.test.ts --grep "$JOURNEY quote:" \
+            2>&1 | tee "$RUNNER_TEMP/quote-evidence/journey.log"
+      - name: Record passing quote journey on authenticated build bytes
+        env:
+          JOURNEY: ${{ matrix.journey }}
+          TAG: ${{ inputs.tag }}
+          SOURCE: ${{ inputs.commit }}
+        run: |
+          python - <<'PY'
+          import json, os
+          from pathlib import Path
+          from guard_harness.testnet_run import verified_asset
+          root = Path(os.environ['RUNNER_TEMP']) / 'quote-evidence'
+          _, digest = verified_asset(root / 'assets', 'install.sh',
+                                     tag=os.environ['TAG'], commit=os.environ['SOURCE'])
+          row = os.environ['JOURNEY']
+          predicate = dict(schema=1, journey=row, commit=os.environ['SOURCE'],
+                           manifest_sha256=digest, result='passed', tier='e2e', coverage=[])
+          (root / 'predicate.json').write_text(json.dumps(predicate) + '\n')
+          PY
+      - name: Attest passing quote journey
+        id: evidence
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-path: ${{ runner.temp }}/quote-evidence/assets/release-manifest.json
+          predicate-type: https://zunderlabs.com/guard/journey/v1
+          predicate-path: ${{ runner.temp }}/quote-evidence/predicate.json
+      - name: Retain sanitized quote evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ matrix.journey }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/quote-evidence/assets.log
+            ${{ runner.temp }}/quote-evidence/journey.log
+            ${{ runner.temp }}/quote-evidence/predicate.json
+            ${{ steps.evidence.outputs.bundle-path }}
+          if-no-files-found: warn
+          retention-days: 7

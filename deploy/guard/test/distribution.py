@@ -91,6 +91,36 @@ class ReleaseRendering(unittest.TestCase):
         return subprocess.run(['bash', str(GUARD / 'packaging/render.sh'), TAG, str(self.dist)],
                               capture_output=True, text=True)
 
+    def test_candidate_archives_render_exact_pinned_version(self):
+        tag = 'v1.0.0-rc.12'
+        binary = self.root / 'binary'
+        binary.write_bytes(b'packaging-only fixture')
+        for target in ('linux-amd64', 'linux-arm64', 'darwin-amd64', 'darwin-arm64', 'windows-amd64'):
+            result = subprocess.run(['bash', str(GUARD / 'packaging/package.sh'), tag,
+                                     target, str(binary), str(self.dist)], capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+        (self.dist / f'zunder-guard-{tag}.image.txt').write_text(IMAGE + '\n')
+        result = subprocess.run(['bash', str(GUARD / 'packaging/render.sh'), tag, str(self.dist)],
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('version "1.0.0-rc.12"', (self.dist / 'zunder-guard.rb').read_text())
+        self.assertIn(f'/releases/download/{tag}/i', (self.dist / 'cloudformation.yaml').read_text())
+        for target, ext in [('linux-amd64', 'tar.gz'), ('windows-amd64', 'zip')]:
+            self.assertIn(f'zunder-guard-{tag}-{target}.{ext}', (self.dist / 'SHA256SUMS').read_text())
+
+    def test_malformed_candidates_refuse_before_packaging_or_rendering(self):
+        binary = self.root / 'binary'
+        binary.write_bytes(b'packaging-only fixture')
+        for tag in ('v1.0.0-rc.0', 'v1.0.0-rc.01', 'v1.0.0-rc1', 'v1.0.0-beta.1', 'v1.0.0-rc.1/other'):
+            for script, args in [('package.sh', ['windows-amd64', str(binary), str(self.root / 'out')]),
+                                 ('render.sh', [str(self.dist)])]:
+                with self.subTest(tag=tag, script=script):
+                    result = subprocess.run(['bash', str(GUARD / 'packaging' / script), tag, *args],
+                                            capture_output=True, text=True)
+                    self.assertNotEqual(result.returncode, 0)
+        self.assertFalse((self.root / 'out').exists())
+        self.assertFalse((self.dist / 'SHA256SUMS').exists())
+
     def test_digest_and_verified_cloud_loader_are_signed_payloads(self):
         result = self.render()
         self.assertEqual(result.returncode, 0, result.stderr)

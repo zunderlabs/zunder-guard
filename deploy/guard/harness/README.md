@@ -128,3 +128,159 @@ release attempt. It verifies both ZIP digests/inventories, limits their combined
 rechecks the selected attempt and latest run after download before exposing private subjects.
 The caller supplies the exact packaging inventory. Its receipt grants no signature/provenance
 credit; those checks must succeed before any downloaded executable runs. POSIX only.
+
+`guard_harness.mcp_client.MCP` ports the testnet journey's subprocess transport into the shared
+package. It requires a private paired client-key file and the expected binary digest, fixes the
+network to testnet and excludes inherited credentials. Writes and reads have one bounded deadline;
+protocol errors never include response bodies. An entry is attempted at most once per client,
+including after a timeout or refused reply. Current binaries expose only read tools to this client:
+place/close/cancel require initialize `capabilities.experimental.exchange_expected_mode: true`,
+which must guarantee that every exchange envelope carries the MCP mode as Guard's atomic
+`expectedMode`. Testnet signatures alone cannot enforce this boundary because Guard accepts both
+client signing domains. T1/T2 writes wait for the producer change and its contract tests.
+The real paper-binary check also exercises MCP account/limits reads on the source-built binary;
+this does not prove released-byte trading or cleanup. POSIX only.
+
+`guard_harness.testnet_protection.prove_stop` retains the old journey's read-only default-stop
+check. It binds the unique active BTC market and size precision to the wire asset, exactly one
+paired-client entry and its unchanged forwarded IOC order, and the default 2% stop with the
+10% execution buffer. The validated proof holds immutable scalar values; its rendered wire is
+fresh on every access. `validate_stop_order` then matches the venue cloid, side, reduce-only
+flag, type, quantity, trigger, limit and optional trigger direction. This is one reconciliation
+step, not permission to close or cancel: fresh fills, successful acknowledgement and current
+open-order lookup must also establish ownership. No API requests or keys are used here.
+
+`guard_harness.testnet_reconcile` continues the read-only T1/T2 reconciliation. Owned buy fills
+must have unique trade IDs and exact entry OID, stay within the requested quantity/limit and
+40 USDC notional, and explain the remaining BTC exposure. The protected-entry acknowledgement
+must be unique, successful, linked to the durable decision and complete for entry plus stop;
+contradictory OIDs or optional cloids are refused. Deferred stop acknowledgement grants no
+stop OID by itself. The frontend order and fresh stop-cloid lookup must both match the validated
+stop and agree on its OID. The controller must still establish fresh entry-cloid ownership,
+exclusive flat preflight, complete order ownership and safe mutation ordering before cleanup.
+These functions never send requests, close positions or cancel orders.
+
+`guard_harness.testnet_ownership.reconcile_ownership` combines the durable proof with
+entry-cloid lookup, timestamped fills, isolated BTC exposure and the complete open-order
+list. An unrelated/stale entry lookup cannot supply the fill OID, and unrelated orders or
+post-start fills refuse the observation. A partial fill is admitted only for cleanup; an
+unfilled entry requires two exact resting readbacks and its deferred acknowledgement.
+Returned observations contain immutable scalar values only. The controller must collect fresh
+inputs before every mutation and independently establish all-DEX flatness at the end.
+Cleanup-only observations also authenticate close/stop fills and reconcile exact net exposure.
+The ordinary journey gate still requires the full owned entry with its live stop. Flat cleanup
+requires closed stop lookup or an exact live orphan stop eligible for later cancellation;
+a canceled unfilled entry can prove flat cleanup only with unchanged remaining size and no
+positions/orders. Cleanup validates immutable protection against its recorded entry reference;
+a crossed current stop price rejects journey credit without blocking owned cleanup.
+
+`guard_harness.testnet_collect.collect_ownership` gathers fresh inputs through the fixed
+public testnet read transport. It checks disabled abstraction, market identity and entry/stop
+cloid lookups; reads primary and every secondary DEX twice; and requires stable entry-fill,
+primary exposure/open-order and DEX inventory observations. Secondary DEX exposure refuses.
+Responses at the conservative 500-fill pagination boundary refuse; the small exclusive journey
+must not accept truncated history. Fill requests reserve their worst-case returned-item weight
+before transmission, including failures. No redirects, proxies, keys or mutation endpoints are
+accepted. Exclusive flat preflight, controller ordering and
+an independent final all-DEX scan remain required. These sequential reads are not an atomic
+snapshot and cannot replace serialization or fresh reads before each mutation.
+
+Exit accounting invariants (`testnet_exits`): an exit OID comes only from a fresh lookup of
+its durable cloid. It must match either the unchanged entry stop or a paired client's later,
+unchanged reduce-only BTC sell IOC plus its successful acknowledgement. All post-start fills
+must belong to the entry or these proved exits, with unique trade IDs. Decimal net quantity
+must never turn negative and must equal the current isolated BTC exposure exactly; missing
+exits, foreign fills and replacement exposure refuse. Exit fills cannot predate their order.
+This read-only component does not replace fresh collection, serial preflight, or final all-DEX
+flatness. The collector fetches each paired-client durable close cloid (at most 16) and the
+historical stop even after exposure becomes flat. Unreadable, missing, duplicated or racing
+reads refuse. The mutation controller remains to port; none of these functions sends orders.
+
+`guard_harness.testnet_cleanup.cleanup` orders bounded cleanup from freshly collected ownership
+observations. It cancels only a proved unfilled entry, closes only the exact current owned BTC
+remainder, and cancels an orphan stop only after exposure is proved flat. Each successful mutation
+requires a new observation with unchanged entry identity and total bought quantity. At most three
+successful partial closes are allowed, each making proved progress. Failed or uncertain sends
+are never retried. An independent all-DEX scan is required even when owned exposure is already
+zero. Failure grants no cleanup evidence and leaves Guard running; the controller does not kill
+processes or protection. Its 900-second maximum admission deadline depends on bounded collectors
+and MCP requests; it is not a mechanism for interrupting an arbitrary injected callback.
+
+MCP cleanup closes require initialize capability `experimental.close_expected_size: true` and
+an exact positive `expected_size` with coin BTC, never an unbounded whole-position close or a
+relative fraction. Older producers fail before a close request is transmitted. The producer
+must refuse when its current absolute position size differs and must send exactly that size.
+Producer support is requested through the private shared status. Actual T1/T2 remain blocked on
+this guarantee and the expected-mode sender guarantee. The orchestrator still must supply
+exclusive flat preflight, account serialization, authenticated binary/process setup, fresh local
+journal collection and Guard lifetime handling. No fixture result proves an actual venue cleanup.
+
+`guard_harness.testnet_journey.execute` integrates the real ownership collector and cleanup
+controller for T1/T2 on an already authenticated, caller-owned testnet Guard and MCP process.
+It requires both sender capabilities before entry, a fresh synchronized matching-account/version
+runtime with active risk and fee mode off, then a C6 all-DEX flat preflight and an exact allow
+preview. It attempts one bounded BTC entry, requires an actual isolated fill with the unchanged
+live stop, and always attempts owned cleanup after an ambiguous entry outcome. It stops Guard
+only through the supplied verified stop operation after successful cleanup and independent
+flatness. An entry/protection failure never earns journey credit merely because cleanup passed.
+Fixture integration exercises the real collector and net accounting, including partial state,
+entry timeout, cleanup timeout and pre-entry refusals. It does not establish live T1/T2 evidence.
+The launcher still must authenticate released bytes, own process/service lifetime and account
+serialization, reserve complete cleanup time before entry, pair a fresh client, and retain
+sanitized evidence on all paths. Producer capabilities remain prerequisites for live execution.
+
+`guard_harness.testnet_process.Foreground` connects T1 foreground custody to that journey core.
+It copies bytes matching the caller's independently authenticated release-archive digest into a
+fresh private work directory, initializes keyless testnet, pairs using C3 JSON, and binds only
+the public API-wallet address while preserving all policy/auth settings. Guard alone inherits
+wallet input through a nonterminal stdin descriptor; init/pair have closed stdin and a minimal
+secret-free environment. Child output is withheld, paired-client state is private, and local
+observations refuse a dead child or changed executable. Successful cleanup stops the owned
+process group and confirms exit; failures have no automatic process teardown. Global C6 workflow
+serialization, entry planning, complete cleanup time reservation/transport lifetime and signed
+release authentication by the caller remain required. The fixture tests exercise real subprocess
+custody but are not live testnet or release evidence. T2 service ownership remains to integrate.
+
+Foreground `journey` now requires the caller's actual monotonic job deadline. After all-DEX
+preflight and exact allow preview, admission rechecks the owned process and requires at least
+1,200 seconds left: 225 seconds for entry/proof, 900 for cleanup admission, 45 for an in-flight
+MCP call, 20 for process exits and 10 margin. Entry reads get a 180-second phase; cleanup gets
+720 seconds on the same paced transport, so an expired preflight window cannot disable cleanup
+or reset its request budget. These bounds depend on the documented bounded HTTP/MCP calls and
+the caller supplying the real remaining job lifetime. T2 must wire equivalent admission hooks.
+The optional entry plan reads testnet BTC metadata/mids, targets 15 USDC using Decimal and the
+venue grids, and refuses inactive/ambiguous markets or size granularity outside 10–40 USDC.
+Global account serialization and signed-release authentication by the orchestrator remain open;
+producer sender capabilities are still required before any actual entry.
+
+`python -m guard_harness.testnet_run` is the T1 foreground command. Its caller supplies an
+explicit release tag/full commit, C6 account and approved public API-wallet address, a fresh
+private `--work` directory, and `--deadline` from the calling job's monotonic start/timeout.
+The calling reusable workflow must serialize all C6 trading jobs. Wallet input enters only
+through a pipe inherited by Guard; Python never reads it. The command invokes the real release
+asset verifier (source CI, signatures and provenance) before accepting the C2 manifest/checksum
+inventory and copying a bounded regular archive binary. It retains a private sanitized
+`receipt.json` before custody, before the journey and on completion/failure. A passing receipt
+requires protected entry, owned cleanup, independent flat scan and confirmed Guard exit; the
+receipt alone does not grant release-gate admission. Incomplete cleanup preserves protection.
+The reusable workflow and live T1 evidence are still pending producer capabilities.
+
+The reusable `journey.yml` currently runs T1. It requires the calling source commit to equal
+its release commit and runs in `e2e` with concurrency group `guard-e2e-testnet`, cancellation
+disabled. T2/nightly trading jobs must share that group. `job_deadline` binds the unique active
+runner job to its run/attempt/source and counts setup against the 45-minute timeout, retaining
+90 seconds for clock skew and artifact upload. The wallet variable is removed from Python's
+environment while its input pipe is inherited by Guard. Successful T1 writes the existing C2
+journey predicate bound to the authenticated manifest; `actions/attest` signs that manifest.
+Artifacts use explicit sanitized file paths, excluding runtime config and client keys.
+T2, purchase jobs and the complete verify/gate caller remain to be wired.
+
+`python -m guard_harness.homebrew_stage --tag TAG --commit FULL_SHA --work FRESH_PRIVATE_DIR`
+verifies the release assets in that invocation, captures the C2/checksum-bound formula, then
+uses an environment-only `HOMEBREW_TAP_TOKEN` scoped to the tap (the lifecycle workflow can
+mint it from the C7 App). `GH_TOKEN` is separately used for public release verification.
+The publisher changes only `Formula/zunder-guard.rb` on the tap's `staging` branch, preserving
+its base tree. Successful branch inventory must include `main`; unknown reads refuse.
+Updates are never forced or retried after conflict. The receipt records the immutable staged
+tap commit; I3 must consume that commit. No canonical branch or Homebrew PR is published here.
+Lifecycle workflow serialization and real channel testing remain to integrate.

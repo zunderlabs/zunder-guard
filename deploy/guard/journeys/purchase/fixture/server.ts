@@ -31,6 +31,43 @@ const server = createServer(async (request, response) => {
         [network, '0x0000000000000000000000000000000000000001'])) });
     return;
   }
+  if (request.method === 'POST' && url.pathname === '/api/licence/quote') {
+    let body = '';
+    for await (const chunk of request) {
+      body += String(chunk);
+      if (body.length > 4096) { reply(response, 413, { ok: false }); return; }
+    }
+    try {
+      const input = JSON.parse(body) as Record<string, unknown>;
+      if (request.headers.origin !== 'http://127.0.0.1:4173' || input['chain'] !== 'testnet') {
+        reply(response, 400, { ok: false, code: 'origin_not_allowed' }); return;
+      }
+      // Finite C4 examples, deliberately not a checkout or payment implementation.
+      const cases: Record<string, { vatId: string; vat: number; rate: number } | string> = {
+        DE: { vatId: '', vat: 3, rate: 1900 },
+        FR: { vatId: 'FRE2EVALID', vat: 0, rate: 0 },
+        US: { vatId: '', vat: 0, rate: 0 },
+        AT: 'vat_id_invalid', KP: 'blocked_country',
+      };
+      const row = cases[String(input['country'])];
+      if (typeof row === 'string') {
+        reply(response, 400, { ok: false, code: row }); return;
+      }
+      if (!row || input['vatId'] !== row.vatId || input['plan'] !== 'pro'
+        || input['term'] !== 'month' || input['network'] !== 'hyperliquid') {
+        reply(response, 400, { ok: false, code: 'invalid_fixture_quote' }); return;
+      }
+      const number = `ZL-2026-${String(orders.size + 1).padStart(6, '0')}`;
+      orders.set(number, { state: 'quoted', network: 'hyperliquid', amount_micro: 180000, key_issued: false });
+      reply(response, 200, { ok: true, token: 'fixture-only-quote-token', order: {
+        number, plan: 'pro', term: 'month', country: input['country'],
+        netCents: 15, vatCents: row.vat, vatRateBp: row.rate, grossCents: 15 + row.vat,
+        status: 'awaiting_payment', chain: 'testnet', network: 'hyperliquid',
+        delivered: false, key: null, usdc: '0.180001',
+      } });
+    } catch { reply(response, 400, { ok: false, code: 'bad_request' }); }
+    return;
+  }
   if (url.pathname.startsWith('/api/licence/test/order/')) {
     if (request.headers.authorization !== `Bearer ${token}`) {
       reply(response, 401, { error: 'unauthorized' });

@@ -549,7 +549,7 @@ def main():
         require(args.prepared_image == bool(args.source_commit), 'Prepared image needs exact source; no ambiguous fallback.')
         validate_input(args, sys.stdin.isatty())
     require(sys.platform == 'linux' and os.geteuid() == 0, 'Linux root is required.')
-    require(re.fullmatch('v[0-9]+\\.[0-9]+\\.[0-9]+', args.version), 'Invalid release version.')
+    require(re.fullmatch('v[0-9]+\\.[0-9]+\\.[0-9]+(-rc\\.[1-9][0-9]*)?', args.version), 'Invalid release version.')
     for tool in (SYSTEMCTL, '/usr/bin/docker', '/usr/bin/systemd-creds', '/usr/bin/python3', '/usr/local/bin/cosign'):
         ops.executable(tool)
     sup = load_module('container_supervisor', STAGE / 'container-supervisor.py')

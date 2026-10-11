@@ -239,6 +239,9 @@ no inbound access by default and Session Manager access through `ConsoleShell`. 
 starts in paper mode using only a public account address and rules; no trading key or licence
 belongs in the launch URL or template. The release renderer pins the loader URL and checksum.
 CloudFormation reports success only after installation, service and local health checks pass.
+Optional `PermissionsBoundaryArn` applies an existing IAM policy as the instance role's
+permissions boundary; leave it empty for accounts that do not require one. The boundary must
+permit Session Manager and signaling the stack bootstrap.
 Optional public access is restricted to one valid IPv4 /32 address. Installer output is
 captured in a root-only temporary file, removed on success, so client keys and pairing codes
 never enter cloud-init logs. On failure the console reports only the diagnostic file path.
@@ -349,7 +352,9 @@ Every release (`github/workflows/release.yml`, on a tag `vX.Y.Z`):
 - **Image**: pushed by digest to `ghcr.io/zunderlabs/zunder-guard`, signed with cosign, with the
   very Linux binaries of the release inside (`GUARD_SOURCE=prebuilt`; the box test checks the
   bytes are identical).
-- **A draft, not a release.** The workflow stops at a draft; a person publishes it.
+- **A staged prerelease.** The draft collects every asset and its provenance first. After
+  installer smoke and image provenance succeed, the workflow publishes it as a prerelease
+  with `latest=false`. This does not promote any canonical channel.
 
 What a user can check:
 
@@ -488,19 +493,28 @@ then `markets` (`markets`) and the two cross-field rules (`open_risk_below_trade
 
 ## Release pipeline and publishing
 
-`github/workflows/release.yml` (tag → draft release, image, provenance), `publish.yml` (a person
-promotes the verified draft → Homebrew pull request, image `latest`), `ci.yml` (checks on every push). Actions are pinned by commit; `slsa-github-generator` by tag, as it
+`github/workflows/release.yml` (tag → assembled prerelease, image, provenance),
+`publish.yml` (legacy stable-release publisher), `ci.yml` (checks on every push). Actions are pinned by commit; `slsa-github-generator` by tag, as it
 requires. Permissions are per job; nothing runs on `pull_request_target`. Linux and both macOS
 architectures build and install natively; Windows uses MSVC. Publishing requires successful
 completed CI and release runs for the tag commit, every signed asset, and a verified immutable
 image digest covered by `SHA256SUMS`, and complete identified maintainer-attested native
-observations bound to those exact assets. Use `github/promote-release.sh` before a draft
-becomes public; downstream publishing repeats the same full gate. Draft rehearsal uses
-`github/verify-release-assets.sh`, which does not authorize publication. See
+observations bound to those exact assets. The new automated prerelease transition is separate
+from canonical promotion. Lifecycle staging, the complete journey gate and automatic promotion
+are still being integrated; a prerelease alone does not grant channel admission. The retained
+`github/promote-release.sh` and downstream publisher enforce the legacy promotion gate.
+`github/verify-release-assets.sh` verifies build subjects only. See
 [Native readiness and promotion](github/NATIVE-READINESS.md). Prereleases do not promote
 packages or `latest`. Homebrew and AWS additionally require their own exact public-entrypoint
 attestations before their publisher jobs acquire write credentials; native service evidence
 alone does not establish those channels.
+
+The versioned AWS template publisher accepts `--staging` for `vX.Y.Z-rc.N` rehearsals;
+without it, stable tags are required. Both modes create only the immutable
+`guard/<tag>/cloudformation.yaml` object with a conditional write, then compare authenticated
+and public downloads with the signed checksum. Upload uses a private snapshot of the same
+captured bytes validated locally. This publishes a versioned template only; channel admission
+still requires the release gate and I7's actual sandbox lifecycle.
 
 ## Testing
 

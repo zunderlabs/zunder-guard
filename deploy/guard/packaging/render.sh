@@ -11,11 +11,14 @@
 # AWS template and Docker Compose with the image pinned to its immutable digest, then SHA256SUMS over every
 # file. Signing SHA256SUMS (cosign, in the workflow) covers them all.
 set -euo pipefail
-[ $# -ge 2 ] && [ $# -le 3 ] || { echo "usage: render.sh <version> <dist-dir> [--payloads-only]" >&2; exit 2; }
+if [ $# -lt 2 ] || [ $# -gt 3 ]; then
+  echo "usage: render.sh <version> <dist-dir> [--payloads-only]" >&2
+  exit 2
+fi
 [ -z "${3:-}" ] || [ "$3" = --payloads-only ] || { echo "unknown rendering option" >&2; exit 2; }
 VERSION=$1 DIST=$2
 HERE=$(cd "$(dirname "$0")" && pwd)
-[[ $VERSION =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "version must look like v1.2.3, got $VERSION" >&2; exit 2; }
+[[ $VERSION =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-rc\.[1-9][0-9]*)?$ ]] || { echo "version must look like v1.2.3 or v1.2.3-rc.1, got $VERSION" >&2; exit 2; }
 NUMBER=${VERSION#v}
 # Deferred providers are not part of this release; stale files must not enter its signed manifest.
 for deferred in fly.toml render.yaml railway.json cloud-init.yaml azuredeploy.json linode-stackscript.sh vultr-cloud-init.yaml oci-terraform.zip; do

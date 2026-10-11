@@ -142,7 +142,9 @@ if [ "$UNINSTALL" -eq 1 ]; then
   fi
   if [ -n "$SERVICE_INSTANCE" ]; then
     case "$SERVICE_INSTANCE" in testnet | mainnet) ;; *) die "service instance is testnet or mainnet" ;; esac
-    [ -z "$PREFIX" ] && [ "$NO_SERVICE" -eq 0 ] || die "service instance uses its fixed managed prefix"
+    if [ -n "$PREFIX" ] || [ "$NO_SERVICE" -ne 0 ]; then
+      die "service instance uses its fixed managed prefix"
+    fi
     SERVICE_UNIT=zunder-guard-$SERVICE_INSTANCE
     PREFIX=/opt/$SERVICE_UNIT/bin
   fi
@@ -388,7 +390,7 @@ import hashlib, os, pathlib, re, resource, shutil, stat, subprocess, sys, tempfi
 resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
 os.umask(0o077)
 source, pinned, version, volume, account, rules, cap, share, licence, network, noninteractive, key_stdin, prepare_image, prepared_image, registry_auth, source_commit = sys.argv[1:]
-if not re.fullmatch(r'v[0-9]+\.[0-9]+\.[0-9]+', version):
+if not re.fullmatch(r'v[0-9]+\.[0-9]+\.[0-9]+(-rc\.[1-9][0-9]*)?', version):
     raise SystemExit('Invalid release version')
 env = {'PATH': '/usr/sbin:/usr/bin:/sbin:/bin', 'HOME': '/root', 'LANG': 'C.UTF-8'}
 def trusted(path, directory=False):

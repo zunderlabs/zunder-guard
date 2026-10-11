@@ -191,3 +191,15 @@ def test_successful_transport_has_fixed_testnet_endpoint_and_bounded_body() -> N
     assert request.data == b'{"type": "perpDexs"}'
     assert opener.open.call_args.kwargs["timeout"] == 10
     response.read.assert_called_once_with(1_048_577)
+
+
+def test_new_phase_preserves_request_pacing_after_preflight_expires() -> None:
+    now = [100.0]
+    reads = VenueReads(clock=lambda: now[0], sleep=lambda _: None, timeout=15)
+    reads.next_read = 118
+    now[0] = 116
+    reads.start_phase(timeout=720)
+    assert reads.deadline == 836 and reads.next_read == 118
+    with pytest.raises(ScanError):
+        reads.start_phase(timeout=721)
+    assert reads.deadline == 836 and reads.next_read == 118

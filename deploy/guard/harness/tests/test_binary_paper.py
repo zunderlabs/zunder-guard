@@ -1,5 +1,6 @@
 """Opt-in real paper-binary contract check; never uses a venue signing key."""
 
+import hashlib
 import json
 import os
 import socket
@@ -12,6 +13,7 @@ import pytest
 from hyperliquid.utils.signing import order_wires_to_order_action
 
 from guard_harness.cli import GuardCLI
+from guard_harness.mcp_client import MCP, MCPError
 from guard_harness.paper_bot import LocalGuard, PaperBot, PaperError, Verdict
 from guard_harness.runner import run
 
@@ -89,6 +91,26 @@ def test_real_paper_decision_and_journal(tmp_path: Path) -> None:
             assert machine_status["licence"]["state"] in {"valid", "expired", "invalid", "none"}
             assert status["mode"] == "paper"
             assert status["capabilities"]["exchange_expected_mode"] is True
+            client_key = tmp_path / "mcp-client.key"
+            client_key.write_text(pair.key)
+            client_key.chmod(0o600)
+            home.chmod(0o700)
+            with MCP(
+                binary,
+                sha256=hashlib.sha256(binary.read_bytes()).hexdigest(),
+                home=home,
+                client_key=client_key,
+                url=url,
+                log=logs / "mcp.log",
+            ) as mcp:
+                for tool in ("account_overview", "limits"):
+                    overview, is_error = mcp.tool(tool)
+                    assert is_error is False and overview["ok"] is True
+                if not mcp.writes_bound:
+                    for write_tool in ("place_order", "close_position", "cancel_order"):
+                        with pytest.raises(MCPError, match="write refused"):
+                            mcp.tool(write_tool)
+                    assert mcp.entry_attempted is False
             action = {
                 "type": "order",
                 "orders": [

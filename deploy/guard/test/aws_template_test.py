@@ -28,6 +28,16 @@ RULES = 'zr1_eyJ2IjoxfQ'
 ACCOUNT = '0x' + '1' * 40
 
 class AwsTemplate(unittest.TestCase):
+    def test_permissions_boundary_is_optional_and_preserved(self):
+        parameter = DOC['Parameters']['PermissionsBoundaryArn']
+        self.assertEqual(parameter['Type'], 'String')
+        self.assertEqual(parameter['Default'], '')
+        condition = DOC['Conditions']['HasPermissionsBoundary']
+        self.assertEqual(condition, {'Not': [{'Equals': [{'Ref': 'PermissionsBoundaryArn'}, '']}]})
+        boundary = DOC['Resources']['Role']['Properties']['PermissionsBoundary']
+        self.assertEqual(boundary, {'If': ['HasPermissionsBoundary',
+            {'Ref': 'PermissionsBoundaryArn'}, {'Ref': 'AWS::NoValue'}]})
+
     def test_next_step_requires_separate_explicit_sending_instance(self):
         output = DOC['Outputs']['NextStep']
         self.assertIsInstance(output['Value'], str)

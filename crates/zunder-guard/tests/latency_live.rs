@@ -207,7 +207,7 @@ fn report(label: &str, mut micros: Vec<u128>) {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "live testnet reads: run on the build box with ZUNDER_GUARD_LATENCY=1"]
+#[ignore = "live testnet reads: run with ZUNDER_GUARD_LATENCY=1"]
 async fn the_latency_guard_adds_with_and_without_the_stream() {
     if std::env::var("ZUNDER_GUARD_LATENCY").as_deref() != Ok("1") {
         return;

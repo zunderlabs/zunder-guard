@@ -4,7 +4,7 @@
 set -euo pipefail
 [ $# -eq 2 ] || { echo "usage: verify-release-assets.sh <vX.Y.Z> <empty-output-dir>" >&2; exit 2; }
 TAG=$1 OUT=$2
-[[ $TAG =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "unexpected release tag" >&2; exit 1; }
+[[ $TAG =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-rc\.[1-9][0-9]*)?$ ]] || { echo "unexpected release tag" >&2; exit 1; }
 : "${GITHUB_REPOSITORY:?GITHUB_REPOSITORY is required}"
 if [ -e "$OUT" ]; then
   echo "release output must not exist" >&2

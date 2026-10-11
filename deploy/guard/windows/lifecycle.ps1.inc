@@ -92,7 +92,7 @@ function Read-ZgTransaction {
   if ([IO.FileInfo]::new($ZgTransactionPath).Length -gt 65536) { throw 'Oversized transaction refused.' }
   $value = [IO.File]::ReadAllText($ZgTransactionPath) | Microsoft.PowerShell.Utility\ConvertFrom-Json
   $phases = @('install-planned','paths-created','image-admitted','service-created-disabled','config-preparing','config-prepared','binding-prepared','credential-provisioning','credential-present','admitted-disabled','journal-requested','journal-present','upgrade-planned','startup-disabled','quiesced','promoting-image','promoting-binding','activation-requested','activation-committed','stopped','uninstalled','rolled-back')
-  if ($value.schema -ne 1 -or $value.id -cne $Id -or $value.service -cne $ZgServiceName -or $value.root -cne $ZgRoot -or $value.exe -cne $ZgExe -or $value.binding -cne $ZgBinding -or $value.phase -notin $phases -or $value.account -notmatch '^0x[0-9a-f]{40}$' -or $value.tag -notmatch '^v[0-9]+\.[0-9]+\.[0-9]+$') { throw 'Transaction identity or phase is ambiguous; refuse recovery.' }
+  if ($value.schema -ne 1 -or $value.id -cne $Id -or $value.service -cne $ZgServiceName -or $value.root -cne $ZgRoot -or $value.exe -cne $ZgExe -or $value.binding -cne $ZgBinding -or $value.phase -notin $phases -or $value.account -notmatch '^0x[0-9a-f]{40}$' -or $value.tag -notmatch '^v[0-9]+\.[0-9]+\.[0-9]+(-rc\.[1-9][0-9]*)?$') { throw 'Transaction identity or phase is ambiguous; refuse recovery.' }
   if ((Get-ZgRecordNetwork $value) -cne $Network) { throw 'Transaction belongs to another sending network; adoption refused.' }
   if ($ConfirmAccount -and $ConfirmAccount.ToLowerInvariant() -cne $value.account) { throw 'Transaction account differs from explicit confirmation.' }
   return $value

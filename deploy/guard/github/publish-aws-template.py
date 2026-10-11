@@ -17,45 +17,69 @@ import urllib.request
 
 
 def checked_template(directory):
+    checksums = directory / 'SHA256SUMS'
+    if checksums.is_symlink() or not checksums.is_file():
+        raise ValueError('Checksums must be a regular release file')
+    with checksums.open('rb') as stream:
+        inventory = stream.read(65537)
+    if not 0 < len(inventory) <= 65536:
+        raise ValueError('Checksum inventory exceeds release bound')
     entries = []
-    for line in (directory / 'SHA256SUMS').read_text().splitlines():
+    for line in inventory.decode('ascii').splitlines():
         match = re.fullmatch(r'([0-9a-fA-F]{64}) [ *]cloudformation\.yaml', line)
         if match:
             entries.append(match.group(1).lower())
     if len(entries) != 1:
         raise ValueError('Signed SHA256SUMS must contain exactly one cloudformation.yaml entry')
     template = directory / 'cloudformation.yaml'
-    digest = hashlib.sha256(template.read_bytes()).hexdigest()
+    if template.is_symlink() or not template.is_file():
+        raise ValueError('Template must be a regular release file')
+    with template.open('rb') as stream:
+        captured = stream.read(1024 * 1024 + 1)
+    if not 0 < len(captured) <= 1024 * 1024:
+        raise ValueError('Template exceeds release size bound')
+    digest = hashlib.sha256(captured).hexdigest()
     if digest != entries[0]:
         raise ValueError('Template differs from signed release checksum')
-    return template, digest
+    return captured, digest
 
 
-def publish(directory, tag, bucket, region):
-    if not re.fullmatch(r'v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)', tag):
-        raise ValueError('Only stable vX.Y.Z release tags may publish templates')
+def publish(directory, tag, bucket, region, *, staging=False):
+    pattern = r'v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)'
+    if staging:
+        pattern += r'(?:-rc\.[1-9][0-9]*)?'
+    if not re.fullmatch(pattern, tag):
+        raise ValueError('Expected stable release tag, or -rc.N with explicit staging')
     if not re.fullmatch(r'[a-z0-9][a-z0-9-]{1,61}[a-z0-9]', bucket):
         raise ValueError('Use a DNS-compatible S3 bucket name without dots')
     if not re.fullmatch(r'[a-z]{2}-[a-z]+-[0-9]+', region):
         raise ValueError('Invalid commercial AWS region')
-    template, digest = checked_template(directory)
+    captured, digest = checked_template(directory)
     key = f'guard/{tag}/cloudformation.yaml'
     checksum = base64.b64encode(bytes.fromhex(digest)).decode('ascii')
     common = ['aws', '--region', region, '--no-cli-pager', 's3api']
-    result = subprocess.run(common + [
-        'put-object', '--bucket', bucket, '--key', key, '--body', str(template),
-        '--if-none-match', '*', '--checksum-algorithm', 'SHA256',
-        '--checksum-sha256', checksum, '--content-type', 'application/yaml',
-        '--cache-control', 'public,max-age=31536000,immutable',
-    ], capture_output=True, text=True, check=False)
-    if result.returncode and '(PreconditionFailed)' not in result.stderr:
-        raise RuntimeError('S3 conditional upload failed: ' + result.stderr.strip())
-    # A retry may reuse identical bytes, but may never overwrite a published version.
     with tempfile.TemporaryDirectory(prefix='guard-template-') as temporary:
+        # Upload the exact captured/checksummed bytes, never reopen the replaceable source.
+        template = Path(temporary) / 'subject.yaml'
+        with template.open('xb') as stream:
+            template.chmod(0o600)
+            stream.write(captured)
+        result = subprocess.run(common + [
+            'put-object', '--bucket', bucket, '--key', key, '--body', str(template),
+            '--if-none-match', '*', '--checksum-algorithm', 'SHA256',
+            '--checksum-sha256', checksum, '--content-type', 'application/yaml',
+            '--cache-control', 'public,max-age=31536000,immutable',
+        ], capture_output=True, text=True, check=False, timeout=60)
+        if result.returncode and '(PreconditionFailed)' not in result.stderr:
+            # AWS diagnostics can contain request details; never propagate them to CI logs.
+            raise RuntimeError('S3 conditional upload failed; inspect protected publisher logs')
+        # A retry may reuse identical bytes, but cannot overwrite a published version.
         downloaded = Path(temporary) / 'cloudformation.yaml'
         subprocess.run(common + ['get-object', '--bucket', bucket, '--key', key,
-                                  str(downloaded)], check=True, stdout=subprocess.DEVNULL)
-        if hashlib.sha256(downloaded.read_bytes()).hexdigest() != digest:
+                                  str(downloaded)], check=True, capture_output=True, timeout=60)
+        with downloaded.open('rb') as stream:
+            stored = stream.read(1024 * 1024 + 1)
+        if hashlib.sha256(stored).hexdigest() != digest:
             raise ValueError('Versioned S3 key contains different bytes; refusing overwrite')
     url = f'https://{bucket}.s3.{region}.amazonaws.com/{key}'
     with urllib.request.urlopen(url, timeout=30) as response:
@@ -76,7 +100,9 @@ def publish(directory, tag, bucket, region):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--release-dir', type=Path, required=True)
+    parser.add_argument('--staging', action='store_true',
+                        help='Allow RC tags at their immutable version key; no canonical change')
     args = parser.parse_args()
     publish(args.release_dir, os.environ.get('TAG', ''),
             os.environ.get('AWS_TEMPLATE_BUCKET', ''),
-            os.environ.get('AWS_REGION', 'ap-northeast-1'))
+            os.environ.get('AWS_REGION', 'ap-northeast-1'), staging=args.staging)
