@@ -75,7 +75,7 @@ pub fn order_names(action: &Value) -> Vec<String> {
 pub const MAX_TTL_MS: i64 = 55_000;
 
 /// The latest an action expires after the intent naming it
-/// (`expiresAfter`, J1: [`crate::guard::INTENT_COVERS_MS`]). The venue
+/// (`expiresAfter`, [`crate::guard::INTENT_COVERS_MS`]). The venue
 /// takes nothing after it, so its evidence of the action (an order placed,
 /// a cancel) is no later.
 pub const EXPIRES_WITHIN_MS: i64 = 40_000;

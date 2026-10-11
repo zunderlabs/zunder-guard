@@ -313,7 +313,7 @@ mod tests {
         assert!(lines.contains(&"alerts: none".to_owned()));
     }
 
-    /// `status --json` (C3): the answer's fields kept, the licence object
+    /// `status --json` (`docs/guard.md`, "Automation"): the answer's fields kept, the licence object
     /// the contract's (from the Guard's own `contract` view), the summary
     /// fields present.
     #[test]

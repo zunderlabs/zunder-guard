@@ -125,6 +125,7 @@ pub fn build(cli: &Cli, input: &mut impl BufRead) -> Result<Server, CliError> {
             kill_file: cli.kill_file.clone(),
             confirm_account,
             kill_confirm_wait_ms: crate::tools::KILL_CONFIRM_WAIT_MS,
+            preview_interval_ms: crate::tools::PREVIEW_INTERVAL_MS,
         },
         guard,
         key,

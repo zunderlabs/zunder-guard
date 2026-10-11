@@ -1,0 +1,191 @@
+# Canonical private source. Stage and run implemented journeys; no complete release gate yet.
+name: verify
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Assembled release tag at this workflow's exact commit
+        required: true
+        type: string
+      commit:
+        description: Full public released commit
+        required: true
+        type: string
+permissions:
+  contents: read
+concurrency:
+  group: guard-release-lifecycle
+  cancel-in-progress: false
+jobs:
+  staging:
+    name: Authenticate and publish initial staged state
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    environment: promote
+    permissions:
+      contents: read
+      actions: read
+      packages: read
+      id-token: write
+      attestations: write
+    steps:
+      - name: Bind the workflow to the released source
+        env:
+          SOURCE: ${{ inputs.commit }}
+          TAG: ${{ inputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [ "$GITHUB_REPOSITORY" = zunderlabs/zunder-guard ]
+          [[ $SOURCE =~ ^[0-9a-f]{40}$ && $TAG =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-rc\.[1-9][0-9]*)?$ ]]
+          [ "$SOURCE" = "$GITHUB_SHA" ]
+          case "$GITHUB_REF" in refs/heads/main|"refs/tags/$TAG") ;; *) exit 1 ;; esac
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.commit }}
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.13'
+      - uses: slsa-framework/slsa-verifier/actions/installer@ea584f4502babc6f60d9bc799dbbb13c1caa9ee6 # v2.7.1
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: v3.1.3
+      - run: python -m pip install -e ./deploy/guard/harness
+      - name: Authenticate assembled release and prepare unavailable staged genesis
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+          SOURCE: ${{ inputs.commit }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          install -d -m 700 "$RUNNER_TEMP/guard-release"
+          python -m guard_harness.staged_state --tag "$TAG" --commit "$SOURCE" --work "$RUNNER_TEMP/guard-release/staging"
+      - name: Attest staged state on its immutable build manifest
+        id: state
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-path: ${{ runner.temp }}/guard-release/staging/assets/release-manifest.json
+          predicate-type: https://zunderlabs.com/guard/release-state/v1
+          predicate-path: ${{ runner.temp }}/guard-release/staging/staged.predicate.json
+      - name: Mint a short-lived contents token for the tap only
+        id: tap-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3
+        with:
+          client-id: ${{ vars.HOMEBREW_APP_CLIENT_ID }}
+          private-key: ${{ secrets.HOMEBREW_APP_PRIVATE_KEY }}
+          owner: zunderlabs
+          repositories: homebrew-tap
+          permission-contents: write
+          skip-token-revoke: false
+      - name: Authenticate formula and stage only the tap staging branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HOMEBREW_TAP_TOKEN: ${{ steps.tap-token.outputs.token }}
+          TAG: ${{ inputs.tag }}
+          SOURCE: ${{ inputs.commit }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          set +x
+          umask 077
+          python -m guard_harness.homebrew_stage --tag "$TAG" --commit "$SOURCE" \
+            --work "$RUNNER_TEMP/guard-release/homebrew"
+      - name: Require the environment-scoped template publishing configuration
+        env:
+          ROLE: ${{ vars.AWS_TEMPLATE_ROLE_ARN }}
+          BUCKET: ${{ vars.AWS_TEMPLATE_BUCKET }}
+          BASE: ${{ vars.AWS_TEMPLATE_BASE_URL }}
+          REGION: ${{ vars.AWS_TEMPLATE_REGION || 'ap-northeast-1' }}
+          TAG: ${{ inputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$ROLE" && test -n "$BUCKET" && test -n "$BASE"
+          python - <<'PY'
+          import json, os
+          from pathlib import Path
+          root = Path(os.environ['RUNNER_TEMP']) / 'guard-release/staging/assets'
+          build = json.loads((root / 'release-manifest.json').read_bytes())
+          suffix = '/guard/' + os.environ['TAG'] + '/cloudformation.yaml'
+          expected = 'https://' + os.environ['BUCKET'] + '.s3.' + os.environ['REGION'] + '.amazonaws.com' + suffix
+          if expected != os.environ['BASE'].rstrip('/') + suffix or expected != build['distribution']['aws_template']['url']:
+              raise SystemExit('Template publishing target differs from the signed distribution descriptor')
+          PY
+      - name: Authenticate the new attestation and publish initial staging head
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INSTALLER_PUBLISH_TOKEN: ${{ secrets.INSTALLER_PUBLISH_TOKEN }}
+          TAG: ${{ inputs.tag }}
+          SOURCE: ${{ inputs.commit }}
+          BUNDLE: ${{ steps.state.outputs.bundle-path }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          set +x
+          umask 077
+          python -m guard_harness.staging_publish --tag "$TAG" --commit "$SOURCE" \
+            --work "$RUNNER_TEMP/guard-release/staging" --bundle "$BUNDLE"
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ vars.AWS_TEMPLATE_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_TEMPLATE_REGION || 'ap-northeast-1' }}
+          role-session-name: guard-staging-${{ github.run_id }}
+          role-duration-seconds: 900
+      - name: Publish the signed template under its immutable version and verify public bytes
+        env:
+          TAG: ${{ inputs.tag }}
+          AWS_TEMPLATE_BUCKET: ${{ vars.AWS_TEMPLATE_BUCKET }}
+          AWS_REGION: ${{ vars.AWS_TEMPLATE_REGION || 'ap-northeast-1' }}
+          AWS_TEMPLATE_BASE_URL: ${{ vars.AWS_TEMPLATE_BASE_URL }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          python3 deploy/guard/github/publish-aws-template.py --staging \
+            --release-dir "$RUNNER_TEMP/guard-release/staging/assets" \
+            > "$RUNNER_TEMP/guard-release/staging/template-url.txt"
+          python - <<'PY'
+          import json, os
+          from pathlib import Path
+          root = Path(os.environ['RUNNER_TEMP']) / 'guard-release/staging'
+          build = json.loads((root / 'assets/release-manifest.json').read_bytes())
+          expected = os.environ['AWS_TEMPLATE_BASE_URL'].rstrip('/') + '/guard/' + os.environ['TAG'] + '/cloudformation.yaml'
+          actual = (root / 'template-url.txt').read_text().strip()
+          if actual != expected or actual != build['distribution']['aws_template']['url']:
+              raise SystemExit('Published template URL differs from the signed distribution descriptor')
+          PY
+      - name: Retain staging evidence and verifier diagnostics
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: staged-state-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/guard-release/staging/assets.log
+            ${{ runner.temp }}/guard-release/staging/staged.predicate.json
+            ${{ runner.temp }}/guard-release/staging/staged.sigstore.json
+            ${{ runner.temp }}/guard-release/staging/publication.json
+            ${{ runner.temp }}/guard-release/staging/publication-logs/
+            ${{ runner.temp }}/guard-release/staging/template-url.txt
+            ${{ runner.temp }}/guard-release/homebrew/assets.log
+            ${{ runner.temp }}/guard-release/homebrew/receipt.json
+            ${{ steps.state.outputs.bundle-path }}
+          if-no-files-found: warn
+          retention-days: 7
+
+  journeys:
+    name: Released trading and purchase journeys
+    needs: staging
+    permissions:
+      contents: read
+      actions: read
+      packages: read
+      id-token: write
+      attestations: write
+    uses: ./.github/workflows/journey.yml
+    with:
+      tag: ${{ inputs.tag }}
+      commit: ${{ inputs.commit }}
+    # Each called job obtains only its own e2e environment secrets.

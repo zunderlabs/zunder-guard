@@ -161,7 +161,7 @@ pub enum StopSpec {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SizeSpec {
     Exactly(Decimal),
-    /// The most Guard's rules allow, by this server's estimate.
+    /// The most Guard's rules allow, as Guard's preview names it.
     Max,
 }
 

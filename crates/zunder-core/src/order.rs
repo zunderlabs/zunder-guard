@@ -59,7 +59,7 @@ pub struct Fill {
     /// Always positive; direction is in `side`.
     pub qty: Decimal,
     pub price: Decimal,
-    /// Fee paid in quote currency. Never negative in M0 (no maker rebates yet).
+    /// Fee paid in quote currency. Never negative yet (no maker rebates).
     pub fee: Decimal,
     pub liquidity: Liquidity,
 }

@@ -28,7 +28,8 @@
 //! flat` line.
 //!
 //! This harness deliberately uses an explicit fee-off fixture: S1 and S8
-//! are refused before they send anything, and C5/C6 are not covered here.
+//! are refused before they send anything, and the builder fee's checkout
+//! and licence flows are not covered here.
 //! The installed systemd rehearsal covers the configured testnet builder.
 
 #![allow(clippy::unwrap_used)]

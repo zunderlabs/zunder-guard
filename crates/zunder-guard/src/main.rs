@@ -649,22 +649,23 @@ impl Paths {
 struct VenueInfo;
 
 impl Venue for VenueInfo {
-    async fn user_role(&self, network: GuardNetwork, key: Address) -> Result<Value, String> {
-        let client = InfoClient::new(network.venue()).map_err(|error| error.to_string())?;
-        client
-            .post(&requests::user_role(key))
-            .await
-            .map_err(|error| error.to_string())
+    async fn user_role(
+        &self,
+        network: GuardNetwork,
+        key: Address,
+    ) -> Result<Value, init::VenueError> {
+        let client = InfoClient::new(network.venue())?;
+        Ok(client.post(&requests::user_role(key)).await?)
     }
 
     async fn equity(
         &self,
         network: GuardNetwork,
         account: Address,
-    ) -> Result<rust_decimal::Decimal, String> {
+    ) -> Result<rust_decimal::Decimal, init::VenueError> {
         equity_of(network, account)
             .await
-            .map_err(|error| format!("{error:#}"))
+            .map_err(|error| init::VenueError::Answer(format!("{error:#}")))
     }
 }
 
@@ -795,8 +796,8 @@ mod platform {
 fn windows_key(config: &Path) -> Result<Option<GuardKey>> {
     #[cfg(windows)]
     {
-        let Some(text) =
-            init::stored_windows_key(&credential_target(config)).map_err(anyhow::Error::msg)?
+        let Some(text) = init::stored_windows_key(&credential_target(config))
+            .map_err(|error| anyhow::anyhow!("{error}"))?
         else {
             return Ok(None);
         };
@@ -1014,7 +1015,7 @@ async fn key_check(paths: &Paths, key_stdin: bool) -> Result<()> {
     let role = VenueInfo
         .user_role(network, key.address())
         .await
-        .map_err(anyhow::Error::msg)?;
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
     check_api_wallet_role(&role, key.address(), account).map_err(anyhow::Error::msg)?;
     match config.api_wallet.as_deref().and_then(Address::from_hex) {
         Some(expected) if expected != key.address() => bail!(
@@ -1067,7 +1068,7 @@ fn client_add(paths: &Paths, out: &Path) -> Result<()> {
     let mut random = init::os_random;
     let (secret, address) = init::new_client(&mut random)?;
     // The key file first: a config never names a client whose key is lost.
-    init::write_client_key(out, secret.as_str()).map_err(anyhow::Error::msg)?;
+    init::write_client_key(out, secret.as_str()).map_err(|error| anyhow::anyhow!("{error}"))?;
     GuardConfig::update(&paths.config, |config| {
         config.auth.clients.push(address.to_hex());
     })?;
@@ -1166,7 +1167,7 @@ fn status(paths: &Paths, args: &StatusArgs) -> Result<()> {
         bail!("no Guard answers on {target} (is it running? zunder-guard health)");
     };
     if args.json {
-        // The answer with the automation contract's fields (C3).
+        // The answer with the automation interface's fields (`docs/guard.md`, "Automation").
         let status = zunder_guard::statusview::contract(&status);
         println!("{}", serde_json::to_string_pretty(&status)?);
     } else {
@@ -1942,7 +1943,8 @@ fn licence_set(paths: &Paths, key: &str, target: &TargetArgs) -> Result<()> {
 
 /// `licence show`: the key in the config, and the running Guard's view.
 /// With `--json`: only the contract's licence object for the key in the
-/// config (C3), the same object `status --json` carries; no Guard needed.
+/// config (`docs/guard.md`, "Automation"), the same object `status --json` carries; no Guard
+/// needed.
 fn licence_show(paths: &Paths, target: &TargetArgs, json: bool) -> Result<()> {
     let config = paths.load()?;
     let account = config.account()?;

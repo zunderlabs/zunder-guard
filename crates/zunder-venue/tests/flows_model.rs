@@ -108,7 +108,8 @@ fn rank(state: RiskState) -> u8 {
     }
 }
 
-/// Solve S6 directly from the loss fraction equation. This test oracle never
+/// Solve the move of the peak and day's start (as the fold does)
+/// directly from the loss fraction equation. This test oracle never
 /// calls the production `rebase` used by the fold.
 fn reference_rebase(
     base: Decimal,
@@ -150,7 +151,7 @@ fn reference_settle(model: &mut Model, before: &RiskSnapshot) {
         .expect("independent settling preserves valid scalar figures");
 }
 
-/// Spec S6: the move of one flow of `amount` at pre-flow equity `before`,
+/// The move of one flow of `amount` at pre-flow equity `before`,
 /// the engine having observed `before`.
 fn moved(
     limits: &RiskLimits,
@@ -259,7 +260,7 @@ impl Model {
         }
     }
 
-    /// Feed a view: `None` when it goes back in venue time (S1), else
+    /// Feed a view: `None` when it goes back in venue time, else
     /// whether it was taken.
     fn view(&mut self, view: &SeenView) -> Option<bool> {
         if view
@@ -650,7 +651,7 @@ struct Setup {
     main: i64,
     second: i64,
     cap: Option<i64>,
-    /// What the flows' values are (S5): 0 none read, 1 all exact (no
+    /// What the flows' values are: 0 none read, 1 all exact (no
     /// position open), 2 mixed: none, exact, or a range a unit either side.
     values: u8,
 }
@@ -1133,7 +1134,7 @@ impl<'a> Run<'a> {
                     .map_err(|error| TestCaseError::fail(format!("apply_flow: {error}")))?;
                 // A replay can take views left out before (a group no
                 // history fitted until this flow was known): stricter for
-                // a flow still unreported that one of them shows is D1's.
+                // a flow still unreported that one of them shows keeps the halt.
                 if rank(self.snapshot().state) > before {
                     let shown_unreported = self.fed.iter().any(|view| {
                         let times = &self.timeline.views[*view].times;
@@ -2113,7 +2114,7 @@ proptest! {
         prop_assert_eq!(figures(&late), figures(&now));
     }
 
-    /// I8: with every flow's value read exactly (S5: no position open),
+    /// I8: with every flow's value read exactly (no position open),
     /// the reference is the truth (the true equity just before every
     /// flow), figures and state, at every view.
     #[test]
@@ -2124,7 +2125,7 @@ proptest! {
         let setup = Setup { values: 1, ..setup };
         let timeline = build(&setup, &ops, false);
         // The truth model has no reading for an account a flow empties, nor
-        // S5 for a view of an empty account.
+        // a measured value for a view of an empty account.
         prop_assume!(timeline.flows.iter().all(|flow| timeline.before[&flow.id] + flow.amount > Decimal::ZERO));
         prop_assume!(timeline.views.iter().all(|view| view.equity > Decimal::ZERO));
         let mut reference = Model::new(&timeline.limits, timeline.start, timeline.equity, timeline.flows.clone());
@@ -2141,7 +2142,7 @@ proptest! {
         }
     }
 
-    /// I5: a move keeps the share of a loss as the engine measures it,
+    /// A move keeps the share of a loss as the engine measures it,
     /// with and without the cap, across it.
     #[test]
     fn rebase_keeps_the_share(

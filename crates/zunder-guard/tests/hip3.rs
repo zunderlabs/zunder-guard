@@ -413,6 +413,43 @@ async fn a_dex_the_rules_do_not_name_is_refused_reported_and_never_touched() {
     assert!(!sent.contains(&FOO), "{sent:?}");
 }
 
+/// The sync's look at a dex the rules do not name reads without Guard's
+/// lock: while the venue has not answered it, a request is answered at
+/// once (here a preview, which waits for nothing else), and what the look
+/// found is recorded once the venue answers.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_request_does_not_wait_for_the_look_at_an_unmanaged_dex() {
+    let running = start("hip3-sweep-unlocked").await;
+    running.venue().add_position("abc:FOO", "5");
+    running.venue().set_dex_equity("abc", "200");
+    let open = running.venue().hold_dex_reads("abc");
+    let guard = running.guard.clone();
+    let sync = tokio::spawn(async move { guard.sync().await });
+    // Until the look at abc waits for the venue.
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while running.venue().held_dex_reads() == 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the sync looks at abc");
+    let preview = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        running
+            .guard
+            .preview(json!({"action": {"type": "scheduleCancel"}})),
+    )
+    .await
+    .expect("answered while the look at abc waits");
+    assert!(preview.get("verdict").is_some(), "{preview}");
+    assert!(!sync.is_finished(), "the look at abc still waits");
+    open.send(true).unwrap();
+    sync.await.unwrap();
+    let status = status(&running.url).await;
+    assert_eq!(status["unmanaged_dexes"][0]["dex"], "abc", "{status}");
+    assert_eq!(status["unmanaged_dexes"][0]["coins"], json!(["abc:FOO"]));
+}
+
 #[tokio::test]
 async fn a_kill_counts_only_the_readable_part_of_a_partial_account() {
     let running = start("hip3-kill-partial").await;

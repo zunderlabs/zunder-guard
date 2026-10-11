@@ -8,11 +8,15 @@
 //! it. Changing a default below is a recorded decision, not a refactoring.
 
 mod book;
+mod cover;
 mod engine;
+pub mod guard_defaults;
 mod limits;
 
 pub use book::{
     CombinedExposure, Exposure, PositionDiscrepancy, TrackedPosition, VenuePosition, VenueView,
 };
+pub use cover::{CoverStop, covering_parts, covering_stop};
 pub use engine::{RestoreError, RiskEngine, RiskSnapshot, RiskState, SizeRequest, Veto};
+pub use guard_defaults::StopPolicy;
 pub use limits::{RiskConfigError, RiskLimits};

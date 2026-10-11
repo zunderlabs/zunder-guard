@@ -13,7 +13,7 @@ for line in sys.stdin:
     value=json.loads(line)
     if value["method"]=="initialize":
         result={"protocolVersion":"2025-11-25",
-            "capabilities":{"experimental":{"exchange_expected_mode":{"enabled":True},"close_expected_size":True}}}
+            "capabilities":{"experimental":{"exchange_expected_mode":{"enabled":True},"close_expected_size":{"enabled":True}}}}
     else:
         result={"structuredContent":{"ok":True},"isError":False}
     reply={"jsonrpc":"2.0","id":value["id"],"result":result}
@@ -69,6 +69,18 @@ def client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Any:
                 "result.update(isError='false') if value['method']!='initialize' else None"
             ),
         }
+
+        for name, capability in {
+            "boolean-close": "True",
+            "false-close": "{'enabled':False}",
+            "integer-close": "{'enabled':1}",
+            "string-close": "{'enabled':'true'}",
+            "extended-close": "{'enabled':True,'extra':True}",
+        }.items():
+            mutations[name] = (
+                "if value['method']=='initialize': "
+                "result['capabilities']['experimental']['close_expected_size']=" + capability
+            )
 
         def child(argv: Any, **kwargs: Any) -> Any:
             assert argv[argv.index("--network") + 1] == "testnet"
@@ -169,9 +181,20 @@ def test_legacy_mcp_reads_allowed_but_all_writes_refused(client: Any, case: str)
         assert mcp.entry_attempted is False
 
 
-def test_absent_bounded_close_capability_refuses_without_sending(client: Any) -> None:
+@pytest.mark.parametrize(
+    "case",
+    [
+        "unbounded-close",
+        "boolean-close",
+        "false-close",
+        "integer-close",
+        "string-close",
+        "extended-close",
+    ],
+)
+def test_invalid_bounded_close_capability_refuses_without_sending(client: Any, case: str) -> None:
     start, _ = client
-    with start("unbounded-close") as mcp:
+    with start(case) as mcp:
         before = mcp.sequence
         with pytest.raises(MCPError, match="close-size capability"):
             mcp.tool("close_position", {"coin": "BTC", "expected_size": "0.0001"})

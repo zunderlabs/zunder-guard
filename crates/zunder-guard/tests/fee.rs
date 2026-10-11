@@ -25,7 +25,7 @@ use support::MemoryVenue;
 use zunder_core::Timestamp;
 use zunder_guard::{
     config::{GuardConfig, GuardMode, GuardNetwork},
-    guard::{Clock, Guard, Limits, Mode, Setup, SystemClock},
+    guard::{Clock, Guard, Limits, Mode, Setup, SystemClock, Via},
     journal::DecisionJournal,
     testdir::TestDir,
 };
@@ -111,7 +111,7 @@ impl Running {
             "nonce": nonce,
             "signature": {"r": minimal_hex(&signature.r), "s": minimal_hex(&signature.s), "v": signature.v},
         });
-        self.guard.exchange(body, "http").await
+        self.guard.exchange(body, Via::Http).await
     }
 
     /// The order actions the venue received after the first `skip`.

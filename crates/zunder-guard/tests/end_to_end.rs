@@ -357,7 +357,8 @@ async fn events(url: &str) -> Vec<Value> {
         .clone()
 }
 
-/// `expectedMode` beside the signed action (C3): a testnet Guard refuses a
+/// `expectedMode` beside the signed action (`docs/guard.md`, "The expected
+/// mode"): a testnet Guard refuses a
 /// request expecting paper or mainnet before anything is done for it
 /// (nothing sent, no decision but the refusal, nonce unused), over HTTP and
 /// WebSocket; the very same signed request expecting testnet then goes
@@ -858,6 +859,7 @@ fn new_guard(
         venue,
         SystemClock,
     )
+    .map_err(|error| error.to_string())
 }
 
 #[tokio::test]

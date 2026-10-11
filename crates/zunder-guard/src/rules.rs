@@ -3,6 +3,7 @@
 //! The rules code (`zr1_…`, rules schema v1) of Guard's policy, through the shared rules
 //! crate (`zunder-guard-rules` in `deploy/guard/rules`), whose bounds are the core policy's.
 
+use thiserror::Error;
 use zunder_guard_core::policy::Policy;
 use zunder_guard_rules::Rules;
 
@@ -13,11 +14,26 @@ pub fn encode(policy: &Policy) -> String {
         .unwrap_or_else(|error| format!("(not expressible as a rules code: {error})"))
 }
 
+/// Why a rules code is refused.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum DecodeError {
+    /// The code does not decode: why, and the rules crate's code for it.
+    #[error("{message} ({code})")]
+    Code { message: String, code: &'static str },
+    /// It decodes, but the policy it describes is not valid.
+    #[error("{0}")]
+    Policy(String),
+}
+
 /// The policy a rules code describes: its nine rules, the rest from `base`, validated.
-pub fn decode(code: &str, base: &Policy) -> Result<Policy, String> {
-    let rules =
-        Rules::decode(code.trim()).map_err(|error| format!("{error} ({})", error.code()))?;
-    rules.to_policy(base).map_err(|error| error.to_string())
+pub fn decode(code: &str, base: &Policy) -> Result<Policy, DecodeError> {
+    let rules = Rules::decode(code.trim()).map_err(|error| DecodeError::Code {
+        message: error.to_string(),
+        code: error.code(),
+    })?;
+    rules
+        .to_policy(base)
+        .map_err(|error| DecodeError::Policy(error.to_string()))
 }
 
 #[cfg(test)]

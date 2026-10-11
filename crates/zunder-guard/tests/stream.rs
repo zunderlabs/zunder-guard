@@ -15,11 +15,13 @@
 //!
 //! Time: Guard and the venue share a test clock ([`VenueClock`]). A wait
 //! measured on Guard's clock (the nonce floor after a start, a loss held for
-//! the ledger, a request budget refilling, the settle window) is skipped
-//! with `running.clock.advance`; real time passes only where Guard measures
-//! on its monotonic clock (the stream's ages and silence, the 1 s after an
-//! event) or the socket's 100 ms cadence has to deliver, and for the tests
-//! of reads still in flight, whose deadlines are timers.
+//! the ledger, a request budget refilling, the settle window, the stream's
+//! ages and silence, the second after an event, the sync's cadence) is
+//! skipped with `running.clock.advance`; real time passes only where the
+//! socket's 100 ms cadence has to deliver ([`socket_delivers`]), and for
+//! the tests of reads still in flight, which the in-memory venue slows in
+//! real time. Tests that count a budget freeze the clock, so that only they
+//! move it.
 
 #![allow(clippy::unwrap_used)]
 
@@ -39,7 +41,7 @@ use support::{GOLD, MemoryVenue, VenueClock, serve_ws};
 use zunder_core::Timestamp;
 use zunder_guard::{
     config::{GuardConfig, GuardMode, GuardNetwork},
-    guard::{Clock, Guard, Limits, Mode, Setup, SystemClock},
+    guard::{Clock, Guard, Limits, Mode, Setup, SystemClock, Via},
     journal::DecisionJournal,
     server,
     testdir::TestDir,
@@ -218,17 +220,16 @@ async fn start_syncing_with_clock<C: TestTime>(
 }
 
 /// Until the stream is connected and has brought the venue's confirmations
-/// and a few rounds of snapshots (one every 100 ms). Guard's monotonic clock
-/// starts at the process's first look at it and counts that start as a
-/// change of the account, so it has to have run for over the second an
-/// event keeps the stream unclean.
+/// and a few rounds of snapshots (one every 100 ms).
 async fn stream_delivers<C: Clock>(guard: &Guard<MemoryVenue, C>) {
     tokio::time::timeout(Duration::from_secs(30), async {
         loop {
             let state = stream_status(guard).await["state"].clone();
+            // A Guard on the process's own monotonic clock counts its start
+            // as a change of the account: past the second after it.
             if state["connected"] == true
                 && state["messages"].as_u64().unwrap_or(0) >= 30
-                && zunder_guard::stream::monotonic_ms() > 1_200
+                && zunder_guard::clock::monotonic_ms() > 1_200
             {
                 return;
             }
@@ -309,6 +310,13 @@ fn cancel(oid: u64) -> Value {
 
 fn signed(action: Wire) -> Value {
     signed_at(action, next_nonce())
+}
+
+/// `body`'s action signed again with `nonce` (a test on a frozen clock
+/// signs on it).
+fn resigned(body: &Value, nonce: u64) -> Value {
+    let action = zunder_guard_core::action::decode_action_value(&body["action"]).unwrap();
+    signed_at(action.to_wire(), nonce)
 }
 
 fn signed_at(action: Wire, nonce: u64) -> Value {
@@ -440,13 +448,14 @@ async fn after_an_order_guard_reads_until_the_snapshots_have_caught_up() {
     // Follow ETH (that entry is sent: its event dirties the stream for 1 s
     // and a snapshot), then an entry from the stream, sent to the venue.
     post(&running.url, &order(1, true, "3000", "0.1", false)).await;
-    tokio::time::sleep(Duration::from_millis(1_500)).await;
+    running.clock.advance(1_100);
+    socket_delivers().await;
     venue.pause_ws_snapshots(true);
     let reply = post(&running.url, &order(1, true, "3000", "0.01", false)).await;
     assert_eq!(reply["status"], "ok", "{reply}");
     assert_eq!(stream_status(&running.guard).await["judged_from_stream"], 1);
     // Its events may come; no snapshot after them: a read.
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    socket_delivers().await;
     let reads = account_reads(venue);
     post(&running.url, &order(1, false, "2900", "0.01", true)).await;
     let status = stream_status(&running.guard).await;
@@ -462,7 +471,8 @@ async fn after_an_order_guard_reads_until_the_snapshots_have_caught_up() {
     );
     // Snapshots again, more than 1 s after the last event: the stream again.
     venue.pause_ws_snapshots(false);
-    tokio::time::sleep(Duration::from_millis(1_400)).await;
+    running.clock.advance(1_100);
+    socket_delivers().await;
     let before = stream_status(&running.guard).await["judged_from_stream"]
         .as_u64()
         .unwrap();
@@ -478,10 +488,13 @@ async fn a_stalled_or_dropped_stream_falls_back_and_exits_still_go() {
     let running = start("stream-drop", false).await;
     let venue = running.guard.upstream();
     post(&running.url, &order(1, true, "3000", "0.1", false)).await;
-    tokio::time::sleep(Duration::from_millis(1_500)).await;
-    // Stalled: nothing for 6 s.
+    running.clock.advance(1_100);
+    socket_delivers().await;
+    // Stalled: nothing for 6 s (and not yet the 10 s of silence that
+    // reconnects).
     venue.pause_ws(true);
-    tokio::time::sleep(Duration::from_millis(6_300)).await;
+    socket_delivers().await;
+    running.clock.advance(6_100);
     let reads = account_reads(venue);
     post(&running.url, &order(1, true, "3000", "0.01", false)).await;
     assert!(account_reads(venue) > reads);
@@ -493,11 +506,13 @@ async fn a_stalled_or_dropped_stream_falls_back_and_exits_still_go() {
     // Dropped: the venue's socket goes away.
     venue.pause_ws(false);
     running.ws.abort();
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    assert_eq!(
-        stream_status(&running.guard).await["state"]["connected"],
-        false
-    );
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while stream_status(&running.guard).await["state"]["connected"] != false {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the stream sees the socket go");
     // A close (reduce-only) still goes, judged after a read.
     let reply = post(&running.url, &order(1, false, "2900", "0.01", true)).await;
     assert_eq!(reply["status"], "ok", "{reply}");
@@ -540,7 +555,8 @@ async fn a_sync_read_that_a_send_overtook_is_read_again_under_the_lock() {
     // Follow ETH; its entry is sent, so let the snapshots catch up (and
     // 2 s pass, after which the sync reads without the lock).
     post(&running.url, &order(1, true, "3000", "0.1", false)).await;
-    tokio::time::sleep(Duration::from_millis(2_100)).await;
+    running.clock.advance(2_100);
+    socket_delivers().await;
     venue.slow_reads(1_500);
     let reads = account_reads(venue);
     let guard = running.guard.clone();
@@ -598,7 +614,8 @@ async fn a_bot_that_sends_during_every_sync_cannot_hold_off_protection() {
     venue.slow_reads(1_500);
     for round in 0..3 {
         // The snapshots catch up with the last send, and 2 s pass.
-        tokio::time::sleep(Duration::from_millis(2_100)).await;
+        running.clock.advance(2_100);
+        socket_delivers().await;
         let guard = running.guard.clone();
         let sync = tokio::spawn(async move { guard.sync().await });
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -752,13 +769,14 @@ async fn a_fall_after_the_snapshot_trips_the_daily_stop_and_flattens_from_a_fres
     let status = stream_status(&running.guard).await;
     assert_eq!(status["judged_from_stream"], from_stream + 1, "{status}");
     assert_ne!(reply["status"], "ok", "{reply}");
-    tokio::time::sleep(Duration::from_millis(2_100)).await;
-    // Revaluing the SAME paused account snapshot cannot end a hold (H2).
-    // Fresh REST snapshots now include the480 main-dex mark loss. A new
-    // ledger-confirmed run has a fresh venue clock and still flattens.
+    running.clock.advance(2_100);
+    // Revaluing the same paused account snapshot cannot end a hold. Fresh
+    // snapshots over HTTP now include the 480 of mark loss on the main dex.
+    // A new run checked by the ledger has a fresh venue clock and still
+    // flattens.
     venue.set_equity("8020");
     running.guard.sync().await;
-    tokio::time::sleep(Duration::from_millis(2_100)).await;
+    running.clock.advance(2_100);
     running.guard.sync().await;
     let reply = post(&running.url, &order(1, true, "3000", "0.1", false)).await;
     assert_ne!(reply["status"], "ok", "{reply}");
@@ -823,7 +841,9 @@ async fn a_price_feed_that_stops_falls_back_to_a_read() {
     assert_eq!(account_reads(venue), reads, "from the stream");
     // Snapshots go on, prices stop: after 1.5 s the mark is stale.
     venue.pause_ws_prices(true);
-    tokio::time::sleep(Duration::from_millis(1_700)).await;
+    socket_delivers().await;
+    running.clock.advance(1_600);
+    socket_delivers().await;
     post(&running.url, &order(1, true, "3000", "0.1", false)).await;
     assert!(account_reads(venue) > reads, "read");
     let status = stream_status(&running.guard).await;
@@ -1015,7 +1035,7 @@ async fn a_syncs_older_reference_data_never_replaces_a_requests_newer() {
     clock.0.store(start + 62_000, Ordering::SeqCst);
     let action = Wire::Map(vec![("type", Wire::str("scheduleCancel"))]);
     guard
-        .exchange(signed_at(action, start + 62_000), "http")
+        .exchange(signed_at(action, start + 62_000), Via::Http)
         .await;
     sync.await.unwrap();
     guard.upstream().slow_reads(0);
@@ -1025,7 +1045,7 @@ async fn a_syncs_older_reference_data_never_replaces_a_requests_newer() {
     let before = metas(&guard);
     let action = Wire::Map(vec![("type", Wire::str("scheduleCancel"))]);
     guard
-        .exchange(signed_at(action, start + 121_500), "http")
+        .exchange(signed_at(action, start + 121_500), Via::Http)
         .await;
     assert_eq!(metas(&guard), before, "meta was still fresh");
 }
@@ -1034,6 +1054,19 @@ async fn a_syncs_older_reference_data_never_replaces_a_requests_newer() {
 /// ledger updates) has gone out.
 async fn socket_delivers() {
     tokio::time::sleep(Duration::from_millis(300)).await;
+}
+
+/// `ms` of the test clock in steps of 100 ms, each with a few milliseconds
+/// of real time for Guard's background tasks (the sync, the stream) to run
+/// at the time it reached.
+async fn pass(clock: &VenueClock, ms: u64) {
+    let mut left = ms;
+    while left > 0 {
+        let step = left.min(100);
+        clock.advance(step);
+        left -= step;
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
 }
 
 fn reduce_only(asset: u64, is_buy: bool, price: &str, size: &str) -> Value {
@@ -1050,10 +1083,19 @@ async fn exits_on_a_spent_budget_go_within_their_allowance() {
     let venue = running.guard.upstream();
     venue.add_position("ETH", "0.5");
     running.guard.sync().await;
-    tokio::time::sleep(Duration::from_millis(400)).await;
+    socket_delivers().await;
+    // Only the test moves the clock now: nothing refills meanwhile.
+    running.clock.freeze();
+    // Signed on the frozen clock, so that the nonces stay within Guard's
+    // window however long the requests take.
+    let mut nonce = running.clock.now_ms();
+    let mut sign = |body: Value| {
+        nonce += 1;
+        resigned(&body, nonce)
+    };
     let mut spent = false;
     for _ in 0..400 {
-        if post(&running.url, &cancel(999_999))
+        if post(&running.url, &sign(cancel(999_999)))
             .await
             .to_string()
             .contains("rate_limited")
@@ -1064,49 +1106,50 @@ async fn exits_on_a_spent_budget_go_within_their_allowance() {
     }
     assert!(spent);
     let through = |reply: &Value| !reply.to_string().contains("rate_limited");
-    // The allowance's 5: any reduce-only order.
+    // The allowance's 5: any reduce-only order; the sixth, an ETH sell that
+    // reduces the long, goes on the known position's 5.
     let mut passed = 0;
     for _ in 0..6 {
-        let reply = post(&running.url, &reduce_only(1, false, "2900", "0.1")).await;
+        let reply = post(&running.url, &sign(reduce_only(1, false, "2900", "0.1"))).await;
         if through(&reply) {
             passed += 1;
         }
     }
-    assert!((5..=6).contains(&passed), "{passed} of 6");
-    // Beyond it, with room for 5 more that reduce a known position: a
+    assert_eq!(passed, 6);
+    // Beyond it, with room for 4 more that reduce a known position: a
     // reduce-only BTC buy (no BTC position) and a reduce-only ETH buy (the
     // same side as the long) reduce nothing, and are refused ...
-    let reply = post(&running.url, &reduce_only(0, true, "61000", "0.01")).await;
+    let reply = post(&running.url, &sign(reduce_only(0, true, "61000", "0.01"))).await;
     assert!(!through(&reply), "{reply}");
-    let reply = post(&running.url, &reduce_only(1, true, "3100", "0.1")).await;
+    let reply = post(&running.url, &sign(reduce_only(1, true, "3100", "0.1"))).await;
     assert!(!through(&reply), "{reply}");
-    // ... while ETH sells, which reduce the long, still go.
+    // ... while ETH sells, which reduce the long, still go: 4 of 5.
     let mut passed = 0;
     for _ in 0..5 {
-        let reply = post(&running.url, &reduce_only(1, false, "2900", "0.1")).await;
+        let reply = post(&running.url, &sign(reduce_only(1, false, "2900", "0.1"))).await;
         if through(&reply) {
             passed += 1;
         }
     }
-    assert!(passed >= 4, "{passed} of 5");
+    assert_eq!(passed, 4);
     // The exits that went were charged: the bot's cancels wait for the
     // debt.
-    let reply = post(&running.url, &cancel(999_999)).await;
+    let reply = post(&running.url, &sign(cancel(999_999))).await;
     assert!(!through(&reply), "{reply}");
-    // Refused exits cost nothing: 30 more BTC buys, refused but for the
-    // odd one the allowance's 1 a second lets through on a slow machine,
-    // and the debt of the dozen or so that went is paid back within 4 s
-    // (4 a second).
+    // Refused exits cost nothing: 30 more BTC buys, all refused, and the
+    // debt of the 10 that went is paid back within 4 s (4 a second: 16).
     let mut refused = 0;
     for _ in 0..30 {
-        let reply = post(&running.url, &reduce_only(0, true, "61000", "0.01")).await;
+        let reply = post(&running.url, &sign(reduce_only(0, true, "61000", "0.01"))).await;
         if !through(&reply) {
             refused += 1;
         }
     }
-    assert!(refused >= 25, "{refused} of 30 refused");
+    assert_eq!(refused, 30);
     running.clock.advance(4_000);
-    let reply = post(&running.url, &cancel(999_999)).await;
+    // Fresh prices at the time reached.
+    socket_delivers().await;
+    let reply = post(&running.url, &sign(cancel(999_999))).await;
     assert!(through(&reply), "{reply}");
 }
 
@@ -1119,10 +1162,19 @@ async fn the_exit_allowances_count_weight() {
     let venue = running.guard.upstream();
     venue.add_position("ETH", "5");
     running.guard.sync().await;
-    tokio::time::sleep(Duration::from_millis(400)).await;
+    socket_delivers().await;
+    // Only the test moves the clock now: nothing refills meanwhile.
+    running.clock.freeze();
+    // Signed on the frozen clock, so that the nonces stay within Guard's
+    // window however long the requests take.
+    let mut nonce = running.clock.now_ms();
+    let mut sign = |body: Value| {
+        nonce += 1;
+        resigned(&body, nonce)
+    };
     let mut spent = false;
     for _ in 0..400 {
-        if post(&running.url, &cancel(999_999))
+        if post(&running.url, &sign(cancel(999_999)))
             .await
             .to_string()
             .contains("rate_limited")
@@ -1134,12 +1186,14 @@ async fn the_exit_allowances_count_weight() {
     assert!(spent);
     let mut passed = 0;
     for _ in 0..8 {
-        let reply = post(&running.url, &reduce_only_batch(41)).await;
+        let reply = post(&running.url, &sign(reduce_only_batch(41))).await;
         if !reply.to_string().contains("rate_limited") {
             passed += 1;
         }
     }
-    assert!((4..=5).contains(&passed), "{passed} of 8");
+    // 2 on the allowance (4 of its 5), 2 on the known position's (4 of
+    // 5); the fifth fits neither's 1 left.
+    assert_eq!(passed, 4, "{passed} of 8");
 }
 
 /// The same when the stream is not clean and the read itself is over
@@ -1252,13 +1306,15 @@ async fn a_kept_leverage_setting_saves_the_update() {
     let reply = post(&running.url, &order(1, true, "3000", "0.1", false)).await;
     assert_eq!(reply["status"], "ok", "{reply}");
     assert_eq!(leverage_updates(venue), 1);
-    tokio::time::sleep(Duration::from_millis(1_500)).await;
+    running.clock.advance(1_100);
+    socket_delivers().await;
     let reply = post(&running.url, &reduce_only(1, false, "2900", "100")).await;
     assert_eq!(reply["status"], "ok", "{reply}");
     assert!(venue.positions().is_empty(), "{:?}", venue.positions());
     // Once the stream is clean again, a new entry: judged from the
     // stream, which shows ETH at isolated 5x; nothing sent first.
-    tokio::time::sleep(Duration::from_millis(1_500)).await;
+    running.clock.advance(1_100);
+    socket_delivers().await;
     let before = stream_status(&running.guard).await["judged_from_stream"]
         .as_u64()
         .unwrap();
@@ -1272,7 +1328,7 @@ async fn a_kept_leverage_setting_saves_the_update() {
 }
 
 /// The settle window counts from when the view was read: a stream view of
-/// snapshots 4.7 s old, judged 6.5 s after Guard's send, is not settled,
+/// snapshots about 4.5 s old, judged 6 s after Guard's send, is not settled,
 /// so the risk engine keeps the position it recorded although the view no
 /// longer shows it.
 #[tokio::test]
@@ -1281,20 +1337,24 @@ async fn the_settle_window_counts_from_the_views_own_time() {
     let venue = running.guard.upstream();
     let reply = post(&running.url, &order(1, true, "3000", "0.1", false)).await;
     assert_eq!(reply["status"], "ok", "{reply}");
-    let sent = std::time::Instant::now();
+    let sent = running.clock.monotonic_ms();
     let status = running.guard.status().await;
     assert_eq!(status["risk"]["tracked"], 1, "{status}");
     // The position goes (a stop fired) with no event; the snapshots show
     // it gone, then stop.
-    tokio::time::sleep(Duration::from_millis(1_400)).await;
+    running.clock.advance(1_400);
     venue.clear_positions();
-    tokio::time::sleep(Duration::from_millis(400)).await;
+    socket_delivers().await;
     venue.pause_ws_snapshots(true);
-    // 6.5 s after the send: judged from the stream, whose snapshots were
-    // taken about 1.8 s after it. Real time: the view's time is Guard's
-    // clock less the snapshots' age, which Guard measures on its monotonic
-    // clock.
-    tokio::time::sleep(Duration::from_millis(6_500).saturating_sub(sent.elapsed())).await;
+    // 6 s after the send: judged from the stream, whose snapshots were
+    // taken about 1.7 s after it (the view's time is Guard's clock less the
+    // snapshots' age).
+    running
+        .clock
+        .advance(6_000u64.saturating_sub(running.clock.monotonic_ms() - sent));
+    // The prices go on (only the snapshots stopped): fresh at the time
+    // reached.
+    socket_delivers().await;
     let before = stream_status(&running.guard).await["judged_from_stream"]
         .as_u64()
         .unwrap();
@@ -1510,8 +1570,8 @@ async fn a_withdrawal_never_halts_and_a_loss_still_does() {
 /// A one-second wick, held, counts when it goes (it was trading: a
 /// withdrawal does not come back), and a later withdrawal that would stop
 /// Guard, shown before a lagging ledger has it, is held and applied: a
-/// fresh run, checked only by a read 2 s into it (the fifth review's M1),
-/// also within 10-12 s of the wick (the seventh review's M2). The ledger is
+/// fresh run, checked only by a read 2 s into it, also within 10-12 s of
+/// the wick. The ledger is
 /// served a second behind; 3,000 withdrawn (30%), not on the socket.
 async fn a_wick_then_a_withdrawal(name: &str, after_ms: u64) {
     let running = start(name, true).await;
@@ -1576,16 +1636,16 @@ async fn slow_sync(
     venue.fail_ledger(ledger_down);
     // 10% down (main dex 8,000) for the first tick.
     venue.set_equity("8000");
-    tokio::time::sleep(Duration::from_millis(1_100)).await;
+    pass(&running.clock, 1_100).await;
     let sync = tokio::spawn(running.guard.clone().sync_forever());
     if goes {
-        tokio::time::sleep(Duration::from_millis(400)).await;
+        pass(&running.clock, 400).await;
         venue.set_equity("9000");
     }
-    tokio::time::sleep(Duration::from_millis(wait_ms)).await;
+    pass(&running.clock, wait_ms).await;
     if skip_ms > 0 {
         running.clock.advance(skip_ms);
-        tokio::time::sleep(Duration::from_millis(1_100)).await;
+        pass(&running.clock, 1_100).await;
     }
     let status = running.guard.status().await;
     sync.abort();
@@ -1641,7 +1701,7 @@ async fn with_a_slow_sync_a_loss_that_stays_is_counted_within_the_hold() {
 
 /// A loss that crosses the line back and forth, a view every 1.1 s: the
 /// 10 s a loss is held for the ledger keep counting across the flat views
-/// in between (D5: a loss hovering at the line cannot stretch it), with the
+/// in between (a loss hovering at the line cannot stretch it), with the
 /// ledger working or down. The round at which Guard was no longer active.
 async fn alternate(name: &str, pattern: &[&str], ledger_down: bool) -> Option<usize> {
     let running = start(name, true).await;
@@ -1660,7 +1720,7 @@ async fn alternate(name: &str, pattern: &[&str], ledger_down: bool) -> Option<us
     None
 }
 
-/// The fifth review's follow-up (H1): 10% down (main dex 8,000) and flat
+/// 10% down (main dex 8,000) and flat
 /// (9,000) in turn; two down, one flat. Counted within the 10 s of the hold
 /// plus a view (round 10 at the latest: 12.1 s).
 #[tokio::test]
@@ -1743,7 +1803,7 @@ async fn a_held_loss_is_looked_at_again_every_second() {
     // 10% down (main dex 9,000 to 8,000), no flow.
     venue.set_equity("8000");
     let sync = tokio::spawn(running.guard.clone().sync_forever());
-    tokio::time::sleep(Duration::from_millis(3_500)).await;
+    pass(&running.clock, 3_500).await;
     let status = running.guard.status().await;
     sync.abort();
     assert_eq!(status["risk"]["state"], "halted_for_day", "{status}");
@@ -2437,7 +2497,7 @@ async fn a_request_started_hold_wakes_the_one_second_sync_loop() {
     running.guard.upstream().set_equity("8000");
     tokio::time::sleep(Duration::from_millis(1100)).await;
     let action = Wire::Map(vec![("type", Wire::str("scheduleCancel"))]);
-    running.guard.exchange(signed(action), "http").await;
+    running.guard.exchange(signed(action), Via::Http).await;
     tokio::time::sleep(Duration::from_millis(3500)).await;
     let status = running.guard.status().await;
     sync.abort();
@@ -2522,7 +2582,7 @@ async fn a_request_hold_bounds_a_sync_read_already_inflight() {
     tokio::time::sleep(Duration::from_millis(300)).await;
     let begun = running.clock.now_ms();
     let action = Wire::Map(vec![("type", Wire::str("scheduleCancel"))]);
-    running.guard.exchange(signed(action), "http").await;
+    running.guard.exchange(signed(action), Via::Http).await;
     let held = running.clock.now_ms();
     assert_eq!(running.guard.status().await["risk"]["state"], "active");
     tokio::time::sleep(Duration::from_millis(10500)).await;
@@ -2645,7 +2705,7 @@ async fn late_request_read_respects_deadline(book: bool) {
     if book {
         running
             .guard
-            .exchange(order(u64::from(GOLD), true, "4000", "10", false), "http")
+            .exchange(order(u64::from(GOLD), true, "4000", "10", false), Via::Http)
             .await;
         tokio::time::sleep(Duration::from_millis(400)).await;
     }
@@ -2679,7 +2739,7 @@ async fn late_request_read_respects_deadline(book: bool) {
         } else {
             signed(Wire::Map(vec![("type", Wire::str("scheduleCancel"))]))
         };
-        guard.exchange(body, "http").await
+        guard.exchange(body, Via::Http).await
     });
     tokio::time::sleep(Duration::from_millis(1600)).await;
     let records = PersistentRisk::read(&running._dir.path().join("risk-paper.jsonl")).unwrap();

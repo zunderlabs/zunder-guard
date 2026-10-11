@@ -75,16 +75,17 @@ jobs:
           set +x
           umask 077
           [ -n "$WALLET_INPUT" ]
+          install -d -m 700 "$RUNNER_TEMP/guard-release"
           printf '%s\n' "$WALLET_INPUT" | env -u WALLET_INPUT python -m guard_harness.testnet_run \
             --tag "$TAG" --commit "$SOURCE" --account "$E2E_ACCOUNT" --api-wallet "$API_WALLET" \
-            --deadline "$JOURNEY_DEADLINE" --work "$RUNNER_TEMP/T1"
+            --deadline "$JOURNEY_DEADLINE" --work "$RUNNER_TEMP/guard-release/T1"
       - name: Attest passing T1 against the signed immutable manifest
         id: evidence
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
         with:
-          subject-path: ${{ runner.temp }}/T1/assets/release-manifest.json
+          subject-path: ${{ runner.temp }}/guard-release/T1/assets/release-manifest.json
           predicate-type: https://zunderlabs.com/guard/journey/v1
-          predicate-path: ${{ runner.temp }}/T1/T1.predicate.json
+          predicate-path: ${{ runner.temp }}/guard-release/T1/T1.predicate.json
       - name: Retain sanitized evidence on success or failure
         if: ${{ always() }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -92,13 +93,13 @@ jobs:
           name: T1-${{ github.run_id }}-${{ github.run_attempt }}
           # Explicit files only: runtime includes credentials and must never be uploaded.
           path: |
-            ${{ runner.temp }}/T1/receipt.json
-            ${{ runner.temp }}/T1/assets.log
-            ${{ runner.temp }}/T1/runtime/init.log
-            ${{ runner.temp }}/T1/runtime/pair.log
-            ${{ runner.temp }}/T1/runtime/process.log
-            ${{ runner.temp }}/T1/runtime/mcp.log
-            ${{ runner.temp }}/T1/T1.predicate.json
+            ${{ runner.temp }}/guard-release/T1/receipt.json
+            ${{ runner.temp }}/guard-release/T1/assets.log
+            ${{ runner.temp }}/guard-release/T1/runtime/init.log
+            ${{ runner.temp }}/guard-release/T1/runtime/pair.log
+            ${{ runner.temp }}/guard-release/T1/runtime/process.log
+            ${{ runner.temp }}/guard-release/T1/runtime/mcp.log
+            ${{ runner.temp }}/guard-release/T1/T1.predicate.json
             ${{ steps.evidence.outputs.bundle-path }}
           if-no-files-found: warn
           retention-days: 7

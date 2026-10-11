@@ -13,7 +13,9 @@ use std::{io::Read, time::Duration};
 use reqwest::{Url, blocking::Client, redirect::Policy};
 use serde_json::Value;
 
-use crate::contract::{EVENTS_PATH, EXCHANGE_PATH, INFO_PATH, KILL_PATH, STATUS_PATH};
+use crate::contract::{
+    EVENTS_PATH, EXCHANGE_PATH, INFO_PATH, KILL_PATH, PREVIEW_PATH, STATUS_PATH,
+};
 
 /// Guard's default address.
 pub const DEFAULT_GUARD_URL: &str = "http://127.0.0.1:8547";
@@ -141,6 +143,13 @@ impl GuardClient {
     /// One signed `/exchange` request (built by `sign::signed_request`).
     pub fn exchange(&self, body: Vec<u8>) -> Result<Value, GuardError> {
         self.post(EXCHANGE_PATH, body)
+    }
+
+    /// Guard's read-only judgement of an unsigned action
+    /// (`{"action": …}`): nothing is journaled or sent.
+    pub fn preview(&self, request: &Value) -> Result<Value, GuardError> {
+        let body = serde_json::to_vec(request).map_err(|_| GuardError::NotSent)?;
+        self.post(PREVIEW_PATH, body)
     }
 
     /// Guard's signed kill request (built by `sign::signed_kill_request`):

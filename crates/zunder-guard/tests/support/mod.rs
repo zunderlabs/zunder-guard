@@ -49,32 +49,71 @@ pub struct Received {
 }
 
 /// The clock a test's Guard and its in-memory venue share: the wall clock
-/// plus an offset the test moves. A test skips over a wait measured on
-/// Guard's clock (the nonce floor after a start, a loss held for the
-/// ledger, a request budget refilling) with [`VenueClock::advance`] instead
-/// of sleeping through it, and every time the venue stamps (account reads,
-/// ledger entries, socket messages) moves with it. Left alone it is the wall
-/// clock. What Guard times on its own monotonic clock (the stream's ages and
-/// silence) and the socket's cadence still take real time.
+/// and the process's monotonic clock, plus an offset the test moves. A
+/// test skips over a wait measured on Guard's clock (the nonce floor after
+/// a start, a loss held for the ledger, a request budget refilling, the
+/// stream's ages and silence, the second after an event, the sync's
+/// cadence) with [`VenueClock::advance`] instead of sleeping through it:
+/// Guard's timers wake when it moves ([`zunder_guard::clock::sleep_by_polling`]),
+/// and every time the venue stamps (account reads, ledger entries, socket
+/// messages) moves with it. Left alone it runs with real time;
+/// [`VenueClock::freeze`] stops it, so that only the test moves it. The
+/// socket's cadence (a tick every so many milliseconds) stays real time.
 #[derive(Debug, Clone, Default)]
-pub struct VenueClock(Arc<AtomicI64>);
+pub struct VenueClock {
+    offset: Arc<AtomicI64>,
+    /// The wall clock and the monotonic clock when frozen.
+    frozen: Arc<Mutex<Option<(i64, i64)>>>,
+}
+
+/// Where the monotonic clock starts: far enough on that moving the clock
+/// back before a start keeps it positive.
+const MONOTONIC_BASE: i64 = 1_000_000_000;
 
 impl VenueClock {
     /// Move the clock `ms` forward.
     pub fn advance(&self, ms: u64) {
-        self.0.fetch_add(ms as i64, Ordering::SeqCst);
+        self.offset.fetch_add(ms as i64, Ordering::SeqCst);
     }
 
     /// Move the clock `ms` back: only before a Guard starts on it.
     pub fn set_back(&self, ms: u64) {
-        self.0.fetch_sub(ms as i64, Ordering::SeqCst);
+        self.offset.fetch_sub(ms as i64, Ordering::SeqCst);
+    }
+
+    /// Stop the clock where it is: from now on only [`VenueClock::advance`]
+    /// moves it.
+    pub fn freeze(&self) {
+        let wall = i64::try_from(zunder_guard::guard::SystemClock.now_ms()).unwrap();
+        let monotonic =
+            i64::try_from(zunder_guard::clock::monotonic_ms()).unwrap() + MONOTONIC_BASE;
+        *self.frozen.lock().unwrap() = Some((wall, monotonic));
+    }
+
+    fn reading(&self) -> (i64, i64) {
+        let frozen = *self.frozen.lock().unwrap();
+        let (wall, monotonic) = frozen.unwrap_or_else(|| {
+            (
+                i64::try_from(zunder_guard::guard::SystemClock.now_ms()).unwrap(),
+                i64::try_from(zunder_guard::clock::monotonic_ms()).unwrap() + MONOTONIC_BASE,
+            )
+        });
+        let offset = self.offset.load(Ordering::SeqCst);
+        (wall + offset, monotonic + offset)
     }
 }
 
 impl Clock for VenueClock {
     fn now_ms(&self) -> u64 {
-        let now = i64::try_from(zunder_guard::guard::SystemClock.now_ms()).unwrap();
-        u64::try_from(now + self.0.load(Ordering::SeqCst)).unwrap()
+        u64::try_from(self.reading().0).unwrap()
+    }
+
+    fn monotonic_ms(&self) -> u64 {
+        u64::try_from(self.reading().1).unwrap()
+    }
+
+    fn sleep(&self, ms: u64) -> zunder_guard::clock::Sleep {
+        zunder_guard::clock::sleep_by_polling(self, ms)
     }
 }
 
@@ -199,6 +238,11 @@ struct State {
     /// While set, every account answer (HTTP and socket) carries this as
     /// its `time`: the venue's time of the account stuck.
     account_time: Option<i64>,
+    /// While set, a dex's `clearinghouseState` over HTTP waits until the
+    /// sender [`MemoryVenue::hold_dex_reads`] returned sends `true` (or is
+    /// dropped); how many reads waited so.
+    dex_hold: Option<(String, tokio::sync::watch::Receiver<bool>)>,
+    dex_hold_waits: usize,
 }
 
 /// Coins the main dex lists after BTC, ETH and SOL when asked to
@@ -690,6 +734,25 @@ impl MemoryVenue {
 
 impl Upstream for MemoryVenue {
     async fn info(&self, body: &Value) -> Result<Value, UpstreamError> {
+        let held = {
+            let mut state = self.state.lock().unwrap();
+            let held = state
+                .dex_hold
+                .as_ref()
+                .filter(|(dex, _)| {
+                    body["type"] == "clearinghouseState"
+                        && body["dex"].as_str() == Some(dex.as_str())
+                        && body.get("_ws").is_none()
+                })
+                .map(|(_, opened)| opened.clone());
+            if held.is_some() {
+                state.dex_hold_waits += 1;
+            }
+            held
+        };
+        if let Some(mut opened) = held {
+            opened.wait_for(|open| *open).await.ok();
+        }
         let delay = {
             let state = self.state.lock().unwrap();
             match body["type"].as_str() {
@@ -1090,6 +1153,19 @@ impl Upstream for MemoryVenue {
 }
 
 impl MemoryVenue {
+    /// Hold every read of `dex`'s account over HTTP until the returned
+    /// sender sends `true` (or is dropped).
+    pub fn hold_dex_reads(&self, dex: &str) -> tokio::sync::watch::Sender<bool> {
+        let (open, opened) = tokio::sync::watch::channel(false);
+        self.state.lock().unwrap().dex_hold = Some((dex.to_owned(), opened));
+        open
+    }
+
+    /// How many reads waited for [`MemoryVenue::hold_dex_reads`].
+    pub fn held_dex_reads(&self) -> usize {
+        self.state.lock().unwrap().dex_hold_waits
+    }
+
     /// Make every account read over HTTP take `ms`.
     pub fn slow_reads(&self, ms: u64) {
         self.state.lock().unwrap().read_delay_ms = ms;

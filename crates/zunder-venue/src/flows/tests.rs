@@ -1,8 +1,8 @@
 // Copyright 2026 Orcastrate UG (haftungsbeschränkt)
 // SPDX-License-Identifier: Elastic-2.0
-//! The fold of `docs/guard.md#deposits-and-withdrawals` on hand-computed numbers. Every
-//! figure below is worked out in the spec's §2 examples or in the comment
-//! next to it. Default limits: 6% daily stop, 25% drawdown stop.
+//! The fold of `docs/guard.md#deposits-and-withdrawals` on hand-computed
+//! numbers, each worked out in the comment next to it. Default limits: 6%
+//! daily stop, 25% drawdown stop.
 
 use rust_decimal::dec;
 
@@ -375,7 +375,7 @@ fn trading_that_took_everything_before_a_deposit_stops_the_engine() {
     // 10,000. Before it the account was at 0: the engine observes 0 and
     // stops. (Read after the deposit it would be a 9% fall.) Next to a
     // deposit alone the stricter reading stands: a deposit must not mask a
-    // loss (no waiver, S5 (b) is for withdrawals).
+    // loss (no waiver, which is for withdrawals).
     let mut fold = fold_at(RiskLimits::default(), dec!(10000));
     fold.add_flow(exact_flow(2 * HOUR, dec!(100000), "d", dec!(0)));
     view(&mut fold, 2 * HOUR + 5_000, dec!(100000));

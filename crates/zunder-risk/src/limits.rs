@@ -13,8 +13,8 @@ pub const MAX_TRADING_EQUITY_USD: Decimal = dec!(2500);
 
 /// Risk limits as fractions of equity. The defaults are the risk frame
 /// recorded on 4 Oct 2026, the limits of Zunder's own bot. Zunder Guard's
-/// defaults are its own preset (`zunder_guard_core::policy::guard_defaults`),
-/// equal in value today but never read from here.
+/// defaults are its own preset ([`crate::guard_defaults`]), equal in value
+/// today but never read from here.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct RiskLimits {

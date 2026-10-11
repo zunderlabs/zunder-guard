@@ -57,7 +57,7 @@ use tokio_tungstenite::{
 };
 
 use crate::{
-    guard::{Clock, Guard},
+    guard::{Clock, Guard, Via},
     upstream::Upstream,
 };
 
@@ -339,7 +339,7 @@ async fn route<U: Upstream, C: Clock>(
             Err(reply) => reply,
         },
         (Method::POST, "/exchange") => match body_json(request).await {
-            Ok(body) => json_reply(StatusCode::OK, &guard.exchange(body, "http").await),
+            Ok(body) => json_reply(StatusCode::OK, &guard.exchange(body, Via::Http).await),
             Err(reply) => reply,
         },
         (Method::POST, "/guard/preview") => match body_json(request).await {
@@ -532,7 +532,7 @@ where
                     "`expectedMode` belongs in the request's payload, beside the signed action; nothing was judged or sent",
                 )
             } else {
-                guard.exchange(payload, "ws").await
+                guard.exchange(payload, Via::WebSocket).await
             };
             let answer = json!({
                 "channel": "post",

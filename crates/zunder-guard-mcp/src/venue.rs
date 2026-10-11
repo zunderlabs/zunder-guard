@@ -299,10 +299,10 @@ pub fn is_cloid(text: &str) -> bool {
         && text.bytes().skip(2).all(|b| b.is_ascii_hexdigit())
 }
 
-/// The stop that protects `position` for the preview's open-risk estimate:
-/// the tightest stop that covers the whole position alone; failing that, if
-/// stops together cover it, the loosest of them (more risk, so a smaller
-/// estimate than Guard's own summing); otherwise none.
+/// The stop that protects `position`, for the overview and for refusing a
+/// cancel that would leave it unprotected: the tightest stop that covers
+/// the whole position alone; failing that, if stops together cover it, the
+/// loosest of them; otherwise none.
 pub fn effective_stop(position: &Position, orders: &[OpenOrder]) -> Option<Decimal> {
     let stops: Vec<&OpenOrder> = orders.iter().filter(|o| o.protects(position)).collect();
     let tighter = |a: Decimal, b: Decimal| match position.side {

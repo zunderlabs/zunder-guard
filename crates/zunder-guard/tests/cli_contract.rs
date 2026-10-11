@@ -113,7 +113,7 @@ fn keys(value: &Value) -> Vec<String> {
     keys
 }
 
-/// The licence object of C3, field by field.
+/// The licence object (`docs/guard.md`, "Automation"), field by field.
 fn assert_licence_object(licence: &Value) {
     let state = licence["state"].as_str().unwrap();
     assert!(
@@ -174,7 +174,8 @@ fn version_is_one_line() {
     );
 }
 
-/// Every command and flag of C3 exists (its `--help` answers, naming the
+/// Every command and flag of the automation interface (`docs/guard.md`, "Automation")
+/// exists (its `--help` answers, naming the
 /// flags), including each `service` subcommand `docs/guard.md` lists.
 #[test]
 fn every_contract_command_and_flag_exists() {
@@ -389,7 +390,7 @@ fn init_paper_home(home: &Path) {
     );
 }
 
-/// `licence set --stdin` (C3): exactly one line from standard input, a
+/// `licence set --stdin` (`docs/guard.md`, "Automation"): exactly one line from standard input, a
 /// trailing newline allowed; checked as the positional form checks it; the
 /// key never appears in what the binary prints, refused or not. A key this
 /// binary accepts would need Orcastrate's issuer, so the success path is
@@ -593,7 +594,8 @@ async fn status_json_and_health() {
     .await;
     assert_eq!(malformed.status.code(), Some(2));
 
-    // `status --json`: at least C3's fields, with their types.
+    // `status --json`: at least the automation interface's fields, with
+    // their types.
     let status = json_out(
         &guard_blocking(vec![
             "--home".into(),

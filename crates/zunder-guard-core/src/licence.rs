@@ -1730,7 +1730,7 @@ mod tests {
         }
     }
 
-    /// Testnet licences (contracts C3, "Testnet licences"): a key the
+    /// Testnet licences (`docs/guard.md`, "Automation", "Testnet licences"): a key the
     /// staging issuer signed counts on testnet only; on mainnet only the
     /// production key does. Two hand-made ed25519 keys stand in for
     /// production and staging (their seeds are here, so they prove

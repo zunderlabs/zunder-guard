@@ -17,6 +17,7 @@ use std::{
 };
 
 use base64::Engine as _;
+use rust_decimal::Decimal;
 use serde_json::{Value, json};
 use zunder_guard_mcp::{
     contract::Mode,
@@ -91,8 +92,12 @@ pub struct MockState {
     /// behind this address becomes this one: another Guard took over the
     /// port between the server's status read and its request.
     pub mode_after_status: Option<&'static str>,
-    /// With `mode_after_status`: the Guard that takes over is an older one,
-    /// without `capabilities.exchange_expected_mode`.
+    /// The same, once the next preview has been answered: another Guard
+    /// took over between the server's preview and its request.
+    pub mode_after_preview: Option<&'static str>,
+    /// With `mode_after_status` or `mode_after_preview`: the Guard that
+    /// takes over is an older one, without
+    /// `capabilities.exchange_expected_mode`.
     pub older_after_status: bool,
     /// Whether the mock answers `POST /guard/kill` as Guard does (checking
     /// `expectedMode` against `kill_expected_mode` and the mode, then
@@ -103,6 +108,22 @@ pub struct MockState {
     /// The next status reads answer only after this many milliseconds
     /// each (a Guard busy with the venue).
     pub status_delays: Vec<u64>,
+    /// Whether the mock answers `POST /guard/preview`; otherwise HTTP 404,
+    /// as an older Guard without it.
+    pub preview_endpoint: bool,
+    /// The `{"error": text}` alone, without a `code`, of a Guard from
+    /// before the refusal code, for the next previews (its budget spent,
+    /// no recent view), before anything is judged. The current Guard's
+    /// `{"code", "error"}` goes in `preview_scripted`.
+    pub preview_errors: Vec<String>,
+    /// Replies to the next previews, verbatim.
+    pub preview_scripted: Vec<Value>,
+    /// The most Guard's rules allow per coin for the entries the tests ask
+    /// about (the numbers in `end_to_end.rs`'s header).
+    pub preview_max: Value,
+    /// A veto (code, text) every preview of an entry ends in, after the
+    /// checks below: the budgets, a position without its stop.
+    pub preview_veto: Option<(String, String)>,
 }
 
 pub struct MockGuard {
@@ -162,10 +183,16 @@ impl MockGuard {
             pinned: None,
             forwarded: Vec::new(),
             mode_after_status: None,
+            mode_after_preview: None,
             older_after_status: false,
             kill_endpoint: false,
             status_failures: 0,
             status_delays: Vec::new(),
+            preview_endpoint: true,
+            preview_errors: Vec::new(),
+            preview_scripted: Vec::new(),
+            preview_max: json!({"BTC": "0.02553", "ETH": "0.2"}),
+            preview_veto: None,
         }));
         let shared = state.clone();
         thread::spawn(move || {
@@ -189,6 +216,18 @@ impl MockGuard {
                 .received
                 .iter()
                 .filter(|r| r.path == "/exchange")
+                .map(|r| r.body.clone())
+                .collect()
+        })
+    }
+
+    /// Every `/guard/preview` body received.
+    pub fn previews(&self) -> Vec<Value> {
+        self.with(|state| {
+            state
+                .received
+                .iter()
+                .filter(|r| r.path == "/guard/preview")
                 .map(|r| r.body.clone())
                 .collect()
         })
@@ -230,6 +269,7 @@ impl MockGuard {
                 kill_file,
                 confirm_account,
                 kill_confirm_wait_ms: 1_000,
+                preview_interval_ms: 0,
             },
             GuardClient::new(GuardUrl::parse(&self.url).expect("loopback url")).expect("client"),
             key.then(|| ClientKey::from_hex(CLIENT_KEY).expect("test key")),
@@ -308,6 +348,11 @@ fn serve(stream: TcpStream, state: &Arc<Mutex<MockState>>) {
         let reply = route(&mut state, &method, path, query, &body);
         if path == "/exchange" && !state.http_failures.is_empty() {
             state.http_failures.remove(0)
+        } else if path == "/guard/preview" && !state.preview_endpoint {
+            (
+                404,
+                "{\"error\":\"Guard serves /info, /exchange, /ws and /guard/*\"}".to_owned(),
+            )
         } else if path == "/guard/status" && state.status_failures > 0 {
             state.status_failures -= 1;
             (502, "{\"error\":\"bad gateway\"}".to_owned())
@@ -338,17 +383,7 @@ fn route(state: &mut MockState, method: &str, path: &str, query: &str, body: &Va
                 status["killed"] = json!(reason.trim());
             }
             if let Some(mode) = state.mode_after_status.take() {
-                state.status["mode"] = json!(mode);
-                state.status["network"] = json!(if mode == "mainnet" {
-                    "mainnet"
-                } else {
-                    "testnet"
-                });
-                if state.older_after_status
-                    && let Some(object) = state.status.as_object_mut()
-                {
-                    object.remove("capabilities");
-                }
+                take_over(state, mode);
             }
             status
         }
@@ -375,8 +410,131 @@ fn route(state: &mut MockState, method: &str, path: &str, query: &str, body: &Va
             _ => json!({"error": "unknown info type"}),
         },
         ("POST", "/exchange") => exchange(state, body),
+        ("POST", "/guard/preview") if state.preview_endpoint => {
+            let reply = preview(state, body);
+            if let Some(mode) = state.mode_after_preview.take() {
+                take_over(state, mode);
+            }
+            reply
+        }
         ("POST", "/guard/kill") if state.kill_endpoint => kill(state, body),
         _ => json!({"error": "not found"}),
+    }
+}
+
+/// Guard's `POST /guard/preview` for the one kind of action the tests
+/// preview, an entry (with its stop in `normalTpsl`, or alone), judged in
+/// Guard's order with the mock's numbers: the kill switch, the market, the
+/// stop (Guard's own under `attach`, 2% beyond the lower of fill and mid
+/// for a buy, the higher for a sell; refused under `refuse`), its side,
+/// `preview_veto`, then the size cut to `preview_max`. The real judgement
+/// is in `crates/zunder-guard/tests/mcp_kit.rs`.
+fn preview(state: &mut MockState, body: &Value) -> Value {
+    if !state.preview_errors.is_empty() {
+        return json!({"error": state.preview_errors.remove(0)});
+    }
+    if !state.preview_scripted.is_empty() {
+        return state.preview_scripted.remove(0);
+    }
+    let decimal = |value: &Value| value.as_str().and_then(|text| text.parse::<Decimal>().ok());
+    let mode = state.status["mode"].clone();
+    let veto = |code: &str, text: &str| {
+        json!({"verdict": "veto", "code": code, "text": text, "changes": [], "entry": null,
+               "pre": null, "forward": null, "post": null, "mode": mode, "view_age_ms": 1000})
+    };
+    let action = &body["action"];
+    let Some(entry) = action["orders"].get(0) else {
+        return json!({"error": "unsupported action"});
+    };
+    if !state.status["killed"].is_null() {
+        return veto("kill_switch", "the kill switch is pulled");
+    }
+    let asset = entry["a"].as_u64().unwrap_or(u64::MAX);
+    let Some(market) = usize::try_from(asset)
+        .ok()
+        .and_then(|index| state.meta["universe"].get(index))
+    else {
+        return veto("unknown_market", "no such asset");
+    };
+    if market["isDelisted"] == true {
+        return veto("unknown_market", "delisted");
+    }
+    let coin = market["name"].as_str().unwrap_or_default().to_owned();
+    let (Some(mid), Some(worst), Some(requested)) = (
+        decimal(&state.mids[coin.as_str()]),
+        decimal(&entry["p"]),
+        decimal(&entry["s"]),
+    ) else {
+        return veto("no_price", "no mid");
+    };
+    let buy = entry["b"] == true;
+    let attach = rules_json(&state.status).contains("\"stopPolicy\":\"attach\"");
+    let (stop, attached) = match action["orders"].get(1) {
+        Some(child) => (decimal(&child["t"]["trigger"]["triggerPx"]), false),
+        None if attach => {
+            let stop = if buy {
+                worst.min(mid) * Decimal::new(98, 2)
+            } else {
+                worst.max(mid) * Decimal::new(102, 2)
+            };
+            (Some(stop.normalize()), true)
+        }
+        None => return veto("stop_required", "the stop policy is refuse"),
+    };
+    let Some(stop) = stop else {
+        return veto("invalid", "unreadable stop");
+    };
+    if (buy && (stop >= mid || stop >= worst)) || (!buy && (stop <= mid || stop <= worst)) {
+        return veto("stop_wrong_side", "the stop is on the wrong side");
+    }
+    if let Some((code, text)) = state.preview_veto.clone() {
+        return veto(&code, &text);
+    }
+    let max = decimal(&state.preview_max[coin.as_str()]).unwrap_or(requested);
+    let size = requested.min(max);
+    let resized = size < requested || attached;
+    json!({
+        "verdict": if resized { "resize" } else { "allow" },
+        "code": if resized { "resized" } else { "allowed" },
+        "text": if resized { "forwarded with changes" } else { "within every rule" },
+        "changes": if size < requested { json!([format!("size {requested} cut to {size}")]) } else { json!([]) },
+        "entry": {"coin": coin, "side": if buy { "buy" } else { "sell" },
+                  "requested_size": requested.normalize().to_string(),
+                  "size": size.normalize().to_string(),
+                  "worst_price": worst.normalize().to_string(),
+                  "stop": stop.normalize().to_string(), "leverage": 3},
+        "pre": [], "forward": action.clone(), "post": [],
+        "mode": mode, "view_age_ms": 1000
+    })
+}
+
+/// The rules code in a status, decoded.
+fn rules_json(status: &Value) -> String {
+    status["rules"]
+        .as_str()
+        .and_then(|code| code.strip_prefix("zr1_"))
+        .and_then(|data| {
+            base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(data)
+                .ok()
+        })
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .unwrap_or_default()
+}
+
+/// Another Guard, of `mode`, now answers at this address (an older one,
+/// without the capabilities, with `older_after_status`).
+fn take_over(state: &mut MockState, mode: &str) {
+    state.status["mode"] = json!(mode);
+    state.status["network"] = json!(if mode == "mainnet" {
+        "mainnet"
+    } else {
+        "testnet"
+    });
+    if state.older_after_status
+        && let Some(object) = state.status.as_object_mut()
+    {
+        object.remove("capabilities");
     }
 }
 

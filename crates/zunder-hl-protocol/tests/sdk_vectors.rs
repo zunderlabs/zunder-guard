@@ -3,7 +3,7 @@
 //! The signer against the official Python SDK's own signing vectors
 //! (hyperliquid-python-sdk, `tests/signing_test.py`, MIT, read 6 Oct 2026),
 //! in both directions: signing gives the SDK's `(r, s, v)`, and recovering
-//! the SDK's signatures gives the SDK's key. Until A5.1 three crates
+//! the SDK's signatures gives the SDK's key. Until this crate existed, three crates
 //! implemented this; a cross-check showed them equal on these vectors, 300
 //! random orders and cancels and 400 random MessagePack trees before they
 //! were merged into this crate.

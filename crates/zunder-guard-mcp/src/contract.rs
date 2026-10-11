@@ -31,9 +31,21 @@
 //!   which latches at once and flattens; only a person removing the kill
 //!   file and restarting Guard releases it. For an older Guard without the
 //!   endpoint, the file `state_dir/kill` ([`pull_kill_switch`], `--kill-file`).
-//! - `preview_order` currently estimates locally with `zunder-risk` and
-//!   the published rules (`preview.rs`), using the constants below. It does
-//!   not call Guard's authoritative `POST /guard/preview` endpoint.
+//! - `POST /guard/preview` with `{"action": …}` (unsigned) answers Guard's
+//!   own judgement of that action, read-only: `verdict`, `code`, `text`,
+//!   `changes`, `entry` (`requested_size`, `size`, `worst_price`, `stop`,
+//!   `leverage`), `mode` and `view_age_ms`, from the background sync's last
+//!   view of the account (at most 60 s old), at most once a second for all
+//!   of Guard's clients together; otherwise `{"code", "error"}`, told apart
+//!   by the stable code (`preview_rate_limited`, `preview_view_stale`,
+//!   `malformed`), the text only quoted ([`parse_preview`]). A Guard from
+//!   before the code sends `{"error": text}` alone; only then are its words
+//!   matched, as a fallback. While recovery runs or the decision journal is
+//!   broken, Guard answers a veto with the code `journal`, with
+//!   `view_age_ms` null when it refused before looking at the view (a
+//!   number when it refused after). A Guard without the endpoint answers
+//!   HTTP 404.
+//!   `preview_order` and `place_order` ask it; neither estimates.
 
 use std::{fs, io::Write, path::Path, str::FromStr};
 
@@ -41,6 +53,7 @@ use base64::Engine as _;
 use rust_decimal::{Decimal, dec};
 use serde::Serialize;
 use serde_json::{Value, json};
+use zunder_core::Side;
 use zunder_risk::RiskLimits;
 
 use crate::sanitize;
@@ -51,13 +64,16 @@ pub const INFO_PATH: &str = "/info";
 pub const EXCHANGE_PATH: &str = "/exchange";
 /// Guard's signed kill request: pulls the switch, never releases it.
 pub const KILL_PATH: &str = "/guard/kill";
+/// Guard's read-only judgement of an unsigned action.
+pub const PREVIEW_PATH: &str = "/guard/preview";
 
 /// The status and event schema this server understands.
 pub const STATUS_SCHEMA: u64 = 1;
 
-/// Guard's `entry_price_bound` default: a limit further than 0.5% beyond
-/// the mid is pulled in to it. A market order is sent as an IOC limit at
-/// exactly this bound, so Guard need not change it.
+/// Guard's `entry_price_bound` default (`docs/guard.md`, "The rules"): a
+/// limit further than 0.5% beyond the mid is pulled in to it. A market
+/// order is sent as an IOC limit at exactly this bound, so Guard need not
+/// change it.
 pub const ENTRY_PRICE_BOUND: Decimal = dec!(0.005);
 /// Guard's fees and slippage per side (`fee_bps` 4.5 + `slippage_bps` 1),
 /// both ways: 11 bps of the entry price per unit, counted into each
@@ -70,8 +86,6 @@ pub const EXIT_SLIPPAGE: Decimal = dec!(0.05);
 /// its trigger, Hyperliquid's own default slippage for market TP/SL. The
 /// stop triggers at its trigger price; this only bounds the fill in a gap.
 pub const STOP_WORST_PRICE: Decimal = dec!(0.10);
-/// Hyperliquid's smallest order value, USD.
-pub const MIN_NOTIONAL: Decimal = Decimal::TEN;
 /// How long a signed request stays valid (`expiresAfter`), ms. Guard's own
 /// nonce window is 30 s back and 5 s ahead.
 pub const REQUEST_TTL_MS: u64 = 20_000;
@@ -507,13 +521,6 @@ impl Rules {
         }
     }
 
-    /// The stop distance Guard attaches, as a fraction of the price.
-    pub fn attach_distance(&self) -> Decimal {
-        self.default_stop_distance_pct
-            .unwrap_or(DEFAULT_STOP_DISTANCE_PCT)
-            / Decimal::ONE_HUNDRED
-    }
-
     /// For the `limits` tool.
     pub fn to_json(&self) -> Value {
         let rule = |name: &str, value: Value, unit: &str, enforced_by: &str| json!({"rule": name, "value": value, "unit": unit, "enforced_by": enforced_by});
@@ -649,6 +656,207 @@ fn bracketed(text: &str) -> Option<(String, &str)> {
     let (code, rest) = inner.split_once(']')?;
     let detail = rest.strip_prefix(':').unwrap_or(rest).trim();
     Some((known_code(code), detail))
+}
+
+/// Guard's verdict in a preview.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PreviewVerdict {
+    Allow,
+    Resize,
+    Veto,
+}
+
+/// The entry of a preview: what Guard would forward.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreviewEntry {
+    pub coin: String,
+    pub side: Side,
+    /// The size asked.
+    pub requested_size: Decimal,
+    /// The size Guard would send: never more than asked.
+    pub size: Decimal,
+    /// The entry's worst fill: its limit, pulled in to Guard's bound.
+    pub worst_price: Decimal,
+    /// The stop's trigger: the entry's own, or the one Guard attaches.
+    pub stop: Decimal,
+    /// The isolated leverage Guard sets before the entry.
+    pub leverage: Option<u32>,
+}
+
+/// Guard's answer to `POST /guard/preview`, read field by field. Text from
+/// Guard is quoted; the code is one this server knows, or `other`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GuardPreview {
+    pub verdict: PreviewVerdict,
+    pub code: String,
+    pub quoted: String,
+    pub changes_quoted: Vec<String>,
+    /// Never on a veto; on an allow or resize, unless Guard judged the
+    /// request as no entry (an order reducing a position).
+    pub entry: Option<PreviewEntry>,
+    pub mode: Mode,
+    /// The age of the account view Guard judged from: at most
+    /// [`PREVIEW_VIEW_MAX_AGE_MS`]. `None` only on a veto Guard made before
+    /// looking at the view (recovery running, the journal broken: `journal`).
+    pub view_age_ms: Option<u64>,
+}
+
+/// Why Guard gave no preview.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PreviewRefusal {
+    /// Guard's preview budget (one a second, for all its clients) is spent.
+    RateLimited,
+    /// Guard has no view of the account from the last 60 s (it has just
+    /// started, or cannot read the venue).
+    ViewStale,
+    /// Guard refused the request for another reason; its words, quoted.
+    Refused { quoted: String },
+    /// The answer is not a preview this server can read.
+    Unreadable,
+}
+
+/// Guard's code when its preview budget is spent.
+const PREVIEW_RATE_LIMITED: &str = "preview_rate_limited";
+/// Guard's code when its last account view is missing or too old.
+const PREVIEW_VIEW_STALE: &str = "preview_view_stale";
+/// Guard's code when the body is not `{"action": …}` with an action it
+/// decodes (the same code `/exchange` refuses such an action with).
+const PREVIEW_MALFORMED: &str = "malformed";
+/// FALLBACK ONLY, for a Guard from before the refusal `code`: its words
+/// when its preview budget is spent ("at most 1 previews a second").
+const LEGACY_PREVIEW_BUDGET_WORDS: &str = "previews a second";
+/// FALLBACK ONLY, for a Guard from before the refusal `code`: its words
+/// when its last account view is too old ("Guard has no recent view of the
+/// account yet; ...").
+const LEGACY_PREVIEW_STALE_WORDS: &str = "no recent view of the account";
+/// The oldest account view Guard previews from (`docs/guard.md`).
+pub const PREVIEW_VIEW_MAX_AGE_MS: u64 = 60_000;
+/// Most of Guard's `changes` shown.
+const MAX_CHANGES: usize = 8;
+
+/// Read Guard's answer to a preview.
+pub fn parse_preview(value: &Value) -> Result<GuardPreview, PreviewRefusal> {
+    if let Some(error) = value.get("error") {
+        let text = error.as_str().unwrap_or_default();
+        let refused = || PreviewRefusal::Refused {
+            quoted: sanitize::quote(text, sanitize::MAX_QUOTE),
+        };
+        return Err(match value.get("code") {
+            // Guard's stable code decides; its text is only quoted.
+            Some(Value::String(code)) => match code.as_str() {
+                PREVIEW_RATE_LIMITED => PreviewRefusal::RateLimited,
+                PREVIEW_VIEW_STALE => PreviewRefusal::ViewStale,
+                // A request this server built that Guard cannot decode (a
+                // version mismatch): a refusal in Guard's words.
+                PREVIEW_MALFORMED => refused(),
+                _ => refused(),
+            },
+            // FALLBACK ONLY: a Guard from before the refusal `code` sends
+            // `{"error": text}` alone, so its words are all there is.
+            None => {
+                if text.contains(LEGACY_PREVIEW_BUDGET_WORDS) {
+                    PreviewRefusal::RateLimited
+                } else if text.contains(LEGACY_PREVIEW_STALE_WORDS) {
+                    PreviewRefusal::ViewStale
+                } else {
+                    refused()
+                }
+            }
+            Some(_) => PreviewRefusal::Unreadable,
+        });
+    }
+    let verdict = match value.get("verdict").and_then(Value::as_str) {
+        Some("allow") => PreviewVerdict::Allow,
+        Some("resize") => PreviewVerdict::Resize,
+        Some("veto") => PreviewVerdict::Veto,
+        _ => return Err(PreviewRefusal::Unreadable),
+    };
+    let code = value
+        .get("code")
+        .and_then(Value::as_str)
+        .map(known_code)
+        .ok_or(PreviewRefusal::Unreadable)?;
+    let mode = value
+        .get("mode")
+        .and_then(Value::as_str)
+        .and_then(Mode::parse)
+        .ok_or(PreviewRefusal::Unreadable)?;
+    let quoted = sanitize::quote(
+        value
+            .get("text")
+            .and_then(Value::as_str)
+            .unwrap_or_default(),
+        sanitize::MAX_QUOTE,
+    );
+    let changes_quoted = value
+        .get("changes")
+        .and_then(Value::as_array)
+        .map(|changes| {
+            changes
+                .iter()
+                .filter_map(Value::as_str)
+                .take(MAX_CHANGES)
+                .map(|change| sanitize::quote(change, sanitize::MAX_QUOTE))
+                .collect()
+        })
+        .unwrap_or_default();
+    let entry = match value.get("entry") {
+        None | Some(Value::Null) => None,
+        Some(entry) => Some(parse_preview_entry(entry).ok_or(PreviewRefusal::Unreadable)?),
+    };
+    // A veto forwards no entry, and an entry is never more than was asked.
+    // (An allow or resize without an entry is a request Guard judged as no
+    // entry at all, such as an order that reduces a position.)
+    let consistent = match (&entry, verdict) {
+        (None, _) => true,
+        (Some(entry), PreviewVerdict::Allow | PreviewVerdict::Resize) => {
+            entry.size <= entry.requested_size
+        }
+        (Some(_), PreviewVerdict::Veto) => false,
+    };
+    if !consistent {
+        return Err(PreviewRefusal::Unreadable);
+    }
+    let view_age_ms = match value.get("view_age_ms") {
+        // Only a veto Guard made before looking at the view (recovery
+        // running, the decision journal broken) has no view age.
+        Some(Value::Null) if verdict == PreviewVerdict::Veto => None,
+        Some(age) => Some(age.as_u64().ok_or(PreviewRefusal::Unreadable)?),
+        None => return Err(PreviewRefusal::Unreadable),
+    };
+    if view_age_ms.is_some_and(|age| age > PREVIEW_VIEW_MAX_AGE_MS) {
+        return Err(PreviewRefusal::ViewStale);
+    }
+    Ok(GuardPreview {
+        verdict,
+        code,
+        quoted,
+        changes_quoted,
+        entry,
+        mode,
+        view_age_ms,
+    })
+}
+
+fn parse_preview_entry(entry: &Value) -> Option<PreviewEntry> {
+    let positive = |name: &str| decimal_value(entry.get(name)?).filter(|d| *d > Decimal::ZERO);
+    Some(PreviewEntry {
+        coin: sanitize::coin_name(entry.get("coin")?.as_str()?)?,
+        side: match entry.get("side")?.as_str()? {
+            "buy" => Side::Buy,
+            "sell" => Side::Sell,
+            _ => return None,
+        },
+        requested_size: positive("requested_size")?,
+        size: positive("size")?,
+        worst_price: positive("worst_price")?,
+        stop: positive("stop")?,
+        leverage: match entry.get("leverage") {
+            None | Some(Value::Null) => None,
+            Some(leverage) => Some(u32::try_from(leverage.as_u64()?).ok()?),
+        },
+    })
 }
 
 /// One statement of the venue's reply to an order, cancel or modify.
@@ -909,7 +1117,7 @@ fn known_reason(code: &str) -> Option<&'static str> {
             "This HIP-3 market's order book is too thin for a stop to close the position."
         }
         "unsupported_order" => "Guard does not forward this kind of order.",
-        "account_unknown" | "account_unreadable" | "equity_not_positive" => {
+        "account_unknown" | "account_unreadable" => {
             "Guard cannot read the account, or its equity is not positive."
         }
         "no_price" => "Guard has no price for this market.",
@@ -955,7 +1163,6 @@ fn known_reason(code: &str) -> Option<&'static str> {
         "venue_refused_leverage" | "margin_not_set" => {
             "The venue refused the isolated leverage Guard needs before the entry."
         }
-        "no_safe_leverage" => "No leverage of 1x or more keeps liquidation beyond the stop.",
         "venue_unreachable" => "Guard could not reach the venue.",
         "rate_limited" => {
             "Guard is reading the account for many requests; it keeps the venue's request limit for protection. Try again in a few seconds."
@@ -983,8 +1190,6 @@ fn known_reason(code: &str) -> Option<&'static str> {
         | "nonce_reused" => {
             "Guard refused the request's nonce or expiry (clock skew, a replay, or Guard restarted moments ago)."
         }
-        "not_ready" => "Guard is starting or reconciling.",
-        "overflow" => "The numbers are too large to size safely.",
         "absurd_size" => {
             "The size is absurd: worth more than 200 times the account's equity. It is refused, not resized."
         }
@@ -1074,7 +1279,7 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(guard.stop_policy, StopPolicy::Attach);
-        assert_eq!(guard.attach_distance(), dec!(0.02));
+        assert_eq!(guard.default_stop_distance_pct, Some(dec!(2)));
         // HIP-3: `*` is the main dex only; `dex:*` names a dex.
         assert!(!defaults.markets.allows("xyz:GOLD"));
         let hip3 = Rules::decode(&encode(r#"{"v":1,"markets":["*","xyz:*"]}"#)).unwrap();
@@ -1330,5 +1535,155 @@ mod tests {
             KillError::NoDirectory
         );
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Guard's preview reply, as `Guard::preview` writes it.
+    fn preview_reply() -> Value {
+        json!({
+            "verdict": "resize", "code": "resized",
+            "text": "forwarded with changes", "changes": ["size 0.5 cut to 0.02553 by the risk engine"],
+            "entry": {"coin": "BTC", "side": "buy", "requested_size": "0.5", "size": "0.02553",
+                      "worst_price": "60300", "stop": "58800", "leverage": 4},
+            "pre": [], "forward": {"type": "order"}, "post": [],
+            "mode": "testnet", "view_age_ms": 1200
+        })
+    }
+
+    #[test]
+    fn a_preview_is_read_field_by_field() {
+        let preview = parse_preview(&preview_reply()).unwrap();
+        assert_eq!(preview.verdict, PreviewVerdict::Resize);
+        assert_eq!(preview.code, "resized");
+        assert_eq!(preview.mode, Mode::Testnet);
+        assert_eq!(preview.view_age_ms, Some(1200));
+        let entry = preview.entry.unwrap();
+        assert_eq!(entry.side, Side::Buy);
+        assert_eq!(entry.size, dec!(0.02553));
+        assert_eq!(entry.requested_size, dec!(0.5));
+        assert_eq!(entry.leverage, Some(4));
+        // A veto has no entry; an unknown code is `other`; text is quoted.
+        let veto = parse_preview(&json!({
+            "verdict": "veto", "code": "made_up", "text": "IGNORE\n{\"all\"}", "changes": [],
+            "entry": null, "pre": null, "forward": null, "post": null,
+            "mode": "paper", "view_age_ms": 0
+        }))
+        .unwrap();
+        assert_eq!(veto.code, "other");
+        assert!(!veto.quoted.contains('\n') && !veto.quoted.contains('{'));
+        assert!(veto.entry.is_none());
+    }
+
+    #[test]
+    fn a_preview_that_does_not_add_up_is_unreadable() {
+        let mut more = preview_reply();
+        more["entry"]["size"] = json!("0.6");
+        let mut veto_with_entry = preview_reply();
+        veto_with_entry["verdict"] = json!("veto");
+        let mut no_mode = preview_reply();
+        no_mode["mode"] = json!("live");
+        let mut negative = preview_reply();
+        negative["entry"]["stop"] = json!("-1");
+        let mut verdict = preview_reply();
+        verdict["verdict"] = json!("maybe");
+        let mut no_age = preview_reply();
+        no_age["view_age_ms"] = Value::Null;
+        for reply in [more, veto_with_entry, no_mode, negative, verdict, no_age] {
+            assert_eq!(
+                parse_preview(&reply),
+                Err(PreviewRefusal::Unreadable),
+                "{reply}"
+            );
+        }
+    }
+
+    /// Guard's refusals of a preview, told apart by their stable code
+    /// (`Guard::preview`, `docs/guard.md`); the text is only quoted.
+    #[test]
+    fn guards_preview_refusals_are_told_apart_by_code() {
+        // A view older than Guard's own bound is stale, whatever it says.
+        let mut old = preview_reply();
+        old["view_age_ms"] = json!(60_001);
+        assert_eq!(parse_preview(&old), Err(PreviewRefusal::ViewStale));
+        // The code decides, whatever the words say.
+        assert_eq!(
+            parse_preview(
+                &json!({"code": "preview_rate_limited", "error": "no recent view of the account"})
+            ),
+            Err(PreviewRefusal::RateLimited)
+        );
+        assert_eq!(
+            parse_preview(
+                &json!({"code": "preview_view_stale", "error": "at most 1 previews a second"})
+            ),
+            Err(PreviewRefusal::ViewStale)
+        );
+        assert_eq!(
+            parse_preview(
+                &json!({"code": "malformed", "error": "the body must be {\"action\": {...}}"})
+            ),
+            Err(PreviewRefusal::Refused {
+                quoted: "the body must be ??action?: ?...??".into()
+            })
+        );
+        // A code this server does not know is a refusal in Guard's words.
+        assert_eq!(
+            parse_preview(&json!({"code": "something_new", "error": "previews a second"})),
+            Err(PreviewRefusal::Refused {
+                quoted: "previews a second".into()
+            })
+        );
+        // A code that is not a string is no answer this server can read.
+        assert_eq!(
+            parse_preview(&json!({"code": 7, "error": "previews a second"})),
+            Err(PreviewRefusal::Unreadable)
+        );
+    }
+
+    /// FALLBACK ONLY: a Guard from before the refusal code sends
+    /// `{"error": text}` alone, and only then are its words matched.
+    #[test]
+    fn an_older_guards_preview_refusals_are_told_apart_by_words() {
+        assert_eq!(
+            parse_preview(&json!({"error": "at most 1 previews a second"})),
+            Err(PreviewRefusal::RateLimited)
+        );
+        assert_eq!(
+            parse_preview(
+                &json!({"error": "Guard has no recent view of the account yet; try again after the next sync"})
+            ),
+            Err(PreviewRefusal::ViewStale)
+        );
+        assert_eq!(
+            parse_preview(&json!({"error": "the body must be {\"action\": {...}}"})),
+            Err(PreviewRefusal::Refused {
+                quoted: "the body must be ??action?: ?...??".into()
+            })
+        );
+    }
+
+    /// While recovery runs or the decision journal is broken, Guard's
+    /// preview is a veto with the code `journal` and no view age
+    /// (`docs/guard.md`, `POST /guard/preview`); a view age is still
+    /// required on anything that is not a veto.
+    #[test]
+    fn a_journal_veto_has_no_view_age() {
+        let veto = parse_preview(&json!({
+            "verdict": "veto", "code": "journal",
+            "text": "the decision could not be journaled, so nothing was sent: disk full",
+            "changes": [], "entry": null, "pre": [], "forward": null, "post": [],
+            "mode": "testnet", "view_age_ms": null
+        }))
+        .unwrap();
+        assert_eq!(veto.verdict, PreviewVerdict::Veto);
+        assert_eq!(veto.code, "journal");
+        assert_eq!(veto.view_age_ms, None);
+        let mut allow = preview_reply();
+        allow["view_age_ms"] = Value::Null;
+        assert_eq!(parse_preview(&allow), Err(PreviewRefusal::Unreadable));
+        let mut missing = preview_reply();
+        missing["verdict"] = json!("veto");
+        missing["entry"] = Value::Null;
+        missing.as_object_mut().unwrap().remove("view_age_ms");
+        assert_eq!(parse_preview(&missing), Err(PreviewRefusal::Unreadable));
     }
 }

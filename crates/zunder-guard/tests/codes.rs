@@ -6,7 +6,7 @@
 //!
 //! The sources are scanned for the places a code is written: `veto("…"`,
 //! `veto_reply("…"`, `code: "…"`, `.code = "…"`, `Verdict::…, "…"` and the
-//! match arms of `Refusal`, `AuthError` and `Veto` that name codes. A code
+//! match arms of `Refusal`, `AuthError`, `Veto` and `ReasonCode` that name codes. A code
 //! added there without a line in the list (or the other way round) fails
 //! here.
 //!
@@ -77,10 +77,10 @@ fn codes_in(text: &str) -> BTreeSet<String> {
         }
     }
     // Match arms naming codes: `Refusal::… => "…"`, `AuthError::… => "…"`,
-    // `Veto::… => "…"`.
+    // `Veto::… => "…"`, `ReasonCode::… => "…"`.
     for line in text.lines() {
         let line = line.trim();
-        let arm = ["Refusal::", "AuthError::", "Veto::"]
+        let arm = ["Refusal::", "AuthError::", "Veto::", "ReasonCode::"]
             .iter()
             .any(|prefix| line.starts_with(prefix));
         if arm
@@ -166,6 +166,7 @@ fn the_scanner_finds_codes_where_they_are_written() {
             Refusal::Decode(_) => "seven",
             AuthError::BadSignature => "eight",
             Veto::Stopped => "nine",
+            ReasonCode::Journal => "ten",
             other => "not_a_code", veto(code, text) }
         #[cfg(test)]
         mod tests { fn t() { veto("in_a_test", "z"); } }
@@ -174,7 +175,7 @@ fn the_scanner_finds_codes_where_they_are_written() {
     assert_eq!(
         found,
         [
-            "eight", "five", "four", "nine", "one", "seven", "six", "three", "two"
+            "eight", "five", "four", "nine", "one", "seven", "six", "ten", "three", "two"
         ]
     );
 }

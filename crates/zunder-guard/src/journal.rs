@@ -12,7 +12,7 @@
 //! Every other record ([`DecisionJournal::append`]: what was sent and the
 //! venue's answer, errors, risk events) is synced with the next intent, or
 //! within [`FLUSH_MS`]; a crash may lose those, and recovery asks the venue
-//! (spec J3). The file is extended with zeros in steps of
+//! (`docs/guard.md`, "Journals"). The file is extended with zeros in steps of
 //! [`ALLOCATE_STEP`], so that a sync commits data only; a clean stop gives
 //! the unused zeros back.
 //!
@@ -32,14 +32,20 @@ use std::{
     fs::{File, OpenOptions},
     io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 use serde_json::Value;
 use sha3::{Digest, Sha3_256};
 use thiserror::Error;
+use zunder_core::Timestamp;
 use zunder_guard_core::event::{EventBody, GuardEvent};
 
-use crate::recover::Tracker;
+use crate::{
+    clock::{Clock, SystemClock, timeout},
+    locks::lock,
+    recover::Tracker,
+};
 
 /// How many events the event endpoint can serve.
 pub const RECENT_EVENTS: usize = 1_000;
@@ -250,45 +256,61 @@ impl Storage for FileStorage {
 pub struct Durable {
     /// `None`: the writer was behind and took no flush (not an error of
     /// the journal: what was appended is synced within [`FLUSH_MS`]).
-    done: Option<tokio::sync::oneshot::Receiver<Result<(), String>>>,
+    done: Option<tokio::sync::oneshot::Receiver<Result<(), WriterError>>>,
     broken: Broken,
+    /// The journal's clock, which times the wait.
+    clock: Arc<dyn Clock>,
 }
 
 type Broken = std::sync::Arc<std::sync::Mutex<Option<String>>>;
+
+/// Why the writer could not make a record durable, on its ack channel. Its
+/// text becomes why the journal is broken ([`JournalError::Broken`]).
+#[derive(Debug, Clone, Error)]
+enum WriterError {
+    #[error("writing the journal: {0}")]
+    Write(Arc<io::Error>),
+    #[error("syncing the journal: {0}")]
+    Sync(Arc<io::Error>),
+    #[error("trimming the journal: {0}")]
+    Trim(Arc<io::Error>),
+    /// The journal was broken before this wait (the writer gone, or an
+    /// earlier failure): why.
+    #[error("{0}")]
+    Broken(String),
+}
 
 impl Durable {
     /// Wait until the record, and every record before it, is on disk: at
     /// most [`ACK_DEADLINE_MS`]; a sync that takes longer breaks the
     /// journal (a stalled disk must not hold Guard up).
     pub async fn wait(self) -> Result<(), JournalError> {
-        let deadline = std::time::Duration::from_millis(ACK_DEADLINE_MS);
         let Some(done) = self.done else {
             return Err(JournalError::Busy);
         };
-        let why = match tokio::time::timeout(deadline, done).await {
-            Ok(Ok(Ok(()))) => return Ok(()),
-            Ok(Ok(Err(why))) => why,
-            Ok(Err(_)) => "the journal writer stopped".to_owned(),
-            Err(_) => format!("the journal's sync took longer than {ACK_DEADLINE_MS} ms"),
+        let why = match timeout(&*self.clock, ACK_DEADLINE_MS, done).await {
+            Some(Ok(Ok(()))) => return Ok(()),
+            Some(Ok(Err(error))) => error.to_string(),
+            Some(Err(_)) => "the journal writer stopped".to_owned(),
+            None => format!("the journal's sync took longer than {ACK_DEADLINE_MS} ms"),
         };
-        if let Ok(mut broken) = self.broken.lock() {
-            broken.get_or_insert_with(|| why.clone());
-        }
+        lock(&self.broken).get_or_insert_with(|| why.clone());
         Err(JournalError::Broken(why))
     }
 
     /// A wait that fails at once.
-    fn failed(why: String, broken: Broken) -> Self {
+    fn failed(why: String, broken: Broken, clock: Arc<dyn Clock>) -> Self {
         let (ack, done) = tokio::sync::oneshot::channel();
-        ack.send(Err(why)).ok();
+        ack.send(Err(WriterError::Broken(why))).ok();
         Self {
             done: Some(done),
             broken,
+            clock,
         }
     }
 }
 
-type Ack = tokio::sync::oneshot::Sender<Result<(), String>>;
+type Ack = tokio::sync::oneshot::Sender<Result<(), WriterError>>;
 
 enum Job {
     /// A record's bytes, with an ack when its writer waits for it.
@@ -317,7 +339,7 @@ fn writer<S: Storage>(
 ) {
     let flush = std::time::Duration::from_millis(FLUSH_MS);
     let mut unsynced_since: Option<std::time::Instant> = None;
-    let mut failed: Option<String> = None;
+    let mut failed: Option<WriterError> = None;
     loop {
         let wait = unsynced_since.map_or(std::time::Duration::from_secs(3_600), |since| {
             flush.saturating_sub(since.elapsed())
@@ -356,7 +378,7 @@ fn writer<S: Storage>(
                                 end = need;
                                 unsynced_since.get_or_insert_with(std::time::Instant::now);
                             }
-                            Err(error) => failed = Some(format!("writing the journal: {error}")),
+                            Err(error) => failed = Some(WriterError::Write(Arc::new(error))),
                         }
                     }
                     if let Some(ack) = ack {
@@ -384,13 +406,11 @@ fn writer<S: Storage>(
                     unsynced_since = None;
                     synced.store(end, std::sync::atomic::Ordering::SeqCst);
                 }
-                Err(error) => failed = Some(format!("syncing the journal: {error}")),
+                Err(error) => failed = Some(WriterError::Sync(Arc::new(error))),
             }
         }
-        if let Some(why) = &failed
-            && let Ok(mut broken) = broken.lock()
-        {
-            broken.get_or_insert_with(|| why.clone());
+        if let Some(why) = &failed {
+            lock(&broken).get_or_insert_with(|| why.to_string());
         }
         let result = failed.clone().map_or(Ok(()), Err);
         for ack in acks {
@@ -406,7 +426,7 @@ fn writer<S: Storage>(
             let trimmed = if failed.is_none() {
                 storage
                     .trim(end)
-                    .map_err(|error| format!("trimming the journal: {error}"))
+                    .map_err(|error| WriterError::Trim(Arc::new(error)))
             } else {
                 result
             };
@@ -454,6 +474,11 @@ pub struct DecisionJournal {
     cut: Option<(u64, PathBuf)>,
     jobs: Option<std::sync::mpsc::SyncSender<Job>>,
     thread: Option<std::thread::JoinHandle<()>>,
+    /// What times the waits for the writer: the system's clock until
+    /// Guard gives the journal its own ([`DecisionJournal::set_clock`]).
+    /// The writer thread's own cadence ([`FLUSH_MS`]) runs on the
+    /// system's monotonic clock.
+    clock: Arc<dyn Clock>,
 }
 
 /// What reading a journal found.
@@ -694,9 +719,7 @@ impl DecisionJournal {
         let (jobs, thread) = match thread {
             Ok(thread) => (Some(jobs), Some(thread)),
             Err(error) => {
-                if let Ok(mut broken) = broken.lock() {
-                    *broken = Some(format!("the journal writer could not start: {error}"));
-                }
+                *lock(&broken) = Some(format!("the journal writer could not start: {error}"));
                 (None, None)
             }
         };
@@ -716,6 +739,24 @@ impl DecisionJournal {
             cut: None,
             jobs,
             thread,
+            clock: Arc::new(SystemClock),
+        }
+    }
+
+    /// Time the waits for the writer on `clock` (Guard's).
+    pub fn set_clock(&mut self, clock: Arc<dyn Clock>) {
+        self.clock = clock;
+    }
+
+    /// A wait for `done` on this journal's clock.
+    fn durable(
+        &self,
+        done: Option<tokio::sync::oneshot::Receiver<Result<(), WriterError>>>,
+    ) -> Durable {
+        Durable {
+            done,
+            broken: self.broken.clone(),
+            clock: self.clock.clone(),
         }
     }
 
@@ -756,13 +797,11 @@ impl DecisionJournal {
     }
 
     fn broken_why(&self) -> Option<String> {
-        self.broken.lock().ok().and_then(|broken| broken.clone())
+        lock(&self.broken).clone()
     }
 
     fn set_broken(&self, why: &str) -> JournalError {
-        if let Ok(mut broken) = self.broken.lock() {
-            broken.get_or_insert_with(|| why.to_owned());
-        }
+        lock(&self.broken).get_or_insert_with(|| why.to_owned());
         JournalError::Broken(why.to_owned())
     }
 
@@ -770,8 +809,8 @@ impl DecisionJournal {
     /// within [`FLUSH_MS`], or with the next record that waits for the
     /// disk. Returns its sequence number. Only for a record nothing is sent
     /// on the strength of.
-    pub fn append(&mut self, at_ms: i64, body: EventBody) -> Result<u64, JournalError> {
-        self.enqueue(at_ms, body, None)
+    pub fn append(&mut self, at: Timestamp, body: EventBody) -> Result<u64, JournalError> {
+        self.enqueue(at, body, None)
     }
 
     /// Append an intent Guard acts on whatever bots do (a protection, a
@@ -779,17 +818,17 @@ impl DecisionJournal {
     /// writer behind (`Busy`) is waited for, at most
     /// [`ACK_DEADLINE_MS`] in all; one still behind then breaks the
     /// journal, as a sync that takes too long does (then the emergency log
-    /// takes over, E1). Returns the record's `seq`.
+    /// takes over). Returns the record's `seq`.
     pub async fn append_durable_waiting(
         &mut self,
-        at_ms: i64,
+        at: Timestamp,
         body: EventBody,
     ) -> Result<u64, JournalError> {
-        let started = std::time::Instant::now();
-        let deadline = std::time::Duration::from_millis(ACK_DEADLINE_MS);
+        let started = self.clock.monotonic_ms();
+        let elapsed = |clock: &dyn Clock| clock.monotonic_ms().saturating_sub(started);
         let mut waited = false;
         loop {
-            let appended = self.append_durable(at_ms, body.clone());
+            let appended = self.append_durable(at, body.clone());
             // One refusal counted for the whole wait.
             if waited && matches!(appended, Err(JournalError::Busy)) {
                 self.busy = self.busy.saturating_sub(1);
@@ -797,16 +836,17 @@ impl DecisionJournal {
             waited = true;
             match appended {
                 Ok((seq, durable)) => {
-                    let left = deadline.saturating_sub(started.elapsed());
-                    return match tokio::time::timeout(left, durable.wait()).await {
-                        Ok(result) => result.map(|()| seq),
-                        Err(_) => Err(self.set_broken(&format!(
+                    let left = ACK_DEADLINE_MS.saturating_sub(elapsed(&*self.clock));
+                    let clock = self.clock.clone();
+                    return match timeout(&*clock, left, durable.wait()).await {
+                        Some(result) => result.map(|()| seq),
+                        None => Err(self.set_broken(&format!(
                             "the journal's sync took longer than {ACK_DEADLINE_MS} ms"
                         ))),
                     };
                 }
-                Err(JournalError::Busy) if started.elapsed() < deadline => {
-                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                Err(JournalError::Busy) if elapsed(&*self.clock) < ACK_DEADLINE_MS => {
+                    self.clock.sleep(5).await;
                 }
                 Err(JournalError::Busy) => {
                     return Err(self.set_broken(&format!(
@@ -821,19 +861,20 @@ impl DecisionJournal {
     /// Append a record nothing waits for, waiting for a writer that is
     /// behind until `until` at most (then `Busy`, counted as dropped, the
     /// journal not broken): for records that must not be dropped
-    /// (recovery's, which share one deadline).
+    /// (recovery's, which share one deadline). `until` is on the journal's
+    /// clock ([`Clock::monotonic_ms`]).
     pub async fn append_waiting(
         &mut self,
-        at_ms: i64,
+        at: Timestamp,
         body: EventBody,
-        until: std::time::Instant,
+        until: u64,
     ) -> Result<u64, JournalError> {
         loop {
-            match self.append(at_ms, body.clone()) {
-                Err(JournalError::Busy) if std::time::Instant::now() < until => {
+            match self.append(at, body.clone()) {
+                Err(JournalError::Busy) if self.clock.monotonic_ms() < until => {
                     // Not dropped yet: counted only if it stays out.
                     self.dropped = self.dropped.saturating_sub(1);
-                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                    self.clock.sleep(5).await;
                 }
                 result => return result,
             }
@@ -843,14 +884,15 @@ impl DecisionJournal {
     /// [`DecisionJournal::flush`], waiting for room in a writer that is
     /// behind until `until` at most; the returned wait (made without the
     /// journal) answers `Busy` if there was none (what is queued is synced
-    /// within [`FLUSH_MS`] all the same).
-    pub async fn flush_when_room(&mut self, until: std::time::Instant) -> Durable {
+    /// within [`FLUSH_MS`] all the same). `until` is on the journal's
+    /// clock ([`Clock::monotonic_ms`]).
+    pub async fn flush_when_room(&mut self, until: u64) -> Durable {
         loop {
             let durable = self.flush();
-            if durable.done.is_some() || std::time::Instant::now() >= until {
+            if durable.done.is_some() || self.clock.monotonic_ms() >= until {
                 return durable;
             }
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            self.clock.sleep(5).await;
         }
     }
 
@@ -859,18 +901,12 @@ impl DecisionJournal {
     /// the returned [`Durable`] before sending.
     pub fn append_durable(
         &mut self,
-        at_ms: i64,
+        at: Timestamp,
         body: EventBody,
     ) -> Result<(u64, Durable), JournalError> {
         let (ack, done) = tokio::sync::oneshot::channel();
-        let seq = self.enqueue(at_ms, body, Some(ack))?;
-        Ok((
-            seq,
-            Durable {
-                done: Some(done),
-                broken: self.broken.clone(),
-            },
-        ))
+        let seq = self.enqueue(at, body, Some(ack))?;
+        Ok((seq, self.durable(Some(done))))
     }
 
     /// Everything appended so far, on disk. A writer behind takes no
@@ -883,25 +919,20 @@ impl DecisionJournal {
             None => Err(std::sync::mpsc::TrySendError::Disconnected(Job::Flush(ack))),
         };
         match sent {
-            Ok(()) => Durable {
-                done: Some(done),
-                broken: self.broken.clone(),
-            },
-            Err(std::sync::mpsc::TrySendError::Full(_)) => Durable {
-                done: None,
-                broken: self.broken.clone(),
-            },
+            Ok(()) => self.durable(Some(done)),
+            Err(std::sync::mpsc::TrySendError::Full(_)) => self.durable(None),
             Err(std::sync::mpsc::TrySendError::Disconnected(_)) => Durable::failed(
                 self.broken_why()
                     .unwrap_or_else(|| "the journal writer is gone".into()),
                 self.broken.clone(),
+                self.clock.clone(),
             ),
         }
     }
 
     fn enqueue(
         &mut self,
-        at_ms: i64,
+        at: Timestamp,
         body: EventBody,
         ack: Option<Ack>,
     ) -> Result<u64, JournalError> {
@@ -920,7 +951,7 @@ impl DecisionJournal {
         };
         let event = GuardEvent {
             seq: self.seq + 1,
-            at_ms,
+            at_ms: at.as_millis(),
             body,
         };
         let value = serde_json::to_value(&event).map_err(|error| JournalError::Io {
@@ -1048,7 +1079,7 @@ impl DecisionJournal {
     pub fn fill_queue_for_test(&mut self) {
         while self
             .append(
-                0,
+                Timestamp::from_millis(0),
                 EventBody::Error {
                     text: "filler".into(),
                 },
@@ -1090,12 +1121,7 @@ impl DecisionJournal {
             self.thread.take();
             return Err(self.set_broken("the journal writer is gone"));
         }
-        let closed = Durable {
-            done: Some(done),
-            broken: self.broken.clone(),
-        }
-        .wait()
-        .await;
+        let closed = self.durable(Some(done)).wait().await;
         let thread = self.thread.take();
         if closed.is_ok()
             && let Some(thread) = thread
@@ -1147,6 +1173,11 @@ impl DecisionJournal {
         self.broken_why().is_some()
     }
 
+    /// Why the journal is broken, as a write to it would fail.
+    pub fn broken_error(&self) -> Option<JournalError> {
+        self.broken_why().map(JournalError::Broken)
+    }
+
     pub fn path(&self) -> &Path {
         &self.path
     }
@@ -1164,7 +1195,7 @@ impl Drop for DecisionJournal {
     }
 }
 
-/// The emergency log (`docs/guard.md#journals`, E1): where Guard
+/// The emergency log (`docs/guard.md#journals`): where Guard
 /// records a protective send (a flattening, a protective stop, a close)
 /// it makes while the decision journal cannot be written, before sending
 /// it where it can. Its own file, best on another disk; the same record
@@ -1227,24 +1258,24 @@ impl EmergencyLog {
     }
 
     /// Append `body` and sync it.
-    pub fn append(&mut self, at_ms: i64, body: EventBody) -> io::Result<u64> {
+    pub fn append(&mut self, at: Timestamp, body: EventBody) -> io::Result<u64> {
         #[cfg(feature = "test-hooks")]
         {
             self.attempts
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             if let Some(gate) = &self.hold {
                 let (open, opened) = &**gate;
-                let mut is_open = open.lock().map_err(|_| io::Error::other("poisoned"))?;
+                let mut is_open = lock(open);
                 while !*is_open {
                     is_open = opened
                         .wait(is_open)
-                        .map_err(|_| io::Error::other("poisoned"))?;
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
                 }
             }
         }
         let event = GuardEvent {
             seq: self.seq + 1,
-            at_ms,
+            at_ms: at.as_millis(),
             body,
         };
         let text = serde_json::to_value(&event)
@@ -1292,12 +1323,27 @@ mod tests {
         let dir = TestDir::new("journal-chain");
         let path = dir.path().join("decisions.jsonl");
         let mut journal = DecisionJournal::open(&path).unwrap();
-        assert_eq!(journal.append(1, kill("a")).unwrap(), 1);
-        assert_eq!(journal.append(2, kill("b")).unwrap(), 2);
+        assert_eq!(
+            journal
+                .append(Timestamp::from_millis(1), kill("a"))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            journal
+                .append(Timestamp::from_millis(2), kill("b"))
+                .unwrap(),
+            2
+        );
         drop(journal);
         let mut reopened = DecisionJournal::open(&path).unwrap();
         assert_eq!(reopened.last_seq(), 2);
-        assert_eq!(reopened.append(3, kill("c")).unwrap(), 3);
+        assert_eq!(
+            reopened
+                .append(Timestamp::from_millis(3), kill("c"))
+                .unwrap(),
+            3
+        );
         assert_eq!(reopened.since(1).len(), 2);
         assert_eq!(reopened.since(0)[0]["reason"], "a");
     }
@@ -1314,8 +1360,12 @@ mod tests {
         let dir = TestDir::new("journal-durable");
         let path = dir.path().join("decisions.jsonl");
         let mut journal = DecisionJournal::open(&path).unwrap();
-        journal.append(1, kill("not waited for")).unwrap();
-        let (seq, durable) = journal.append_durable(2, kill("intent")).unwrap();
+        journal
+            .append(Timestamp::from_millis(1), kill("not waited for"))
+            .unwrap();
+        let (seq, durable) = journal
+            .append_durable(Timestamp::from_millis(2), kill("intent"))
+            .unwrap();
         assert_eq!(seq, 2);
         runtime().block_on(durable.wait()).unwrap();
         // On disk, both (the file is allocated ahead: zeros after them).
@@ -1340,7 +1390,11 @@ mod tests {
         let path = dir.path().join("decisions.jsonl");
         let mut journal = DecisionJournal::open(&path).unwrap();
         runtime().block_on(journal.close()).unwrap();
-        assert!(journal.append(1, kill("after")).is_err());
+        assert!(
+            journal
+                .append(Timestamp::from_millis(1), kill("after"))
+                .is_err()
+        );
         assert!(journal.is_broken());
         assert!(runtime().block_on(journal.flush().wait()).is_err());
     }
@@ -1366,8 +1420,12 @@ mod tests {
         let dir = TestDir::new("journal-crash");
         let path = dir.path().join("decisions.jsonl");
         let mut journal = DecisionJournal::open(&path).unwrap();
-        journal.append(1, kill("decision")).unwrap();
-        journal.append(2, kill("sent")).unwrap();
+        journal
+            .append(Timestamp::from_millis(1), kill("decision"))
+            .unwrap();
+        journal
+            .append(Timestamp::from_millis(2), kill("sent"))
+            .unwrap();
         drop(journal);
         let full = std::fs::read(&path).unwrap();
         let first_end = full.iter().position(|byte| *byte == b'\n').unwrap() + 1;
@@ -1384,7 +1442,12 @@ mod tests {
         let (bytes, aside) = journal.cut_on_open().unwrap();
         assert_eq!(bytes, (half - first_end) as u64);
         assert_eq!(std::fs::read(aside).unwrap(), full[first_end..half]);
-        assert_eq!(journal.append(3, kill("again")).unwrap(), 2);
+        assert_eq!(
+            journal
+                .append(Timestamp::from_millis(3), kill("again"))
+                .unwrap(),
+            2
+        );
         drop(journal);
         assert_eq!(DecisionJournal::open(&path).unwrap().last_seq(), 2);
         // Zeros where it was, then the writer's allocated zeros.
@@ -1436,9 +1499,13 @@ mod tests {
         let dir = TestDir::new("journal-durable-damage");
         let path = dir.path().join("decisions.jsonl");
         let mut journal = DecisionJournal::open(&path).unwrap();
-        journal.append(1, kill("first")).unwrap();
+        journal
+            .append(Timestamp::from_millis(1), kill("first"))
+            .unwrap();
         runtime().block_on(journal.flush().wait()).unwrap();
-        journal.append(2, kill("second")).unwrap();
+        journal
+            .append(Timestamp::from_millis(2), kill("second"))
+            .unwrap();
         drop(journal);
         let text = std::fs::read_to_string(&path).unwrap();
         // The first, changed, or gone, or zeroed.
@@ -1521,7 +1588,9 @@ mod tests {
         let path = dir.path().join("decisions.jsonl");
         let mut journal = DecisionJournal::open(&path).unwrap();
         for at in 1..=3 {
-            journal.append(at, kill("x")).unwrap();
+            journal
+                .append(Timestamp::from_millis(at), kill("x"))
+                .unwrap();
             runtime().block_on(journal.flush().wait()).unwrap();
         }
         drop(journal);
@@ -1574,12 +1643,17 @@ mod lookup_tests {
         let mut journal = DecisionJournal::open(&path).unwrap();
         // Multi-byte text before and between: offsets count bytes.
         journal
-            .append(1, decision(100, "0xAA", "Größe über dem Budget, 2 € — ✓"))
+            .append(
+                Timestamp::from_millis(1),
+                decision(100, "0xAA", "Größe über dem Budget, 2 € — ✓"),
+            )
             .unwrap();
-        let seq = journal.append(2, decision(200, "0xaa", "zweite")).unwrap();
+        let seq = journal
+            .append(Timestamp::from_millis(2), decision(200, "0xaa", "zweite"))
+            .unwrap();
         journal
             .append(
-                3,
+                Timestamp::from_millis(3),
                 EventBody::Sent {
                     decision: seq,
                     nonce: 9,
@@ -1591,7 +1665,10 @@ mod lookup_tests {
             )
             .unwrap();
         journal
-            .append(4, decision(200, "0xbb", "another bot, same nonce"))
+            .append(
+                Timestamp::from_millis(4),
+                decision(200, "0xbb", "another bot, same nonce"),
+            )
             .unwrap();
         drop(journal);
         let journal = DecisionJournal::open(&path).unwrap();
@@ -1619,12 +1696,16 @@ mod lookup_tests {
         let dir = TestDir::new("journal-newline");
         let path = dir.path().join("decisions.jsonl");
         let mut journal = DecisionJournal::open(&path).unwrap();
-        journal.append(1, decision(100, "0xaa", "one")).unwrap();
+        journal
+            .append(Timestamp::from_millis(1), decision(100, "0xaa", "one"))
+            .unwrap();
         drop(journal);
         let text = std::fs::read_to_string(&path).unwrap();
         std::fs::write(&path, text.trim_end_matches('\n')).unwrap();
         let mut journal = DecisionJournal::open(&path).unwrap();
-        journal.append(2, decision(200, "0xaa", "two")).unwrap();
+        journal
+            .append(Timestamp::from_millis(2), decision(200, "0xaa", "two"))
+            .unwrap();
         drop(journal);
         let journal = DecisionJournal::open(&path).unwrap();
         assert_eq!(journal.last_seq(), 2);
@@ -1639,12 +1720,11 @@ mod lookup_tests {
 /// journal runs on a simulated disk that keeps what was synced apart from
 /// what was only written; a model of Guard sends intents and actions in
 /// random sequences; at every send the disk image a power loss would
-/// leave must hold the intent (J1); at random points a crash leaves one
-/// of several images (nothing unsynced kept, a prefix of it, random pages
-/// kept or zeroed, all of it), which must open (J7), keep the chain (J5),
-/// and leave every action the venue executed either answered or pending
-/// for recovery (J3), with no answer claiming an action that did not
-/// happen (J2).
+/// leave must hold the intent; at random points a crash leaves one of
+/// several images (nothing unsynced kept, a prefix of it, random pages
+/// kept or zeroed, all of it), which must open, keep the chain, and leave
+/// every action the venue executed either answered or pending for
+/// recovery, with no answer claiming an action that did not happen.
 #[cfg(test)]
 mod crash_tests {
     use std::{
@@ -1778,7 +1858,7 @@ mod crash_tests {
                 0..=2 => {
                     journal
                         .append(
-                            op as i64,
+                            Timestamp::from_millis(op as i64),
                             EventBody::Error {
                                 text: "x".repeat(rng.usize(1..300)),
                             },
@@ -1798,7 +1878,7 @@ mod crash_tests {
                         .collect();
                     let (seq, durable) = journal
                         .append_durable(
-                            op as i64,
+                            Timestamp::from_millis(op as i64),
                             EventBody::Flatten {
                                 reason: "test".into(),
                                 actions: actions.clone(),
@@ -1813,7 +1893,7 @@ mod crash_tests {
                         if rng.u8(0..10) == 0 {
                             break;
                         }
-                        // J1: what a power loss leaves now holds the intent.
+                        // What a power loss leaves now holds the intent.
                         let image = disk.lock().unwrap().durable.clone();
                         assert!(
                             named(&image).contains(action),
@@ -1827,7 +1907,7 @@ mod crash_tests {
                         };
                         journal
                             .append(
-                                op as i64,
+                                Timestamp::from_millis(op as i64),
                                 EventBody::Sent {
                                     decision: seq,
                                     nonce: 0,
@@ -1841,7 +1921,10 @@ mod crash_tests {
                     }
                     if rng.u8(0..10) != 0 {
                         journal
-                            .append(op as i64, EventBody::Done { intent: seq })
+                            .append(
+                                Timestamp::from_millis(op as i64),
+                                EventBody::Done { intent: seq },
+                            )
                             .unwrap();
                     }
                 }
@@ -1858,7 +1941,9 @@ mod crash_tests {
         images
     }
 
-    /// J7, J5, J3 and J2 on one crash image.
+    /// One crash image: it opens, keeps the chain, answers or leaves
+    /// pending every executed action, and answers nothing that did not
+    /// happen.
     fn check(seed: u64, image: &[u8], executed: &BTreeSet<String>) {
         let read = read_records(Cursor::new(image), Path::new("image"))
             .unwrap_or_else(|error| panic!("seed {seed}: a crash image does not open: {error}"));
@@ -1881,7 +1966,7 @@ mod crash_tests {
                     .and_then(|actions| actions.get(index).cloned())
                     .unwrap();
                 let id = action["id"].as_str().unwrap().to_owned();
-                // J2: an answer only for what the venue executed.
+                // An answer only for what the venue executed.
                 assert!(
                     executed.contains(&id),
                     "seed {seed}: {id} answered, never executed"
@@ -1889,7 +1974,7 @@ mod crash_tests {
                 answered.insert(id);
             }
         }
-        // J3: every executed action whose intent survived is answered or
+        // Every executed action whose intent survived is answered or
         // pending.
         for actions in events.iter().filter_map(intent_actions) {
             for action in actions {
@@ -1902,7 +1987,7 @@ mod crash_tests {
                 }
             }
         }
-        // J1 at the crash: every executed action's intent survived.
+        // At the crash, every executed action's intent survived.
         let named: BTreeSet<String> = events
             .iter()
             .filter_map(intent_actions)
@@ -2022,14 +2107,17 @@ mod crash_tests {
             forward: None,
             post: Vec::new(),
         };
-        journal.append(1, decision).unwrap();
+        journal.append(Timestamp::from_millis(1), decision).unwrap();
         let found = journal.find_decision(77, Some("0xAA")).unwrap();
         assert_eq!(found["decision"]["text"], "kept in memory");
         // The writer may take a whole queue into its batch before its first
         // write waits: up to twice the queue fits.
         let mut busy = 0;
         for at in 0..(3 * QUEUE as i64) {
-            match journal.append(at, EventBody::Error { text: "x".into() }) {
+            match journal.append(
+                Timestamp::from_millis(at),
+                EventBody::Error { text: "x".into() },
+            ) {
                 Ok(_) => {}
                 Err(JournalError::Busy) => busy += 1,
                 Err(other) => panic!("{other}"),
@@ -2040,7 +2128,7 @@ mod crash_tests {
         assert!(!journal.is_broken());
         assert!(matches!(
             journal.append_durable(
-                1,
+                Timestamp::from_millis(1),
                 EventBody::Error {
                     text: "intent".into()
                 }
@@ -2061,7 +2149,7 @@ mod crash_tests {
             index: Some(0),
         };
         assert!(matches!(
-            journal.append(3, sent(5)),
+            journal.append(Timestamp::from_millis(3), sent(5)),
             Err(JournalError::Busy)
         ));
         // A flush the writer has no room for: `Busy`, not broken.
@@ -2077,13 +2165,15 @@ mod crash_tests {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         assert!(matches!(
-            journal.append(4, EventBody::Done { intent: 5 }),
+            journal.append(Timestamp::from_millis(4), EventBody::Done { intent: 5 }),
             Err(JournalError::Busy)
         ));
-        journal.append(4, EventBody::Done { intent: 6 }).unwrap();
+        journal
+            .append(Timestamp::from_millis(4), EventBody::Done { intent: 6 })
+            .unwrap();
         let (_, durable) = journal
             .append_durable(
-                2,
+                Timestamp::from_millis(2),
                 EventBody::Error {
                     text: "intent".into(),
                 },
@@ -2108,7 +2198,10 @@ mod crash_tests {
         let mut journal = DecisionJournal::start(Path::new("image"), empty, 0, storage, 1 << 20);
         let _open = OpenOnDrop(gate.clone());
         while journal
-            .append(1, EventBody::Error { text: "x".into() })
+            .append(
+                Timestamp::from_millis(1),
+                EventBody::Error { text: "x".into() },
+            )
             .is_ok()
         {}
         let dropped = journal.dropped();
@@ -2116,20 +2209,23 @@ mod crash_tests {
             text: "recovered".into(),
         };
         // Still behind at the deadline: `Busy`, not before it, counted once.
-        let until =
-            || std::time::Instant::now() + std::time::Duration::from_millis(ACK_DEADLINE_MS);
+        let until = || crate::clock::monotonic_ms() + ACK_DEADLINE_MS;
         let deadline = until();
-        let result = runtime().block_on(journal.append_waiting(2, record(), deadline));
+        let result = runtime().block_on(journal.append_waiting(
+            Timestamp::from_millis(2),
+            record(),
+            deadline,
+        ));
         assert!(matches!(result, Err(JournalError::Busy)), "{result:?}");
         assert!(
-            std::time::Instant::now() >= deadline,
+            crate::clock::monotonic_ms() >= deadline,
             "Busy before the deadline"
         );
         assert_eq!(journal.dropped(), dropped + 1);
         assert!(!journal.is_broken());
         // No room by the deadline (the writer still held): a wait that
         // answers `Busy`, the journal not broken.
-        let soon = std::time::Instant::now() + std::time::Duration::from_millis(50);
+        let soon = crate::clock::monotonic_ms() + 50;
         let busy = runtime().block_on(journal.flush_when_room(soon));
         assert!(matches!(
             runtime().block_on(busy.wait()),
@@ -2148,7 +2244,7 @@ mod crash_tests {
         let durable = runtime().block_on(journal.flush_when_room(until()));
         runtime().block_on(durable.wait()).unwrap();
         let seq = runtime()
-            .block_on(journal.append_waiting(3, record(), until()))
+            .block_on(journal.append_waiting(Timestamp::from_millis(3), record(), until()))
             .unwrap();
         assert_eq!(seq, journal.last_seq());
         assert_eq!(journal.dropped(), dropped + 1);
@@ -2167,7 +2263,10 @@ mod crash_tests {
         let _open = OpenOnDrop(gate.clone());
         let mut taken = 0;
         while journal
-            .append(1, EventBody::Error { text: "x".into() })
+            .append(
+                Timestamp::from_millis(1),
+                EventBody::Error { text: "x".into() },
+            )
             .is_ok()
         {
             taken += 1;
@@ -2210,7 +2309,7 @@ mod crash_tests {
             // A full queue alone is insufficient: its first batch may still drain.
             journal
                 .append(
-                    1,
+                    Timestamp::from_millis(1),
                     EventBody::Error {
                         text: "seed".into(),
                     },
@@ -2222,12 +2321,15 @@ mod crash_tests {
             }
             for _ in 0..QUEUE {
                 journal
-                    .append(1, EventBody::Error { text: "x".into() })
+                    .append(
+                        Timestamp::from_millis(1),
+                        EventBody::Error { text: "x".into() },
+                    )
                     .unwrap();
             }
             assert!(matches!(
                 journal.append(
-                    1,
+                    Timestamp::from_millis(1),
                     EventBody::Error {
                         text: "full".into()
                     }
@@ -2258,7 +2360,9 @@ mod crash_tests {
         let seq = waiting_runtime
             .block_on(async {
                 use std::future::Future;
-                let mut waiting = std::pin::pin!(journal.append_durable_waiting(2, intent()));
+                let mut waiting = std::pin::pin!(
+                    journal.append_durable_waiting(Timestamp::from_millis(2), intent())
+                );
                 let mut first = true;
                 std::future::poll_fn(|context| {
                     let result = waiting.as_mut().poll(context);
@@ -2287,7 +2391,8 @@ mod crash_tests {
         let (mut journal, _open) = behind(&gate);
         let deadline_runtime = runtime();
         let started = std::time::Instant::now();
-        let result = deadline_runtime.block_on(journal.append_durable_waiting(2, intent()));
+        let result = deadline_runtime
+            .block_on(journal.append_durable_waiting(Timestamp::from_millis(2), intent()));
         assert!(matches!(result, Err(JournalError::Broken(_))), "{result:?}");
         assert!(journal.is_broken());
         let waited = started.elapsed();
@@ -2305,7 +2410,7 @@ mod crash_tests {
         let mut journal = DecisionJournal::start(Path::new("image"), empty, 0, storage, 1_024);
         let (_, durable) = journal
             .append_durable(
-                1,
+                Timestamp::from_millis(1),
                 EventBody::Error {
                     text: "intent".into(),
                 },
@@ -2322,7 +2427,7 @@ mod crash_tests {
         assert!(
             journal
                 .append(
-                    2,
+                    Timestamp::from_millis(2),
                     EventBody::Error {
                         text: "after".into()
                     }

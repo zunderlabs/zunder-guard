@@ -23,7 +23,7 @@ use support::MemoryVenue;
 use zunder_core::Timestamp;
 use zunder_guard::{
     config::{GuardConfig, GuardMode, GuardNetwork},
-    guard::{Clock, Guard, Mode, Setup, SystemClock},
+    guard::{Clock, Guard, Mode, Setup, SystemClock, Via},
     journal::DecisionJournal,
     testdir::TestDir,
 };
@@ -153,7 +153,7 @@ async fn protection_goes_first_on_a_spent_budget_at_a_third_of_the_ip() {
     let mut spent = false;
     for _ in 0..10 {
         nonce += 1;
-        if rate_limited(&guard.exchange(cancel(nonce), "http").await) {
+        if rate_limited(&guard.exchange(cancel(nonce), Via::Http).await) {
             spent = true;
             break;
         }
@@ -189,13 +189,15 @@ async fn protection_goes_first_on_a_spent_budget_at_a_third_of_the_ip() {
     assert!(stop.orders[0].reduce_only);
     // The bot is still held to its budget.
     nonce += 1;
-    assert!(rate_limited(&guard.exchange(cancel(nonce), "http").await));
+    assert!(rate_limited(
+        &guard.exchange(cancel(nonce), Via::Http).await
+    ));
 
     // The kill switch: the bot's request cannot even read to flatten (no
     // budget), the sync flattens all the same.
     std::fs::write(dir.path().join("kill"), "ip_share drill\n").unwrap();
     nonce += 1;
-    guard.exchange(cancel(nonce), "http").await;
+    guard.exchange(cancel(nonce), Via::Http).await;
     guard.sync().await;
     assert!(
         guard.upstream().positions().is_empty(),
@@ -258,7 +260,7 @@ fn guard_refuses_to_start_on_too_small_a_share() {
     let Err(error) = refused else {
         panic!("started on ip_share 0.2")
     };
-    assert!(error.contains("ip_share 0.2"), "{error}");
+    assert!(error.to_string().contains("ip_share 0.2"), "{error}");
 }
 
 /// A Guard sending on testnet (in memory) at `share`, the main dex alone,
@@ -337,7 +339,7 @@ async fn a_stretched_sync_never_skips_a_round() {
         let syncing = guard.clone();
         let sync = tokio::spawn(async move { syncing.sync().await });
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-        guard.exchange(cancel(nonce + 1), "http").await;
+        guard.exchange(cancel(nonce + 1), Via::Http).await;
         sync.await.unwrap();
         guard.upstream().slow_reads(0);
         let status = guard.status().await;
@@ -401,7 +403,10 @@ fn recovering_guard(
             "s": "0.1", "r": false, "t": {"limit": {"tif": "Ioc"}},
             "c": format!("0x7a68{:028x}", 1_000 + i)}], "grouping": "na"});
         journal
-            .append(now as i64, EventBody::Intent { of: 0, action })
+            .append(
+                Timestamp::from_millis(now as i64),
+                EventBody::Intent { of: 0, action },
+            )
             .unwrap();
     }
     let venue = MemoryVenue::new(

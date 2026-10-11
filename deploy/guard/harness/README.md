@@ -284,3 +284,21 @@ its base tree. Successful branch inventory must include `main`; unknown reads re
 Updates are never forced or retried after conflict. The receipt records the immutable staged
 tap commit; I3 must consume that commit. No canonical branch or Homebrew PR is published here.
 Lifecycle workflow serialization and real channel testing remain to integrate.
+
+`verify.yml` now supports an initial staged publication by dispatch on the exact released
+commit/tag. It authenticates the assembled release, attests staged genesis on its immutable
+manifest, re-verifies that attestation and publishes original signed loaders to the C2 store.
+The `promote` environment supplies only the publication step's token; Python removes it before
+verification subprocesses. The initial empty-head compare-and-swap cannot overwrite an existing
+release. An unknown POST outcome must be reconciled before any further publication; this command
+does not retry or acquire a replacement head. Retained output excludes credentials.
+The same workflow uses the scoped Homebrew App to run `homebrew_stage`, preserving the tap's
+canonical branch, and the C7 OIDC role to publish the signed AWS template at its immutable version
+URL. The configured bucket, region and base must match the signed URL before AWS credentials are
+issued; authenticated and public downloads must match the template bytes. AWS credentials are
+removed from the installer publisher's environment. A later failure can leave some channels
+staged; it grants no gate credit and requires reconciliation before attempting installer writes.
+This job publishes unavailable staged state only. The complete install/journey gate, subsequent
+release head reconciliation, hosted channel evidence and promotion still need integration; a green
+staging job is not S3. The workflow must be present in a new RC's source before it can attest
+that RC. It cannot retrospectively attest an older RC from a newer workflow commit.

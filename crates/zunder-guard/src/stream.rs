@@ -68,12 +68,11 @@
 //! [`PRICE_MAX_AGE_MS`] old, not the snapshot's, and the mids of those
 //! coins are the fresh ones. Otherwise Guard reads the account over HTTP,
 //! as it always did. Ages are measured on a monotonic clock
-//! ([`monotonic_ms`]).
+//! ([`Clock::monotonic_ms`]).
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    sync::OnceLock,
-    time::Instant,
+    sync::Arc,
 };
 
 use rust_decimal::Decimal;
@@ -82,6 +81,8 @@ use zunder_guard_core::{
     account::{Leverage, revalue_clearinghouse},
     sign::Address,
 };
+
+use crate::{clock::Clock, locks::lock};
 
 /// The oldest a snapshot may be for the view to be clean, by its arrival
 /// and by the venue's clock: they come every 5 s (5.15 s apart at most,
@@ -108,14 +109,6 @@ pub const MAX_COINS: usize = 32;
 /// (a fraction, 5%) before the stream's prices are not trusted: a bigger
 /// move within a snapshot's period is read over HTTP.
 pub const MAX_MID_DRIFT: Decimal = Decimal::from_parts(5, 0, 0, false, 2);
-
-/// Milliseconds on a monotonic clock, from the first call in this process:
-/// for ages, which a wall clock stepping back would shorten.
-pub fn monotonic_ms() -> u64 {
-    static START: OnceLock<Instant> = OnceLock::new();
-    let start = START.get_or_init(Instant::now);
-    u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX)
-}
 
 /// One dex's latest snapshots, each with when it arrived.
 #[derive(Debug, Clone, Default)]
@@ -159,7 +152,7 @@ struct OrderEvent {
 /// [`EVENT_MARGIN_MS`] and the next periodic snapshot.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Expectation {
-    /// When Guard heard back ([`monotonic_ms`]), as it passes to
+    /// When Guard heard back ([`Clock::monotonic_ms`]), as it passes to
     /// [`StreamState::answers`] as the last send.
     pub sent: u64,
     /// The dex of the orders (`""` for the main dex).
@@ -190,7 +183,7 @@ const OWN_EVENT_AFTER_MS: u64 = 5_000;
 /// How long order events and Guard's sends are kept.
 const EVENTS_KEPT_MS: u64 = 30_000;
 
-/// One of Guard's sends: when Guard heard back ([`monotonic_ms`]), and what
+/// One of Guard's sends: when Guard heard back ([`Clock::monotonic_ms`]), and what
 /// the socket should report of it, when Guard knows (`None` for a send
 /// whose outcome is unknown, or one that raises no event: a leverage or
 /// margin update, a modify).
@@ -784,7 +777,7 @@ impl StreamState {
         }
     }
 
-    /// Guard heard back on a send at `sent` ([`monotonic_ms`]): what the
+    /// Guard heard back on a send at `sent` ([`Clock::monotonic_ms`]): what the
     /// socket should report of it, if Guard knows. Every send is recorded,
     /// before Guard notes it as its last send.
     pub fn sent(&mut self, sent: u64, expectation: Option<Expectation>) {
@@ -882,7 +875,7 @@ impl StreamState {
     /// Every dex's answers, if the stream is clean at `now` for a judgement
     /// of `coin` (none for an action naming no coin), given that Guard last
     /// heard back from the venue on something it sent at `last_send`
-    /// (both on [`monotonic_ms`]'s clock): the snapshots revalued at fresh
+    /// (both on [`Clock::monotonic_ms`]): the snapshots revalued at fresh
     /// marks, and the fresh mids.
     pub fn answers(
         &self,
@@ -1142,32 +1135,37 @@ fn event_time(message: &Value) -> Option<i64> {
 /// The stream as Guard holds it: the state, shared with the socket's task,
 /// and a way to ask it to follow a coin.
 pub struct Stream {
-    pub state: std::sync::Arc<std::sync::Mutex<StreamState>>,
+    pub state: Arc<std::sync::Mutex<StreamState>>,
     follow: tokio::sync::mpsc::UnboundedSender<String>,
 }
 
 /// How long to wait for the venue's socket to connect.
 const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 /// How often to ping: the venue closes a socket silent for a minute.
-const PING_EVERY: std::time::Duration = std::time::Duration::from_secs(20);
+const PING_EVERY_MS: u64 = 20_000;
+/// How often to look whether the socket went silent ([`SILENCE_MS`]).
+const SILENCE_CHECK_EVERY_MS: u64 = 1_000;
 /// Waits between reconnects: 1 s, doubling to 30 s; after connections
 /// that ended broken (an `error` from the venue), doubling on to 5 min.
-const RECONNECT_MAX: std::time::Duration = std::time::Duration::from_secs(30);
-const RECONNECT_BROKEN_MAX: std::time::Duration = std::time::Duration::from_secs(300);
+const RECONNECT_FIRST_MS: u64 = 1_000;
+const RECONNECT_MAX_MS: u64 = 30_000;
+const RECONNECT_BROKEN_MAX_MS: u64 = 300_000;
 
 impl Stream {
     /// Start following `user`'s account on the main dex and `dexes` at the
     /// venue's WebSocket `url`, reconnecting whenever the socket drops,
-    /// goes silent or is broken. Times are [`monotonic_ms`]. Dropping the
-    /// returned task's handle does not stop it; abort it.
+    /// goes silent or is broken. Ages, silence and the waits between
+    /// connections are timed on `clock` (Guard's). Dropping the returned
+    /// task's handle does not stop it; abort it.
     pub fn spawn(
         url: String,
         user: Address,
         dexes: &[String],
+        clock: Arc<dyn Clock>,
     ) -> (Self, tokio::task::JoinHandle<()>) {
-        let state = std::sync::Arc::new(std::sync::Mutex::new(StreamState::new(user, dexes)));
+        let state = Arc::new(std::sync::Mutex::new(StreamState::new(user, dexes)));
         let (follow, requests) = tokio::sync::mpsc::unbounded_channel();
-        let task = tokio::spawn(run(url, state.clone(), requests));
+        let task = tokio::spawn(run(url, state.clone(), requests, clock));
         (Self { state, follow }, task)
     }
 
@@ -1177,21 +1175,17 @@ impl Stream {
     }
 }
 
-fn lock(state: &std::sync::Mutex<StreamState>) -> std::sync::MutexGuard<'_, StreamState> {
-    state
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-}
-
 async fn run(
     url: String,
-    state: std::sync::Arc<std::sync::Mutex<StreamState>>,
+    state: Arc<std::sync::Mutex<StreamState>>,
     mut requests: tokio::sync::mpsc::UnboundedReceiver<String>,
+    clock: Arc<dyn Clock>,
 ) {
     use futures_util::{SinkExt, StreamExt};
     use tokio_tungstenite::tungstenite::Message;
 
-    let mut wait = std::time::Duration::from_secs(1);
+    let wall = |clock: &dyn Clock| i64::try_from(clock.now_ms()).unwrap_or(i64::MAX);
+    let mut wait = RECONNECT_FIRST_MS;
     loop {
         let connected = tokio::time::timeout(
             CONNECT_TIMEOUT,
@@ -1202,7 +1196,7 @@ async fn run(
             let (mut sink, mut source) = socket.split();
             let subscriptions = {
                 let mut state = lock(&state);
-                state.connected(monotonic_ms());
+                state.connected(clock.monotonic_ms());
                 state.subscriptions()
             };
             let mut ok = true;
@@ -1213,14 +1207,19 @@ async fn run(
                     break;
                 }
             }
-            let mut ping = tokio::time::interval(PING_EVERY);
-            let mut check = tokio::time::interval(std::time::Duration::from_secs(1));
+            // The first ping and the first look at once, as a timer's first
+            // tick.
+            let mut next_ping = clock.monotonic_ms();
+            let mut next_check = next_ping;
             while ok {
+                let timer = next_ping
+                    .min(next_check)
+                    .saturating_sub(clock.monotonic_ms());
                 let changes = tokio::select! {
                     message = source.next() => match message {
                         Some(Ok(Message::Text(text))) => {
                             match serde_json::from_str::<Value>(text.as_str()) {
-                                Ok(value) => lock(&state).apply_at(&value, monotonic_ms(), Some(wall_ms())),
+                                Ok(value) => lock(&state).apply_at(&value, clock.monotonic_ms(), Some(wall(&*clock))),
                                 Err(_) => Vec::new(),
                             }
                         }
@@ -1231,16 +1230,20 @@ async fn run(
                         let Some(coin) = request else { return };
                         lock(&state).follow(&coin)
                     }
-                    _ = ping.tick() => {
-                        let text = json!({"method": "ping"}).to_string();
-                        if sink.send(Message::text(text)).await.is_err() {
-                            break;
+                    () = clock.sleep(timer) => {
+                        let now = clock.monotonic_ms();
+                        if now >= next_ping {
+                            next_ping = now.saturating_add(PING_EVERY_MS);
+                            let text = json!({"method": "ping"}).to_string();
+                            if sink.send(Message::text(text)).await.is_err() {
+                                break;
+                            }
                         }
-                        Vec::new()
-                    }
-                    _ = check.tick() => {
-                        if lock(&state).silent(monotonic_ms()) {
-                            break;
+                        if now >= next_check {
+                            next_check = now.saturating_add(SILENCE_CHECK_EVERY_MS);
+                            if lock(&state).silent(now) {
+                                break;
+                            }
                         }
                         Vec::new()
                     }
@@ -1261,11 +1264,11 @@ async fn run(
             if broken {
                 // The venue refused something: the next connection would
                 // likely be refused the same way; wait longer each time.
-                tokio::time::sleep(wait).await;
-                wait = (wait * 2).min(RECONNECT_BROKEN_MAX);
+                clock.sleep(wait).await;
+                wait = wait.saturating_mul(2).min(RECONNECT_BROKEN_MAX_MS);
                 continue;
             }
-            wait = std::time::Duration::from_secs(1);
+            wait = RECONNECT_FIRST_MS;
         } else {
             // Not connected: coins asked for meanwhile are followed from
             // the next connection on.
@@ -1273,18 +1276,9 @@ async fn run(
                 lock(&state).follow(&coin);
             }
         }
-        tokio::time::sleep(wait).await;
-        wait = (wait * 2).min(RECONNECT_MAX);
+        clock.sleep(wait).await;
+        wait = wait.saturating_mul(2).min(RECONNECT_MAX_MS);
     }
-}
-
-/// The wall clock, epoch ms.
-fn wall_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |elapsed| {
-            i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX)
-        })
 }
 
 /// A coin's subscriptions: its mark and mid, its best prices, and the

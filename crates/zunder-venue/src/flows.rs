@@ -21,14 +21,14 @@ use zunder_risk::{RiskEngine, RiskLimits, RiskSnapshot, RiskState};
 /// How far a view's venue time may be from a flow's and still not tell
 /// whether it shows the flow, on either side: the venue's `time` of an
 /// account may be when it answered rather than the state it answered with
-/// (spec, "margin").
+/// (`docs/guard.md#deposits-and-withdrawals`).
 pub const FLOW_TIME_MARGIN_MS: i64 = 2_000;
 
 /// How far below the last equity written a view's equity may fall before an
 /// engine that takes flows writes it, as a share of the day's start (or of
 /// the equity cap, when smaller): what a restart can forget
 /// (`docs/guard.md#deposits-and-withdrawals`). A loss up to this much in a gap is read
-/// before the flows (S5).
+/// before the flows.
 pub(crate) const FLOW_FALL_WRITTEN: Decimal = Decimal::from_parts(1, 0, 0, false, 3);
 
 /// For each dex (`""` for the main dex), the latest venue time of any view
@@ -53,7 +53,7 @@ pub struct Flow {
     /// other after shows the money twice or not at all.
     pub between: bool,
     /// What the accounts the equity sums were worth just before it, as
-    /// reconstructed from the venue's public records (spec S5); `None` when
+    /// reconstructed from the venue's public records; `None` when
     /// they could not be read.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub value: Option<ValueRange>,
@@ -102,7 +102,8 @@ pub struct SeenView {
     pub equity: Decimal,
 }
 
-/// An unknown flow span halted the current UTC day (spec S5). The name
+/// An unknown flow span halted the current UTC day (`docs/guard.md#deposits-and-withdrawals`,
+/// "When it is unknown"). The name
 /// and legacy figures remain for callers; scalar reconstruction never
 /// estimates a drawdown from range endpoints.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -119,7 +120,8 @@ pub struct WaivedStop {
     pub reason: Option<String>,
 }
 
-/// Where a view stands to a flow (spec, "where a view stands to a flow").
+/// Where a view stands to a flow: before it, showing it, or too close to
+/// tell ([`FLOW_TIME_MARGIN_MS`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Side {
     /// Read before it: the flow is not in it.
@@ -151,7 +153,7 @@ pub(crate) fn side(flow: &Flow, times: &BTreeMap<String, i64>) -> Side {
 }
 
 /// Whether a view whose dexes the venue showed at `times` goes back in
-/// venue time from `horizon` (S1): such a view is ignored.
+/// venue time from `horizon`: such a view is ignored.
 pub(crate) fn goes_back(times: &BTreeMap<String, i64>, horizon: &Horizon) -> bool {
     times
         .iter()
@@ -197,9 +199,10 @@ pub fn rebase(
 
 /// How strict a state is: a drawdown stop over a day's halt over active;
 /// between two stops, the larger drawdown (then the later one).
-/// The fold of spec §2: views in order, each left out (S1-S3) or taken
-/// (S4), with the flows it shows applied just before it as one group (S5,
-/// S6).
+/// The fold (`docs/guard.md#deposits-and-withdrawals`): views in order, each ignored
+/// (older than the horizon), left out (on the wrong side of a flow) or
+/// taken, with the flows it shows applied just before it as one group and
+/// the peak and day's start moved for them ([`rebase`]).
 #[derive(Debug, Clone)]
 pub(crate) struct Fold {
     limits: RiskLimits,
@@ -212,7 +215,7 @@ pub(crate) struct Fold {
     views: usize,
     /// Immutable monetary origin while an empty showing view defers a group.
     deferred_origin: Option<RiskEngine>,
-    /// The stops waived so far (S5 (b)).
+    /// The stops waived so far.
     pub(crate) waived: Vec<WaivedStop>,
 }
 
@@ -265,16 +268,16 @@ impl Fold {
     /// Fold one view.
     pub(crate) fn view(&mut self, view: &SeenView) -> Result<Step, String> {
         let at = view.at;
-        // The callers feed views that go forward in venue time (S1,
-        // `ignored`); the horizon is the latest of them, per dex.
+        // The callers feed views that go forward in venue time (older
+        // ones are `ignored`); the horizon is the latest of them, per dex.
         for (dex, time) in &view.times {
             let latest = self.horizon.entry(dex.clone()).or_insert(*time);
             *latest = (*latest).max(*time);
         }
         let index = self.views;
         self.views += 1;
-        // S2: a view must show every flow applied, and stand clearly to
-        // every flow not applied yet.
+        // A view must show every flow applied, and stand clearly to every
+        // flow not applied yet.
         let mut left = false;
         let mut shows = Vec::new();
         for (i, flow) in self.flows.iter().enumerate() {
@@ -300,7 +303,7 @@ impl Fold {
                 let (a, b) = (&self.flows[*a], &self.flows[*b]);
                 (a.time_ms, &a.id).cmp(&(b.time_ms, &b.id))
             });
-            // S4: a group that cannot be applied leaves the view out.
+            // A group that cannot be applied leaves the view out.
             if self.group(&shows, view.equity, at)? {
                 for i in &shows {
                     self.placed[*i] = Some(index);
@@ -310,7 +313,7 @@ impl Fold {
             }
         }
         if left {
-            // S3: the day still rolls at the view's time.
+            // A view left out still rolls the day at its time.
             let last = self.engine.snapshot().last;
             self.engine.observe(at, last);
             return Ok(Step::Left);
@@ -319,7 +322,7 @@ impl Fold {
         Ok(Step::Taken { applied: shows })
     }
 
-    /// S5: apply the flows `group` (indices, in time order) between the
+    /// Apply the flows `group` (indices, in time order) between the
     /// engine's last equity and a view that shows them all at `shown`,
     /// observed at `at`. `false` when the view is left out: the account is
     /// empty at it after a withdrawal, or no value of the account at the
@@ -659,7 +662,7 @@ fn share(limits: &RiskLimits, peak: Decimal, equity: Decimal) -> Decimal {
         .unwrap_or(Decimal::ONE)
 }
 
-/// S6: move the engine's peak and day's start for a flow of `amount` at the
+/// Move the engine's peak and day's start for a flow of `amount` at the
 /// equity `before` just before it, the engine having observed `before` at
 /// the flow's time. `None` when they cannot be moved.
 fn move_flow(
@@ -712,7 +715,7 @@ pub(crate) struct Replayed {
     pub(crate) horizon: Horizon,
     /// For each flow, the index of the view it was applied at.
     pub(crate) placed: Vec<Option<usize>>,
-    /// The stops waived on the way (S5 (b)).
+    /// The stops waived on the way.
     pub(crate) waived: Vec<WaivedStop>,
 }
 

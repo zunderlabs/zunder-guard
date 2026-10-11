@@ -34,7 +34,7 @@ zeroize.workspace = true
 zunder-core.workspace = true
 # The Hyperliquid protocol: MessagePack and L1 signing, shared with Guard.
 zunder-hl-protocol.workspace = true
-# The preview's estimate (`preview.rs`): the real engine, never a copy of it.
+# The rules code's bounds (`contract.rs`): the risk engine's own validation.
 zunder-risk.workspace = true
 # Address parsing and Hyperliquid's price and size grid (`InstrumentRules`).
 zunder-venue.workspace = true

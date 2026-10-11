@@ -1,34 +1,30 @@
 // Copyright 2026 Orcastrate UG (haftungsbeschränkt)
 // SPDX-License-Identifier: Elastic-2.0
-//! `preview_order`: what Guard would allow for one entry, **estimated**
-//! here because Guard has no preview endpoint yet (`contract.rs`).
+//! `preview_order`: what Guard would decide about one entry, asked of Guard
+//! itself (`POST /guard/preview`), never estimated here.
 //!
-//! The estimate uses the real risk engine (`zunder-risk`'s
-//! `RiskEngine::size_entry` and `combined_exposure`, never a copy of their
-//! arithmetic), Guard's rules from its status (the `zr1_` code), Guard's
-//! own state (kill switch, halts) and the account as the venue reports it
-//! through Guard. It follows Guard's documented order (`docs/guard.md`, "An
-//! entry"). What it cannot see is listed in every result as `not_judged`,
-//! and Guard judges every real order again: its verdict wins.
+//! Guard's preview runs the same judgement as its `/exchange` on the exact
+//! action this server would send, from the background sync's last view of
+//! the account (at most 60 s old), and journals, sends and consumes
+//! nothing. This module builds what is asked and shows what Guard
+//! answered; the arithmetic of the rules lives in Guard alone. `place_order`
+//! asks the same question first and sends nothing that Guard's preview
+//! vetoes.
 //!
-//! When Guard gets a preview endpoint, this module is replaced by a call to
-//! it; nothing else in the server depends on how the estimate is made.
-
-use std::collections::HashMap;
+//! What stays here: the price an entry is sent at (Guard's bound from the
+//! mid), stops on the venue's grid rounded towards the price, the size
+//! asked for `max`, and this server's sanity bound on absurd prices and
+//! sizes, which are refused before Guard is asked.
 
 use rust_decimal::{Decimal, dec};
 use serde::Serialize;
 use serde_json::{Value, json};
-use zunder_core::{Side, Symbol, Timestamp};
-use zunder_risk::{RiskEngine, RiskLimits, SizeRequest, VenuePosition, VenueView, Veto};
+use zunder_core::Side;
 
 use crate::{
-    contract::{
-        ENTRY_PRICE_BOUND, MIN_NOTIONAL, ROUND_TRIP_COST, RiskStateView, Rules, Status, StopPolicy,
-        reason_for,
-    },
+    contract::{ENTRY_PRICE_BOUND, GuardPreview, ROUND_TRIP_COST, reason_for},
     schema::{SizeSpec, StopSpec},
-    venue::{Account, Market, OpenOrder, effective_stop},
+    venue::Market,
 };
 
 /// An entry is refused as absurd when its value exceeds this many times
@@ -37,17 +33,6 @@ pub const ABSURD_NOTIONAL_MULTIPLE: Decimal = dec!(200);
 /// A limit or stop price this many times away from the mid (either way) is
 /// refused as absurd.
 pub const ABSURD_PRICE_FACTOR: Decimal = Decimal::TEN;
-
-/// The risk engine's budget vetoes: the estimate may see less room than
-/// Guard (it counts open risk more conservatively), so with an explicit
-/// size these go to Guard, whose verdict counts. Every other veto is final
-/// in `place_order`.
-pub const BUDGET_VETOES: [&str; 4] = [
-    "open_risk",
-    "leverage",
-    "below_minimum",
-    "unprotected_position",
-];
 
 /// The entry being asked about.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -58,409 +43,69 @@ pub struct EntryRequest {
     pub limit_price: Option<Decimal>,
 }
 
-/// Everything the estimate reads, fetched through Guard just before.
-#[derive(Debug, Clone, Copy)]
-pub struct Snapshot<'a> {
-    pub status: &'a Status,
-    pub rules: &'a Rules,
-    pub account: &'a Account,
-    pub orders: &'a [OpenOrder],
-    pub market: &'a Market,
-    pub mids: &'a HashMap<String, Decimal>,
-    pub now_ms: u64,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Verdict {
-    Allow,
-    Resize,
-    Veto,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum DecidedBy {
-    /// Guard's own state (kill switch, halts, journal).
-    GuardState,
-    /// Guard's policy rules, applied here as Guard documents them.
-    GuardPolicy,
-    /// `zunder-risk`, run here.
-    RiskEngine,
-    /// This server's own sanity checks.
-    ThisServer,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CheckStatus {
-    Passed,
-    Resized,
-    Vetoed,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct Check {
-    pub rule: &'static str,
-    pub decided_by: DecidedBy,
-    pub status: CheckStatus,
-}
-
 /// How the stop was chosen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StopSource {
     Explicit,
-    /// Guard attaches it; the price is where Guard documents it would go.
+    /// Guard attaches it, at the price its preview names.
     GuardPolicy,
 }
 
-/// The estimate.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Estimate {
-    pub verdict: Verdict,
-    pub code: &'static str,
-    pub decided_by: DecidedBy,
-    /// The rule that bound a resize.
-    pub bound_by: Option<&'static str>,
-    pub requested_size: Option<Decimal>,
-    /// What would be sent and filled at most; `None` on a veto.
-    pub allowed_size: Option<Decimal>,
-    /// The most the rules allow for this entry and stop.
-    pub max_size: Option<Decimal>,
-    /// The price the entry is sent at: the limit, or for a market order an
-    /// IOC limit at Guard's 0.5% bound from the mid. It is also the worst
-    /// fill the size is computed from.
-    pub order_price: Option<Decimal>,
-    pub mid: Option<Decimal>,
-    pub stop_price: Option<Decimal>,
-    pub stop_source: StopSource,
-    pub notional: Option<Decimal>,
-    pub risk_at_stop: Option<Decimal>,
-    pub equity: Decimal,
-    pub checks: Vec<Check>,
-}
-
-/// What every estimate says it did not judge.
-pub const NOT_JUDGED: [&str; 4] = [
-    "min_liquidation_distance: Guard chooses the isolated leverage when it sends, and may still refuse (liquidation_too_close, no_safe_leverage)",
-    "resting entry orders: Guard counts their risk and value; this estimate does not",
-    "equity cap: Guard may size from less equity (max_trading_equity_usd), which its status does not show",
-    "costs: Guard's fees and slippage are assumed at its defaults, 4.5 + 1 bps per side",
+/// What every preview says about itself.
+pub const CAVEATS: [&str; 4] = [
+    "Guard judged this from its last view of the account, view_age_ms old (at most 60 s; null on a veto Guard made before looking at the view); the real order is judged again from a fresh read, and that verdict is the one that counts",
+    "the entry is priced from the mid when it is sent; Guard pulls a limit further than 0.5% beyond the mid in to that bound",
+    "only sending can show venue_refused_leverage (the venue did not confirm the isolated leverage Guard sets first) or venue_unreachable",
+    "risk_at_stop_usd adds Guard's default costs (4.5 + 1 bps per side) to the distance from the worst fill to the stop; a stop can fill worse in a gap",
 ];
 
-struct Builder {
-    estimate: Estimate,
-}
-
-impl Builder {
-    fn pass(&mut self, rule: &'static str, by: DecidedBy) {
-        self.estimate.checks.push(Check {
-            rule,
-            decided_by: by,
-            status: CheckStatus::Passed,
-        });
-    }
-
-    fn veto(mut self, rule: &'static str, by: DecidedBy, code: &'static str) -> Estimate {
-        self.estimate.checks.push(Check {
-            rule,
-            decided_by: by,
-            status: CheckStatus::Vetoed,
-        });
-        self.estimate.verdict = Verdict::Veto;
-        self.estimate.code = code;
-        self.estimate.decided_by = by;
-        self.estimate.allowed_size = None;
-        self.estimate.notional = None;
-        self.estimate.risk_at_stop = None;
-        self.estimate
-    }
-}
-
-fn engine_code(veto: Veto) -> &'static str {
-    match veto {
-        Veto::HaltedForDay => "daily_loss_stop",
-        Veto::Stopped => "drawdown_halt",
-        Veto::StopOnWrongSide => "stop_wrong_side",
-        Veto::OpenRiskExhausted => "open_risk",
-        Veto::LeverageExhausted => "leverage",
-        Veto::BelowMinimum => "below_minimum",
-        Veto::InvalidRequest => "invalid",
-        Veto::Overflow => "overflow",
-        Veto::UnprotectedPosition => "unprotected_position",
-    }
-}
-
-/// Estimate Guard's verdict on `request`.
-pub fn estimate(snapshot: Snapshot<'_>, request: &EntryRequest) -> Estimate {
-    let Snapshot {
-        status,
-        rules,
-        account,
-        orders: _,
-        market,
-        mids,
-        now_ms,
-    } = snapshot;
-    let side = request.side;
-    let mid = mids.get(&market.name).copied();
-    let mut b = Builder {
-        estimate: Estimate {
-            verdict: Verdict::Allow,
-            code: "allowed",
-            decided_by: DecidedBy::RiskEngine,
-            bound_by: None,
-            requested_size: match request.size {
-                SizeSpec::Exactly(size) => Some(size),
-                SizeSpec::Max => None,
-            },
-            allowed_size: None,
-            max_size: None,
-            order_price: None,
-            mid,
-            stop_price: None,
-            stop_source: match request.stop {
-                StopSpec::Price(_) => StopSource::Explicit,
-                StopSpec::GuardPolicy => StopSource::GuardPolicy,
-            },
-            notional: None,
-            risk_at_stop: None,
-            equity: account.equity,
-            checks: Vec::new(),
-        },
-    };
-
-    // 1. Guard's state.
-    if status.killed {
-        return b.veto("kill_switch", DecidedBy::GuardState, "kill_switch");
-    }
-    if status.journal_broken {
-        return b.veto("decision_journal", DecidedBy::GuardState, "journal");
-    }
-    match status.risk_state {
-        RiskStateView::Active => b.pass("risk_state", DecidedBy::GuardState),
-        RiskStateView::HaltedForDay => {
-            return b.veto("daily_loss_stop", DecidedBy::GuardState, "daily_loss_stop");
-        }
-        RiskStateView::Stopped => {
-            return b.veto("drawdown_halt", DecidedBy::GuardState, "drawdown_halt");
-        }
-        RiskStateView::Unknown => {
-            return b.veto("risk_state", DecidedBy::GuardState, "not_ready");
-        }
-    }
-
-    // 2. A listed market, and an account and a price.
-    if market.delisted {
-        return b.veto("market", DecidedBy::GuardPolicy, "unknown_market");
-    }
-    if account.equity <= Decimal::ZERO {
-        return b.veto("account", DecidedBy::GuardPolicy, "equity_not_positive");
-    }
-    let Some(mid) = mid else {
-        return b.veto("price", DecidedBy::GuardPolicy, "no_price");
-    };
-
-    // 3. This server's sanity checks, before anything else is weighed: an
-    // absurd price or size is refused, never resized.
+/// This server's sanity bound, before Guard is asked: a limit or stop more
+/// than [`ABSURD_PRICE_FACTOR`] times away from the mid, or an explicit
+/// size worth more than [`ABSURD_NOTIONAL_MULTIPLE`] times `equity`
+/// (valued at the higher of the limit and the mid), is refused, never
+/// resized. `equity` must be positive. The refusal's code.
+pub fn sanity(request: &EntryRequest, mid: Decimal, equity: Decimal) -> Result<(), &'static str> {
     let absurd = |price: Decimal| {
         price < mid / ABSURD_PRICE_FACTOR
             || mid
                 .checked_mul(ABSURD_PRICE_FACTOR)
                 .is_none_or(|high| price > high)
     };
-    let stop_price = match request.stop {
+    let stop = match request.stop {
         StopSpec::Price(price) => Some(price),
         StopSpec::GuardPolicy => None,
     };
-    if request.limit_price.is_some_and(absurd) || stop_price.is_some_and(absurd) {
-        return b.veto("sanity", DecidedBy::ThisServer, "absurd_price");
+    if request.limit_price.is_some_and(absurd) || stop.is_some_and(absurd) {
+        return Err("absurd_price");
     }
     if let SizeSpec::Exactly(size) = request.size {
         let price = request.limit_price.unwrap_or(mid).max(mid);
         let value = size.checked_mul(price);
-        let limit = account.equity.checked_mul(ABSURD_NOTIONAL_MULTIPLE);
+        let limit = equity.checked_mul(ABSURD_NOTIONAL_MULTIPLE);
         match (value, limit) {
             (Some(value), Some(limit)) if value <= limit => {}
-            _ => return b.veto("sanity", DecidedBy::ThisServer, "absurd_size"),
+            _ => return Err("absurd_size"),
         }
     }
-    b.pass("sanity", DecidedBy::ThisServer);
+    Ok(())
+}
 
-    // 4. The market allowlist and the position already held.
-    if !rules.markets.allows(&market.name) {
-        return b.veto(
-            "market_allowlist",
-            DecidedBy::GuardPolicy,
-            "market_not_allowed",
-        );
-    }
-    b.pass("market_allowlist", DecidedBy::GuardPolicy);
-    let existing = account
-        .positions
-        .iter()
-        .find(|position| position.coin == market.name);
-    if let Some(position) = existing {
-        if position.side != side {
-            return b.veto("one_direction", DecidedBy::GuardPolicy, "flip");
-        }
-        if position.leverage_type.as_deref() != Some("isolated") {
-            return b.veto("isolated_margin", DecidedBy::GuardPolicy, "cross_margin");
-        }
-    }
-
-    // 5. The worst fill: the limit, pulled in to 0.5% beyond the mid.
-    let Some(entry) = entry_price(market, mid, side, request.limit_price) else {
-        return b.veto("price", DecidedBy::ThisServer, "no_price");
-    };
-    b.estimate.order_price = Some(entry);
-
-    // The stop.
-    let stop = match request.stop {
-        StopSpec::Price(price) => round_stop(market, side, price),
-        StopSpec::GuardPolicy => {
-            if rules.stop_policy == StopPolicy::Refuse {
-                return b.veto("protective_stop", DecidedBy::GuardPolicy, "stop_required");
-            }
-            let distance = rules.attach_distance();
-            match side {
-                Side::Buy => entry
-                    .min(mid)
-                    .checked_mul(Decimal::ONE - distance)
-                    .and_then(|price| market.round_price(price, true)),
-                Side::Sell => entry
-                    .max(mid)
-                    .checked_mul(Decimal::ONE + distance)
-                    .and_then(|price| market.round_price(price, false)),
-            }
-        }
-    };
-    let Some(stop) = stop else {
-        return b.veto("protective_stop", DecidedBy::ThisServer, "invalid");
-    };
-    b.estimate.stop_price = Some(stop);
-    let wrong_side = match side {
-        Side::Buy => stop >= mid || stop >= entry,
-        Side::Sell => stop <= mid || stop <= entry,
-    };
-    if wrong_side {
-        return b.veto("protective_stop", DecidedBy::GuardPolicy, "stop_wrong_side");
-    }
-    b.pass("protective_stop", DecidedBy::GuardPolicy);
-
-    // A requested size on the venue's grid.
-    let requested = match request.size {
-        SizeSpec::Exactly(size) => Some(market.round_qty_down(size)),
-        SizeSpec::Max => None,
-    };
-
-    // 6. The risk engine: per-trade loss, open risk, leverage.
-    let limits = rules.risk_limits();
-    let engine_qty = match size_with(&limits, snapshot, side, entry, stop, now_ms) {
-        Ok(qty) => qty,
-        Err(veto) => {
-            let rule = match veto {
-                Veto::OpenRiskExhausted | Veto::UnprotectedPosition => "max_open_risk",
-                Veto::LeverageExhausted => "max_leverage",
-                _ => "max_loss_per_trade",
-            };
-            return b.veto(rule, DecidedBy::RiskEngine, engine_code(veto));
-        }
-    };
-    b.pass("risk_engine", DecidedBy::RiskEngine);
-
-    // 7. The position cap: the coin's position plus this entry, valued at
-    // the higher of the entry and the mid.
-    // Checked throughout: the equity and the position come from outside.
-    let cap = account
-        .equity
-        .checked_mul(rules.max_position_pct)
-        .and_then(|value| value.checked_div(Decimal::ONE_HUNDRED))
-        .and_then(|cap_value| {
-            let held = existing.map_or(Some(Decimal::ZERO), |position| {
-                position.qty.checked_mul(mid)
-            })?;
-            cap_value.checked_sub(held)
-        })
-        .map(|room| {
-            if room > Decimal::ZERO {
-                room.checked_div(entry.max(mid))
-                    .map(|qty| market.round_qty_down(qty))
-                    .unwrap_or(Decimal::ZERO)
-            } else {
-                Decimal::ZERO
-            }
-        });
-    let Some(cap_qty) = cap else {
-        return b.veto("sanity", DecidedBy::ThisServer, "overflow");
-    };
-    if cap_qty <= Decimal::ZERO
-        || cap_qty
-            .checked_mul(entry)
-            .is_none_or(|value| value < MIN_NOTIONAL)
-    {
-        return b.veto("max_position_size", DecidedBy::GuardPolicy, "position_cap");
-    }
-    b.pass("max_position_size", DecidedBy::GuardPolicy);
-
-    let (max, bound_by, decided_by) = if cap_qty < engine_qty {
-        (cap_qty, "max_position_size", DecidedBy::GuardPolicy)
-    } else {
-        (
-            engine_qty,
-            engine_bound(&limits, snapshot, side, entry, stop, engine_qty),
-            DecidedBy::RiskEngine,
-        )
-    };
-    b.estimate.max_size = Some(max);
-
-    let allowed = match requested {
-        None => max,
-        Some(asked) => {
-            if asked <= Decimal::ZERO
-                || asked
-                    .checked_mul(entry)
-                    .is_none_or(|value| value < MIN_NOTIONAL)
-            {
-                return b.veto("venue_minimum", DecidedBy::ThisServer, "below_minimum");
-            }
-            if asked <= max {
-                asked
-            } else {
-                b.estimate.verdict = Verdict::Resize;
-                b.estimate.code = "resized";
-                b.estimate.bound_by = Some(bound_by);
-                b.estimate.decided_by = decided_by;
-                let resized_rule = if decided_by == DecidedBy::GuardPolicy {
-                    "max_position_size"
-                } else {
-                    "risk_engine"
-                };
-                if let Some(check) = b
-                    .estimate
-                    .checks
-                    .iter_mut()
-                    .find(|check| check.rule == resized_rule)
-                {
-                    check.status = CheckStatus::Resized;
-                }
-                max
-            }
-        }
-    };
-    b.estimate.allowed_size = Some(allowed);
-    b.estimate.notional = allowed.checked_mul(entry);
-    b.estimate.risk_at_stop = entry
-        .checked_sub(stop)
-        .zip(entry.checked_mul(ROUND_TRIP_COST))
-        .and_then(|(distance, cost)| distance.abs().checked_add(cost))
-        .and_then(|per_unit| allowed.checked_mul(per_unit));
-    b.estimate
+/// The size asked of Guard for `max`: the sanity bound itself, worth
+/// [`ABSURD_NOTIONAL_MULTIPLE`] times `equity` at `price`, on the venue's
+/// grid. No rules code lets Guard allow that much (leverage at most 100x,
+/// a position at most 100 times equity), so Guard cuts it to the most its
+/// rules allow, and its preview names that size.
+pub fn max_probe(market: &Market, equity: Decimal, price: Decimal) -> Option<Decimal> {
+    let size = equity
+        .checked_mul(ABSURD_NOTIONAL_MULTIPLE)?
+        .checked_div(price)?;
+    Some(market.round_qty_down(size)).filter(|size| *size > Decimal::ZERO)
 }
 
 /// The price an entry is sent at, which is also its worst fill: a limit
-/// pulled in to Guard's bound of 0.5% beyond the mid, or for a market order
+/// pulled in to Guard's default bound of 0.5% beyond the mid (`docs/guard.md`,
+/// "The rules", `entry_price_bound`), or for a market order
 /// an IOC limit at that bound; on the venue's grid, rounded towards the mid.
 pub fn entry_price(
     market: &Market,
@@ -489,124 +134,74 @@ pub fn round_stop(market: &Market, side: Side, stop: Decimal) -> Option<Decimal>
     market.round_price(stop, side == Side::Buy)
 }
 
-/// `RiskEngine::size_entry` on the account as the venue shows it, through
-/// `combined_exposure` exactly as Zunder's own trading session does.
-fn size_with(
-    limits: &RiskLimits,
-    snapshot: Snapshot<'_>,
-    side: Side,
-    entry: Decimal,
-    stop: Decimal,
-    now_ms: u64,
-) -> Result<Decimal, Veto> {
-    let account = snapshot.account;
-    let now = Timestamp::from_millis(i64::try_from(now_ms).map_err(|_| Veto::Overflow)?);
-    let engine =
-        RiskEngine::new(limits.clone(), now, account.equity).map_err(|_| Veto::InvalidRequest)?;
-    let mut marks = HashMap::new();
-    let mut positions = Vec::new();
-    for position in &account.positions {
-        let Some(mark) = snapshot
-            .mids
-            .get(&position.coin)
-            .copied()
-            .or_else(|| position.mark())
-        else {
-            // A position without a price cannot be bounded.
-            return Err(Veto::UnprotectedPosition);
-        };
-        let symbol = Symbol::new(&position.coin);
-        marks.insert(symbol.clone(), mark);
-        positions.push(VenuePosition {
-            symbol,
-            side: position.side,
-            qty: position.qty,
-            entry: position.entry_price.unwrap_or(mark),
-            stop: effective_stop(position, snapshot.orders),
-        });
-    }
-    let view = VenueView { positions, marks };
-    let open = engine.combined_exposure(&view)?.exposure;
-    engine.size_entry(&SizeRequest {
-        equity: account.equity,
-        side,
-        entry,
-        stop,
-        round_trip_cost: entry.checked_mul(ROUND_TRIP_COST).ok_or(Veto::Overflow)?,
-        open_risk: open.risk,
-        open_notional: open.notional,
-        qty_step: snapshot.market.qty_step(),
-        min_notional: MIN_NOTIONAL,
-    })
-}
-
-/// Which of the engine's three limits bound `qty`: the engine asked again
-/// with one limit opened up, as the website's judge does; never our own
-/// arithmetic.
-fn engine_bound(
-    limits: &RiskLimits,
-    snapshot: Snapshot<'_>,
-    side: Side,
-    entry: Decimal,
-    stop: Decimal,
-    qty: Decimal,
-) -> &'static str {
-    let wider = |limits: RiskLimits| {
-        size_with(&limits, snapshot, side, entry, stop, snapshot.now_ms)
-            .is_ok_and(|wider| wider > qty)
-    };
-    if wider(RiskLimits {
-        max_leverage: Decimal::ONE_HUNDRED,
-        ..limits.clone()
-    }) {
-        "max_leverage"
-    } else if wider(RiskLimits {
-        max_open_risk: Decimal::ONE,
-        ..limits.clone()
-    }) {
-        "max_open_risk"
-    } else {
-        "max_loss_per_trade"
-    }
-}
-
 fn text(value: Option<Decimal>) -> Value {
     value.map_or(Value::Null, |value| {
         Value::String(value.normalize().to_string())
     })
 }
 
-impl Estimate {
-    pub fn to_json(&self) -> Value {
-        let risk_pct = self
-            .risk_at_stop
-            .filter(|_| self.equity > Decimal::ZERO)
-            .and_then(|risk| risk.checked_mul(Decimal::ONE_HUNDRED))
-            .and_then(|risk| risk.checked_div(self.equity))
-            .map(|pct| pct.round_dp(4));
-        json!({
-            "estimate": true,
-            "verdict": self.verdict,
-            "code": self.code,
-            "reason": reason_for(self.code),
-            "decided_by": self.decided_by,
-            "bound_by": self.bound_by,
-            "requested_size": text(self.requested_size),
-            "allowed_size": text(self.allowed_size),
-            "max_size": text(self.max_size),
-            "order_price": text(self.order_price),
-            "mid_price": text(self.mid),
-            "stop_price": text(self.stop_price),
-            "stop_source": self.stop_source,
-            "notional_usd": text(self.notional),
-            "risk_at_stop_usd": text(self.risk_at_stop),
-            "risk_at_stop_pct_of_equity": text(risk_pct),
-            "equity_usd": text(Some(self.equity)),
-            "checks": self.checks,
-            "not_judged": NOT_JUDGED,
-            "note": "An estimate made by this server with the risk engine and Guard's published rules. Guard judges every real order again, and its verdict wins.",
-        })
-    }
+/// What `preview_order` shows: Guard's answer, with the order this server
+/// built (`asked`: the size asked of Guard, on the venue's grid) and a few
+/// numbers computed from Guard's size, worst fill and stop.
+pub fn to_json(
+    preview: &GuardPreview,
+    request: &EntryRequest,
+    asked: Decimal,
+    order_price: Decimal,
+    equity: Decimal,
+) -> Value {
+    let entry = preview.entry.as_ref();
+    let allowed = entry.map(|entry| entry.size);
+    let notional = entry.and_then(|entry| entry.size.checked_mul(entry.worst_price));
+    let risk = entry.and_then(|entry| {
+        let distance = entry.worst_price.checked_sub(entry.stop)?.abs();
+        let cost = entry.worst_price.checked_mul(ROUND_TRIP_COST)?;
+        entry.size.checked_mul(distance.checked_add(cost)?)
+    });
+    let risk_pct = risk
+        .filter(|_| equity > Decimal::ZERO)
+        .and_then(|risk| risk.checked_mul(Decimal::ONE_HUNDRED))
+        .and_then(|risk| risk.checked_div(equity))
+        .map(|pct| pct.round_dp(4));
+    // `resized` also covers changes that are not a size (an attached stop,
+    // a limit pulled in): say which.
+    let reason = if preview.code == "resized"
+        && entry.is_some_and(|entry| entry.size == entry.requested_size)
+    {
+        "Guard would forward it with changes other than its size (see changes_quoted): an attached stop, a limit pulled in, or a stop's limit widened.".to_owned()
+    } else {
+        reason_for(&preview.code)
+    };
+    json!({
+        "source": "guard",
+        "verdict": preview.verdict,
+        "code": preview.code,
+        "reason": reason,
+        "guard_quoted": preview.quoted,
+        "changes_quoted": preview.changes_quoted,
+        "requested_size": match request.size {
+            SizeSpec::Exactly(_) => text(Some(asked)),
+            SizeSpec::Max => json!("max"),
+        },
+        "allowed_size": text(allowed),
+        "size_cut": entry.is_some_and(|entry| entry.size < entry.requested_size)
+            && request.size != SizeSpec::Max,
+        "order_price": text(Some(order_price)),
+        "worst_price": text(entry.map(|entry| entry.worst_price)),
+        "stop_price": text(entry.map(|entry| entry.stop)),
+        "stop_source": match request.stop {
+            StopSpec::Price(_) => StopSource::Explicit,
+            StopSpec::GuardPolicy => StopSource::GuardPolicy,
+        },
+        "isolated_leverage": entry.and_then(|entry| entry.leverage),
+        "notional_usd": text(notional),
+        "risk_at_stop_usd": text(risk),
+        "risk_at_stop_pct_of_equity": text(risk_pct),
+        "equity_usd": text(Some(equity)),
+        "view_age_ms": preview.view_age_ms,
+        "caveats": CAVEATS,
+        "note": "Guard's own judgement (its preview), made without sending anything. Guard judges every real order again, and its verdict wins.",
+    })
 }
 
 #[cfg(test)]
@@ -615,408 +210,214 @@ mod tests {
 
     use super::*;
     use crate::{
-        contract::{Markets, Mode},
-        venue::{parse_account, parse_meta, parse_open_orders},
+        contract::{Mode, PreviewEntry, PreviewVerdict},
+        venue::parse_meta,
     };
 
-    fn status() -> Status {
-        Status {
-            mode: Mode::Testnet,
-            account: "0x14791697260e4c9a71f18484c9f997b308e59325".into(),
-            killed: false,
-            risk_state: RiskStateView::Active,
-            journal_ready: true,
-            journal_broken: false,
-            rules_code: String::new(),
-            clients: Vec::new(),
-            last_event: 0,
-            equity: None,
-            version: "test".into(),
-            exchange_expected_mode: true,
-            kill_expected_mode: true,
-        }
-    }
-
-    fn rules() -> Rules {
-        Rules {
-            max_leverage: dec!(5),
-            max_loss_at_stop_pct: dec!(2),
-            require_stop: true,
-            stop_policy: StopPolicy::Attach,
-            min_liq_distance_pct: dec!(10),
-            max_position_pct: dec!(200),
-            max_open_risk_pct: dec!(6),
-            daily_loss_stop_pct: dec!(6),
-            drawdown_halt_pct: dec!(25),
-            markets: Markets::All,
-            default_stop_distance_pct: Some(dec!(2)),
-        }
-    }
-
     fn btc() -> Market {
-        parse_meta(&json!({"universe": [{"name": "BTC", "szDecimals": 5}, {"name": "ETH", "szDecimals": 4}]}))
+        parse_meta(&json!({"universe": [{"name": "BTC", "szDecimals": 5}]}))
             .unwrap()
             .remove(0)
     }
 
-    fn mids() -> HashMap<String, Decimal> {
-        HashMap::from([("BTC".into(), dec!(60000)), ("ETH".into(), dec!(3000))])
-    }
-
-    fn flat() -> Account {
-        parse_account(&json!({"marginSummary": {"accountValue": "2000"}, "assetPositions": []}))
-            .unwrap()
-    }
-
-    fn run(
-        status: &Status,
-        rules: &Rules,
-        account: &Account,
-        orders: &[OpenOrder],
-        request: EntryRequest,
-    ) -> Estimate {
-        let market = btc();
-        let mids = mids();
-        estimate(
-            Snapshot {
-                status,
-                rules,
-                account,
-                orders,
-                market: &market,
-                mids: &mids,
-                now_ms: 1_791_000_000_000,
-            },
-            &request,
-        )
-    }
-
-    fn buy(stop: StopSpec, size: SizeSpec) -> EntryRequest {
+    fn buy(stop: StopSpec, size: SizeSpec, limit_price: Option<Decimal>) -> EntryRequest {
         EntryRequest {
             side: Side::Buy,
             stop,
             size,
-            limit_price: None,
+            limit_price,
         }
-    }
-
-    /// Equity 2,000, BTC mid 60,000, a market buy with its stop at 58,800.
-    /// Worst fill: 60,000 × 1.005 = 60,300. Risk per BTC: 60,300 − 58,800 =
-    /// 1,500, plus costs 60,300 × 0.0011 = 66.33: 1,566.33. Budget 2% of
-    /// 2,000 = 40. 40 / 1,566.33 = 0.0255372…, down to the 0.00001 step:
-    /// 0.02553. Leverage room 10,000 / 60,300 = 0.1658; position cap 4,000 /
-    /// 60,300 = 0.0663: neither binds. Risk at the stop: 0.02553 × 1,566.33
-    /// = 39.9884049.
-    #[test]
-    fn a_market_buy_is_sized_from_its_stop() {
-        let estimate = run(
-            &status(),
-            &rules(),
-            &flat(),
-            &[],
-            buy(StopSpec::Price(dec!(58800)), SizeSpec::Exactly(dec!(0.5))),
-        );
-        assert_eq!(estimate.verdict, Verdict::Resize);
-        assert_eq!(estimate.order_price, Some(dec!(60300)));
-        assert_eq!(estimate.allowed_size, Some(dec!(0.02553)));
-        assert_eq!(estimate.max_size, Some(dec!(0.02553)));
-        assert_eq!(estimate.bound_by, Some("max_loss_per_trade"));
-        assert_eq!(estimate.risk_at_stop, Some(dec!(39.9884049)));
-        assert_eq!(estimate.notional, Some(dec!(1539.459)));
-        // A size within the budget is allowed as asked.
-        let small = run(
-            &status(),
-            &rules(),
-            &flat(),
-            &[],
-            buy(StopSpec::Price(dec!(58800)), SizeSpec::Exactly(dec!(0.01))),
-        );
-        assert_eq!(small.verdict, Verdict::Allow);
-        assert_eq!(small.allowed_size, Some(dec!(0.01)));
-    }
-
-    /// A market sell with its stop at 61,200: sent at 60,000 × 0.995 =
-    /// 59,700; risk per BTC 61,200 − 59,700 = 1,500 plus 59,700 × 0.0011 =
-    /// 65.67: 1,565.67. 40 / 1,565.67 = 0.0255481…, down to 0.02554
-    /// (0.02555 would risk 40.0029).
-    #[test]
-    fn a_market_sell_is_sized_from_its_stop() {
-        let estimate = run(
-            &status(),
-            &rules(),
-            &flat(),
-            &[],
-            EntryRequest {
-                side: Side::Sell,
-                stop: StopSpec::Price(dec!(61200)),
-                size: SizeSpec::Max,
-                limit_price: None,
-            },
-        );
-        assert_eq!(estimate.verdict, Verdict::Allow);
-        assert_eq!(estimate.order_price, Some(dec!(59700)));
-        assert_eq!(estimate.allowed_size, Some(dec!(0.02554)));
-        // Under attach, a sell's stop goes 2% above the higher of fill and
-        // mid: 60,000 × 1.02 = 61,200.
-        let attached = run(
-            &status(),
-            &rules(),
-            &flat(),
-            &[],
-            EntryRequest {
-                side: Side::Sell,
-                stop: StopSpec::GuardPolicy,
-                size: SizeSpec::Max,
-                limit_price: None,
-            },
-        );
-        assert_eq!(attached.stop_price, Some(dec!(61200)));
-        assert_eq!(attached.allowed_size, Some(dec!(0.02554)));
-    }
-
-    /// An account value from outside near `Decimal::MAX` must not panic.
-    #[test]
-    fn huge_numbers_from_outside_never_panic() {
-        let huge = parse_account(&json!({
-            "marginSummary": {"accountValue": "79228162514264337593543950335"},
-            "assetPositions": []
-        }))
-        .unwrap();
-        let one_x = Rules {
-            max_leverage: dec!(1),
-            ..rules()
-        };
-        let estimate = run(
-            &status(),
-            &one_x,
-            &huge,
-            &[],
-            buy(StopSpec::Price(dec!(58800)), SizeSpec::Max),
-        );
-        assert_eq!(estimate.verdict, Verdict::Veto);
-        let _ = estimate.to_json();
-    }
-
-    /// Under `attach`, Guard's stop goes 2% below the lower of the fill
-    /// (60,300) and the mid (60,000): 58,800, the same numbers as above.
-    #[test]
-    fn guard_policy_attaches_or_refuses() {
-        let attached = run(
-            &status(),
-            &rules(),
-            &flat(),
-            &[],
-            buy(StopSpec::GuardPolicy, SizeSpec::Max),
-        );
-        assert_eq!(attached.verdict, Verdict::Allow);
-        assert_eq!(attached.stop_price, Some(dec!(58800)));
-        assert_eq!(attached.allowed_size, Some(dec!(0.02553)));
-        let refuse = Rules {
-            stop_policy: StopPolicy::Refuse,
-            ..rules()
-        };
-        let refused = run(
-            &status(),
-            &refuse,
-            &flat(),
-            &[],
-            buy(StopSpec::GuardPolicy, SizeSpec::Max),
-        );
-        assert_eq!(refused.verdict, Verdict::Veto);
-        assert_eq!(refused.code, "stop_required");
-    }
-
-    /// Position cap 10% of 2,000 = 200; 200 / 60,300 = 0.0033167, down to
-    /// 0.00331, worth 199.593 at 60,300.
-    #[test]
-    fn the_position_cap_binds_before_the_engine() {
-        let capped = Rules {
-            max_position_pct: dec!(10),
-            ..rules()
-        };
-        let estimate = run(
-            &status(),
-            &capped,
-            &flat(),
-            &[],
-            buy(StopSpec::Price(dec!(58800)), SizeSpec::Exactly(dec!(0.5))),
-        );
-        assert_eq!(estimate.verdict, Verdict::Resize);
-        assert_eq!(estimate.allowed_size, Some(dec!(0.00331)));
-        assert_eq!(estimate.bound_by, Some("max_position_size"));
-    }
-
-    #[test]
-    fn guard_state_and_policy_veto_first() {
-        let killed = Status {
-            killed: true,
-            ..status()
-        };
-        let request = || buy(StopSpec::Price(dec!(58800)), SizeSpec::Max);
-        assert_eq!(
-            run(&killed, &rules(), &flat(), &[], request()).code,
-            "kill_switch"
-        );
-        let halted = Status {
-            risk_state: RiskStateView::HaltedForDay,
-            ..status()
-        };
-        assert_eq!(
-            run(&halted, &rules(), &flat(), &[], request()).code,
-            "daily_loss_stop"
-        );
-        let stopped = Status {
-            risk_state: RiskStateView::Stopped,
-            ..status()
-        };
-        assert_eq!(
-            run(&stopped, &rules(), &flat(), &[], request()).code,
-            "drawdown_halt"
-        );
-        let eth_only = Rules {
-            markets: Markets::Only(vec!["ETH".into()]),
-            ..rules()
-        };
-        assert_eq!(
-            run(&status(), &eth_only, &flat(), &[], request()).code,
-            "market_not_allowed"
-        );
-        // A stop above the price for a buy.
-        let wrong = run(
-            &status(),
-            &rules(),
-            &flat(),
-            &[],
-            buy(StopSpec::Price(dec!(61000)), SizeSpec::Max),
-        );
-        assert_eq!(wrong.code, "stop_wrong_side");
-    }
-
-    #[test]
-    fn an_unprotected_position_blocks_every_entry() {
-        let account = parse_account(&json!({"marginSummary": {"accountValue": "2000"}, "assetPositions": [
-            {"position": {"coin": "ETH", "szi": "0.1", "entryPx": "3000", "positionValue": "300",
-              "leverage": {"type": "isolated", "value": 3}}}
-        ]}))
-        .unwrap();
-        let estimate = run(
-            &status(),
-            &rules(),
-            &account,
-            &[],
-            buy(StopSpec::Price(dec!(58800)), SizeSpec::Max),
-        );
-        assert_eq!(estimate.code, "unprotected_position");
-        assert_eq!(estimate.decided_by, DecidedBy::RiskEngine);
-        // With a stop at 2,940 it counts 0.1 × 60 = 6 of open risk: the
-        // per-trade budget (40) still binds, at the same size.
-        let orders = parse_open_orders(&json!([
-            {"coin": "ETH", "side": "A", "limitPx": "2646", "sz": "0.1", "oid": 9, "isTrigger": true,
-             "triggerPx": "2940", "orderType": "Stop Market", "reduceOnly": true}
-        ]))
-        .unwrap();
-        let protected = run(
-            &status(),
-            &rules(),
-            &account,
-            &orders,
-            buy(StopSpec::Price(dec!(58800)), SizeSpec::Max),
-        );
-        assert_eq!(protected.verdict, Verdict::Allow);
-        assert_eq!(protected.allowed_size, Some(dec!(0.02553)));
-    }
-
-    #[test]
-    fn opposite_and_cross_positions_are_refused() {
-        let short = parse_account(
-            &json!({"marginSummary": {"accountValue": "2000"}, "assetPositions": [
-                {"position": {"coin": "BTC", "szi": "-0.01", "positionValue": "600",
-                  "leverage": {"type": "isolated", "value": 3}}}
-            ]}),
-        )
-        .unwrap();
-        let request = || buy(StopSpec::Price(dec!(58800)), SizeSpec::Max);
-        assert_eq!(
-            run(&status(), &rules(), &short, &[], request()).code,
-            "flip"
-        );
-        let cross = parse_account(
-            &json!({"marginSummary": {"accountValue": "2000"}, "assetPositions": [
-                {"position": {"coin": "BTC", "szi": "0.01", "positionValue": "600",
-                  "leverage": {"type": "cross", "value": 3}}}
-            ]}),
-        )
-        .unwrap();
-        assert_eq!(
-            run(&status(), &rules(), &cross, &[], request()).code,
-            "cross_margin"
-        );
     }
 
     #[test]
     fn absurd_sizes_and_prices_are_refused_not_resized() {
-        // 1,000,000 BTC at 60,300 is far above 200 × 2,000.
-        let huge = run(
-            &status(),
-            &rules(),
-            &flat(),
-            &[],
-            buy(
-                StopSpec::Price(dec!(58800)),
-                SizeSpec::Exactly(dec!(1000000)),
+        let mid = dec!(60000);
+        let equity = dec!(2000);
+        // 1,000,000 BTC at 60,000 is far above 200 × 2,000 = 400,000.
+        assert_eq!(
+            sanity(
+                &buy(
+                    StopSpec::Price(dec!(58800)),
+                    SizeSpec::Exactly(dec!(1000000)),
+                    None
+                ),
+                mid,
+                equity
             ),
+            Err("absurd_size")
         );
-        assert_eq!(huge.code, "absurd_size");
-        assert_eq!(huge.decided_by, DecidedBy::ThisServer);
-        let far_stop = run(
-            &status(),
-            &rules(),
-            &flat(),
-            &[],
-            buy(StopSpec::Price(dec!(1)), SizeSpec::Max),
-        );
-        assert_eq!(far_stop.code, "absurd_price");
-        let tiny = run(
-            &status(),
-            &rules(),
-            &flat(),
-            &[],
-            buy(
-                StopSpec::Price(dec!(58800)),
-                SizeSpec::Exactly(dec!(0.000001)),
+        // 6.66 BTC × 60,000 = 399,600: within; 6.67 × 60,000 = 400,200: not.
+        assert_eq!(
+            sanity(
+                &buy(
+                    StopSpec::Price(dec!(58800)),
+                    SizeSpec::Exactly(dec!(6.66)),
+                    None
+                ),
+                mid,
+                equity
             ),
+            Ok(())
         );
-        assert_eq!(tiny.code, "below_minimum");
+        assert_eq!(
+            sanity(
+                &buy(
+                    StopSpec::Price(dec!(58800)),
+                    SizeSpec::Exactly(dec!(6.67)),
+                    None
+                ),
+                mid,
+                equity
+            ),
+            Err("absurd_size")
+        );
+        // A stop at 1 is more than 10 times below 60,000; a limit at
+        // 600,001 more than 10 times above.
+        assert_eq!(
+            sanity(
+                &buy(StopSpec::Price(dec!(1)), SizeSpec::Max, None),
+                mid,
+                equity
+            ),
+            Err("absurd_price")
+        );
+        assert_eq!(
+            sanity(
+                &buy(StopSpec::GuardPolicy, SizeSpec::Max, Some(dec!(600001))),
+                mid,
+                equity
+            ),
+            Err("absurd_price")
+        );
+        // An equity near the largest `Decimal` must not panic.
+        let huge = Decimal::MAX;
+        let _ = sanity(
+            &buy(
+                StopSpec::Price(dec!(58800)),
+                SizeSpec::Exactly(dec!(1)),
+                None,
+            ),
+            mid,
+            huge,
+        );
+        assert_eq!(max_probe(&btc(), huge, dec!(60300)), None);
+    }
+
+    /// 200 × 2,000 = 400,000; / 60,300 = 6.633499…, down to the 0.00001
+    /// step: 6.63349.
+    #[test]
+    fn max_asks_guard_for_the_sanity_bound() {
+        assert_eq!(
+            max_probe(&btc(), dec!(2000), dec!(60300)),
+            Some(dec!(6.63349))
+        );
+        assert_eq!(max_probe(&btc(), dec!(0.000001), dec!(60300)), None);
     }
 
     #[test]
     fn a_limit_beyond_the_bound_is_pulled_in() {
-        let estimate = run(
-            &status(),
-            &rules(),
-            &flat(),
-            &[],
-            EntryRequest {
-                side: Side::Buy,
-                stop: StopSpec::Price(dec!(58800)),
-                size: SizeSpec::Max,
-                limit_price: Some(dec!(65000)),
-            },
-        );
-        assert_eq!(estimate.order_price, Some(dec!(60300)));
-        let resting = run(
-            &status(),
-            &rules(),
-            &flat(),
-            &[],
-            EntryRequest {
-                side: Side::Buy,
-                stop: StopSpec::Price(dec!(58800)),
-                size: SizeSpec::Max,
-                limit_price: Some(dec!(59500.5)),
-            },
+        // 60,000 × 1.005 = 60,300.
+        assert_eq!(
+            entry_price(&btc(), dec!(60000), Side::Buy, Some(dec!(65000))),
+            Some(dec!(60300))
         );
         // 59,500.5 has six significant figures: down to 59,500.
-        assert_eq!(resting.order_price, Some(dec!(59500)));
+        assert_eq!(
+            entry_price(&btc(), dec!(60000), Side::Buy, Some(dec!(59500.5))),
+            Some(dec!(59500))
+        );
+        // A market sell: 60,000 × 0.995 = 59,700.
+        assert_eq!(
+            entry_price(&btc(), dec!(60000), Side::Sell, None),
+            Some(dec!(59700))
+        );
+        // Stops round towards the price: up for a buy, down for a sell.
+        assert_eq!(
+            round_stop(&btc(), Side::Buy, dec!(58800.5)),
+            Some(dec!(58801))
+        );
+        assert_eq!(
+            round_stop(&btc(), Side::Sell, dec!(61200.5)),
+            Some(dec!(61200))
+        );
+    }
+
+    /// Guard's answer for a 0.5 BTC buy at 60,300 with its stop at 58,800,
+    /// cut to 0.02553: notional 0.02553 × 60,300 = 1,539.459; risk per BTC
+    /// 1,500 + 60,300 × 0.0011 = 1,566.33, × 0.02553 = 39.9884049, which is
+    /// 1.9994% of 2,000.
+    #[test]
+    fn the_numbers_shown_come_from_guards_answer() {
+        let preview = GuardPreview {
+            verdict: PreviewVerdict::Resize,
+            code: "resized".into(),
+            quoted: "size cut".into(),
+            changes_quoted: vec!["size 0.5 to 0.02553".into()],
+            entry: Some(PreviewEntry {
+                coin: "BTC".into(),
+                side: Side::Buy,
+                requested_size: dec!(0.5),
+                size: dec!(0.02553),
+                worst_price: dec!(60300),
+                stop: dec!(58800),
+                leverage: Some(4),
+            }),
+            mode: Mode::Testnet,
+            view_age_ms: Some(1200),
+        };
+        let shown = to_json(
+            &preview,
+            &buy(
+                StopSpec::Price(dec!(58800)),
+                SizeSpec::Exactly(dec!(0.5)),
+                None,
+            ),
+            dec!(0.5),
+            dec!(60300),
+            dec!(2000),
+        );
+        assert_eq!(shown["source"], "guard");
+        assert_eq!(shown["verdict"], "resize");
+        assert_eq!(shown["allowed_size"], "0.02553");
+        assert_eq!(shown["size_cut"], true);
+        assert_eq!(shown["notional_usd"], "1539.459");
+        assert_eq!(shown["risk_at_stop_usd"], "39.9884049");
+        assert_eq!(shown["risk_at_stop_pct_of_equity"], "1.9994");
+        assert_eq!(shown["isolated_leverage"], 4);
+        assert_eq!(shown["view_age_ms"], 1200);
+        assert_eq!(
+            shown["reason"],
+            "Guard cut the size to what its rules allow."
+        );
+        // A veto has no size and no numbers.
+        let vetoed = GuardPreview {
+            verdict: PreviewVerdict::Veto,
+            code: "stop_wrong_side".into(),
+            entry: None,
+            changes_quoted: Vec::new(),
+            ..preview
+        };
+        let shown = to_json(
+            &vetoed,
+            &buy(StopSpec::Price(dec!(61000)), SizeSpec::Max, None),
+            dec!(6.63349),
+            dec!(60300),
+            dec!(2000),
+        );
+        assert_eq!(shown["allowed_size"], Value::Null);
+        assert_eq!(shown["risk_at_stop_usd"], Value::Null);
+        assert_eq!(shown["requested_size"], "max");
+        assert_eq!(shown["size_cut"], false);
+    }
+
+    /// The caveats name only codes Guard has.
+    #[test]
+    fn the_caveats_name_real_codes() {
+        let joined = CAVEATS.join(" ");
+        for code in ["venue_refused_leverage", "venue_unreachable"] {
+            assert!(joined.contains(code));
+            assert_ne!(crate::contract::known_code(code), "other");
+        }
+        assert!(!joined.contains("no_safe_leverage"));
     }
 }

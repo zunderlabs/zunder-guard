@@ -26,7 +26,7 @@ use crate::flows::{self, Flow, Fold, Horizon, SeenView, Step, WaivedStop};
 const FLOW_UNWRITTEN_KEEP_MS: i64 = 30 * 60_000;
 
 /// How long views on the journal, and the records a replay may start from,
-/// are remembered (D4).
+/// are remembered.
 const FLOW_KEEP_MS: i64 = 24 * Timestamp::MS_PER_HOUR;
 
 /// At most one record a replay may start from per this long, besides the
@@ -111,7 +111,7 @@ pub(super) struct FlowBook {
     pub(super) bases: VecDeque<Base>,
     /// What became of flows since the caller last asked.
     pub(super) outcomes: Vec<(Flow, FlowOutcome)>,
-    /// Stops waived (S5 (b)) since the caller last asked, and the views
+    /// Stops waived since the caller last asked, and the views
     /// they were waived at lately (a replay meets them again).
     pub(super) waived: Vec<WaivedStop>,
     pub(super) waived_at: VecDeque<Timestamp>,
@@ -480,7 +480,7 @@ impl PersistentRisk {
             return self.observe_view(now, equity, view, settled);
         };
         if flows::goes_back(&times, &book.horizon) {
-            // Older than a view before it: not a view at all (S1).
+            // Older than a view before it: not a view at all.
             return ViewSync {
                 state: self.engine.state(),
                 discrepancies: Vec::new(),

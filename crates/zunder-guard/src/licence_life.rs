@@ -79,8 +79,8 @@ pub fn check_key(
     issuers: &LicenceIssuers,
     account: Address,
     now_ms: i64,
-) -> Result<Licence, String> {
-    verified(key, issuers, account, now_ms).map_err(|error| error.to_string())
+) -> Result<Licence, LicenceError> {
+    verified(key, issuers, account, now_ms)
 }
 
 /// Most bytes `licence set --stdin` reads: the longest key and a line end
@@ -162,7 +162,8 @@ pub enum LicenceSource {
     AutoUpdate,
 }
 
-/// The licence object of the automation contract (C3): what `zunder-guard
+/// The licence object of the command line's automation interface
+/// (`docs/guard.md`, "Automation"): what `zunder-guard
 /// licence show --json` prints and `status --json` carries as `licence`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct LicenceView {
@@ -331,27 +332,47 @@ pub fn judge_answer(
     issuers: &LicenceIssuers,
     account: Address,
     now_ms: i64,
-) -> Result<Option<(String, Licence)>, String> {
+) -> Result<Option<(String, Licence)>, RenewalError> {
     match status {
         200 => {}
-        404 => {
-            return Err(
-                "the licence service knows no licence for this renewal token and account (check licence_renewal_token, and that the licence names this account)"
-                    .to_owned(),
-            );
-        }
-        429 => return Err("the licence service asks to wait (rate limited)".to_owned()),
-        other => return Err(format!("the licence service answered HTTP {other}")),
+        404 => return Err(RenewalError::UnknownToken),
+        429 => return Err(RenewalError::RateLimited),
+        other => return Err(RenewalError::Status(other)),
     }
     let Some(key) = body.get("key").and_then(Value::as_str) else {
-        return Err("the licence service's answer holds no key".to_owned());
+        return Err(RenewalError::NoKey);
     };
     let licence = check_key(key, issuers, account, now_ms)
-        .map_err(|error| format!("the key the licence service sent is not used: {error}"))?;
+        .map_err(|error| RenewalError::KeyNotUsed(error.to_string()))?;
     if current_end.is_some_and(|end| licence.expires_at_ms <= end) {
         return Ok(None);
     }
     Ok(Some((key.to_owned(), licence)))
+}
+
+/// Why a look at renewal failed.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum RenewalError {
+    #[error(
+        "the licence service knows no licence for this renewal token and account (check licence_renewal_token, and that the licence names this account)"
+    )]
+    UnknownToken,
+    #[error("the licence service asks to wait (rate limited)")]
+    RateLimited,
+    #[error("the licence service answered HTTP {0}")]
+    Status(u16),
+    #[error("the licence service's answer holds no key")]
+    NoKey,
+    #[error("the key the licence service sent is not used: {0}")]
+    KeyNotUsed(String),
+    /// The config file could not be read, or names no account.
+    #[error("{0}")]
+    Config(String),
+    /// The request to the licence service failed.
+    #[error("{0}")]
+    Request(String),
+    #[error("writing the renewed key into the config: {0}")]
+    Write(String),
 }
 
 /// What one look at renewal did.
@@ -379,16 +400,19 @@ pub async fn renew_once<F, Fut>(
     issuers: &LicenceIssuers,
     now_ms: i64,
     post: F,
-) -> Result<Renewal, String>
+) -> Result<Renewal, RenewalError>
 where
     F: FnOnce(Value) -> Fut,
     Fut: Future<Output = Result<(u16, Value), String>>,
 {
-    let config = GuardConfig::load(path).map_err(|error| error.to_string())?;
+    let config =
+        GuardConfig::load(path).map_err(|error| RenewalError::Config(error.to_string()))?;
     let (true, Some(token)) = (config.licence_auto_update, &config.licence_renewal_token) else {
         return Ok(Renewal::Off);
     };
-    let account = config.account().map_err(|error| error.to_string())?;
+    let account = config
+        .account()
+        .map_err(|error| RenewalError::Config(error.to_string()))?;
     // Keys are checked as on the config's network: the staging issuer's
     // never counts for a mainnet account.
     let issuers = &issuers.on(licence_network(&config));
@@ -396,7 +420,9 @@ where
     if !due {
         return Ok(Renewal::NotDue);
     }
-    let (status, body) = post(request_body(token, account)).await?;
+    let (status, body) = post(request_body(token, account))
+        .await
+        .map_err(RenewalError::Request)?;
     let Some((key, licence)) = judge_answer(status, &body, end, issuers, account, now_ms)? else {
         return Ok(Renewal::NotYet);
     };
@@ -417,7 +443,7 @@ where
         current.licence = Some(key);
         installed = true;
     })
-    .map_err(|error| format!("writing the renewed key into the config: {error}"))?;
+    .map_err(|error| RenewalError::Write(error.to_string()))?;
     if !installed {
         return Ok(Renewal::NotYet);
     }
@@ -522,7 +548,7 @@ mod tests {
         .unwrap()
     }
 
-    /// The C3 licence object: each state, with the licensee and end where
+    /// The licence object: each state, with the licensee and end where
     /// the key verified, and where the key comes from.
     #[test]
     fn the_contract_view_names_each_state() {
@@ -572,7 +598,7 @@ mod tests {
             view(None, &public, account(), NOW, false).state,
             LicenceState::None
         );
-        // The JSON names, exactly as C3 has them.
+        // The JSON names, exactly as `docs/guard.md` ("Automation") has them.
         assert_eq!(
             serde_json::to_value(view(None, &public, account(), NOW, true)).unwrap(),
             json!({"state": "none", "licensee": null, "expires_at_ms": null, "fee_free": false, "source": "auto_update"})
@@ -630,6 +656,7 @@ mod tests {
         assert!(
             check_key(&staged, &on_mainnet, account(), NOW)
                 .unwrap_err()
+                .to_string()
                 .contains("not issued by Orcastrate")
         );
         assert_eq!(
@@ -678,7 +705,12 @@ mod tests {
             NOW,
             move |_| async move { Ok((200, json!({"key": renewed}))) },
         ));
-        assert!(result.unwrap_err().contains("not issued by Orcastrate"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("not issued by Orcastrate")
+        );
         assert_eq!(
             GuardConfig::load(&path).unwrap().licence.as_deref(),
             Some(near.as_str())
@@ -703,6 +735,7 @@ mod tests {
         assert!(
             check_key(&expired, &public, account(), NOW)
                 .unwrap_err()
+                .to_string()
                 .contains("expired")
         );
         assert!(

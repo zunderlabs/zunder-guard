@@ -44,18 +44,9 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use zunder_risk::{RiskConfigError, RiskLimits};
 
-/// What Guard does with an entry that carries no stop loss.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum StopPolicy {
-    /// Size the entry from a stop at [`Policy::default_stop_distance`] and
-    /// attach a reduce-only stop there. A stop the bot sends later replaces
-    /// it only when it is tighter: stops only tighten.
-    #[default]
-    Attach,
-    /// Refuse the entry.
-    Refuse,
-}
+/// What Guard does with an entry that carries no stop loss: attach one at
+/// [`Policy::default_stop_distance`] (the default) or refuse the entry.
+pub use zunder_risk::StopPolicy;
 
 /// The markets Guard lets a bot open positions in. Closing, stops and
 /// cancels are never limited by it, on the dexes Guard reads.
@@ -257,28 +248,13 @@ pub struct Policy {
     pub max_trading_equity_usd: Option<Decimal>,
 }
 
-/// Guard's product defaults. Kept separate from `RiskLimits::default()`
-/// so changes to this preset cannot change the shared engine defaults.
-/// The rules schema and website derive their defaults from these constants.
+/// Guard's product defaults, kept in `zunder_risk::guard_defaults` so that
+/// Guard and the website's judge share one copy. Kept separate from
+/// `RiskLimits::default()` so changes to this preset cannot change the
+/// shared engine defaults. The rules schema and website derive their
+/// defaults from these constants.
 pub mod guard_defaults {
-    use rust_decimal::{Decimal, dec};
-
-    use super::StopPolicy;
-
-    pub const MAX_LEVERAGE: Decimal = dec!(5);
-    pub const MAX_LOSS_AT_STOP: Decimal = dec!(0.02);
-    pub const STOP: StopPolicy = StopPolicy::Attach;
-    pub const DEFAULT_STOP_DISTANCE: Decimal = dec!(0.02);
-    pub const MIN_LIQUIDATION_DISTANCE: Decimal = dec!(0.10);
-    pub const MAX_POSITION_OF_ACCOUNT: Decimal = dec!(2);
-    pub const MAX_OPEN_RISK: Decimal = dec!(0.06);
-    pub const DAILY_LOSS_STOP: Decimal = dec!(0.06);
-    pub const DRAWDOWN_HALT: Decimal = dec!(0.25);
-    pub const ENTRY_PRICE_BOUND: Decimal = dec!(0.005);
-    pub const FEE_BPS: Decimal = dec!(4.5);
-    pub const SLIPPAGE_BPS: Decimal = dec!(1);
-    pub const STOP_SLIPPAGE: Decimal = dec!(0.10);
-    pub const EXIT_SLIPPAGE: Decimal = dec!(0.05);
+    pub use zunder_risk::guard_defaults::*;
 }
 
 /// The loosest Guard's own rules (those that are not the risk engine's) may

@@ -2,8 +2,8 @@
 // SPDX-License-Identifier: Elastic-2.0
 //! The decision journal's write-ahead rule and recovery, end to end
 //! (`docs/guard.md#journals`): an intent naming each action is on disk
-//! before the venue receives it (J1), and after a crash Guard asks the
-//! venue what became of the actions nothing answered (J3).
+//! before the venue receives it, and after a crash Guard asks the venue
+//! what became of the actions nothing answered.
 
 #![allow(clippy::unwrap_used)]
 
@@ -24,7 +24,10 @@ use support::{MORE_COINS, MemoryVenue};
 use zunder_core::Timestamp;
 use zunder_guard::{
     config::{GuardConfig, GuardMode, GuardNetwork},
-    guard::{Clock, Guard, INTENT_COVERS_MS, Limits, Mode, Setup, SystemClock},
+    guard::{
+        Clock, Guard, INTENT_COVERS_MS, Limits, Mode, PREVIEW_MALFORMED, PREVIEW_RATE_LIMITED,
+        PREVIEW_VIEW_STALE, Setup, SystemClock, Via,
+    },
     journal::{DecisionJournal, Gate},
     recover::intent_actions,
     testdir::TestDir,
@@ -248,7 +251,7 @@ async fn an_intent_naming_each_action_is_on_disk_before_the_venue_gets_it() {
     let guard = start(dir.path(), venue, true).await;
     *synced.lock().unwrap() = Some(guard.journal_synced_for_test().await);
     // An entry (isolated leverage set first, the order with Guard's stop).
-    let reply = guard.exchange(buy("3000", "0.1"), "http").await;
+    let reply = guard.exchange(buy("3000", "0.1"), Via::Http).await;
     assert_eq!(reply["status"], "ok", "{reply}");
     // Its client id, given by Guard, is not in the bot's reply.
     assert!(
@@ -259,7 +262,7 @@ async fn an_intent_naming_each_action_is_on_disk_before_the_venue_gets_it() {
     // earlier intent named: its own intent first).
     guard.upstream().refuse_stops();
     let before = checked.load(Ordering::SeqCst);
-    let reply = guard.exchange(buy("3000", "0.05"), "http").await;
+    let reply = guard.exchange(buy("3000", "0.05"), Via::Http).await;
     assert_eq!(reply["status"], "ok", "{reply}");
     // The entry and Guard's close of it.
     assert!(checked.load(Ordering::SeqCst) >= before + 2);
@@ -292,7 +295,7 @@ async fn after_a_crash_guard_asks_the_venue_what_became_of_unanswered_actions() 
     let guard = start(dir.path(), venue(), true).await;
     // The venue takes the entry but its answer is lost: in doubt.
     guard.upstream().swallow_answers(true);
-    let reply = guard.exchange(buy("3000", "0.1"), "http").await;
+    let reply = guard.exchange(buy("3000", "0.1"), Via::Http).await;
     assert_ne!(reply["status"], "ok", "{reply}");
     let venue = guard.upstream().fork();
     venue.swallow_answers(false);
@@ -305,7 +308,7 @@ async fn after_a_crash_guard_asks_the_venue_what_became_of_unanswered_actions() 
         "grouping": "na"});
     journal
         .append(
-            SystemClock.now_ms() as i64,
+            Timestamp::from_millis(SystemClock.now_ms() as i64),
             EventBody::Started {
                 schema: 1,
                 version: "test".into(),
@@ -318,7 +321,7 @@ async fn after_a_crash_guard_asks_the_venue_what_became_of_unanswered_actions() 
         .unwrap();
     journal
         .append(
-            SystemClock.now_ms() as i64,
+            Timestamp::from_millis(SystemClock.now_ms() as i64),
             EventBody::Intent {
                 of: 0,
                 action: never.clone(),
@@ -364,7 +367,7 @@ async fn after_a_crash_guard_asks_the_venue_what_became_of_unanswered_actions() 
     let _: PathBuf = path;
 }
 
-/// E1: while the decision journal cannot be written,
+/// While the decision journal cannot be written,
 /// no new position is opened, but Guard still flattens and protects, each
 /// action recorded in the emergency log first, with an alert.
 #[tokio::test(flavor = "multi_thread")]
@@ -372,10 +375,10 @@ async fn with_the_journal_broken_guard_refuses_entries_and_still_flattens() {
     let dir = TestDir::new("journal-e1");
     let config = config(dir.path());
     let guard = start(dir.path(), venue(), true).await;
-    let reply = guard.exchange(buy("3000", "0.1"), "http").await;
+    let reply = guard.exchange(buy("3000", "0.1"), Via::Http).await;
     assert_eq!(reply["status"], "ok", "{reply}");
     guard.break_journal_for_test().await;
-    let reply = guard.exchange(buy("3000", "0.1"), "http").await;
+    let reply = guard.exchange(buy("3000", "0.1"), Via::Http).await;
     assert!(reply.to_string().contains("journal"), "{reply}");
     std::fs::write(config.kill_file(), "test").unwrap();
     guard.sync().await;
@@ -405,6 +408,114 @@ async fn with_the_journal_broken_guard_refuses_entries_and_still_flattens() {
     assert!(status.to_string().contains("emergency log"), "{status}");
 }
 
+/// While `/exchange` refuses every request (recovery after a restart still
+/// running, the decision journal broken), a preview refuses too, with the
+/// same code and text, rather than showing what would be forwarded.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_preview_refuses_what_the_exchange_refuses_before_judging() {
+    let dir = TestDir::new("journal-preview");
+    let clock = TestClock::new();
+    let guard = start_with(dir.path(), venue(), true, clock.clone()).await;
+    // Past the nonce floor of the start (its time plus 5 s).
+    clock.advance(5_100);
+    let action = json!({"action": buy_wire(1, "3000", "0.1").to_value()});
+    // Neither: the preview judges the entry.
+    let preview = guard.preview(action.clone()).await;
+    assert_ne!(preview["verdict"], "veto", "{preview}");
+    assert!(preview["entry"].is_object(), "{preview}");
+    // The same refusal from both: the exchange's reply carries the
+    // preview's text.
+    let same = |reply: &Value, preview: &Value| {
+        assert_eq!(reply["code"], "journal", "{reply}");
+        assert_eq!(preview["verdict"], "veto", "{preview}");
+        assert_eq!(preview["code"], "journal", "{preview}");
+        assert!(preview["forward"].is_null(), "{preview}");
+        assert_eq!(
+            reply["response"],
+            format!(
+                "Zunder Guard veto [journal]: {}",
+                preview["text"].as_str().unwrap()
+            ),
+        );
+    };
+    // Recovery after a restart running.
+    guard.set_recovering(true);
+    clock.advance(1_000);
+    let reply = guard
+        .exchange(
+            signed_by(CLIENT_KEY, buy_wire(1, "3000", "0.1"), clock.now_ms()),
+            Via::Http,
+        )
+        .await;
+    let preview = guard.preview(action.clone()).await;
+    same(&reply, &preview);
+    assert!(
+        preview["text"].as_str().unwrap().contains("restart"),
+        "{preview}"
+    );
+    guard.set_recovering(false);
+    // The decision journal broken.
+    guard.break_journal_for_test().await;
+    clock.advance(1_000);
+    let reply = guard
+        .exchange(
+            signed_by(CLIENT_KEY, buy_wire(1, "3000", "0.1"), clock.now_ms()),
+            Via::Http,
+        )
+        .await;
+    let preview = guard.preview(action).await;
+    same(&reply, &preview);
+    assert!(
+        preview["text"].as_str().unwrap().contains("broken"),
+        "{preview}"
+    );
+    assert!(guard.upstream().received().is_empty(), "nothing was sent");
+}
+
+/// Every refusal of a preview carries a stable code beside its text: its
+/// own budget (`preview_rate_limited`), a body that is no action
+/// (`malformed`), no recent view (`preview_view_stale`); the refusals it
+/// shares with `/exchange` carry `/exchange`'s code (above).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refused_preview_says_why_by_a_stable_code() {
+    let dir = TestDir::new("journal-preview-codes");
+    let clock = TestClock::new();
+    let guard = start_with(dir.path(), venue(), true, clock.clone()).await;
+    let action = json!({"action": {"type": "scheduleCancel"}});
+    let refused = |answer: &Value, code: &str, text: &str| {
+        assert_eq!(answer["code"], code, "{answer}");
+        assert!(answer["error"].as_str().unwrap().contains(text), "{answer}");
+    };
+    // One a second: the second in the same second is refused.
+    let first = guard.preview(action.clone()).await;
+    assert!(first.get("verdict").is_some(), "{first}");
+    let second = guard.preview(action.clone()).await;
+    refused(&second, PREVIEW_RATE_LIMITED, "previews a second");
+    assert_eq!(PREVIEW_RATE_LIMITED, "preview_rate_limited");
+    // A body that is not an action, or not one Guard decodes.
+    clock.advance(1_000);
+    refused(
+        &guard.preview(json!({"no": "action"})).await,
+        PREVIEW_MALFORMED,
+        "the body must be",
+    );
+    clock.advance(1_000);
+    refused(
+        &guard.preview(json!({"action": {"type": "nonsense"}})).await,
+        PREVIEW_MALFORMED,
+        "",
+    );
+    assert_eq!(PREVIEW_MALFORMED, "malformed");
+    // The sync's last view more than a minute old.
+    clock.advance(61_000);
+    refused(
+        &guard.preview(action).await,
+        PREVIEW_VIEW_STALE,
+        "no recent view",
+    );
+    assert_eq!(PREVIEW_VIEW_STALE, "preview_view_stale");
+}
+
 /// Recovery waits until an action has expired before asking the venue (an
 /// action not yet expired may still arrive), and refuses bots' requests
 /// meanwhile.
@@ -416,7 +527,7 @@ async fn recovery_waits_for_expiry() {
     clock.advance(5_100);
     guard.upstream().swallow_answers(true);
     let request = signed_by(CLIENT_KEY, buy_wire(1, "3000", "0.1"), clock.now_ms());
-    let reply = guard.exchange(request, "http").await;
+    let reply = guard.exchange(request, Via::Http).await;
     assert_ne!(reply["status"], "ok", "{reply}");
     let venue = guard.upstream().fork();
     venue.swallow_answers(false);
@@ -437,7 +548,7 @@ async fn recovery_waits_for_expiry() {
     .await;
     assert!(guard.recovering());
     let request = signed_by(CLIENT_KEY, buy_wire(1, "3000", "0.01"), clock.now_ms());
-    let reply = guard.exchange(request, "http").await;
+    let reply = guard.exchange(request, Via::Http).await;
     assert!(reply.to_string().contains("restart"), "{reply}");
     assert_eq!(guard.upstream().info_log().len(), reads_before);
     clock.advance(1);
@@ -461,7 +572,7 @@ async fn recovery_waits_for_expiry() {
     assert_eq!(recovered[0]["outcome"], "happened", "{recovered:?}");
 }
 
-/// E1 for protection: with the journal broken, a position without a stop
+/// The same for protection: with the journal broken, a position without a stop
 /// gets Guard's stop all the same, recorded in the emergency log first.
 #[tokio::test(flavor = "multi_thread")]
 async fn with_the_journal_broken_guard_still_places_protective_stops() {
@@ -498,7 +609,7 @@ async fn recovery_reads_an_unknown_order_twice() {
     let dir = TestDir::new("journal-j3-twice");
     let guard = start(dir.path(), venue(), true).await;
     guard.upstream().swallow_answers(true);
-    guard.exchange(buy("3000", "0.1"), "http").await;
+    guard.exchange(buy("3000", "0.1"), Via::Http).await;
     let venue = guard.upstream().fork();
     venue.swallow_answers(false);
     venue.lag_order_status(1);
@@ -527,7 +638,7 @@ async fn without_time_for_the_second_read_an_unknown_order_stays_unknown() {
     let dir = TestDir::new("journal-j3-short");
     let guard = start(dir.path(), venue(), true).await;
     guard.upstream().swallow_answers(true);
-    guard.exchange(buy("3000", "0.1"), "http").await;
+    guard.exchange(buy("3000", "0.1"), Via::Http).await;
     let venue = guard.upstream().fork();
     venue.swallow_answers(false);
     venue.lag_order_status(1);
@@ -565,7 +676,7 @@ fn crashed_with(path: &Path, orders: u64) {
             "c": format!("0x7a68{:028x}", 1_000 + i)}], "grouping": "na"});
         journal
             .append(
-                SystemClock.now_ms() as i64,
+                Timestamp::from_millis(SystemClock.now_ms() as i64),
                 EventBody::Intent { of: 0, action },
             )
             .unwrap();
@@ -777,7 +888,7 @@ async fn on_a_hung_emergency_disk_every_stop_goes_out_unexpired() {
     .unwrap();
 }
 
-/// J1 with the round's sends late (the venue taking 4 s of Guard's clock
+/// The intent first, with the round's sends late (the venue taking 4 s of Guard's clock
 /// for each): an action goes out named by an intent written no more than
 /// [`INTENT_COVERS_MS`] before it expires, the late ones by intents of
 /// their own, so that recovery, which waits that long after an intent,
@@ -852,7 +963,7 @@ async fn vetoes_are_journaled_600_a_minute_for_each_client() {
     // Held: nothing is written, and the decision is still found.
     let held = guard.hold_journal_writer_for_test().await;
     let (first, request) = veto(CLIENT_KEY);
-    let reply = guard.exchange(request, "http").await;
+    let reply = guard.exchange(request, Via::Http).await;
     assert_eq!(reply["code"], "dex_not_allowed", "{reply}");
     let found = guard.decision(first, Some(&client(CLIENT_KEY))).await;
     assert_eq!(
@@ -870,15 +981,15 @@ async fn vetoes_are_journaled_600_a_minute_for_each_client() {
     drop(held);
     for _ in 1..VETOES {
         let (_, request) = veto(CLIENT_KEY);
-        guard.exchange(request, "http").await;
+        guard.exchange(request, Via::Http).await;
     }
     // One more: refused, not journaled.
     let (over, request) = veto(CLIENT_KEY);
-    let reply = guard.exchange(request, "http").await;
+    let reply = guard.exchange(request, Via::Http).await;
     assert_eq!(reply["code"], "dex_not_allowed", "{reply}");
     // The other bot's: journaled.
     let (other, request) = veto(OTHER_KEY);
-    guard.exchange(request, "http").await;
+    guard.exchange(request, Via::Http).await;
     let journaled = |events: &Value, key: &str| {
         events
             .as_array()
@@ -908,7 +1019,7 @@ async fn vetoes_are_journaled_600_a_minute_for_each_client() {
     // The next minute: the one left out is counted.
     clock.advance(60_000);
     let (_, request) = veto(CLIENT_KEY);
-    guard.exchange(request, "http").await;
+    guard.exchange(request, Via::Http).await;
     let events = guard.events(0).await;
     assert!(
         events
@@ -939,7 +1050,7 @@ async fn a_send_after_the_restart_makes_the_old_action_shared() {
     let guard = start(dir.path(), venue(), true).await;
     // A bot's limit buy below the market: it rests.
     let reply = guard
-        .exchange(signed(order_wire(1, "2900", "0.1", "Gtc")), "http")
+        .exchange(signed(order_wire(1, "2900", "0.1", "Gtc")), Via::Http)
         .await;
     let oid = reply["response"]["data"]["statuses"][0]["resting"]["oid"]
         .as_u64()
@@ -961,7 +1072,7 @@ async fn a_send_after_the_restart_makes_the_old_action_shared() {
     let mut journal = DecisionJournal::open(&path).unwrap();
     journal
         .append(
-            SystemClock.now_ms() as i64,
+            Timestamp::from_millis(SystemClock.now_ms() as i64),
             EventBody::Intent {
                 of: 0,
                 action: cancel(oid).to_value(),
@@ -973,7 +1084,7 @@ async fn a_send_after_the_restart_makes_the_old_action_shared() {
     let pending = guard.pending_for_recovery().await;
     assert_eq!(pending.len(), 1, "{pending:?}");
     assert!(!pending[0].shared);
-    let reply = guard.exchange(signed(cancel(oid)), "http").await;
+    let reply = guard.exchange(signed(cancel(oid)), Via::Http).await;
     assert_eq!(reply["status"], "ok", "{reply}");
     assert_eq!(guard.recover_after(pending, 0, 90_000).await, 1);
     let recovered = recovered(&guard).await;
@@ -1018,7 +1129,7 @@ async fn a_retry_after_the_restart_makes_the_old_order_moot() {
     let mut journal = DecisionJournal::open(&path).unwrap();
     journal
         .append(
-            SystemClock.now_ms() as i64,
+            Timestamp::from_millis(SystemClock.now_ms() as i64),
             EventBody::Intent {
                 of: 0,
                 action: close.to_value(),
@@ -1032,7 +1143,7 @@ async fn a_retry_after_the_restart_makes_the_old_order_moot() {
     assert!(!pending[0].shared);
     let before = guard.upstream().received().len();
     guard.upstream().swallow_answers(true);
-    guard.exchange(signed(close.clone()), "http").await;
+    guard.exchange(signed(close.clone()), Via::Http).await;
     guard.upstream().swallow_answers(false);
     // Sent as the old intent named it: the venue's order matches it.
     assert!(
@@ -1074,7 +1185,7 @@ async fn a_cancel_by_order_id_after_the_restart_makes_one_by_client_id_moot() {
     let mut journal = DecisionJournal::open(&path).unwrap();
     journal
         .append(
-            SystemClock.now_ms() as i64,
+            Timestamp::from_millis(SystemClock.now_ms() as i64),
             EventBody::Intent {
                 of: 0,
                 action: by_cloid,
@@ -1131,7 +1242,7 @@ async fn an_order_another_action_names_by_its_order_id_is_moot() {
     let mut journal = DecisionJournal::open(&path).unwrap();
     journal
         .append(
-            SystemClock.now_ms() as i64,
+            Timestamp::from_millis(SystemClock.now_ms() as i64),
             EventBody::Intent {
                 of: 0,
                 action: order,

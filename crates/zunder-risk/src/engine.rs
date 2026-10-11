@@ -1163,7 +1163,7 @@ mod tests {
 
     #[test]
     fn a_tiny_day_start_cannot_overflow_the_daily_loss() {
-        // From the review of the M2 changes: equity of 1e-20 at the end of a
+        // Found in review: equity of 1e-20 at the end of a
         // day, then 1e8 the next morning, divided the loss by 1e-20.
         let limits = RiskLimits {
             drawdown_stop: dec!(1),

@@ -227,7 +227,7 @@ fn deferred_origin_survives_midnight_retention_restart_and_refill_once() {
             seen(&mut risk, 2 * DAY + HOUR + 4000, dec!(20000)),
             RiskState::HaltedForDay { day: 2 }
         );
-        // S6 conserves the known 7% drawdown exactly once. With cap:
+        // Moving the bases conserves the known 7% drawdown exactly once. With cap:
         // peak=20000+140. Without cap: peak=20000/(1-.07).
         let peak = if cap.is_some() {
             dec!(20140)
@@ -413,7 +413,7 @@ fn r3_m1_p3_a_view_inside_the_window_set_a_peak_before_the_deposit_was_known() {
     // 5,000 in at 2 h. A view 0.5 s later shows 15,100 (taken: unknown,
     // a new peak); one at 2 h 5 s shows 15,000; reported at 2 h 5.5 s. The
     // first view may or may not show the deposit: left out on the
-    // recomputation (its 100 of gain is not seen, D6). Peak and day start
+    // recomputation (its 100 of gain is not seen). Peak and day start
     // 15,000; the journal is readable and reopens.
     let dir = Dir::new("p3");
     let limits = RiskLimits::default();
@@ -599,7 +599,7 @@ fn r3_m2_q6_a_withdrawal_not_yet_known_explains_a_loss() {
         seen(&mut risk, 2 * HOUR + 6_000, dec!(19000)),
         RiskState::Active
     );
-    // Taken before the withdrawal was known, the halt stays (D1).
+    // Taken before the withdrawal was known, the halt stays.
     let dir = Dir::new("q6b");
     let mut risk = start(&dir, RiskLimits::default(), dec!(10000));
     report(
@@ -2270,7 +2270,7 @@ fn r7_l3_a_transfer_fee_between_dexes_is_no_withdrawal() {
     assert!(risk.take_waived_stops().is_empty());
 }
 
-// S5/S6 worked numbers from the measured-value specification of 7 Oct.
+// Worked numbers for exact checkpoints and moving bases (`docs/guard.md#deposits-and-withdrawals`).
 fn measured(time_ms: i64, amount: Decimal, id: &str, lo: Decimal, hi: Decimal) -> Flow {
     Flow {
         value: Some(ValueRange {

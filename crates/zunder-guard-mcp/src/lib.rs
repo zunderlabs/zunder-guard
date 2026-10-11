@@ -9,7 +9,8 @@
 //! itself. It talks only to a Guard on this machine ([`guard`]), through
 //! Guard's public contract: Hyperliquid's own `/info` and `/exchange`
 //! formats, with requests signed by a Guard-issued client key as the
-//! official SDK signs ([`sign`]), and Guard's read-only status and events.
+//! official SDK signs ([`sign`]), and Guard's read-only status, events and
+//! preview.
 //! Every assumption about that contract lives in [`contract`].
 //!
 //! Where each guarantee is enforced:
@@ -21,6 +22,9 @@
 //!   funds, changes limits or leverage, resumes, or sends a raw action.
 //! - **Arguments**: strict schemas, checked again on the server
 //!   ([`schema`]); absurd prices and sizes refused ([`preview`]).
+//! - **What Guard would decide**: Guard's own preview of the exact request
+//!   (`POST /guard/preview`), never an estimate here ([`preview`]);
+//!   nothing it vetoes is sent, and nothing is sent without it.
 //! - **Stops only tighten**: here before sending (`move_stop`) and by
 //!   Guard.
 //! - **Which Guard and which network**: a loopback URL only, a status that

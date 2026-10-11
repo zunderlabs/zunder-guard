@@ -77,7 +77,8 @@ pub enum EventBody {
         action: Option<Value>,
         /// The action's place among the actions the intent `decision`
         /// named (`docs/guard.md#journals`); none for a send no intent
-        /// on disk named (exception E1).
+        /// on disk named (flattening or protection while the decision journal
+        /// is broken, recorded in the emergency log).
         #[serde(skip_serializing_if = "Option::is_none")]
         index: Option<u64>,
     },
@@ -91,8 +92,8 @@ pub enum EventBody {
     /// not sent.
     Done { intent: u64 },
     /// After a crash: what the venue says became of an action an intent
-    /// named and no `sent` record answers (`docs/guard.md#journals`,
-    /// J3). `intent` is the intent's `seq`, `index` the action's place in
+    /// named and no `sent` record answers (`docs/guard.md#journals`).
+    /// `intent` is the intent's `seq`, `index` the action's place in
     /// it; `outcome` is `happened`, `did_not_happen` or `unknown`, with the
     /// venue's evidence.
     Recovered {

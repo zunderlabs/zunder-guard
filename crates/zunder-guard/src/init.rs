@@ -74,6 +74,53 @@ fn refused<T>(text: impl Into<String>) -> Result<T, InitError> {
     Err(InitError::Refused(text.into()))
 }
 
+/// Why a question init asks the venue got no answer ([`Venue`]).
+#[derive(Debug, Error)]
+pub enum VenueError {
+    /// The venue could not be asked, or refused the question.
+    #[error("{0}")]
+    Upstream(#[from] crate::upstream::UpstreamError),
+    /// The venue answered, but not with what init needs; the caller's
+    /// words for why.
+    #[error("{0}")]
+    Answer(String),
+}
+
+/// Why a [`SecretStore`] did not keep the key.
+#[derive(Debug, Error)]
+pub enum StoreError {
+    /// A key is stored there already, and `--force` was not given.
+    #[error("{} exists (another Guard's key?); pass --force to replace it", .0.display())]
+    Exists(PathBuf),
+    #[error("{0}")]
+    Io(#[from] io::Error),
+    #[error("systemd-creds encrypt failed")]
+    EncryptFailed,
+    /// The owner-only file could not be created.
+    #[error("{}: {source}", path.display())]
+    Create { path: PathBuf, source: io::Error },
+    /// The Credential Manager holds a key for this configuration already,
+    /// and `--force` was not given.
+    #[error(
+        "the Credential Manager already holds a key for {0} (another Guard's?); pass --force to replace it"
+    )]
+    CredentialExists(String),
+    #[cfg(windows)]
+    #[error("Credential Manager: {0}")]
+    CredentialManager(keyring::Error),
+    #[error("the Windows Credential Manager exists on Windows only")]
+    WindowsOnly,
+}
+
+/// Why a client key file was not written ([`write_client_key`]).
+#[derive(Debug, Error)]
+pub enum ClientKeyError {
+    #[error("{}: {source} (an existing file is never replaced)", path.display())]
+    Create { path: PathBuf, source: io::Error },
+    #[error("writing {}: {source}", path.display())]
+    Write { path: PathBuf, source: io::Error },
+}
+
 /// How init talks to the person.
 pub trait Prompter {
     fn say(&mut self, text: &str);
@@ -186,13 +233,13 @@ pub trait Venue {
         &self,
         network: GuardNetwork,
         key: Address,
-    ) -> impl std::future::Future<Output = Result<Value, String>>;
+    ) -> impl std::future::Future<Output = Result<Value, VenueError>>;
 
     fn equity(
         &self,
         network: GuardNetwork,
         account: Address,
-    ) -> impl std::future::Future<Output = Result<Decimal, String>>;
+    ) -> impl std::future::Future<Output = Result<Decimal, VenueError>>;
 }
 
 /// Where the API wallet key is kept, and how `run` gets it back.
@@ -207,7 +254,7 @@ pub struct StoredSecret {
 }
 
 pub trait SecretStore {
-    fn store(&self, secret: &str) -> Result<StoredSecret, String>;
+    fn store(&self, secret: &str) -> Result<StoredSecret, StoreError>;
 }
 
 /// The name of the stored credential.
@@ -237,13 +284,10 @@ impl SystemdCreds {
 }
 
 impl SecretStore for SystemdCreds {
-    fn store(&self, secret: &str) -> Result<StoredSecret, String> {
+    fn store(&self, secret: &str) -> Result<StoredSecret, StoreError> {
         let location = self.dir.join(CREDENTIAL_NAME);
         if location.exists() && !self.replace {
-            return Err(format!(
-                "{} exists (another Guard's key?); pass --force to replace it",
-                location.display()
-            ));
+            return Err(StoreError::Exists(location));
         }
         let mut child = Command::new("systemd-creds")
             .arg("encrypt")
@@ -253,16 +297,13 @@ impl SecretStore for SystemdCreds {
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
-            .spawn()
-            .map_err(|error| error.to_string())?;
+            .spawn()?;
         if let Some(mut stdin) = child.stdin.take() {
-            stdin
-                .write_all(secret.as_bytes())
-                .map_err(|error| error.to_string())?;
+            stdin.write_all(secret.as_bytes())?;
         }
-        let status = child.wait().map_err(|error| error.to_string())?;
+        let status = child.wait()?;
         if !status.success() {
-            return Err("systemd-creds encrypt failed".into());
+            return Err(StoreError::EncryptFailed);
         }
         Ok(StoredSecret {
             how: "systemd-creds".into(),
@@ -285,19 +326,21 @@ pub struct OwnerOnlyFile {
 }
 
 impl SecretStore for OwnerOnlyFile {
-    fn store(&self, secret: &str) -> Result<StoredSecret, String> {
+    fn store(&self, secret: &str) -> Result<StoredSecret, StoreError> {
         if let Some(parent) = self.path.parent() {
-            fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+            fs::create_dir_all(parent)?;
         }
         if self.replace && fs::symlink_metadata(&self.path).is_ok() {
-            fs::remove_file(&self.path).map_err(|error| error.to_string())?;
+            fs::remove_file(&self.path)?;
         }
-        let mut file = zunder_venue::owner_only::create(&self.path)
-            .map_err(|error| format!("{}: {error}", self.path.display()))?;
+        let mut file =
+            zunder_venue::owner_only::create(&self.path).map_err(|source| StoreError::Create {
+                path: self.path.clone(),
+                source,
+            })?;
         file.write_all(secret.as_bytes())
             .and_then(|()| file.write_all(b"\n"))
-            .and_then(|()| file.sync_all())
-            .map_err(|error| error.to_string())?;
+            .and_then(|()| file.sync_all())?;
         Ok(StoredSecret {
             how: "file (owner only)".into(),
             location: self.path.clone(),
@@ -334,26 +377,21 @@ pub struct CredentialManager {
 
 #[cfg(windows)]
 impl SecretStore for CredentialManager {
-    fn store(&self, secret: &str) -> Result<StoredSecret, String> {
+    fn store(&self, secret: &str) -> Result<StoredSecret, StoreError> {
         let entry = keyring::Entry::new(WINDOWS_CREDENTIAL_SERVICE, &self.target)
-            .map_err(|error| format!("Credential Manager: {error}"))?;
+            .map_err(StoreError::CredentialManager)?;
         // Only a missing entry lets init write without --force: an entry,
         // or an error that hides whether there is one, stops it.
         if !self.replace {
             match entry.get_password().map(Zeroizing::new) {
                 Err(keyring::Error::NoEntry) => {}
-                Ok(_) => {
-                    return Err(format!(
-                        "the Credential Manager already holds a key for {} (another Guard's?); pass --force to replace it",
-                        self.target
-                    ));
-                }
-                Err(error) => return Err(format!("Credential Manager: {error}")),
+                Ok(_) => return Err(StoreError::CredentialExists(self.target.clone())),
+                Err(error) => return Err(StoreError::CredentialManager(error)),
             }
         }
         entry
             .set_password(secret)
-            .map_err(|error| format!("Credential Manager: {error}"))?;
+            .map_err(StoreError::CredentialManager)?;
         Ok(StoredSecret {
             how: "Windows Credential Manager (DPAPI, this user)".into(),
             location: PathBuf::from(format!("{WINDOWS_CREDENTIAL_SERVICE}:{}", self.target)),
@@ -365,21 +403,21 @@ impl SecretStore for CredentialManager {
 
 #[cfg(not(windows))]
 impl SecretStore for CredentialManager {
-    fn store(&self, _secret: &str) -> Result<StoredSecret, String> {
-        Err("the Windows Credential Manager exists on Windows only".into())
+    fn store(&self, _secret: &str) -> Result<StoredSecret, StoreError> {
+        Err(StoreError::WindowsOnly)
     }
 }
 
 /// Windows: the key `init` stored for the configuration in `target`, if
 /// any. Wiped when dropped.
 #[cfg(windows)]
-pub fn stored_windows_key(target: &str) -> Result<Option<Zeroizing<String>>, String> {
+pub fn stored_windows_key(target: &str) -> Result<Option<Zeroizing<String>>, StoreError> {
     let entry = keyring::Entry::new(WINDOWS_CREDENTIAL_SERVICE, target)
-        .map_err(|error| format!("Credential Manager: {error}"))?;
+        .map_err(StoreError::CredentialManager)?;
     match entry.get_password() {
         Ok(key) => Ok(Some(Zeroizing::new(key))),
         Err(keyring::Error::NoEntry) => Ok(None),
-        Err(error) => Err(format!("Credential Manager: {error}")),
+        Err(error) => Err(StoreError::CredentialManager(error)),
     }
 }
 
@@ -435,17 +473,19 @@ fn previous_ip_share(path: &Path) -> Option<Decimal> {
 /// Write a client key to a new file only its owner can read and write
 /// (`0600`, refused if the file exists): for a bot or an agent kit that
 /// reads its key from a file, so the key never shows on a terminal.
-pub fn write_client_key(path: &Path, key_hex: &str) -> Result<(), String> {
-    let mut file = zunder_venue::owner_only::create(path).map_err(|error| {
-        format!(
-            "{}: {error} (an existing file is never replaced)",
-            path.display()
-        )
-    })?;
+pub fn write_client_key(path: &Path, key_hex: &str) -> Result<(), ClientKeyError> {
+    let mut file =
+        zunder_venue::owner_only::create(path).map_err(|source| ClientKeyError::Create {
+            path: path.to_path_buf(),
+            source,
+        })?;
     file.write_all(key_hex.as_bytes())
         .and_then(|()| file.write_all(b"\n"))
         .and_then(|()| file.sync_all())
-        .map_err(|error| format!("writing {}: {error}", path.display()))
+        .map_err(|source| ClientKeyError::Write {
+            path: path.to_path_buf(),
+            source,
+        })
 }
 
 /// What init produced, for the caller and the tests. The secrets shown
@@ -458,8 +498,8 @@ pub struct InitOutcome {
 }
 
 /// Fresh randomness from the operating system.
-pub fn os_random(buffer: &mut [u8]) -> Result<(), String> {
-    getrandom::fill(buffer).map_err(|error| error.to_string())
+pub fn os_random(buffer: &mut [u8]) -> Result<(), getrandom::Error> {
+    getrandom::fill(buffer)
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -522,20 +562,34 @@ pub fn describe(policy: &Policy) -> Vec<String> {
     ]
 }
 
+/// Why a value typed while editing the policy is refused (shown, then
+/// asked again).
+#[derive(Debug, Error)]
+enum EditError {
+    #[error("`{0}` is not a number")]
+    NotAPercent(String),
+    #[error("not a number")]
+    NotANumber,
+    #[error("`{0}`: attach or refuse")]
+    StopPolicy(String),
+    #[error("{0}")]
+    Bounds(zunder_guard_core::policy::PolicyError),
+}
+
 /// Edit the policy value by value. An empty answer keeps a value; every
 /// change is checked against the bounds and asked again when refused.
 fn edit_policy(prompter: &mut dyn Prompter, mut policy: Policy) -> Result<Policy, InitError> {
-    type Setter = fn(&mut Policy, &str) -> Result<(), String>;
-    fn percent(text: &str) -> Result<Decimal, String> {
+    type Setter = fn(&mut Policy, &str) -> Result<(), EditError>;
+    fn percent(text: &str) -> Result<Decimal, EditError> {
         let text = text.trim().trim_end_matches('%');
         Decimal::from_str(text)
             .map(|value| value / dec!(100))
-            .map_err(|_| format!("`{text}` is not a number"))
+            .map_err(|_| EditError::NotAPercent(text.to_owned()))
     }
     let fields: [(&str, Setter); 10] = [
         ("max leverage (x)", |p, t| {
             p.max_leverage = Decimal::from_str(t.trim().trim_end_matches('x'))
-                .map_err(|_| "not a number".to_owned())?;
+                .map_err(|_| EditError::NotANumber)?;
             Ok(())
         }),
         ("max loss at the stop (%)", |p, t| {
@@ -546,7 +600,7 @@ fn edit_policy(prompter: &mut dyn Prompter, mut policy: Policy) -> Result<Policy
             p.stop = match t.trim() {
                 "attach" => StopPolicy::Attach,
                 "refuse" => StopPolicy::Refuse,
-                other => return Err(format!("`{other}`: attach or refuse")),
+                other => return Err(EditError::StopPolicy(other.to_owned())),
             };
             Ok(())
         }),
@@ -597,7 +651,7 @@ fn edit_policy(prompter: &mut dyn Prompter, mut policy: Policy) -> Result<Policy
             }
             let mut changed = policy.clone();
             let result = set(&mut changed, &answer)
-                .and_then(|()| changed.validate().map_err(|error| error.to_string()));
+                .and_then(|()| changed.validate().map_err(EditError::Bounds));
             match result {
                 Ok(()) => {
                     policy = changed;
@@ -623,7 +677,7 @@ pub async fn init(
     key_input: Option<&mut dyn io::Read>,
     venue: &impl Venue,
     store: &dyn SecretStore,
-    random: &mut dyn FnMut(&mut [u8]) -> Result<(), String>,
+    random: &mut dyn FnMut(&mut [u8]) -> Result<(), getrandom::Error>,
 ) -> Result<InitOutcome, InitError> {
     let interactive = !options.non_interactive;
     if options.config.exists() && !options.force {
@@ -847,7 +901,7 @@ pub async fn init(
     // 5. The client key, shown once.
     let mut client_secret = Zeroizing::new([0u8; 32]);
     let client = loop {
-        random(client_secret.as_mut()).map_err(InitError::Io)?;
+        random(client_secret.as_mut()).map_err(|error| InitError::Io(error.to_string()))?;
         if let Ok(client) = GuardKey::from_bytes(&client_secret) {
             break client;
         }
@@ -856,7 +910,8 @@ pub async fn init(
     // The client key file, when asked for, before anything is written: a
     // config never names a client whose key went nowhere.
     if let Some(path) = &options.client_key_out {
-        write_client_key(path, client_hex.as_str()).map_err(InitError::Io)?;
+        write_client_key(path, client_hex.as_str())
+            .map_err(|error| InitError::Io(error.to_string()))?;
     }
 
     // 6. The pairing code, shown once.
@@ -1043,10 +1098,10 @@ pub async fn init(
 /// A pairing code for the browser monitor and its SHA3-256 (hex), which is
 /// all Guard keeps.
 pub fn pairing(
-    random: &mut dyn FnMut(&mut [u8]) -> Result<(), String>,
+    random: &mut dyn FnMut(&mut [u8]) -> Result<(), getrandom::Error>,
 ) -> Result<(String, String), InitError> {
     let mut pairing = [0u8; 16];
-    random(&mut pairing).map_err(InitError::Io)?;
+    random(&mut pairing).map_err(|error| InitError::Io(error.to_string()))?;
     let code = format!("zgp1_{}", hex(&pairing));
     let hash = hex(&Sha3_256::digest(code.as_bytes()));
     Ok((code, hash))
@@ -1055,11 +1110,11 @@ pub fn pairing(
 /// A new client key for a bot: its secret (shown once by the caller) and
 /// its address (kept).
 pub fn new_client(
-    random: &mut dyn FnMut(&mut [u8]) -> Result<(), String>,
+    random: &mut dyn FnMut(&mut [u8]) -> Result<(), getrandom::Error>,
 ) -> Result<(Zeroizing<String>, Address), InitError> {
     let mut secret = Zeroizing::new([0u8; 32]);
     loop {
-        random(secret.as_mut()).map_err(InitError::Io)?;
+        random(secret.as_mut()).map_err(|error| InitError::Io(error.to_string()))?;
         if let Ok(key) = GuardKey::from_bytes(&secret) {
             return Ok((secret_hex(secret.as_ref()), key.address()));
         }
@@ -1131,10 +1186,10 @@ mod tests {
     struct FakeVenue(Value);
 
     impl Venue for FakeVenue {
-        async fn user_role(&self, _: GuardNetwork, _: Address) -> Result<Value, String> {
+        async fn user_role(&self, _: GuardNetwork, _: Address) -> Result<Value, VenueError> {
             Ok(self.0.clone())
         }
-        async fn equity(&self, _: GuardNetwork, _: Address) -> Result<Decimal, String> {
+        async fn equity(&self, _: GuardNetwork, _: Address) -> Result<Decimal, VenueError> {
             Ok(dec!(1000))
         }
     }
@@ -1147,7 +1202,7 @@ mod tests {
     struct Kept(RefCell<Option<String>>);
 
     impl SecretStore for Kept {
-        fn store(&self, secret: &str) -> Result<StoredSecret, String> {
+        fn store(&self, secret: &str) -> Result<StoredSecret, StoreError> {
             *self.0.borrow_mut() = Some(secret.to_owned());
             Ok(StoredSecret {
                 how: "test".into(),
@@ -1158,7 +1213,7 @@ mod tests {
         }
     }
 
-    fn counter() -> impl FnMut(&mut [u8]) -> Result<(), String> {
+    fn counter() -> impl FnMut(&mut [u8]) -> Result<(), getrandom::Error> {
         let mut next = 1u8;
         move |buffer: &mut [u8]| {
             for byte in buffer.iter_mut() {

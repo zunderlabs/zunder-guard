@@ -98,8 +98,11 @@ class MCP:
             self.writes_bound = (
                 isinstance(mode, dict) and set(mode) == {"enabled"} and mode["enabled"] is True
             )
+            close = (
+                experimental.get("close_expected_size") if isinstance(experimental, dict) else None
+            )
             self.close_size_bound = (
-                isinstance(experimental, dict) and experimental.get("close_expected_size") is True
+                isinstance(close, dict) and set(close) == {"enabled"} and close["enabled"] is True
             )
             if value.get("protocolVersion") != "2025-11-25":
                 raise MCPError("MCP protocol version differs")

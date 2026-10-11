@@ -33,7 +33,7 @@ use rust_decimal::{Decimal, RoundingStrategy};
 use serde_json::{Value, json};
 use thiserror::Error;
 use zunder_core::{Side, Symbol};
-use zunder_risk::{Exposure, VenuePosition, VenueView};
+use zunder_risk::{CoverStop, Exposure, VenuePosition, VenueView};
 
 use zunder_hl_protocol::{
     PriceGrid, Round,
@@ -951,7 +951,7 @@ impl AccountView {
         extra: Option<(Decimal, Decimal)>,
     ) -> Option<Decimal> {
         let position = self.position(coin)?;
-        let mut stops: Vec<(Decimal, Decimal, bool)> = self
+        let stops = self
             .open_orders
             .iter()
             .filter(|order| {
@@ -961,37 +961,16 @@ impl AccountView {
                     && order.side == position.side.opposite()
             })
             .filter_map(|order| {
-                order
-                    .protective_level()
-                    .map(|px| (px, order.qty, order.is_position_tpsl))
+                order.protective_level().map(|px| CoverStop {
+                    trigger: px,
+                    size: (!order.is_position_tpsl).then_some(order.qty),
+                    first_part_only: false,
+                })
             })
-            .collect();
-        stops.extend(extra.map(|(trigger, qty)| (trigger, qty, false)));
-        // Tightest first: the highest trigger under a long, the lowest
-        // above a short.
-        match position.side {
-            Side::Buy => stops.sort_by_key(|stop| std::cmp::Reverse(stop.0)),
-            Side::Sell => stops.sort_by_key(|stop| stop.0),
-        }
-        let mut remaining = position.qty;
-        let mut weighted = Decimal::ZERO;
-        for (trigger, qty, whole) in stops {
-            let closes = if whole { remaining } else { qty.min(remaining) };
-            weighted = weighted.checked_add(closes.checked_mul(trigger)?)?;
-            remaining = remaining.checked_sub(closes)?;
-            if remaining <= Decimal::ZERO {
-                // Rounded towards the looser side: the risk measured from
-                // it is never below the real one.
-                let strategy = match position.side {
-                    Side::Buy => RoundingStrategy::ToNegativeInfinity,
-                    Side::Sell => RoundingStrategy::ToPositiveInfinity,
-                };
-                return weighted
-                    .checked_div(position.qty)
-                    .map(|average| average.round_dp_with_strategy(12, strategy));
-            }
-        }
-        None
+            .chain(extra.map(|(trigger, qty)| CoverStop::sized(trigger, qty)));
+        // Tightest first, the size-weighted trigger rounded towards the
+        // looser side (`zunder_risk::covering_stop`).
+        zunder_risk::covering_stop(position.side, position.qty, stops)
     }
 
     /// The venue's side for the risk engine: every position with the stop
@@ -1754,7 +1733,7 @@ pub(crate) mod tests {
             book.exit_depth(Side::Sell, dec!(4222), dec!(4644)),
             Some(dec!(477.1245))
         );
-        // Just above a power of ten (the review's case, as HBAR at 0.1004
+        // Just above a power of ten (a case found in review, as HBAR at 0.1004
         // shows the venue doing it): a mid of 100.5 read at 3 figures, every
         // level 1.0 wide, also below 100. A long's stop at 99.5, worst fill
         // 89.55: the level at 99 holds bids up to 99.99, above the trigger,
@@ -1769,7 +1748,7 @@ pub(crate) mod tests {
             book.exit_depth(Side::Buy, dec!(99.5), dec!(89.55)),
             Some(dec!(0.4))
         );
-        // Just below one (the second review's case, xyz:CL at 88.5, 2
+        // Just below one (another case found in review, xyz:CL at 88.5, 2
         // figures): the asks run on past 100 at the mid's step of 1, so the
         // step is the best ask's, not the highest's (which would be 10 and
         // count nothing). A long's stop at 86.73, worst fill 78.06: only the
