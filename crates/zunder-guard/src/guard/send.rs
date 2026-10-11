@@ -17,7 +17,9 @@ use zunder_guard_core::{
     event::EventBody,
     judge::Forward,
     licence,
-    reply::{OrderStatus, action_ok, client_reply, order_statuses, signed_request},
+    reply::{
+        OrderStatus, action_ok, client_reply, order_outcome_unknown, order_statuses, signed_request,
+    },
 };
 
 use crate::{
@@ -734,14 +736,8 @@ impl<U: Upstream, C: Clock> Guard<U, C> {
         // answer of no known shape, leaves the outcome unknown.
         let refused_whole = reply.get("status").and_then(Value::as_str) == Some("err");
         let read = order_statuses(&reply);
-        let unreadable = match (&forward.action, &read) {
-            (Action::Order(sent), Ok(statuses)) => {
-                statuses.len() != sent.orders.len()
-                    || statuses
-                        .iter()
-                        .any(|status| matches!(status, OrderStatus::Other(_)))
-            }
-            (Action::Order(_), Err(_)) => !refused_whole,
+        let unreadable = match &forward.action {
+            Action::Order(sent) => order_outcome_unknown(sent.orders.len(), &reply),
             _ => false,
         };
         let statuses = read.unwrap_or_default();

@@ -6,7 +6,7 @@
 //! `perpDexs`, HIP-3 dexes' caps), books, and the `/info` passthrough.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     sync::{Arc, atomic::Ordering},
 };
 
@@ -128,7 +128,23 @@ pub(super) struct Caches {
     pub(super) missing_dexes: Vec<String>,
     /// The account mode.
     pub(super) mode_cache: Option<Cached<Value>>,
+    /// How many ledger entries showing the account mode may have changed
+    /// (`activateDexAbstraction`) Guard has seen: a count, not a time, so
+    /// no step of a clock can make an older read count as newer.
+    pub(super) mode_epoch: u64,
+    /// [`Self::mode_epoch`] when the cached mode's read began: the cached
+    /// mode is used only while no such entry was seen since.
+    pub(super) mode_read_epoch: Option<u64>,
+    /// The ids of the entries counted in [`Self::mode_epoch`], the most
+    /// recent [`MODE_CHANGES_KEPT`]: one seen again (a ledger read overlaps
+    /// the last; the stream's entry is seen before it is taken) is not
+    /// counted twice.
+    pub(super) mode_changes_seen: VecDeque<String>,
 }
+
+/// How many ids of entries that may have changed the account mode are
+/// kept, so that one seen again is not counted again.
+const MODE_CHANGES_KEPT: usize = 256;
 
 impl Caches {
     /// Nothing read yet, for `account` and the HIP-3 dexes `names`.
@@ -142,7 +158,40 @@ impl Caches {
             open_interest_caps: HashMap::new(),
             missing_dexes: Vec::new(),
             mode_cache: None,
+            mode_epoch: 0,
+            mode_read_epoch: None,
+            mode_changes_seen: VecDeque::new(),
         }
+    }
+
+    /// The account mode while it is fresh at `now` and its read began
+    /// after every entry Guard saw that may have changed it.
+    pub(super) fn mode(&self, now: u64) -> Option<&Value> {
+        if self.mode_stale() {
+            return None;
+        }
+        self.mode_cache.as_ref()?.fresh(now, MODE_TTL_MS)
+    }
+
+    /// Whether the cached mode was read before an entry Guard saw that may
+    /// have changed it (or none was read).
+    pub(super) fn mode_stale(&self) -> bool {
+        self.mode_read_epoch != Some(self.mode_epoch)
+    }
+
+    /// The ledger entry `id` shows the account mode may have changed: the
+    /// mode is read again before an entry is judged on it. Whether it was
+    /// new (an entry seen before counts once).
+    pub(super) fn mode_may_have_changed(&mut self, id: String) -> bool {
+        if self.mode_changes_seen.contains(&id) {
+            return false;
+        }
+        self.mode_changes_seen.push_back(id);
+        while self.mode_changes_seen.len() > MODE_CHANGES_KEPT {
+            self.mode_changes_seen.pop_front();
+        }
+        self.mode_epoch = self.mode_epoch.wrapping_add(1);
+        true
     }
 
     /// The HIP-3 dexes `perpDexs` listed when last read, however old.
@@ -176,7 +225,12 @@ impl Caches {
         if newer(&mut self.perp_dexs, other.perp_dexs) {
             self.missing_dexes = other.missing_dexes;
         }
-        newer(&mut self.mode_cache, other.mode_cache);
+        // A mode read by a sync that began before an entry this one saw
+        // carries the older epoch, and so is stale here.
+        if newer(&mut self.mode_cache, other.mode_cache) {
+            self.mode_read_epoch = other.mode_read_epoch;
+        }
+        self.mode_epoch = self.mode_epoch.max(other.mode_epoch);
         newer_each(&mut self.dex_metas, other.dex_metas);
         newer_each(&mut self.open_interest_caps, other.open_interest_caps);
     }
@@ -464,9 +518,7 @@ impl<U: Upstream, C: Clock> Guard<U, C> {
         else {
             return Err(StreamFallback::MetaStale);
         };
-        let Some(mode) =
-            (inner.caches.mode_cache.as_ref()).and_then(|mode| mode.fresh(now, MODE_TTL_MS))
-        else {
+        let Some(mode) = inner.caches.mode(now) else {
             return Err(StreamFallback::ModeStale);
         };
         // Each HIP-3 dex the markets name, by its index, with its meta and
@@ -800,17 +852,17 @@ impl<U: Upstream, C: Clock> Guard<U, C> {
         }
         let dexes = readable;
         let user = caches.account;
-        let cached_mode = (caches.mode_cache.as_ref())
-            .and_then(|mode| mode.fresh(now, MODE_TTL_MS))
-            .cloned();
+        let cached_mode = caches.mode(now).cloned();
         let mode = match cached_mode {
             Some(mode) => mode,
             None => {
+                let epoch = caches.mode_epoch;
                 let mode = self
                     .upstream
                     .info(&requests::user_abstraction(user))
                     .await?;
                 caches.mode_cache = Some(Cached::new(mode.clone(), now));
+                caches.mode_read_epoch = Some(epoch);
                 mode
             }
         };
@@ -1022,5 +1074,48 @@ impl<U: Upstream, C: Clock> Guard<U, C> {
                 "no positions within {LOCKED_READ_MS} ms"
             )))
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+
+    use super::*;
+
+    /// A sync reads the mode without Guard's lock, on a copy of the caches
+    /// taken before an entry showed the mode may have changed; merged after
+    /// it, that read is stale (it began before the change), however much
+    /// later it ended. One that began after the change is used.
+    #[test]
+    fn a_mode_read_before_a_change_and_merged_after_it_is_stale() {
+        let account = Address::from_hex("0x5e9ee1089755c3435139848e47e6635505d5a13a").unwrap();
+        let mut inner = Caches::new(account, std::collections::BTreeSet::new());
+        inner.mode_cache = Some(Cached::new(json!("disabled"), 1_000));
+        inner.mode_read_epoch = Some(inner.mode_epoch);
+        assert_eq!(inner.mode(1_500), Some(&json!("disabled")));
+        // The sync's copy, and the read it makes on it (its mode at the
+        // copy's epoch, 0), ending later than anything inner read.
+        let mut copy = inner.clone();
+        // Meanwhile the ledger shows the change: inner's mode is stale.
+        assert!(inner.mode_may_have_changed("act:2000".into()));
+        assert_eq!(inner.mode(2_100), None);
+        // Seen again (the HTTP read overlapping, the socket's copy): once.
+        assert!(!inner.mode_may_have_changed("act:2000".into()));
+        assert_eq!(inner.mode_epoch, 1);
+        copy.mode_cache = Some(Cached::new(json!("disabled"), 2_200));
+        copy.mode_read_epoch = Some(copy.mode_epoch);
+        inner.take_newer(copy);
+        assert_eq!(inner.mode_epoch, 1);
+        assert_eq!(inner.mode_read_epoch, Some(0));
+        assert_eq!(inner.mode(2_300), None);
+        // A read that began after the change (a copy taken now) is used.
+        let mut later = inner.clone();
+        later.mode_cache = Some(Cached::new(json!("dexAbstraction"), 2_400));
+        later.mode_read_epoch = Some(later.mode_epoch);
+        inner.take_newer(later);
+        assert_eq!(inner.mode(2_500), Some(&json!("dexAbstraction")));
+        // Its lifetime still applies: 60 s.
+        assert_eq!(inner.mode(2_400 + MODE_TTL_MS), None);
     }
 }

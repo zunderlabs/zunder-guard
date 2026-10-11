@@ -193,6 +193,8 @@ struct State {
     events: u64,
     /// The ledger read over HTTP fails.
     ledger_fails: bool,
+    /// The account mode `userAbstraction` answers (`disabled` when unset).
+    mode: Option<String>,
     flow_records_fails: bool,
     ledger_delay_ms: u64,
     flow_records_delay_ms: u64,
@@ -385,6 +387,11 @@ impl MemoryVenue {
             .unwrap()
             .dex_equity
             .insert(dex.to_owned(), value.to_owned());
+    }
+
+    /// Set the account mode (`userAbstraction`'s answer).
+    pub fn set_mode(&self, mode: &str) {
+        self.state.lock().unwrap().mode = Some(mode.to_owned());
     }
 
     /// Set the main dex's account value.
@@ -941,7 +948,7 @@ impl Upstream for MemoryVenue {
                     }
                 }
             }
-            Some("userAbstraction") => json!("disabled"),
+            Some("userAbstraction") => json!(state.mode.as_deref().unwrap_or("disabled")),
             // The API wallet is an agent of the account; any other key (a
             // Guard client key) is unknown to the venue.
             Some("userRole")

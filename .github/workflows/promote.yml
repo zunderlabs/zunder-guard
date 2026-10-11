@@ -2,6 +2,13 @@
 name: promote
 on:
   workflow_call:
+    secrets:
+      HOMEBREW_APP_PRIVATE_KEY:
+        description: Environment-scoped tap publisher credential
+        required: true
+      INSTALLER_PUBLISH_TOKEN:
+        description: Environment-scoped canonical capsule publisher credential
+        required: true
     inputs:
       tag: {type: string, required: true}
       commit: {type: string, required: true}

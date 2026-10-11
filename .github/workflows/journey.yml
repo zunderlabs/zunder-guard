@@ -12,6 +12,27 @@ on:
       profile:
         type: string
         default: all
+    # Caller admission is required even for secrets stored only in e2e.
+    # Optional credentials are guarded by the specific all-profile row that uses them.
+    secrets:
+      E2E_ACCESS_CLIENT_ID:
+        required: true
+      E2E_ACCESS_CLIENT_SECRET:
+        required: true
+      E2E_ORDER_TOKEN:
+        required: true
+      E2E_INBOX_TOKEN:
+        required: true
+      E2E_PAYER_HYPERLIQUID_TESTNET_KEY:
+        required: true
+      E2E_PAYER_EVM_SEPOLIA_KEY:
+        required: false
+      E2E_PAYER_BLOCKED_KEY:
+        required: false
+      E2E_TESTNET_API_WALLET_KEY:
+        required: false
+      E2E_TESTNET_OWNER_KEY:
+        required: false
 permissions:
   contents: read
 jobs:
@@ -547,12 +568,23 @@ jobs:
         path: ${{ runner.temp }}/sdk/assets
     - run: rustup toolchain install
     - name: Run SDK vectors and native custody contracts
+      if: runner.os != 'Windows'
       env:
         GH_TOKEN: ${{ github.token }}
         TAG: ${{ inputs.tag }}
         SOURCE: ${{ inputs.commit }}
       run: python -m guard_harness.signing_vectors --tag "$TAG" --commit "$SOURCE"
         --assets "$RUNNER_TEMP/sdk/assets" --output "$RUNNER_TEMP/sdk/proof"
+    - name: Run SDK vectors with the native Windows linker path
+      if: runner.os == 'Windows'
+      shell: pwsh
+      env:
+        GH_TOKEN: ${{ github.token }}
+        TAG: ${{ inputs.tag }}
+        SOURCE: ${{ inputs.commit }}
+      run: |
+        python -m guard_harness.signing_vectors --tag "$env:TAG" --commit "$env:SOURCE" --assets "$env:RUNNER_TEMP/sdk/assets" --output "$env:RUNNER_TEMP/sdk/proof"
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
     - uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6
       id: signing
       with:

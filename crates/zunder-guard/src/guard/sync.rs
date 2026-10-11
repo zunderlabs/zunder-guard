@@ -153,25 +153,30 @@ impl<U: Upstream, C: Clock> Guard<U, C> {
                 .sends
                 .last_ms
                 .is_some_and(|sent| started.saturating_sub(sent) < SYNC_LOCKED_AFTER_SEND_MS);
-        let (mut inner, read_started, read_started_mono, read) = if sending {
+        // With each read, the count of entries that may have changed the
+        // account mode its mode is good for (`Caches::mode_epoch` of the
+        // caches it read with).
+        let (mut inner, read_started, read_started_mono, read, mode_epoch) = if sending {
             let read = self
                 .sync_read_locked(&mut inner.caches, started, deadline)
                 .await;
             inner.sync.read_twice = false;
             inner.sync.last_reads = 1;
             inner.sync.unlock_next = share_locked && read.is_err();
-            (inner, started, started_mono, read)
+            let epoch = inner.caches.mode_epoch;
+            (inner, started, started_mono, read, epoch)
         } else {
             let mut caches = inner.caches.clone();
             let sent_before = inner.sends.answered;
             drop(inner);
             let read = self.sync_read_unlocked(&mut caches, started).await;
+            let clone_epoch = caches.mode_epoch;
             let mut inner = self.inner.lock().await;
             inner.caches.take_newer(caches);
             if inner.sends.answered == sent_before {
                 inner.sync.read_twice = false;
                 inner.sync.last_reads = 1;
-                (inner, started, started_mono, read)
+                (inner, started, started_mono, read, clone_epoch)
             } else {
                 let now = self.clock.now_ms();
                 let now_mono = self.clock.monotonic_ms();
@@ -185,7 +190,8 @@ impl<U: Upstream, C: Clock> Guard<U, C> {
                     .await;
                 inner.sync.read_twice = true;
                 inner.sync.last_reads = 2;
-                (inner, now, now_mono, read)
+                let epoch = inner.caches.mode_epoch;
+                (inner, now, now_mono, read, epoch)
             }
         };
         // Awaited reads may cross the hold deadline. Expire before any
@@ -271,7 +277,7 @@ impl<U: Upstream, C: Clock> Guard<U, C> {
                 {
                     let at = now.max(inner.last_sync_ms.unwrap_or(0));
                     if self.take_flows(&mut inner, at, &account).await {
-                        self.observe(&mut inner, at, &account);
+                        self.observe(&mut inner, at, &account, Some(mode_epoch));
                     }
                 }
                 self.halt(&mut inner, now, &account, true).await;

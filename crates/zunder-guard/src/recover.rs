@@ -9,7 +9,10 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 
 use serde_json::{Value, json};
-use zunder_guard_core::action::{Action, OrderRef, decode_action_value};
+use zunder_guard_core::{
+    action::{Action, OrderRef, decode_action_value},
+    reply::order_outcome_unknown,
+};
 
 /// An action an intent named that no `sent`, `recovered` or `done` record
 /// answers.
@@ -107,6 +110,12 @@ struct Open {
     answered: BTreeSet<usize>,
     /// Actions sent without a parsed answer (a transport error): in doubt.
     doubt: BTreeSet<usize>,
+    /// Order actions the venue answered without saying what they placed
+    /// (`reply::order_outcome_unknown`): in doubt, `done` or not, until a
+    /// record shows Guard's clock [`MAX_TTL_MS`] past the intent (the
+    /// action can no longer arrive unseen, and Guard's live hold covered
+    /// it) or a recovery conclusion answers it.
+    unread: BTreeSet<usize>,
     /// Guard finished acting on it: actions with no `sent` were not sent.
     done: bool,
     /// Actions another action in the journal names an order of (before
@@ -121,7 +130,7 @@ impl Open {
     fn unresolved(&self) -> Vec<usize> {
         (0..self.actions.len())
             .filter(|index| !self.answered.contains(index))
-            .filter(|index| !self.done || self.doubt.contains(index))
+            .filter(|index| !self.done || self.doubt.contains(index) || self.unread.contains(index))
             .collect()
     }
 }
@@ -145,12 +154,33 @@ pub struct Tracker {
     /// intent's own are kept in it until it is resolved).
     answered_oids: HashSet<u64>,
     oid_order: VecDeque<u64>,
+    /// The unread answers ([`Open::unread`]) by when they stop counting
+    /// (the intent's time plus [`MAX_TTL_MS`]), intent and index.
+    unread_until: BTreeSet<(i64, u64, usize)>,
 }
 
 impl Tracker {
     /// Take in one record's event.
     pub fn observe(&mut self, event: &Value) {
         let seq = event["seq"].as_u64().unwrap_or(0);
+        // Guard's clock has passed the point an unread answer's action
+        // could still arrive (recovery waits as long after an intent): it
+        // no longer holds anything, and the account as read since shows
+        // whatever it did. So a journal's old unread answers never come
+        // back after a restart, and none is kept open through a run.
+        if let Some(at_ms) = event["at_ms"].as_i64() {
+            while let Some(&(until, intent, index)) = self.unread_until.first()
+                && until <= at_ms
+            {
+                self.unread_until.pop_first();
+                if let Some(open) = self.open.get_mut(&intent)
+                    && open.unread.contains(&index)
+                {
+                    open.answered.insert(index);
+                }
+                self.resolve(intent);
+            }
+        }
         let index = |field: &str| {
             event[field]
                 .as_u64()
@@ -174,10 +204,32 @@ impl Tracker {
                     })
                     .collect();
                 if let Some(open) = self.open.get_mut(&intent) {
-                    if event["reply"].get("status").is_some() {
-                        open.answered.insert(index);
-                    } else {
+                    // An order action's answer that does not say what it
+                    // placed is in doubt, as a lost one: it may still
+                    // arrive (`reply::order_outcome_unknown`, the rule Guard
+                    // holds entries by live).
+                    let action = event
+                        .get("action")
+                        .filter(|action| !action.is_null())
+                        .or_else(|| open.actions.get(index));
+                    let unread = action.is_some_and(|action| {
+                        action["type"] == "order"
+                            && order_outcome_unknown(
+                                action["orders"].as_array().map_or(0, Vec::len),
+                                &event["reply"],
+                            )
+                    });
+                    if event["reply"].get("status").is_none() {
                         open.doubt.insert(index);
+                    } else if unread {
+                        open.unread.insert(index);
+                        self.unread_until.insert((
+                            open.at_ms.saturating_add(MAX_TTL_MS),
+                            intent,
+                            index,
+                        ));
+                    } else {
+                        open.answered.insert(index);
                     }
                     open.oids.extend(&oids);
                 }
@@ -248,6 +300,7 @@ impl Tracker {
                             actions,
                             answered: BTreeSet::new(),
                             doubt: BTreeSet::new(),
+                            unread: BTreeSet::new(),
                             done: false,
                             shared,
                             oids: Vec::new(),
@@ -1062,6 +1115,116 @@ mod tests {
     fn answered(seq: u64, decision: u64, status: Value) -> Value {
         json!({"seq": seq, "kind": "sent", "decision": decision, "index": 0,
             "reply": {"status": "ok", "response": {"data": {"statuses": [status]}}}})
+    }
+
+    /// An order answered `ok` without a status Guard can read for each
+    /// order sent is in doubt after a restart, as a lost answer: it may
+    /// still arrive, so recovery waits for it and asks the venue. Answers
+    /// that say what happened (resting, filled, an error, refused whole)
+    /// resolve it, as before.
+    #[test]
+    fn an_answer_that_does_not_say_what_was_placed_is_pending() {
+        let cloid = "0x00000000000000000000000000000abc";
+        let unread = [
+            json!({"status": "ok"}),
+            json!({"status": "ok", "response": {"type": "order", "data": {"statuses": []}}}),
+            json!({"status": "ok", "response": {"type": "order", "data": {"statuses": [{"what": 1}]}}}),
+            json!({"status": "ok", "response": {"type": "order", "data": {"statuses": [{"filled": {"oid": 7}}]}}}),
+            json!({"status": "ok", "response": {"type": "order", "data": {"statuses": [
+                {"resting": {"oid": 7}}, {"resting": {"oid": 8}}]}}}),
+            json!({"status": "unknown"}),
+        ];
+        for reply in unread {
+            let events = vec![
+                intent(1, 9_000, order_action(cloid)),
+                json!({"seq": 2, "kind": "sent", "decision": 1, "index": 0, "reply": reply}),
+                // Guard finished with it: a send in doubt stays pending.
+                json!({"seq": 3, "kind": "done", "intent": 1}),
+            ];
+            let found: Vec<(u64, usize)> = pending(&events)
+                .iter()
+                .map(|pending| (pending.intent, pending.index))
+                .collect();
+            assert_eq!(found, vec![(1, 0)], "{reply}");
+        }
+        let told = [
+            json!({"status": "ok", "response": {"type": "order", "data": {"statuses": [{"resting": {"oid": 7}}]}}}),
+            json!({"status": "ok", "response": {"type": "order", "data": {"statuses": [
+                {"filled": {"totalSz": "0.01", "avgPx": "60000", "oid": 7}}]}}}),
+            json!({"status": "ok", "response": {"type": "order", "data": {"statuses": [{"error": "no margin"}]}}}),
+            json!({"status": "err", "response": "User or API Wallet does not exist."}),
+        ];
+        for reply in told {
+            let events = vec![
+                intent(1, 9_000, order_action(cloid)),
+                json!({"seq": 2, "kind": "sent", "decision": 1, "index": 0, "reply": reply}),
+            ];
+            assert!(pending(&events).is_empty(), "{reply}");
+        }
+        // A non-order action answered `ok` without statuses is answered.
+        let cancel = json!({"type": "cancel", "cancels": [{"a": 0, "o": 7}]});
+        let events = vec![
+            intent(1, 9_000, cancel),
+            json!({"seq": 2, "kind": "sent", "decision": 1, "index": 0, "reply": {"status": "ok"}}),
+        ];
+        assert!(pending(&events).is_empty());
+        // The action as sent decides when the send records one (an order
+        // sent again): two orders, two readable statuses.
+        let two = json!({"type": "order", "orders": [limit_buy(cloid), limit_buy("0x01")],
+            "grouping": "na"});
+        let events = vec![
+            intent(1, 9_000, order_action(cloid)),
+            json!({"seq": 2, "kind": "sent", "decision": 1, "index": 0, "action": two,
+                "reply": {"status": "ok", "response": {"type": "order", "data": {"statuses": [
+                    {"resting": {"oid": 7}}, {"resting": {"oid": 8}}]}}}}),
+        ];
+        assert!(pending(&events).is_empty());
+    }
+
+    /// A journal of 1,000 unread answers, each followed by its `done` and,
+    /// 10 s apart, by the next: once a record shows Guard's clock 55 s
+    /// (`MAX_TTL_MS`) past an intent, its unread answer can no longer
+    /// arrive unseen and is resolved, so a restart reopens only the last
+    /// ones, and a run keeps none open for long. A recovery conclusion
+    /// resolves one at once.
+    #[test]
+    fn old_unread_answers_never_reopen() {
+        let unread = json!({"status": "ok", "response": {"type": "order", "data": {"statuses": [{"what": 1}]}}});
+        let mut events = Vec::new();
+        let mut seq = 0;
+        for n in 0..1_000u64 {
+            let at = 1_000_000 + 10_000 * n as i64;
+            let cloid = format!("0x{:032x}", n + 1);
+            seq += 3;
+            events.push(intent(seq, at, order_action(&cloid)));
+            events.push(json!({"seq": seq + 1, "at_ms": at + 100, "kind": "sent",
+                "decision": seq, "index": 0, "reply": unread}));
+            events.push(json!({"seq": seq + 2, "at_ms": at + 101, "kind": "done", "intent": seq}));
+        }
+        let mut tracker = Tracker::default();
+        for event in &events {
+            tracker.observe(event);
+            // Never more than six open at once: those of the last 55 s.
+            assert!(tracker.open.len() <= 6, "{}", tracker.open.len());
+        }
+        // The last record is at 10,990,101: intents up to 10,935,101 are 55 s
+        // behind it; the last six (10,940,000 to 10,990,000) are pending.
+        let found: Vec<u64> = tracker.pending().iter().map(|p| p.intent).collect();
+        assert_eq!(found, vec![2_985, 2_988, 2_991, 2_994, 2_997, 3_000]);
+        // A record 55 s past the last intent (at 10,990,000): none left.
+        tracker.observe(&json!({"seq": 3_004, "at_ms": 10_990_000 + 55_000, "kind": "stopped"}));
+        assert!(tracker.pending().is_empty());
+        assert_eq!(tracker.oldest(), None);
+        assert!(tracker.unread_until.is_empty());
+        // A recovery conclusion answers one before that.
+        let mut tracker = Tracker::default();
+        for event in &events[..3] {
+            tracker.observe(event);
+        }
+        assert_eq!(tracker.pending().len(), 1);
+        tracker.observe(&json!({"seq": 4, "at_ms": 1_000_200, "kind": "recovered",
+            "intent": 3, "index": 0}));
+        assert!(tracker.pending().is_empty());
     }
 
     /// Regression case: a send in

@@ -65,6 +65,10 @@ fn preview_refusal(code: &str, text: impl Into<String>) -> Value {
     json!({"code": code, "error": text.into()})
 }
 
+/// Why an entry is refused when the account's ledger showed its mode may
+/// have changed after the mode it would be judged on was read.
+const MODE_CHANGED: &str = "the account's ledger shows its mode may have changed (HIP-3 dex abstraction switched on) since Guard last read it; Guard reads the mode again: try again in a moment";
+
 /// A preview's answer: `decision` as `/exchange` would act on it.
 fn preview_answer(decision: &Decision, mode: &str, view_age_ms: Option<u64>) -> Value {
     let forward = decision.forward.as_ref();
@@ -195,6 +199,7 @@ impl<U: Upstream, C: Clock> Guard<U, C> {
                 return preview_answer(&refusal, inner.mode.name(), None);
             }
             Self::check_kill(&mut inner, now);
+            self.note_waiting_mode_changes(&mut inner);
             // The view's own age: since it was read, or for a view from the
             // stream, since its oldest snapshot arrived.
             let age = inner
@@ -238,7 +243,13 @@ impl<U: Upstream, C: Clock> Guard<U, C> {
             .forward
             .as_ref()
             .is_some_and(|forward| forward.entry.is_some());
-        if opens && let Err(error) = inner.risk.check_ready() {
+        // The last view's mode was read before an entry showing it may
+        // have changed: the request itself would read it again.
+        let mode_unread = inner.caches.mode_epoch > 0
+            && inner.last_view_mode_epoch != Some(inner.caches.mode_epoch);
+        if opens && mode_unread {
+            decision = Decision::veto("account_unknown", MODE_CHANGED);
+        } else if opens && let Err(error) = inner.risk.check_ready() {
             decision = ReasonCode::Journal.veto(format!(
                 "the risk journal does not allow new positions: {error}"
             ));
@@ -277,6 +288,10 @@ impl<U: Upstream, C: Clock> Guard<U, C> {
             Ok(admitted) => admitted,
             Err(refusal) => return self.refuse(&mut inner, now, via, &body, &refusal),
         };
+        // An entry that may have changed the account mode, delivered by the
+        // stream and not taken yet: counted first, so that the view built
+        // now reads the mode again.
+        self.note_waiting_mode_changes(&mut inner);
         let (account, read) = match self.account_for_request(&mut inner, now, &request).await {
             Ok(read) => (read.view, read.fresh_read),
             Err(error) => {
@@ -305,9 +320,19 @@ impl<U: Upstream, C: Clock> Guard<U, C> {
         };
         // Stamped no earlier than the risk engine's last observation.
         let at = now.max(inner.last_sync_ms.unwrap_or(0));
+        // The view's mode is good for this count: read under this lock, at
+        // it (`Caches::mode`).
+        let mode_epoch = inner.caches.mode_epoch;
         let held = !self.take_flows(&mut inner, at, &account).await;
+        // Delivered by the socket while the view was built, and left
+        // waiting if `take_flows` did not take the stream's entries.
+        self.note_waiting_mode_changes(&mut inner);
+        // The ledger showed a change of the account mode only now (read
+        // over HTTP, or delivered meanwhile): the view was built on a mode
+        // read before it, so its entry is not judged on it.
+        let mode_changed = inner.caches.mode_epoch != mode_epoch;
         if !held {
-            self.observe(&mut inner, at, &account);
+            self.observe(&mut inner, at, &account, Some(mode_epoch));
         }
         self.halt(&mut inner, now, &account, read).await;
         // An entry is sized with the builder fee it pays on the way in and
@@ -328,7 +353,9 @@ impl<U: Upstream, C: Clock> Guard<U, C> {
             .forward
             .as_ref()
             .is_some_and(|forward| forward.entry.is_some());
-        if opens && let Err(error) = inner.risk.check_ready() {
+        if opens && mode_changed {
+            decision = Decision::veto("account_unknown", MODE_CHANGED);
+        } else if opens && let Err(error) = inner.risk.check_ready() {
             decision = ReasonCode::Journal.veto(format!(
                 "the risk journal does not allow new positions: {error}"
             ));

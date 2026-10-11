@@ -75,6 +75,8 @@ jobs:
     needs: promoted
     # Same-commit reusable workflow; $. syntax is unsupported by pinned actionlint.
     uses: ./.github/workflows/install-matrix.yml # zizmor: ignore[self-repository]
+    secrets:
+      E2E_TESTNET_API_WALLET_KEY: ${{ secrets.E2E_TESTNET_API_WALLET_KEY }}
     with:
       profile: nightly
       tag: ${{ needs.promoted.outputs.tag }}
@@ -91,6 +93,13 @@ jobs:
     needs: promoted
     # Same-commit reusable workflow; $. syntax is unsupported by pinned actionlint.
     uses: ./.github/workflows/journey.yml # zizmor: ignore[self-repository]
+    # Forward named capabilities; each called job selects its scoped e2e values.
+    secrets:
+      E2E_ACCESS_CLIENT_ID: ${{ secrets.E2E_ACCESS_CLIENT_ID }}
+      E2E_ACCESS_CLIENT_SECRET: ${{ secrets.E2E_ACCESS_CLIENT_SECRET }}
+      E2E_ORDER_TOKEN: ${{ secrets.E2E_ORDER_TOKEN }}
+      E2E_INBOX_TOKEN: ${{ secrets.E2E_INBOX_TOKEN }}
+      E2E_PAYER_HYPERLIQUID_TESTNET_KEY: ${{ secrets.E2E_PAYER_HYPERLIQUID_TESTNET_KEY }}
     with:
       profile: nightly
       tag: ${{ needs.promoted.outputs.tag }}

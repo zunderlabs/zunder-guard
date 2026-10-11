@@ -28,17 +28,9 @@ A refusal always carries a code (stable, for programs) and a reason (a sentence,
 
 ## Policy: the website's judge
 
-The judge in the website's WebAssembly build, which judges trades on this website (backtest, Watch). Guard's own policy answers with its own codes, below.
+The judge in the website's WebAssembly build, which judges trades on this website (backtest, Watch), is Guard's own (`zunder_guard_core::judge`, since 11 Oct 2026): a refusal carries Guard's code and text, listed under Guard below, and names the rule row it belongs to (`market_allowlist`, `protective_stop`, `max_leverage`, `max_open_risk`, `max_position_size`, `min_liquidation_distance`, `max_loss_per_trade`, `daily_loss_stop`, `drawdown_stop`, `order`, `account`). The website adds no code of its own.
 
-| Code | Rule | Example reason |
-|---|---|---|
-| `coin_not_allowed` | (a) | HYPE is not on the market allowlist |
-| `no_protective_stop` | (b) | no stop order protects the ETH position |
-| `liquidation_too_close` | (d) | liquidation is 7% from the price; the minimum is 10% |
-| `position_cap_reached` | (f) | a position may be worth at most 200% of account value |
-| `equity_not_positive` | (g) | the account has no positive equity |
-
-**Resizes** carry the rule that bound the size instead of a code: `max_leverage`, `max_open_risk`, `max_position_size` or `max_loss_per_trade`, with a reason such as "a stop-out may lose at most 2% of equity".
+**Resizes** carry the rule that bound the size instead of a code: `max_position_size` or `max_loss_per_trade` (Guard's risk engine: loss at the stop, open risk and leverage together), or `protective_stop` when Guard only attached its stop, with Guard's reason.
 
 ## Watch: account warnings
 

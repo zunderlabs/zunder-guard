@@ -1568,6 +1568,225 @@ async fn a_withdrawal_never_halts_and_a_loss_still_does() {
     assert_eq!(status["risk"]["state"], "halted_for_day", "{status}");
 }
 
+/// Switching HIP-3 dex abstraction on, reported on the socket, moves xyz's
+/// 1,000 to the main dex (9,000 + 1,000 before, 10,000 + 0 after): a
+/// transfer between the two dexes Guard manages, applied without a halt and
+/// without refusing entries for the day. The account has left standard
+/// mode, so the mode Guard read 20 ms before (cached for 60 s) is not used
+/// again: the next entry reads it, and is refused while the venue shows
+/// `dexAbstraction` (equity unknown); once it shows `disabled` again and
+/// Guard has read that, entries go on.
+#[tokio::test]
+async fn dex_abstraction_is_a_transfer_and_the_mode_is_read_again() {
+    let running = start("stream-dex-abstraction", true).await;
+    let venue = running.guard.upstream();
+    running.guard.sync().await;
+    let mut nonce = running.clock.now_ms();
+    let mut signed_now = |body: &Value| {
+        nonce = nonce.max(running.clock.now_ms()) + 1;
+        resigned(body, nonce)
+    };
+    let entry = order(1, true, "3000", "0.1", false);
+    let reply = post(&running.url, &signed_now(&entry)).await;
+    assert_ne!(reply["code"], "account_unknown", "{reply}");
+    let modes = venue_reads(venue, "userAbstraction");
+    running.clock.advance(20);
+    venue.set_dex_equity("xyz", "0");
+    venue.set_equity("10000");
+    venue.set_mode("dexAbstraction");
+    let now = running.clock.now_ms();
+    venue.ledger_entry_at(
+        json!({"type": "activateDexAbstraction", "dex": "xyz", "token": "USDC", "amount": "1000"}),
+        now as i64,
+        false,
+    );
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    running.clock.advance(2_100);
+    running.guard.sync().await;
+    let status = running.guard.status().await;
+    assert_eq!(status["risk"]["state"], "active", "{status}");
+    assert!(status["risk"]["ledger_unaccounted"].is_null(), "{status}");
+    assert!(
+        status["risk"]["entries_refused_until_ms"].is_null(),
+        "{status}"
+    );
+    assert_eq!(status["risk"]["flows_applied"], 1, "{status}");
+    // Within the cached mode's 60 s: read again, and refused on it.
+    let reply = post(&running.url, &signed_now(&entry)).await;
+    assert_eq!(reply["code"], "account_unknown", "{reply}");
+    assert!(venue_reads(venue, "userAbstraction") > modes);
+    // Back in standard mode, and read so: entries go on.
+    venue.set_mode("disabled");
+    running.clock.advance(60_100);
+    running.guard.sync().await;
+    let reply = post(&running.url, &signed_now(&entry)).await;
+    assert_ne!(reply["code"], "account_unknown", "{reply}");
+    assert_ne!(reply["code"], "account_unreadable", "{reply}");
+}
+
+/// The activation of [`dex_abstraction_is_a_transfer_and_the_mode_is_read_again`],
+/// on the socket, and the bot's entry before any sync took it: Guard counts
+/// the waiting entry before it builds the request's view, so the view reads
+/// the mode again (`dexAbstraction`) and the entry is refused on it, whether
+/// the request then takes the entry (`fresh`: the venue's time moved on) or
+/// leaves it waiting (the view's times are those of the last one, so the
+/// ledger is not taken yet: the venue's account time held).
+async fn dex_abstraction_waiting_on_the_socket(name: &str, fresh: bool) {
+    let running = start(name, true).await;
+    let venue = running.guard.upstream();
+    if !fresh {
+        // The venue's account time stays where the sync reads it: the
+        // request's view is no fresher, so its ledger is not taken.
+        venue.hold_account_time(Some(running.clock.now_ms() as i64));
+    }
+    running.guard.sync().await;
+    let mut nonce = running.clock.now_ms();
+    let mut signed_now = |body: &Value| {
+        nonce = nonce.max(running.clock.now_ms()) + 1;
+        resigned(body, nonce)
+    };
+    let entry = order(1, true, "3000", "0.1", false);
+    let modes = venue_reads(venue, "userAbstraction");
+    venue.set_dex_equity("xyz", "0");
+    venue.set_equity("10000");
+    venue.set_mode("dexAbstraction");
+    let now = running.clock.now_ms();
+    venue.ledger_entry_at(
+        json!({"type": "activateDexAbstraction", "dex": "xyz", "token": "USDC", "amount": "1000"}),
+        now as i64,
+        false,
+    );
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    if fresh {
+        running.clock.advance(2_100);
+    }
+    let reply = post(&running.url, &signed_now(&entry)).await;
+    assert_eq!(reply["code"], "account_unknown", "{reply}");
+    // Refused on the mode read again, not on the stale one.
+    assert!(
+        reply["response"]
+            .as_str()
+            .unwrap_or("")
+            .contains("dexAbstraction"),
+        "{reply}"
+    );
+    assert!(venue_reads(venue, "userAbstraction") > modes);
+    // The branch it took: the request took the stream's entries, or left
+    // them waiting.
+    let waiting = running.guard.stream_ledger_waiting_for_test();
+    if fresh {
+        assert_eq!(waiting, 0);
+    } else {
+        assert!(waiting >= 1, "{waiting}");
+    }
+}
+
+#[tokio::test]
+async fn dex_abstraction_on_the_socket_taken_by_the_request() {
+    dex_abstraction_waiting_on_the_socket("stream-dex-abstraction-taken", true).await;
+}
+
+#[tokio::test]
+async fn dex_abstraction_on_the_socket_left_waiting_by_the_request() {
+    dex_abstraction_waiting_on_the_socket("stream-dex-abstraction-waiting", false).await;
+}
+
+/// A preview judges the sync's last view: once a sync took an activation
+/// after reading the mode (`disabled`, read before it), its view's mode is
+/// older than the change, so a preview refuses entries (`account_unknown`)
+/// until a view whose mode was read after it; then it sizes again.
+#[tokio::test]
+async fn a_preview_refuses_entries_on_a_view_read_before_a_mode_change() {
+    let running = start("stream-dex-abstraction-preview", true).await;
+    let venue = running.guard.upstream();
+    running.guard.sync().await;
+    let entry = order(1, true, "3000", "0.1", false);
+    let preview = |body: &Value| {
+        let url = format!("{}/guard/preview", running.url);
+        let body = json!({"action": body["action"]});
+        async move {
+            reqwest::Client::new()
+                .post(url)
+                .header("content-type", "application/json")
+                .body(body.to_string())
+                .send()
+                .await
+                .unwrap()
+                .text()
+                .await
+                .map(|text| serde_json::from_str::<Value>(&text).unwrap())
+                .unwrap()
+        }
+    };
+    let before = preview(&entry).await;
+    assert_ne!(before["code"], "account_unknown", "{before}");
+    let now = running.clock.now_ms();
+    venue.ledger_entry_at(
+        json!({"type": "activateDexAbstraction", "dex": "xyz", "token": "USDC", "amount": "1000"}),
+        now as i64,
+        false,
+    );
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    running.clock.advance(2_100);
+    running.guard.sync().await;
+    let stale = preview(&entry).await;
+    assert_eq!(stale["code"], "account_unknown", "{stale}");
+    // A request reads the mode again (the cache is now fresh) but not the
+    // account (the main dex's read fails): the view is still the sync's,
+    // from before the change, so a preview still refuses.
+    venue.fail_reads("");
+    let body = resigned(&entry, running.clock.now_ms() + 1);
+    let refused = post(&running.url, &body).await;
+    assert_eq!(refused["code"], "account_unreadable", "{refused}");
+    running.clock.advance(1_100);
+    let still = preview(&entry).await;
+    assert_eq!(still["code"], "account_unknown", "{still}");
+    venue.restore_reads("");
+    // A sync whose read began after it (the venue still in `disabled`
+    // here): previews size again.
+    running.clock.advance(2_100);
+    running.guard.sync().await;
+    let fresh = preview(&entry).await;
+    assert_ne!(fresh["code"], "account_unknown", "{fresh}");
+}
+
+/// An activation only the ledger read over HTTP brings, inside the bot's
+/// request (the 5-minute read is due), after the request's view read the
+/// mode: the entry is not judged on that mode but refused, to try again;
+/// the next one reads the mode again (here still `disabled`) and goes on.
+#[tokio::test]
+async fn dex_abstraction_read_over_http_refuses_the_entry_judged_before_it() {
+    let running = start("stream-dex-abstraction-http", true).await;
+    let venue = running.guard.upstream();
+    running.guard.sync().await;
+    let mut nonce = running.clock.now_ms();
+    let mut signed_now = |body: &Value| {
+        nonce = nonce.max(running.clock.now_ms()) + 1;
+        resigned(body, nonce)
+    };
+    let entry = order(1, true, "3000", "0.1", false);
+    let now = running.clock.now_ms();
+    venue.ledger_entry_at(
+        json!({"type": "activateDexAbstraction", "dex": "xyz", "token": "USDC", "amount": "1000"}),
+        now as i64,
+        true,
+    );
+    running.clock.advance(300_100);
+    let modes = venue_reads(venue, "userAbstraction");
+    let reply = post(&running.url, &signed_now(&entry)).await;
+    assert_eq!(reply["code"], "account_unknown", "{reply}");
+    assert!(
+        reply["response"]
+            .as_str()
+            .unwrap_or("")
+            .contains("may have changed"),
+        "{reply}"
+    );
+    let reply = post(&running.url, &signed_now(&entry)).await;
+    assert_ne!(reply["code"], "account_unknown", "{reply}");
+    assert!(venue_reads(venue, "userAbstraction") >= modes + 2);
+}
+
 /// An entry whose answer was lost may still reach the venue until it
 /// expires (30 s): every new entry, on any coin, waits until 15 s after that
 /// (Guard's clock may run ahead of the venue's, and the venue's view may lag
@@ -1674,6 +1893,50 @@ async fn an_early_round_on_a_view_that_does_not_show_the_fill_keeps_protection_d
     assert_eq!(order.orders[0].size.raw(), "0.1");
 }
 
+/// An activation the socket delivers while the request's view is being
+/// built (a HIP-3 entry's book read, slowed), with the venue's account time
+/// held so that the request does not take the stream's entries: counted
+/// after `take_flows`, it refuses the entry, which was judged on a mode
+/// read before it.
+#[tokio::test]
+async fn dex_abstraction_delivered_while_the_view_is_read_refuses_the_entry() {
+    let running = start("stream-dex-abstraction-during", true).await;
+    let venue = running.guard.upstream();
+    venue.hold_account_time(Some(running.clock.now_ms() as i64));
+    running.guard.sync().await;
+    let mut nonce = running.clock.now_ms();
+    let mut signed_now = |body: &Value| {
+        nonce = nonce.max(running.clock.now_ms()) + 1;
+        resigned(body, nonce)
+    };
+    let gold = order(u64::from(GOLD), true, "4000", "10", false);
+    let warm = post(&running.url, &signed_now(&gold)).await;
+    assert_ne!(warm["code"], "account_unknown", "{warm}");
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    venue.slow_books(1_000);
+    let url = running.url.clone();
+    let body = signed_now(&gold);
+    let request = tokio::spawn(async move { post(&url, &body).await });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let now = running.clock.now_ms();
+    venue.ledger_entry_at(
+        json!({"type": "activateDexAbstraction", "dex": "xyz", "token": "USDC", "amount": "1000"}),
+        now as i64,
+        false,
+    );
+    let reply = request.await.unwrap();
+    venue.slow_books(0);
+    assert_eq!(reply["code"], "account_unknown", "{reply}");
+    assert!(
+        reply["response"]
+            .as_str()
+            .unwrap_or("")
+            .contains("may have changed"),
+        "{reply}"
+    );
+    assert!(running.guard.stream_ledger_waiting_for_test() >= 1);
+}
+
 /// A ledger entry Guard cannot account for whose amount cannot be read (a
 /// type it does not know without a USD amount, a transfer without its fee):
 /// reported by name, and new positions refused until the end of the UTC day
@@ -1699,13 +1962,17 @@ async fn a_ledger_entry_guard_cannot_account_for_is_money_in_or_refuses_entries(
     assert_ne!(reply["code"], "account_unreadable", "{reply}");
     // Now, on the socket: a type Guard does not know, with no USD amount.
     let now = running.clock.now_ms();
-    venue.ledger_entry_at(json!({"type": "activateDexAbstraction"}), now as i64, false);
+    venue.ledger_entry_at(
+        json!({"type": "hip3LiquidatorWithdraw", "token": "USDC", "amount": "5"}),
+        now as i64,
+        false,
+    );
     tokio::time::sleep(Duration::from_millis(300)).await;
     running.clock.advance(1_100);
     running.guard.sync().await;
     let status = running.guard.status().await;
     let text = status["risk"]["ledger_unaccounted"].as_str().unwrap_or("");
-    assert!(text.contains("activateDexAbstraction"), "{status}");
+    assert!(text.contains("hip3LiquidatorWithdraw"), "{status}");
     let until = status["risk"]["entries_refused_until_ms"].as_u64().unwrap();
     let today = running.clock.now_ms() / DAY_MS;
     assert_eq!(until, (today + 1) * DAY_MS);
@@ -1717,7 +1984,7 @@ async fn a_ledger_entry_guard_cannot_account_for_is_money_in_or_refuses_entries(
             .any(|alert| alert
                 .as_str()
                 .unwrap_or("")
-                .contains("activateDexAbstraction")),
+                .contains("hip3LiquidatorWithdraw")),
         "{status}"
     );
     let reply = post(&running.url, &order(1, true, "3000", "0.1", false)).await;
@@ -1726,7 +1993,7 @@ async fn a_ledger_entry_guard_cannot_account_for_is_money_in_or_refuses_entries(
         reply["response"]
             .as_str()
             .unwrap_or("")
-            .contains("activateDexAbstraction"),
+            .contains("hip3LiquidatorWithdraw"),
         "{reply}"
     );
     // A reduce-only order still goes on (judged, not refused for it).

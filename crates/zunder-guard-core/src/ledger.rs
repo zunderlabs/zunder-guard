@@ -13,14 +13,21 @@
 //! - in: `deposit`, `vaultWithdraw` (`netWithdrawnUsd`), `vaultDistribution`,
 //!   `rewardsClaim`, a transfer from another account, money moved from spot
 //!   to perps (`accountClassTransfer` with `toPerp`), a `send` into one of
-//!   the managed dexes from outside them;
+//!   the managed dexes from outside them, `activateDexAbstraction` into the
+//!   main dex from a HIP-3 dex Guard does not manage;
 //! - out: `withdraw`, `vaultDeposit`, `vaultCreate` (with its fee), a
 //!   transfer to another account (with its fee), money moved from perps to
-//!   spot, a `send` out of the managed dexes (with its fee);
+//!   spot, a `send` out of the managed dexes (with its fee),
+//!   `activateDexAbstraction` out of a managed HIP-3 dex when Guard does
+//!   not manage the main dex;
 //! - for a vault's own ledger the vault's side of the same entries;
 //! - nothing: `liquidation` (trading), `spotTransfer` (spot only),
 //!   `spotGenesis`, `cStakingTransfer`, `borrowLend`, a `send` between two
-//!   managed dexes (less its fee, which is money out);
+//!   managed dexes (less its fee, which is money out), an
+//!   `activateDexAbstraction` between two managed dexes, and the charges
+//!   `accountActivationGas`, `deployGasAuction` and
+//!   `gossipPriorityGasAuction` (paid by the account, never credited: left
+//!   in the equity, so one a perp account paid counts as the loss it is);
 //! - unknown ([`LedgerProblem`]): any other type, and an entry without its
 //!   time, hash or type, with an amount that is not a non-negative decimal
 //!   string, or without a field its flow needs (the fee the account pays
@@ -298,6 +305,57 @@ pub fn classify(
         "vaultLeaderCommission" if me("user") => field("usdc")?,
         "vaultLeaderCommission" => return Ok(None),
         "rewardsClaim" => field("amount")?,
+        // Charges the account pays in a token (`token`, `amount`): the
+        // fee of a transfer that activated the account, in the token it
+        // carried (the transfer shows the same fee); a spot or HIP-3
+        // deploy auction's gas; a gossip priority auction's bid. Never a
+        // credit, so never a gain hidden. In a spot token (HYPE on
+        // mainnet) none of the perp accounts' money; in USDC from spot as
+        // far as seen. Not booked either way: one a perp account paid
+        // counts as the loss it shows (`docs/guard.md`, "Deposits and
+        // withdrawals").
+        "accountActivationGas" | "deployGasAuction" | "gossipPriorityGasAuction" => {
+            if delta["token"].as_str().is_none() {
+                return Err(problem("token is not a token name".into()));
+            }
+            return Ok(None);
+        }
+        // HIP-3 dex abstraction switched on: the collateral of the dex
+        // `dex` leaves it, for the main dex's USDC perp account when it is
+        // USDC ("spot otherwise", Hyperliquid's exchange endpoint, "Enable
+        // HIP-3 DEX abstraction"); as a `send` from that dex to the main
+        // dex, without a fee.
+        "activateDexAbstraction" => {
+            let source = delta["dex"]
+                .as_str()
+                .filter(|name| !name.is_empty())
+                .map(str::to_owned)
+                .ok_or_else(|| problem("dex is not a HIP-3 dex name".into()))?;
+            let usdc = match delta["token"].as_str() {
+                Some(token) => token == "USDC",
+                None => return Err(problem("token is not a token name".into())),
+            };
+            let value = field("amount")?;
+            let out_of = dexes.contains(&source);
+            if out_of && !usdc {
+                return Err(problem(format!(
+                    "the token is not USDC, but {source} margins in USDC"
+                )));
+            }
+            match (out_of, usdc && main) {
+                (false, false) => return Ok(None),
+                (true, true) => {
+                    between = value > Decimal::ZERO;
+                    dex = source;
+                    Decimal::ZERO
+                }
+                (true, false) => {
+                    dex = source;
+                    -value
+                }
+                (false, true) => value,
+            }
+        }
         other => {
             let why = format!("Guard does not know the type {other}");
             let usd = decimal(&delta["usdc"]).or_else(|| decimal(&delta["usdcValue"]));
@@ -555,7 +613,8 @@ mod tests {
             Treated::Unread
         );
         assert_eq!(
-            problem(json!({"type": "deployGasAuction", "token": "HYPE", "amount": "2"})).treated,
+            problem(json!({"type": "hip3LiquidatorWithdraw", "token": "USDC", "amount": "2"}))
+                .treated,
             Treated::Unread
         );
         // Guard managing only a HIP-3 dex cannot book it on the main dex.
@@ -662,6 +721,138 @@ mod tests {
             ),
             Ok(None)
         );
+    }
+
+    /// The charges, from entries of Hyperliquid's mainnet ledger (the
+    /// node's `LedgerUpdate` events, the same deltas `info`'s
+    /// `userNonFundingLedgerUpdates` returns): an activation fee of 1 USDC
+    /// (15 May 2026, hash 0x6ca46d4f…, in the same transaction as a
+    /// `spotTransfer` of 10 USDC into the new account showing `fee` 1.0),
+    /// one of 0.01135383 HYPE (3 Oct 2026), a deploy auction's 561.28653182
+    /// HYPE (2 Oct 2026) and a gossip priority bid of 1.08608564 HYPE
+    /// (3 Oct 2026). Each is paid by the account, so none is booked: a
+    /// charge a perp account paid counts as the loss it shows.
+    #[test]
+    fn charges_the_account_pays_are_no_flow() {
+        let main = dexes(&[""]);
+        for delta in [
+            json!({"type": "accountActivationGas", "amount": "1.0", "token": "USDC"}),
+            json!({"type": "accountActivationGas", "amount": "0.01135383", "token": "HYPE"}),
+            json!({"type": "deployGasAuction", "token": "HYPE", "amount": "561.28653182"}),
+            json!({"type": "gossipPriorityGasAuction", "token": "HYPE", "amount": "1.08608564"}),
+        ] {
+            assert_eq!(
+                classify(&entry(delta.clone()), me(), &main),
+                Ok(None),
+                "{delta}"
+            );
+            assert_eq!(
+                classify(&entry(delta.clone()), me(), &dexes(&["", "xyz"])),
+                Ok(None),
+                "{delta}"
+            );
+        }
+        // Without its token the shape is not the one seen: unread, never
+        // taken as no flow.
+        for kind in [
+            "accountActivationGas",
+            "deployGasAuction",
+            "gossipPriorityGasAuction",
+        ] {
+            let problem =
+                classify(&entry(json!({"type": kind, "amount": "1.0"})), me(), &main).unwrap_err();
+            assert_eq!(problem.treated, Treated::Unread, "{problem}");
+            assert!(problem.why.contains("token"), "{problem}");
+        }
+        // A negative amount fails the checks every entry passes.
+        assert!(
+            classify(
+                &entry(json!({"type": "deployGasAuction", "token": "HYPE", "amount": "-1"})),
+                me(),
+                &main
+            )
+            .is_err()
+        );
+    }
+
+    /// `activateDexAbstraction`, from mainnet (15 Nov 2025, account
+    /// 0x70da7c86…, hash 0x1c0401eb…): `{"dex": "xyz", "token": "USDC",
+    /// "amount": "3383.81"}`, 69 s after the account sent 3383.81 USDC from
+    /// spot into xyz; its next entry sends 3237.41 USDC from the main dex
+    /// to spot. The money left xyz for the main dex's perp account, as
+    /// Hyperliquid's exchange endpoint docs say ("collateral is returned to
+    /// the same source": the validator-operated USDC perps balance for a
+    /// USDC dex). A second account (0x9a6e657b…) sent 7.06 from the main
+    /// dex into xyz and the activation moved 7.06.
+    #[test]
+    fn dex_abstraction_moves_a_hip3_dex_into_the_main_dex() {
+        let activation = json!({"type": "activateDexAbstraction", "dex": "xyz",
+            "token": "USDC", "amount": "3383.81"});
+        let on = |names: &[&str]| classify(&entry(activation.clone()), me(), &dexes(names));
+        // Only the main dex managed: 3383.81 in, on the main dex.
+        let into = on(&[""]).unwrap().unwrap();
+        assert_eq!(
+            (into.amount, into.dex.as_str(), into.between),
+            (dec!(3383.81), "", false)
+        );
+        assert_eq!(into.id, "0xabc:1000:activateDexAbstraction");
+        // From a USDC dex Guard does not manage: in as well.
+        assert_eq!(
+            on(&["", "abc"]).unwrap().map(|flow| flow.amount),
+            Some(dec!(3383.81))
+        );
+        // Only xyz managed: 3383.81 out of xyz (0 - 3383.81).
+        let out = on(&["xyz"]).unwrap().unwrap();
+        assert_eq!(
+            (out.amount, out.dex.as_str(), out.between),
+            (dec!(-3383.81), "xyz", false)
+        );
+        // Both managed: no money in or out, marked as between them, on
+        // xyz; the per-dex reads sum to it (3383.81 - 3383.81 = 0).
+        let inner = on(&["", "xyz"]).unwrap().unwrap();
+        assert_eq!(
+            (inner.amount, inner.dex.as_str(), inner.between),
+            (Decimal::ZERO, "xyz", true)
+        );
+        assert_eq!(into.amount + out.amount, inner.amount);
+        // A zero amount between them moves nothing.
+        let empty = json!({"type": "activateDexAbstraction", "dex": "xyz",
+            "token": "USDC", "amount": "0.0"});
+        assert_eq!(
+            classify(&entry(empty), me(), &dexes(&["", "xyz"])),
+            Ok(None)
+        );
+        // Neither managed: nothing.
+        assert_eq!(on(&["abc"]), Ok(None));
+        // A dex margined in another token returns it to spot: none of the
+        // USDC perp accounts' money; a USDC dex Guard manages cannot be
+        // one, so that entry is unread.
+        let usdh = json!({"type": "activateDexAbstraction", "dex": "flx",
+            "token": "USDH", "amount": "10"});
+        assert_eq!(
+            classify(&entry(usdh.clone()), me(), &dexes(&[""])),
+            Ok(None)
+        );
+        assert_eq!(
+            classify(&entry(usdh), me(), &dexes(&["", "flx"]))
+                .unwrap_err()
+                .treated,
+            Treated::Unread
+        );
+        // Missing or malformed fields: unread, whatever Guard manages.
+        for delta in [
+            json!({"type": "activateDexAbstraction"}),
+            json!({"type": "activateDexAbstraction", "token": "USDC", "amount": "1"}),
+            json!({"type": "activateDexAbstraction", "dex": "", "token": "USDC", "amount": "1"}),
+            json!({"type": "activateDexAbstraction", "dex": "xyz", "amount": "1"}),
+            json!({"type": "activateDexAbstraction", "dex": "xyz", "token": "USDC"}),
+            json!({"type": "activateDexAbstraction", "dex": "xyz", "token": "USDC", "amount": 1}),
+        ] {
+            for names in [&[""][..], &["xyz"], &["abc"]] {
+                let problem = classify(&entry(delta.clone()), me(), &dexes(names)).unwrap_err();
+                assert_eq!(problem.treated, Treated::Unread, "{delta} {names:?}");
+            }
+        }
     }
 
     #[test]

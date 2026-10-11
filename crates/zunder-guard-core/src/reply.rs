@@ -187,6 +187,23 @@ pub fn order_statuses(venue: &Value) -> Result<Vec<OrderStatus>, String> {
         .collect())
 }
 
+/// Whether the venue's answer to an order action of `sent` orders leaves
+/// what it placed unknown: an `ok` answer without one readable status per
+/// order sent, or an answer of no known shape. One refused whole (`{"status":
+/// "err"}`) placed nothing. Guard treats such an answer as lost, live and
+/// in recovery after a restart.
+pub fn order_outcome_unknown(sent: usize, venue: &Value) -> bool {
+    match order_statuses(venue) {
+        Ok(statuses) => {
+            statuses.len() != sent
+                || statuses
+                    .iter()
+                    .any(|status| matches!(status, OrderStatus::Other(_)))
+        }
+        Err(_) => venue.get("status").and_then(Value::as_str) != Some("err"),
+    }
+}
+
 /// Whether a reply to a non-order action (`updateLeverage`, a cancel)
 /// says it worked: `{"status": "ok"}` without per-item errors.
 pub fn action_ok(venue: &Value) -> Result<(), String> {

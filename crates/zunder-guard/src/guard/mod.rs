@@ -227,6 +227,10 @@ struct Inner {
     /// The account as the risk engine last saw it, when, and the last
     /// error reading it.
     last_view: Option<AccountView>,
+    /// The count of entries that may have changed the account mode
+    /// (`Caches::mode_epoch`) that `last_view`'s mode is good for; `None`
+    /// when not known (a held view shown later).
+    last_view_mode_epoch: Option<u64>,
     last_sync_ms: Option<u64>,
     last_error: Option<String>,
     sends: Sends,
@@ -603,6 +607,7 @@ impl<U: Upstream, C: Clock> Guard<U, C> {
             halt: HaltReads::default(),
             caches: Caches::new(account, setup.config.policy.markets.hip3_dexes()),
             last_view: None,
+            last_view_mode_epoch: None,
             last_sync_ms: None,
             last_error: None,
             sends: Sends::default(),
@@ -682,6 +687,18 @@ impl<U: Upstream, C: Clock> Guard<U, C> {
 
     pub fn upstream(&self) -> &U {
         &self.upstream
+    }
+
+    /// Tests only (feature `test-hooks`, never in a release build): how
+    /// many ledger entries the account stream delivered that nothing has
+    /// taken yet.
+    #[cfg(feature = "test-hooks")]
+    pub fn stream_ledger_waiting_for_test(&self) -> usize {
+        crate::locks::lock(&self.stream)
+            .as_ref()
+            .map_or(0, |stream| {
+                crate::locks::lock(&stream.state).waiting_ledger().len()
+            })
     }
 
     /// Tests only (feature `test-hooks`, never in a release build): up to

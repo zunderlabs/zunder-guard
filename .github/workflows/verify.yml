@@ -202,6 +202,8 @@ jobs:
       id-token: write
       attestations: write
     uses: ./.github/workflows/install-matrix.yml
+    secrets:
+      E2E_TESTNET_API_WALLET_KEY: ${{ secrets.E2E_TESTNET_API_WALLET_KEY }}
     with:
       tag: ${{ inputs.tag }}
       commit: ${{ inputs.commit }}
@@ -219,10 +221,20 @@ jobs:
       id-token: write
       attestations: write
     uses: ./.github/workflows/journey.yml
+    # Forward named capabilities; each called job selects its scoped e2e values.
+    secrets:
+      E2E_ACCESS_CLIENT_ID: ${{ secrets.E2E_ACCESS_CLIENT_ID }}
+      E2E_ACCESS_CLIENT_SECRET: ${{ secrets.E2E_ACCESS_CLIENT_SECRET }}
+      E2E_ORDER_TOKEN: ${{ secrets.E2E_ORDER_TOKEN }}
+      E2E_INBOX_TOKEN: ${{ secrets.E2E_INBOX_TOKEN }}
+      E2E_PAYER_HYPERLIQUID_TESTNET_KEY: ${{ secrets.E2E_PAYER_HYPERLIQUID_TESTNET_KEY }}
+      E2E_PAYER_EVM_SEPOLIA_KEY: ${{ secrets.E2E_PAYER_EVM_SEPOLIA_KEY }}
+      E2E_PAYER_BLOCKED_KEY: ${{ secrets.E2E_PAYER_BLOCKED_KEY }}
+      E2E_TESTNET_API_WALLET_KEY: ${{ secrets.E2E_TESTNET_API_WALLET_KEY }}
+      E2E_TESTNET_OWNER_KEY: ${{ secrets.E2E_TESTNET_OWNER_KEY }}
     with:
       tag: ${{ inputs.tag }}
       commit: ${{ inputs.commit }}
-    # Each called job obtains only its own e2e environment secrets.
 
   gate:
     name: Authenticate every required journey and publish gated state
@@ -306,6 +318,9 @@ jobs:
       id-token: write
       attestations: write
     uses: ./.github/workflows/promote.yml
+    secrets:
+      HOMEBREW_APP_PRIVATE_KEY: ${{ secrets.HOMEBREW_APP_PRIVATE_KEY }}
+      INSTALLER_PUBLISH_TOKEN: ${{ secrets.INSTALLER_PUBLISH_TOKEN }}
     with:
       tag: ${{ inputs.tag }}
       commit: ${{ inputs.commit }}

@@ -159,7 +159,16 @@ fn view_times(account: &AccountView) -> std::collections::BTreeMap<String, i64> 
 impl<U: Upstream, C: Clock> Guard<U, C> {
     /// Show the risk engine the account (its dexes at the venue's time of
     /// each, `view_times`). Flattening is [`Guard::halt`]'s.
-    pub(super) fn observe(&self, inner: &mut Inner, now: u64, account: &AccountView) {
+    /// `mode_epoch`: the count of entries that may have changed the account
+    /// mode its mode is good for (`Caches::mode_epoch` when it was read),
+    /// `None` when not known.
+    pub(super) fn observe(
+        &self,
+        inner: &mut Inner,
+        now: u64,
+        account: &AccountView,
+        mode_epoch: Option<u64>,
+    ) {
         let before = inner.risk.state();
         let mut journal_error = None;
         let mut discrepancies = 0;
@@ -208,7 +217,27 @@ impl<U: Upstream, C: Clock> Guard<U, C> {
                 .ok();
         }
         inner.last_view = Some(account.clone());
+        inner.last_view_mode_epoch = mode_epoch;
         inner.last_sync_ms = Some(now);
+    }
+
+    /// Count the entries that may have changed the account mode which the
+    /// stream delivered and nothing has taken yet (`take_flows` may wait
+    /// for a fresher view): the view built next reads the mode again.
+    pub(super) fn note_waiting_mode_changes(&self, inner: &mut Inner) {
+        let ids: Vec<String> = lock(&self.stream)
+            .as_ref()
+            .map(|stream| {
+                lock(&stream.state)
+                    .waiting_ledger()
+                    .iter()
+                    .filter_map(mode_change_id)
+                    .collect()
+            })
+            .unwrap_or_default();
+        for id in ids {
+            inner.caches.mode_may_have_changed(id);
+        }
     }
 
     /// Keep deposits and withdrawals out of the account stops, before the
@@ -331,7 +360,7 @@ impl<U: Upstream, C: Clock> Guard<U, C> {
         if let Some(hold) = inner.ledger.hold.take()
             && hold.deepest_at < now
         {
-            self.observe(inner, hold.deepest_at, &hold.deepest);
+            self.observe(inner, hold.deepest_at, &hold.deepest, None);
         }
         true
     }
@@ -344,7 +373,7 @@ impl<U: Upstream, C: Clock> Guard<U, C> {
             .is_some_and(|hold| now.saturating_sub(hold.since) >= LEDGER_HOLD_MS)
             && let Some(hold) = inner.ledger.hold.take()
         {
-            self.observe(inner, hold.deepest_at, &hold.deepest);
+            self.observe(inner, hold.deepest_at, &hold.deepest, None);
         }
     }
 
@@ -445,6 +474,14 @@ impl<U: Upstream, C: Clock> Guard<U, C> {
         // cannot account for is reported, never skipped as no flow.
         let mut flows = Vec::new();
         for update in entries {
+            // Dex abstraction switched on: the account has left standard
+            // mode, where Guard's equity is unknown and nothing is opened.
+            // The cached mode is not used again: no entry is judged on a
+            // mode read before this was seen (`docs/guard.md`, "Deposits and
+            // withdrawals").
+            if let Some(id) = mode_change_id(update) {
+                inner.caches.mode_may_have_changed(id);
+            }
             match classify(update, inner.account, &dexes) {
                 Ok(Some(flow)) => flows.push(flow),
                 Ok(None) => {}
@@ -660,43 +697,15 @@ impl<U: Upstream, C: Clock> Guard<U, C> {
             return None;
         }
         let mut equity = Decimal::ZERO;
-        for (dex, anchor) in anchors {
-            let on_dex = |coin: &str| {
-                coin.split_once(':')
-                    .map_or(dex.is_empty(), |(name, _)| name == dex)
-            };
-            let scoped_fills: Vec<Value> = fills
-                .iter()
-                .filter(|fill| fill["coin"].as_str().is_some_and(on_dex))
-                .cloned()
-                .collect();
-            let scoped_funding: Vec<Value> = funding
-                .iter()
-                .filter(|row| row["delta"]["coin"].as_str().is_some_and(on_dex))
-                .cloned()
-                .collect();
-            // Read each dex's own ledger effect, including the principal of
-            // internal transfers. The summed reconstruction cancels it.
-            let one = std::collections::BTreeSet::from([dex.clone()]);
-            let mut other = Vec::new();
-            let mut target_amount = Decimal::ZERO;
-            for row in ledger {
-                if let Some(item) = ledger_flow(row, inner.account, &one) {
-                    if item.id != flow.id {
-                        other.push((item.time_ms, item.amount));
-                    } else {
-                        target_amount = target_amount.checked_add(item.amount)?;
-                    }
-                }
-            }
-            let value = flow_value::reconstruct(
-                &anchor,
-                flow.time_ms,
-                &scoped_fills,
-                &scoped_funding,
-                &other,
-                target_amount,
-            )?;
+        for (_, value) in flow_value::reconstruct_dexes(
+            &anchors,
+            &flow.id,
+            flow.time_ms,
+            fills,
+            funding,
+            ledger,
+            inner.account,
+        )? {
             equity = equity.checked_add(value)?;
         }
         Some(zunder_venue::ValueRange::cash_exact(equity))
@@ -755,6 +764,18 @@ impl<U: Upstream, C: Clock> Guard<U, C> {
             Self::add_alert(inner, now, &text, None);
         }
     }
+}
+
+/// An id for a ledger entry that may have changed the account mode
+/// (`activateDexAbstraction`: HIP-3 dex abstraction switched on), `None`
+/// for any other: its hash and time, or the entry itself.
+fn mode_change_id(entry: &Value) -> Option<String> {
+    (entry["delta"]["type"] == "activateDexAbstraction").then(|| {
+        match (entry["hash"].as_str(), entry["time"].as_i64()) {
+            (Some(hash), Some(time)) => format!("{hash}:{time}"),
+            _ => entry.to_string().chars().take(200).collect(),
+        }
+    })
 }
 
 #[cfg(test)]

@@ -1099,6 +1099,12 @@ impl StreamState {
         Some((state.clone(), orders.clone()))
     }
 
+    /// The ledger entries that arrived and wait to be taken
+    /// ([`Self::take_ledger`]), oldest first.
+    pub fn waiting_ledger(&self) -> &[Value] {
+        &self.ledger
+    }
+
     /// The ledger entries that arrived since the last call, oldest first.
     pub fn take_ledger(&mut self) -> Vec<Value> {
         std::mem::take(&mut self.ledger)

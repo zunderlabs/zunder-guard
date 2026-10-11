@@ -91,6 +91,23 @@ pub fn valid_ledger(
             "vaultWithdraw" => &["requestedUsd", "netWithdrawnUsd"],
             "rewardsClaim" => &["amount"],
             "spotTransfer" | "spotGenesis" | "cStakingTransfer" => &[],
+            // Charges in a spot token only: one in USDC is left unbooked
+            // (`ledger::classify`), and an exact reconstruction cannot
+            // vouch that no perp account paid it.
+            "accountActivationGas" | "deployGasAuction" | "gossipPriorityGasAuction" => {
+                if delta["token"].as_str().is_none_or(|token| token == "USDC") {
+                    return false;
+                }
+                &[]
+            }
+            "activateDexAbstraction" => {
+                if delta["dex"].as_str().is_none_or(str::is_empty)
+                    || delta["token"].as_str().is_none()
+                {
+                    return false;
+                }
+                &["amount"]
+            }
             _ => return false,
         };
         fields.iter().all(|key| number(&delta[*key]).is_some())
@@ -238,6 +255,65 @@ pub fn reconstruct(
     Some(cash)
 }
 
+/// [`reconstruct`] for each managed USDC perp account: `anchors` are each
+/// dex's `clearinghouseState` (`""` the main dex), `ledger` the account's
+/// entries over the interval (checked whole by [`valid_ledger`] first), and
+/// the target flow is the one with id `flow_id` at `flow_time`. Each dex
+/// counts its own fills and funding (a HIP-3 coin is `dex:COIN`) and its
+/// own side of every ledger entry, the principal of a transfer between two
+/// of them included ([`crate::ledger::ledger_flow`] on that dex alone): the
+/// sum of the values cancels it. `None` when any dex's value is unknown.
+pub fn reconstruct_dexes<S: AsRef<str>>(
+    anchors: &[(S, Value)],
+    flow_id: &str,
+    flow_time: i64,
+    fills: &[Value],
+    funding: &[Value],
+    ledger: &[Value],
+    user: crate::sign::Address,
+) -> Option<Vec<(String, Decimal)>> {
+    let mut values = Vec::with_capacity(anchors.len());
+    for (dex, anchor) in anchors {
+        let dex = dex.as_ref();
+        let on_dex = |coin: &str| {
+            coin.split_once(':')
+                .map_or(dex.is_empty(), |(name, _)| name == dex)
+        };
+        let scoped_fills: Vec<Value> = fills
+            .iter()
+            .filter(|fill| fill["coin"].as_str().is_some_and(on_dex))
+            .cloned()
+            .collect();
+        let scoped_funding: Vec<Value> = funding
+            .iter()
+            .filter(|row| row["delta"]["coin"].as_str().is_some_and(on_dex))
+            .cloned()
+            .collect();
+        let one = std::collections::BTreeSet::from([dex.to_owned()]);
+        let mut other = Vec::new();
+        let mut target_amount = Decimal::ZERO;
+        for row in ledger {
+            if let Some(item) = crate::ledger::ledger_flow(row, user, &one) {
+                if item.id != flow_id {
+                    other.push((item.time_ms, item.amount));
+                } else {
+                    target_amount = target_amount.checked_add(item.amount)?;
+                }
+            }
+        }
+        let value = reconstruct(
+            anchor,
+            flow_time,
+            &scoped_fills,
+            &scoped_funding,
+            &other,
+            target_amount,
+        )?;
+        values.push((dex.to_owned(), value));
+    }
+    Some(values)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -282,6 +358,89 @@ mod tests {
         }
         assert!(!valid_for(std::slice::from_ref(&feeless), SENDER));
         assert!(valid_for(&[feeless], RECEIVER));
+    }
+
+    /// An activation of HIP-3 dex abstraction through the per-dex
+    /// reconstruction Guard runs (`observe.rs`, `reconstruct_flow`). Before
+    /// it: main 9,000 and xyz 1,000, both flat; at 100,000 the 1,000 leaves
+    /// xyz for the main dex; at 120,001 the anchors show main 10,000 and xyz
+    /// 0. Each dex undoes its own side: main 10,000 - 1,000 = 9,000, xyz
+    /// 0 - (-1,000) = 1,000; together 10,000, the equity before it.
+    #[test]
+    fn dex_abstraction_reconstructs_each_dex_on_its_own_side() {
+        let user = crate::sign::Address::from_hex(SENDER).unwrap();
+        let activation = json!({"time":100000,"hash":"act","delta":{"type":"activateDexAbstraction",
+            "dex":"xyz","token":"USDC","amount":"1000"}});
+        let anchor = |value: &str| json!({"time":120001,"marginSummary":{"accountValue":value},"assetPositions":[]});
+        let both = [("", anchor("10000")), ("xyz", anchor("0"))];
+        let id = "act:100000:activateDexAbstraction";
+        let ledger = std::slice::from_ref(&activation);
+        let all = std::collections::BTreeSet::from([String::new(), "xyz".to_owned()]);
+        assert!(valid_ledger(ledger, user, &all));
+        let values = reconstruct_dexes(&both, id, 100000, &[], &[], ledger, user).unwrap();
+        assert_eq!(
+            values,
+            vec![("".to_owned(), d("9000")), ("xyz".to_owned(), d("1000"))]
+        );
+        // Guard managing one of them reads only its anchor: the same value.
+        assert_eq!(
+            reconstruct_dexes(&both[..1], id, 100000, &[], &[], ledger, user),
+            Some(vec![("".to_owned(), d("9000"))])
+        );
+        assert_eq!(
+            reconstruct_dexes(&both[1..], id, 100000, &[], &[], ledger, user),
+            Some(vec![("xyz".to_owned(), d("1000"))])
+        );
+        // The activation between a deposit of 500 to the main dex at 90,000
+        // (the flow reconstructed) and the anchors (main 10,500, xyz 0):
+        // main 10,500 - 500 - 1,000 = 9,000, xyz 0 + 1,000 = 1,000.
+        let deposit = json!({"time":90000,"hash":"dep","delta":{"type":"deposit","usdc":"500"}});
+        let ledger = [deposit, activation];
+        assert!(valid_ledger(&ledger, user, &all));
+        let both = [("", anchor("10500")), ("xyz", anchor("0"))];
+        assert_eq!(
+            reconstruct_dexes(&both, "dep:90000:deposit", 90000, &[], &[], &ledger, user),
+            Some(vec![
+                ("".to_owned(), d("9000")),
+                ("xyz".to_owned(), d("1000"))
+            ])
+        );
+    }
+
+    #[test]
+    fn charges_in_spot_tokens_and_dex_abstraction_can_be_exact() {
+        // Mainnet shapes (`ledger::tests`): a charge in HYPE moves none of
+        // the perp accounts' money; one in USDC, or without its token,
+        // cannot be vouched for.
+        let row = |delta: Value| json!({"time":100000,"hash":"c","delta":delta});
+        for kind in [
+            "accountActivationGas",
+            "deployGasAuction",
+            "gossipPriorityGasAuction",
+        ] {
+            assert!(
+                valid(&[row(json!({"type":kind,"token":"HYPE","amount":"0.5"}))]),
+                "{kind}"
+            );
+            assert!(
+                !valid(&[row(json!({"type":kind,"token":"USDC","amount":"1.0"}))]),
+                "{kind}"
+            );
+            assert!(
+                !valid(&[row(json!({"type":kind,"amount":"1.0"}))]),
+                "{kind}"
+            );
+        }
+        let activation =
+            json!({"type":"activateDexAbstraction","dex":"xyz","token":"USDC","amount":"3383.81"});
+        assert!(valid(&[row(activation.clone())]));
+        for key in ["dex", "token", "amount"] {
+            let mut partial = activation.clone();
+            if let Some(delta) = partial.as_object_mut() {
+                delta.remove(key);
+            }
+            assert!(!valid(&[row(partial)]), "{key}");
+        }
     }
 
     #[test]

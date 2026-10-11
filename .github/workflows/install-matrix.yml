@@ -1,6 +1,10 @@
 name: install-matrix
 on:
   workflow_call:
+    secrets:
+      E2E_TESTNET_API_WALLET_KEY:
+        description: Environment-scoped key, needed only by the protected testnet service row
+        required: false
     inputs:
       tag: {type: string, required: true}
       commit: {type: string, required: true}
@@ -57,6 +61,7 @@ jobs:
           install -d -m 700 "$RUNNER_TEMP/matrix"
           python -m guard_harness.native_release --tag "$TAG" --commit "$SOURCE" --previous-tag "$PREVIOUS_TAG" --previous-commit "$PREVIOUS_SOURCE" --work "$RUNNER_TEMP/matrix/subjects" --loader-channel "$CHANNEL"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
         with:
           name: install-matrix-subjects
           path: ${{ runner.temp }}/matrix/subjects
