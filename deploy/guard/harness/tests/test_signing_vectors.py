@@ -1,5 +1,7 @@
 import hashlib
 import json
+import os
+import shlex
 from pathlib import Path
 from typing import Any
 
@@ -7,6 +9,7 @@ import pytest
 
 from guard_harness import signing_vectors
 from guard_harness.runner import RunResult
+from guard_harness.testnet_run import ROOT
 
 
 @pytest.mark.parametrize("system", ["Linux", "Darwin", "Windows"])
@@ -69,3 +72,39 @@ def test_signing_never_attests_wrong_source_or_zero_tests(
     with pytest.raises(ValueError):
         signing_vectors.execute(Release(), output)  # type: ignore[arg-type]
     assert not (output / "signing.predicate.json").exists()
+
+
+@pytest.mark.parametrize("windows_mode_ignored", [False, True])
+def test_sdk_workflow_creates_fresh_homes_without_posix_chmod(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, windows_mode_ignored: bool
+) -> None:
+    workflow = ROOT / "github/workflows/journey.yml"
+    if not workflow.exists():
+        workflow = ROOT.parents[1] / ".github/workflows/journey.yml"
+    setup = (
+        workflow.read_text()
+        .split("- name: Install the pinned SDK toolchain in fresh job-private homes", 1)[1]
+        .split("- name: Run SDK vectors", 1)[0]
+    )
+    line = next(line.strip() for line in setup.splitlines() if "pathlib.Path" in line)
+    argv = shlex.split(line)
+    assert argv[:2] == ["python", "-c"] and len(argv) == 3
+    homes = [tmp_path / "sdk-rustup", tmp_path / "sdk-cargo"]
+    for name, home in zip(("RUSTUP_HOME", "CARGO_HOME"), homes, strict=True):
+        monkeypatch.setenv(name, str(home))
+    monkeypatch.setattr(os, "chmod", lambda *a, **k: pytest.fail("no POSIX chmod on NTFS"))
+    original_mkdir = Path.mkdir
+    if windows_mode_ignored:
+        # Model native Windows accepting the creation mode without a POSIX chmod.
+        monkeypatch.setattr(Path, "mkdir", lambda path, **kwargs: original_mkdir(path))
+    exec(argv[2], {})
+    assert all(home.is_dir() for home in homes)
+    if not windows_mode_ignored:
+        assert all(home.stat().st_mode & 0o777 == 0o700 for home in homes)
+    sentinel = homes[0] / "existing-cache-fixture"
+    sentinel.write_text("retain")
+    with pytest.raises(FileExistsError):
+        exec(argv[2], {})
+    assert sentinel.read_text() == "retain"
+    assert "rustup toolchain install --no-self-update" in setup
+    assert 'tomllib.load(open("rust-toolchain.toml","rb"))' in setup

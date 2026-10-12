@@ -141,9 +141,11 @@ function Get-ZgImage {
         if ($name -cnotin ($required+@('README.md')) -or $seen.ContainsKey($name.ToLowerInvariant()) -or (($entry.ExternalAttributes -shr 16) -band 0xF000) -eq 0xA000 -or ($entry.ExternalAttributes -band 0x400) -ne 0) { throw 'Unsafe, repeated or unexpected archive member.' }
         if ($entry.Length -gt 512MB) { throw 'Archive member exceeds installer size bound.' }
         $seen[$name.ToLowerInvariant()] = $true
-        $output = [IO.FileStream]::new([IO.Path]::Combine($directory,$name),[IO.FileMode]::CreateNew,[IO.FileAccess]::Write,[IO.FileShare]::None)
+        $outputPath = [IO.Path]::Combine($directory,$name)
+        $output = New-ZgSecureFile $outputPath
         $input = $entry.Open()
         try { $input.CopyTo($output); $output.Flush($true) } finally { $input.Dispose(); $output.Dispose() }
+        Assert-ZgPath $outputPath
       }
       foreach ($name in $required) { if (-not $seen.ContainsKey($name.ToLowerInvariant())) { throw 'Required executable or notice missing.' } }
     } finally { $archive.Dispose() }

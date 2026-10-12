@@ -534,3 +534,65 @@ def test_actual_refusal_status_and_diagnostics_are_admitted_without_replay(
         with pytest.raises(LifecycleError):
             lifecycle.refuse_pending_uninstall(["released-uninstall"])
     assert b"private needle" not in (tmp_path / "uninstall-refusal.log").read_bytes()
+
+
+@pytest.mark.parametrize(
+    "kind,category",
+    [
+        ("error", "error"),
+        ("decision", "decision"),
+        ("intent", "intent"),
+        ("done", "done"),
+        ("sent", "sent"),
+        ("recovered", "recovered"),
+        ("flatten", "flatten"),
+        ("protect", "protect"),
+        ("kill", "kill"),
+        ("private-token-sentinel", "unknown"),
+        (None, "unknown"),
+        ({"private-token-sentinel": "fixture"}, "unknown"),
+    ],
+)
+def test_authenticated_refusal_reports_only_known_kind_and_bounded_sequence(
+    tmp_path: Path, kind: Any, category: str
+) -> None:
+    account = "0x" + "a" * 40
+    journal(
+        tmp_path,
+        [
+            {"kind": "started", "mode": "testnet"},
+            {
+                "kind": kind,
+                "text": "private-token-sentinel",
+                "account": account,
+                "action": {"private-payload-sentinel": "fixture"},
+            },
+        ],
+    )
+    with pytest.raises(LifecycleError) as caught:
+        no_exchange(tmp_path)
+    text = str(caught.value)
+    assert text.endswith(f"(kind={category}, seq=2)")
+    assert all(private not in text for private in [account, "private-token", "private-payload"])
+
+
+@pytest.mark.parametrize("tamper", ["check", "prev", "seq"])
+def test_unvalidated_record_cannot_claim_observed_kind(tmp_path: Path, tamper: str) -> None:
+    journal(tmp_path, [{"kind": "started", "mode": "testnet"}, {"kind": "error"}])
+    path = tmp_path / "decisions.jsonl"
+    records = [json.loads(line) for line in path.read_text().splitlines()]
+    if tamper == "seq":
+        records[1]["event"]["seq"] = 99999
+    else:
+        records[1][tamper] = "private-token-sentinel"
+    path.write_text("\n".join(json.dumps(record) for record in records) + "\n")
+    with pytest.raises(LifecycleError) as caught:
+        no_exchange(tmp_path)
+    assert "kind=" not in str(caught.value) and "seq=" not in str(caught.value)
+    assert "private-token" not in str(caught.value)
+
+
+def test_validated_large_sequence_stays_unknown_in_refusal(tmp_path: Path) -> None:
+    journal(tmp_path, [{"kind": "started", "mode": "testnet"}] * 4096 + [{"kind": "error"}])
+    with pytest.raises(LifecycleError, match=r"kind=error, seq=unknown"):
+        no_exchange(tmp_path)

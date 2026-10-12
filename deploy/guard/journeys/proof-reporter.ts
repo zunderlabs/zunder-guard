@@ -10,6 +10,6 @@ export default class ProofReporter implements Reporter {
   }
   onEnd(result: FullResult): void {
     const path = process.env['GUARD_TEST_PROOF'];
-    if (path) writeFileSync(path, JSON.stringify({ status: result.status, tests: this.tests }) + '\n', { flag: 'wx', mode: 0o600 });
+    if (path) writeFileSync(path, JSON.stringify({ status: process.env['GUARD_CHECKOUT_DIAGNOSTIC'] === '1' ? 'diagnostic_only' : result.status, tests: this.tests }) + '\n', { flag: 'wx', mode: 0o600 });
   }
 }

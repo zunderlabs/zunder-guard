@@ -6,6 +6,7 @@ import subprocess
 import sys
 import tarfile
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -14,6 +15,70 @@ from test_install_evidence import release
 from guard_harness import native_channels
 from guard_harness.cli import GuardCLI, Pair
 from guard_harness.native_paper import LifecycleError
+
+
+@pytest.mark.parametrize(
+    "case,expected",
+    [
+        ("eof", "outcome=child-nonzero, phase=account, exit=2"),
+        ("incomplete", "outcome=incomplete-dialogue, phase=account, exit=0"),
+        ("deadline", "outcome=deadline, phase=account, exit=unknown"),
+        ("oversized-status", "outcome=child-nonzero, phase=account, exit=unknown"),
+        ("private", "paper channel output/private prompt refused"),
+    ],
+)
+def test_conpty_failure_exposes_only_fixed_progress(
+    monkeypatch: pytest.MonkeyPatch, case: str, expected: str
+) -> None:
+    class Child:
+        fileobj = object()
+        exitstatus = 0 if case == "incomplete" else 1000000 if case == "oversized-status" else 2
+
+        def __init__(self) -> None:
+            self.reads = 0
+            self.closed = False
+            self.replies: list[str] = []
+
+        def read(self, size: int) -> str:
+            self.reads += 1
+            if self.reads > 1:
+                raise EOFError
+            return "private-transcript-sentinel Keep these? [Y/edit]" + (
+                " API wallet private prompt" if case == "private" else ""
+            )
+
+        def write(self, value: str) -> None:
+            self.replies.append(value)
+
+        def isalive(self) -> bool:
+            return case == "deadline" or self.reads < 2
+
+        def close(self, force: bool) -> None:
+            assert force
+            self.closed = True
+
+    child = Child()
+    monkeypatch.setitem(
+        sys.modules,
+        "winpty",
+        SimpleNamespace(
+            Backend=SimpleNamespace(ConPTY=1),
+            PtyProcess=SimpleNamespace(spawn=lambda *args, **kwargs: child),
+        ),
+    )
+    monkeypatch.setattr(
+        "guard_harness.native_channels.select.select", lambda *args: ([child.fileobj], [], [])
+    )
+    ticks = iter([0.0, 0.0, 0.1, 2.0])
+    monkeypatch.setattr("guard_harness.native_channels.time.monotonic", lambda: next(ticks))
+    with pytest.raises(LifecycleError) as error:
+        native_channels.dialogue(
+            ["private-argv-sentinel"], "private-account-sentinel", env={}, windows=True, timeout=1
+        )
+    assert expected in str(error.value)
+    assert "sentinel" not in str(error.value)
+    assert child.closed
+    assert child.replies == ([] if case == "private" else ["\r\n"])
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX owned manual cleanup")

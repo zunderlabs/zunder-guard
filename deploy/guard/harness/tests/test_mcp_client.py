@@ -13,7 +13,7 @@ for line in sys.stdin:
     value=json.loads(line)
     if value["method"]=="initialize":
         result={"protocolVersion":"2025-11-25",
-            "capabilities":{"experimental":{"exchange_expected_mode":{"enabled":True},"close_expected_size":{"enabled":True}}}}
+            "capabilities":{"experimental":{"exchange_expected_mode":{"enabled":True},"close_expected_size":{"enabled":True},"limit_price_ioc":{"enabled":True}}}}
     else:
         result={"structuredContent":{"ok":True},"isError":False}
     reply={"jsonrpc":"2.0","id":value["id"],"result":result}
@@ -80,6 +80,18 @@ def client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Any:
             mutations[name] = (
                 "if value['method']=='initialize': "
                 "result['capabilities']['experimental']['close_expected_size']=" + capability
+            )
+
+        for name, capability in {
+            "missing-ioc": "None",
+            "false-ioc": "{'enabled':False}",
+            "boolean-ioc": "True",
+            "integer-ioc": "{'enabled':1}",
+            "extended-ioc": "{'enabled':True,'extra':True}",
+        }.items():
+            mutations[name] = (
+                "if value['method']=='initialize': "
+                "result['capabilities']['experimental']['limit_price_ioc']=" + capability
             )
 
         def child(argv: Any, **kwargs: Any) -> Any:
@@ -231,3 +243,19 @@ def test_mode_capability_requires_exact_mcp_object(client: Any, case: str) -> No
         for name in ("place_order", "close_position", "cancel_order"):
             with pytest.raises(MCPError):
                 mcp.tool(cast(Any, name), {"coin": "BTC", "expected_size": "0.0001"})
+
+
+@pytest.mark.parametrize(
+    "case", ["missing-ioc", "false-ioc", "boolean-ioc", "integer-ioc", "extended-ioc"]
+)
+def test_explicit_limit_ioc_requires_exact_supported_capability(client: Any, case: str) -> None:
+    start, _ = client
+    with start(case) as mcp:
+        assert not mcp.limit_price_ioc
+        before = mcp.sequence
+        for name in ("preview_order", "place_order"):
+            with pytest.raises(MCPError):
+                mcp.tool(
+                    cast(Any, name), {"coin": "BTC", "limit_price": "60120", "time_in_force": "ioc"}
+                )
+        assert mcp.sequence == before and not mcp.entry_attempted

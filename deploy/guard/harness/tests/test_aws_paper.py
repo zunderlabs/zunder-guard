@@ -10,18 +10,19 @@ import pytest
 from guard_harness import aws_paper
 
 
+@pytest.mark.parametrize("reserve", [0, 4096])
 def test_reboot_snapshot_and_retention_use_actual_paper_journals(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, reserve: int
 ) -> None:
     home = tmp_path / "home"
     home.mkdir()
     paper = {
-        "guard.toml": b"paper configuration\n",
-        "risk-paper.jsonl": b"paper risk history\n",
+        "guard.toml": b"paper configuration\n\x00",
+        "risk-paper.jsonl": b"paper risk history\n\x00retained interior byte\n",
         "decisions-paper.jsonl": b"paper decisions history\n",
     }
     for name, body in paper.items():
-        (home / name).write_bytes(body)
+        (home / name).write_bytes(body + (b"\x00" * reserve if name.endswith(".jsonl") else b""))
     for name in ("risk.jsonl", "decisions.jsonl"):
         (home / name).write_bytes(b"unrelated testnet history\n")
     boot = tmp_path / "boot-id"
@@ -51,9 +52,13 @@ def test_reboot_snapshot_and_retention_use_actual_paper_journals(
     assert {name: base64.b64decode(body) for name, body in state["files"].items()} == paper
     assert state_path.stat().st_mode & 0o077 == 0
     for name in ("risk-paper.jsonl", "decisions-paper.jsonl"):
-        with (home / name).open("ab") as output:
-            output.write(b"next paper record\n")
+        # A real journal appends over its preallocated zeros after reboot.
+        (home / name).write_bytes(paper[name] + b"next paper record\n" + b"\x00" * reserve)
     aws_paper.preserve(state)
+    (home / "guard.toml").write_bytes(paper["guard.toml"].rstrip(b"\x00"))
+    with pytest.raises(RuntimeError, match="journal history"):
+        aws_paper.preserve(state)
+    (home / "guard.toml").write_bytes(paper["guard.toml"])
     (home / "risk-paper.jsonl").write_bytes(b"replacement paper history\n")
     with pytest.raises(RuntimeError, match="journal history"):
         aws_paper.preserve(state)

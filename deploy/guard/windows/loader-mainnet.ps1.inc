@@ -44,7 +44,10 @@ function Install-ZgMainnet($Rules,$Account,$ConfirmAccount,$EquityCap,$Licence,$
     foreach ($name in @('SHA256SUMS','SHA256SUMS.sigstore.json',"zunder-guard-$Tag-windows-amd64.zip",'install-windows-service.ps1')) { Get-ZgAsset $Source $name ([IO.Path]::Combine($stage,$name)) }
     # Never resolve a verifier through PATH. Offline override is copied, pinned and then executed only in protected staging.
     $verifier = [IO.Path]::Combine($stage,'cosign.exe')
-    if ($providedVerifier) { [IO.File]::Copy($providedVerifier,$verifier,$false) }
+    if ($providedVerifier) {
+      $providedVerifier = [IO.Path]::GetFullPath($providedVerifier) # Explicit CWD path, never PATH lookup.
+      Get-ZgAsset ([IO.Path]::GetDirectoryName($providedVerifier)) ([IO.Path]::GetFileName($providedVerifier)) $verifier
+    }
     else { Get-ZgAsset 'https://github.com/sigstore/cosign/releases/download/v3.1.3' 'cosign-windows-amd64.exe' $verifier }
     Confirm-ZgRelease $stage $Tag
     $cache = [IO.Path]::Combine($releases,($Tag+'-'+(Get-ZgHash ([IO.Path]::Combine($stage,'SHA256SUMS')))))

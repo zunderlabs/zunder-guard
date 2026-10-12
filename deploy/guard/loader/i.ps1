@@ -182,12 +182,46 @@ function Confirm-ZgRelease([string]$Directory,[string]$Tag) {
     if ((Get-ZgHash $asset) -ne (Get-ZgManifestHash $sums $name)) { throw 'Signed release asset checksum mismatch.' }
   }
 }
+function New-ZgSecureFile([string]$Path) {
+  $full = [IO.Path]::GetFullPath($Path)
+  if ($full -cne $Path -or $full.StartsWith('\\') -or $full.Substring(2).Contains(':')) { throw 'Noncanonical machine file refused.' }
+  Assert-ZgPath ([IO.Path]::GetDirectoryName($Path)) -Machine
+  # GetAttributes sees dangling reparse entries that File.Exists hides. Only a
+  # missing entry permits creation; access/IO failures never mean absence.
+  $exists = $false
+  try { $null = [IO.File]::GetAttributes($Path); $exists = $true }
+  catch {
+    $reason = $_.Exception.GetBaseException()
+    if ($reason -isnot [IO.FileNotFoundException] -and $reason -isnot [IO.DirectoryNotFoundException]) { throw 'Machine file absence could not be admitted.' }
+  }
+  if ($exists) { throw 'Existing machine file entry refused.' }
+  # The admitted parent is writable only by trusted administrators/SYSTEM.
+  # CreateNew prevents ordinary file collisions, but does not alone prove a
+  # final-leaf reparse race impossible against another trusted administrator.
+  # Supply owner and protected DACL atomically; never repair/adopt an existing file.
+  $acl = New-ZgAcl $false ''
+  if ($PSVersionTable.PSVersion.Major -ge 6) {
+    return [IO.FileSystemAclExtensions]::Create([IO.FileInfo]::new($Path),[IO.FileMode]::CreateNew,[Security.AccessControl.FileSystemRights]::Write,[IO.FileShare]::None,4096,[IO.FileOptions]::None,$acl)
+  }
+  return [IO.FileStream]::new($Path,[IO.FileMode]::CreateNew,[Security.AccessControl.FileSystemRights]::Write,[IO.FileShare]::None,4096,[IO.FileOptions]::None,$acl)
+}
+function Copy-ZgSecureFile([IO.Stream]$InputStream,[string]$Destination) {
+  $output = New-ZgSecureFile $Destination
+  try { $InputStream.CopyTo($output); $output.Flush($true) } finally { $output.Dispose() }
+  Assert-ZgPath $Destination
+}
 function Get-ZgAsset([string]$Source,[string]$Name,[string]$Destination) {
   if ($Source.StartsWith('https://')) {
     $client = [Net.WebClient]::new()
-    try { $client.DownloadFile($Source.TrimEnd('/')+'/'+$Name,$Destination) } finally { $client.Dispose() }
-  } elseif ([IO.Directory]::Exists($Source)) { [IO.File]::Copy([IO.Path]::Combine($Source,$Name),$Destination,$false) }
-  else { throw 'Release source must be HTTPS or an offline release directory.' }
+    $inputStream = $null
+    try {
+      $inputStream = $client.OpenRead($Source.TrimEnd('/')+'/'+$Name)
+      Copy-ZgSecureFile $inputStream $Destination
+    } finally { if ($inputStream) { $inputStream.Dispose() }; $client.Dispose() }
+  } elseif ([IO.Directory]::Exists($Source)) {
+    $inputStream = [IO.File]::OpenRead([IO.Path]::Combine($Source,$Name))
+    try { Copy-ZgSecureFile $inputStream $Destination } finally { $inputStream.Dispose() }
+  } else { throw 'Release source must be HTTPS or an offline release directory.' }
 }
 
 function Get-ZgHelperInvocation([string]$Helper) {
@@ -247,7 +281,10 @@ function Install-ZgMainnet($Rules,$Account,$ConfirmAccount,$EquityCap,$Licence,$
     foreach ($name in @('SHA256SUMS','SHA256SUMS.sigstore.json',"zunder-guard-$Tag-windows-amd64.zip",'install-windows-service.ps1')) { Get-ZgAsset $Source $name ([IO.Path]::Combine($stage,$name)) }
     # Never resolve a verifier through PATH. Offline override is copied, pinned and then executed only in protected staging.
     $verifier = [IO.Path]::Combine($stage,'cosign.exe')
-    if ($providedVerifier) { [IO.File]::Copy($providedVerifier,$verifier,$false) }
+    if ($providedVerifier) {
+      $providedVerifier = [IO.Path]::GetFullPath($providedVerifier) # Explicit CWD path, never PATH lookup.
+      Get-ZgAsset ([IO.Path]::GetDirectoryName($providedVerifier)) ([IO.Path]::GetFileName($providedVerifier)) $verifier
+    }
     else { Get-ZgAsset 'https://github.com/sigstore/cosign/releases/download/v3.1.3' 'cosign-windows-amd64.exe' $verifier }
     Confirm-ZgRelease $stage $Tag
     $cache = [IO.Path]::Combine($releases,($Tag+'-'+(Get-ZgHash ([IO.Path]::Combine($stage,'SHA256SUMS')))))

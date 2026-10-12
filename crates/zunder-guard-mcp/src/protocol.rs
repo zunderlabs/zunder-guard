@@ -201,6 +201,7 @@ pub fn handle(server: &mut Server, text: &str) -> Option<Value> {
                         "experimental": {
                             contract::EXPECTED_MODE_CAPABILITY: {"enabled": true},
                             contract::CLOSE_EXPECTED_SIZE_CAPABILITY: {"enabled": true},
+                            contract::LIMIT_PRICE_IOC_CAPABILITY: {"enabled": true},
                         },
                     },
                     "serverInfo": {

@@ -206,11 +206,12 @@ def test_new_phase_preserves_request_pacing_after_preflight_expires() -> None:
     assert reads.deadline == 116 + SCAN_TIMEOUT and reads.next_read == 118
 
 
-@pytest.mark.parametrize("timeout,passes", [(720, False), (SCAN_TIMEOUT, True)])
+@pytest.mark.parametrize("timeout,passes", [(500, False), (720, True), (SCAN_TIMEOUT, True)])
 def test_complete_270_dex_inventory_keeps_every_paced_read(timeout: int, passes: bool) -> None:
     now = [0.0]
     pauses: list[float] = []
     calls: list[dict[str, Any]] = []
+    timings: list[tuple[float, int]] = []
     dexes: list[object] = [None, *({"name": f"fixture{index}"} for index in range(269))]
 
     def sleep(seconds: float) -> None:
@@ -222,6 +223,7 @@ def test_complete_270_dex_inventory_keeps_every_paced_read(timeout: int, passes:
         payload = json.loads(request.data)
         calls.append(payload)
         kind = payload["type"]
+        timings.append((now[0], 2 if kind == "clearinghouseState" else 20))
         value: object = (
             dexes
             if kind == "perpDexs"
@@ -246,7 +248,68 @@ def test_complete_270_dex_inventory_keeps_every_paced_read(timeout: int, passes:
         report = flat_scan(reads, ACCOUNT)
         observations = report["observations"]
         assert isinstance(observations, list) and len(observations) == 270
-        assert len(calls) == 543 and now[0] == 1086
+        assert len(calls) == 543 and 600 <= now[0] < 620
         assert len([p for p in calls if p["type"] == "frontendOpenOrders"]) == 270
         assert calls[-1] == {"type": "perpDexs"}
-    assert pauses and all(seconds == 2 for seconds in pauses)
+        # 270 holdings×2 + 270 orders×20 + abstraction/inventory×20 = 6000.
+        assert sum(cost for _, cost in timings) == 6000
+    assert pauses and min(pauses) == pytest.approx(0.2)
+    assert sum(cost for _, cost in reads.reservations) <= 600
+    assert all(
+        sum(cost for at, cost in timings if end - 60 < at <= end) <= 600 for end, _ in timings
+    )
+
+
+def test_weighted_failures_and_phase_changes_keep_rolling_minute_budget() -> None:
+    now = [0.0]
+    pauses: list[float] = []
+
+    def sleep(seconds: float) -> None:
+        pauses.append(seconds)
+        now[0] += seconds
+
+    reads = VenueReads(clock=lambda: now[0], sleep=sleep)
+    reads.opener = Mock()
+    reads.opener.open.side_effect = ValueError("withheld body")
+    for _ in range(5):
+        with pytest.raises(ScanError, match="HTTP/JSON"):
+            reads({"type": "userFillsByTime", "user": ACCOUNT, "startTime": 1})
+    # Five 120-weight failed requests exhaust 600 at 12,24,36,48,60s.
+    # The next 2-weight read must wait until the first reservation leaves at 72s.
+    reads.start_phase(timeout=SCAN_TIMEOUT)
+    with pytest.raises(ScanError, match="HTTP/JSON"):
+        reads({"type": "clearinghouseState", "user": ACCOUNT})
+    assert now[0] == pytest.approx(72.001)
+    assert pauses == pytest.approx([12] * 5 + [12.001])
+    assert reads.reservations == [(24, 120), (36, 120), (48, 120), (60, 120), (72.001, 2)]
+    with pytest.raises(ScanError, match="HTTP/JSON"):
+        reads({"type": "perpDexs"})
+    with pytest.raises(ScanError, match="HTTP/JSON"):
+        reads({"type": "allMids"})
+    with pytest.raises(ScanError, match="HTTP/JSON"):
+        reads({"type": "orderStatus", "user": ACCOUNT, "oid": "0x" + "a" * 32})
+    assert pauses[-3:] == pytest.approx([2, 0.2, 0.2])
+
+
+def test_weighted_deadline_refuses_before_sleep_or_transmission() -> None:
+    now = [0.0]
+    reads = VenueReads(clock=lambda: now[0], sleep=lambda _: pytest.fail("no sleep"), timeout=11)
+    reads.opener = Mock()
+    with pytest.raises(ScanError, match="deadline"):
+        reads({"type": "perpDexs"})
+    assert reads.opener.open.call_count == 0 and reads.reservations == []
+
+
+def test_pacing_sleep_overshoot_never_transmits_past_deadline() -> None:
+    clock = [100.0]
+
+    def oversleep(_: float) -> None:
+        clock[0] = 122.0
+
+    read = VenueReads(clock=lambda: clock[0], sleep=oversleep, timeout=15)
+    opener = Mock()
+    opener.open.side_effect = AssertionError("must refuse before transmission")
+    read.opener = opener
+    with pytest.raises(ScanError, match="nothing sent"):
+        read({"type": "perpDexs"})
+    assert read.reservations == [] and opener.open.call_count == 0

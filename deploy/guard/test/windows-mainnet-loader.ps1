@@ -1,5 +1,5 @@
 # Synthetic boundaries only: no service, credential, network, privilege or native binary.
-# Parses/loads real function ASTs; exercises actual lifecycle code with temp files.
+# Parses real function ASTs; exercises lifecycle code and secured creation in owned temp files.
 [CmdletBinding()]
 param([string]$SourceRoot = (Split-Path $PSScriptRoot -Parent))
 Set-StrictMode -Version Latest
@@ -7,12 +7,26 @@ $ErrorActionPreference='Stop'
 $tests=0
 $Network='mainnet'; $KeyStdin=$false
 function Assert([bool]$Condition,[string]$Name) { if (-not $Condition) { throw "FAIL: $Name" }; $script:tests++ }
-function Refuses([scriptblock]$Code,[string]$Name) { $failed=$false; try { & $Code | Out-Null } catch { $failed=$true }; Assert $failed $Name }
+function Refuses([scriptblock]$Code,[string]$Name) {
+  $failed=$false; $result=$null
+  try { $result=& $Code } catch { $failed=$true }
+  finally { if ($result -is [IO.Stream]) { $result.Dispose() } }
+  Assert $failed $Name
+}
 foreach ($relative in @('loader/i.ps1','windows/service.ps1')) {
   $tokens=$null; $errors=$null
   $ast=[Management.Automation.Language.Parser]::ParseFile((Join-Path $SourceRoot $relative),[ref]$tokens,[ref]$errors)
   Assert ($errors.Count -eq 0) "parse $relative"
   $pathNode = $ast.Find({ param($candidate) $candidate -is [Management.Automation.Language.FunctionDefinitionAst] -and $candidate.Name -eq 'Assert-ZgPath' },$true)
+  $secureNode = $ast.Find({ param($candidate) $candidate -is [Management.Automation.Language.FunctionDefinitionAst] -and $candidate.Name -eq 'New-ZgSecureFile' },$true)
+  $absenceCatch = $secureNode.Find({ param($candidate) $candidate -is [Management.Automation.Language.CatchClauseAst] },$true)
+  $absencePolicy = [scriptblock]::Create(($absenceCatch.Body.Statements.Extent.Text -join "`n"))
+  foreach ($cause in @([IO.FileNotFoundException]::new(),[IO.DirectoryNotFoundException]::new(),[UnauthorizedAccessException]::new('private-error-sentinel'),[IO.IOException]::new('private-error-sentinel'))) {
+    $_=[pscustomobject]@{Exception=$cause}; $message=''
+    try { & $absencePolicy } catch { $message=$_.Exception.Message }
+    if ($cause -is [IO.FileNotFoundException] -or $cause -is [IO.DirectoryNotFoundException]) { Assert (-not $message) "actual missing-entry admission $relative" }
+    else { Assert ($message -ceq 'Machine file absence could not be admitted.') "actual access/IO error refuses without private suffix $relative" }
+  }
   # Execute the real rights-policy block with inert DirectoryInfo/FileInfo and ACE
   # values: no filesystem ACL mutation, native binary, service or key operation.
   $policyText = [regex]::Match($pathNode.Extent.Text,'(?ms)^      \$allowed =.*?(?=^    \}\r?$)').Value
@@ -82,6 +96,59 @@ $realStart=(Get-Item Function:Complete-ZgStart).ScriptBlock
 $realManifest=(Get-Item Function:Get-ZgManifestHash).ScriptBlock
 $realImage=(Get-Item Function:Get-ZgImage).ScriptBlock
 $realHash=(Get-Item Function:Get-ZgHash).ScriptBlock
+# Exercise actual atomic file-creation APIs on Windows, without machine paths,
+# services, credentials or downloads. Each hosted PS5.1/7 job runs its own branch.
+if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
+  $secureFixture=Join-Path ([IO.Path]::GetTempPath()) ('zg-secure-file-'+[Guid]::NewGuid().ToString('N'))
+  [IO.Directory]::CreateDirectory($secureFixture) | Out-Null
+  $actualAssert=(Get-Item Function:Assert-ZgPath).ScriptBlock
+  $script:actualFileAcl=(Get-Item Function:New-ZgAcl).ScriptBlock
+  function Assert-ZgPath($Path,[switch]$Machine,[string]$ReadSid) {
+    if ($Path -cne $secureFixture -and [IO.Path]::GetDirectoryName($Path) -cne $secureFixture) { throw 'fixture parent differs' }
+  }
+  function New-ZgAcl([bool]$Directory,[string]$ServiceSid,[bool]$Writable=$false) {
+    $result=& $script:actualFileAcl $Directory $ServiceSid $Writable
+    # This hook runs after GetAttributes proved absence, before CreateNew.
+    if ($script:raceDestination) { [IO.File]::WriteAllText($script:raceDestination,'preserve-race'); $script:raceDestination=$null }
+    return $result
+  }
+  try {
+    $script:raceDestination=$null
+    $destination=Join-Path $secureFixture 'new.bin'
+    $inputStream=[IO.MemoryStream]::new([byte[]](1,2,3,4))
+    try { Copy-ZgSecureFile $inputStream $destination } finally { $inputStream.Dispose() }
+    Assert (([IO.File]::ReadAllBytes($destination) -join ',') -ceq '1,2,3,4') 'actual secure creation preserves exact bytes'
+    $item=[IO.FileInfo]::new($destination)
+    $acl=if ($PSVersionTable.PSVersion.Major -ge 6) { [IO.FileSystemAclExtensions]::GetAccessControl($item) } else { $item.GetAccessControl() }
+    Assert ($acl.GetOwner([Security.Principal.SecurityIdentifier]).Value -ceq 'S-1-5-32-544') 'new file owner is trusted Administrators at creation'
+    Assert $acl.AreAccessRulesProtected 'new file DACL is protected at creation'
+    $originalAcl=$acl.GetSecurityDescriptorSddlForm([Security.AccessControl.AccessControlSections]::All)
+    Refuses { New-ZgSecureFile $destination } 'existing file cannot be adopted'
+    $afterAcl=if ($PSVersionTable.PSVersion.Major -ge 6) { [IO.FileSystemAclExtensions]::GetAccessControl($item) } else { $item.GetAccessControl() }
+    Assert ($afterAcl.GetSecurityDescriptorSddlForm([Security.AccessControl.AccessControlSections]::All) -ceq $originalAcl) 'existing ACL unchanged'
+    Assert (([IO.File]::ReadAllBytes($destination) -join ',') -ceq '1,2,3,4') 'existing bytes unchanged'
+    $directory=Join-Path $secureFixture 'existing-directory'; [IO.Directory]::CreateDirectory($directory) | Out-Null
+    Refuses { New-ZgSecureFile $directory } 'existing directory refused'
+    $script:raceDestination=Join-Path $secureFixture 'raced.bin'; $racePath=$script:raceDestination
+    Refuses { New-ZgSecureFile $racePath } 'destination created after absence admission refused atomically'
+    Assert ([IO.File]::ReadAllText($racePath) -ceq 'preserve-race') 'race winner bytes retained'
+    $link=Join-Path $secureFixture 'broken-link'
+    $linkTarget=Join-Path $secureFixture 'missing-target'
+    # Windows PowerShell requires a present target when creating this link.
+    [IO.File]::WriteAllText($linkTarget,'owned fixture target')
+    Microsoft.PowerShell.Management\New-Item -ItemType SymbolicLink -Path $link -Target $linkTarget | Out-Null
+    [IO.File]::Delete($linkTarget)
+    Refuses { New-ZgSecureFile $link } 'broken reparse destination refused'
+    Assert (([IO.FileInfo]::new($link).Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) 'preexisting reparse entry retained'
+    Assert (-not [IO.File]::Exists((Join-Path $secureFixture 'missing-target'))) 'dangling link target never created'
+    Refuses { New-ZgSecureFile (Join-Path $secureFixture '..\noncanonical.bin') } 'noncanonical file refused'
+    Refuses { New-ZgSecureFile (Join-Path ([IO.Path]::GetTempPath()) 'foreign-parent.bin') } 'foreign parent refused'
+  } finally {
+    Set-Item Function:Assert-ZgPath $actualAssert
+    Set-Item Function:New-ZgAcl $script:actualFileAcl
+    [IO.Directory]::Delete($secureFixture,$true)
+  }
+}
 # All OS/trust/network/Guard boundaries below are synthetic; production functions
 # have no test flags and cannot select these adapters through user arguments/env.
 function Assert-ZgPath($Path,[switch]$Machine,[string]$ReadSid) { if (-not (Test-Path -LiteralPath $Path)) { throw 'missing fixture path' } }

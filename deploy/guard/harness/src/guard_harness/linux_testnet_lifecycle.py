@@ -62,10 +62,6 @@ def no_exchange(home: Path) -> int:
             "decision record shape differs",
         )
         require(
-            event.get("kind") in {"started", "risk", "stopped"},
-            "action-bearing or unknown event; no exchange credit",
-        )
-        require(
             type(event.get("seq")) is int and event["seq"] == sequence + 1,
             "decision sequence incomplete",
         )
@@ -73,6 +69,33 @@ def no_exchange(home: Path) -> int:
         text = json.dumps(event, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
         check = hashlib.sha3_256((previous + text).encode()).hexdigest()
         require(record.get("check") == check, "decision checksum differs")
+        kind = event.get("kind")
+        category = (
+            kind
+            if isinstance(kind, str)
+            and kind
+            in {
+                "started",
+                "risk",
+                "stopped",
+                "decision",
+                "sent",
+                "intent",
+                "done",
+                "recovered",
+                "flatten",
+                "protect",
+                "kill",
+                "error",
+            }
+            else "unknown"
+        )
+        diagnostic_seq = str(sequence + 1) if sequence < 4096 else "unknown"
+        require(
+            category in {"started", "risk", "stopped"},
+            "action-bearing or unknown event; no exchange credit "
+            f"(kind={category}, seq={diagnostic_seq})",
+        )
         if event["kind"] == "started":
             require(event.get("mode") == "testnet", "journal contains another runtime mode")
             started += 1

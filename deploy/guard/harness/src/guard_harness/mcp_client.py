@@ -104,6 +104,14 @@ class MCP:
             self.close_size_bound = (
                 isinstance(close, dict) and set(close) == {"enabled"} and close["enabled"] is True
             )
+            limit_ioc = (
+                experimental.get("limit_price_ioc") if isinstance(experimental, dict) else None
+            )
+            self.limit_price_ioc = (
+                isinstance(limit_ioc, dict)
+                and set(limit_ioc) == {"enabled"}
+                and limit_ioc["enabled"] is True
+            )
             if value.get("protocolVersion") != "2025-11-25":
                 raise MCPError("MCP protocol version differs")
         except BaseException:
@@ -168,6 +176,13 @@ class MCP:
     def tool(
         self, name: Tool, arguments: dict[str, Any] | None = None
     ) -> tuple[dict[str, Any], bool]:
+        if (
+            name in {"preview_order", "place_order"}
+            and isinstance(arguments, dict)
+            and arguments.get("time_in_force") == "ioc"
+            and not self.limit_price_ioc
+        ):
+            raise MCPError("explicit limit IOC capability required; nothing sent")
         if name not in TOOLS:
             raise MCPError("MCP journey tool refused")
         if name in {"place_order", "close_position", "cancel_order"} and not self.writes_bound:

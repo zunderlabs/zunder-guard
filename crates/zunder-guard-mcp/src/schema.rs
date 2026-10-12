@@ -23,6 +23,8 @@ pub enum Field {
     /// A perp market's name, as the venue writes it.
     Coin,
     Side,
+    /// Opt in to IOC for an explicitly priced entry; no other override.
+    EntryTimeInForce,
     /// A positive price.
     Price,
     /// A stop price, or `guard_policy`.
@@ -51,6 +53,7 @@ impl Field {
         match self {
             Field::Coin => json!({"type": "string", "pattern": "^[A-Za-z0-9]{1,16}$"}),
             Field::Side => json!({"type": "string", "enum": ["buy", "sell"]}),
+            Field::EntryTimeInForce => json!({"type": "string", "enum": ["ioc"]}),
             Field::Price => json!({"type": "string", "pattern": format!("^{DECIMAL}$")}),
             Field::Stop => {
                 json!({"type": "string", "pattern": format!("^(guard_policy|{DECIMAL})$")})
@@ -85,6 +88,9 @@ impl Field {
                 "sell" => Some(Arg::Side(Side::Sell)),
                 _ => None,
             },
+            Field::EntryTimeInForce => {
+                (value.as_str()? == "ioc").then(|| Arg::Text("ioc".to_owned()))
+            }
             Field::Price | Field::Quantity => positive_decimal(value.as_str()?).map(Arg::Decimal),
             Field::Stop => match value.as_str()? {
                 "guard_policy" => Some(Arg::Stop(StopSpec::GuardPolicy)),

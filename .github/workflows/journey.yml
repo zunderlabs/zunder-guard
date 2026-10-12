@@ -1,6 +1,13 @@
 # Canonical private source; exported once to .github/workflows/journey.yml.
 name: journey
 on:
+  workflow_dispatch:
+    inputs:
+      profile:
+        type: choice
+        options: [checkout]
+        default: checkout
+        description: Diagnostic-only pre-payment checkout; never release evidence
   workflow_call:
     inputs:
       tag:
@@ -342,6 +349,7 @@ jobs:
           retention-days: 7
 
   purchase:
+    if: ${{ inputs.profile == 'all' || inputs.profile == 'nightly' }}
     name: ${{ matrix.journey }}
     runs-on: ubuntu-24.04
     timeout-minutes: 35
@@ -616,7 +624,7 @@ jobs:
         set -euo pipefail
         [ ! -e "$RUSTUP_HOME" ]
         [ ! -e "$CARGO_HOME" ]
-        mkdir -m 700 "$RUSTUP_HOME" "$CARGO_HOME"
+        python -c 'import os,pathlib; [pathlib.Path(os.environ[k]).mkdir(mode=0o700) for k in ("RUSTUP_HOME","CARGO_HOME")]'
         unset RUSTUP_TOOLCHAIN
         rustup toolchain install --no-self-update
         python -c 'import os,tomllib; pin=tomllib.load(open("rust-toolchain.toml","rb"))["toolchain"]["channel"]; f=open(os.environ["GITHUB_ENV"],"a"); f.write("RUSTUP_TOOLCHAIN="+pin+"\n"); f.writelines(k+"="+os.environ[k]+"\n" for k in ("RUSTUP_HOME","CARGO_HOME")); f.close()'
@@ -799,3 +807,49 @@ jobs:
           MONITOR_ALERT_TOKEN: ${{ secrets.MONITOR_ALERT_TOKEN }}
           RUN_URL: https://github.com/zunderlabs/zunder-guard/actions/runs/${{ github.run_id }}/attempts/${{ github.run_attempt }}
         run: python -m guard_harness.monitor --alert --check C6.journey-failed --run-url "$RUN_URL"
+
+  checkout-diagnostic:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.profile == 'checkout' }}
+    name: Checkout diagnostic ${{ matrix.journey }} (no payment)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    environment: e2e
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix: {journey: [P1, P2, P3]}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: {persist-credentials: false}
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with: {node-version: '24'}
+      - run: npm ci --prefix deploy/guard/journeys
+      - working-directory: deploy/guard/journeys
+        run: npx playwright install --with-deps chromium
+      - name: Check staged pricing, ordinary consent and quote; stop before payment
+        working-directory: deploy/guard/journeys
+        env:
+          GUARD_CHECKOUT_DIAGNOSTIC: '1'
+          GUARD_PAID_JOURNEY: ${{ matrix.journey }}
+          GUARD_STAGING_URL: ${{ vars.GUARD_STAGING_URL }}
+          GUARD_EMAIL_DOMAIN: ${{ vars.GUARD_EMAIL_DOMAIN }}
+          GUARD_LICENSE_ACCOUNT: ${{ vars.E2E_TESTNET_ACCOUNT }}
+          GUARD_PAY_TO_HYPERLIQUID: ${{ vars.E2E_PAY_TO_HYPERLIQUID }}
+          GUARD_PAY_TO_ARBITRUM: ${{ vars.E2E_PAY_TO_ARBITRUM }}
+          GUARD_PAY_TO_BASE: ${{ vars.E2E_PAY_TO_BASE }}
+          GUARD_ACCESS_CLIENT_ID: ${{ secrets.E2E_ACCESS_CLIENT_ID }}
+          GUARD_ACCESS_CLIENT_SECRET: ${{ secrets.E2E_ACCESS_CLIENT_SECRET }}
+          GUARD_BROWSER_DIAGNOSTICS: ${{ runner.temp }}/checkout-diagnostic
+          GUARD_TEST_PROOF: ${{ runner.temp }}/checkout-diagnostic-proof.json
+        run: npm test -- purchase/paid.test.ts
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: checkout-diagnostic-${{ matrix.journey }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/checkout-diagnostic/*.json
+            ${{ runner.temp }}/checkout-diagnostic/pricing-buy-pro/diagnostics.json
+            ${{ runner.temp }}/checkout-diagnostic-proof.json
+          if-no-files-found: warn
+          retention-days: 7

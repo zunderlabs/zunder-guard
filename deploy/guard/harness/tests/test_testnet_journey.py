@@ -22,10 +22,40 @@ class Scenario:
         self.fields = copy.deepcopy(opening[3])
         self.fields.update(fills=[], positions=[], orders=[])
         self.events: list[dict[str, Any]] = []
-        self.writes_bound, self.close_size_bound = True, True
+        self.writes_bound, self.close_size_bound, self.limit_price_ioc = True, True, True
         self.calls: list[str] = []
         self.stopped = False
         self.fee: dict[str, Any] = {"mode": "off"}
+        # Public MCP preview::to_json schema: attaching Guard's default stop
+        # reports resize/resized even when the planned quantity is unchanged.
+        self.preview: dict[str, Any] = {
+            "ok": True,
+            "coin": "BTC",
+            "side": "buy",
+            "preview": {
+                "source": "guard",
+                "verdict": "resize",
+                "code": "resized",
+                "reason": "Guard would forward it with changes other than its size",
+                "guard_quoted": "Guard attached its default stop",
+                "changes_quoted": ["a reduce-only stop at 58800 (2% from 60000) is attached"],
+                "requested_size": "0.0002",
+                "allowed_size": "0.0002",
+                "size_cut": False,
+                "order_price": "60120",
+                "worst_price": "60120",
+                "stop_price": "58800",
+                "stop_source": "guard_policy",
+                "time_in_force": "ioc",
+                "isolated_leverage": 3,
+                "notional_usd": "12.024",
+                "risk_at_stop_usd": "0.2772264",
+                "risk_at_stop_pct_of_equity": "0.0693",
+                "equity_usd": "400",
+                "view_age_ms": 0,
+                "caveats": [],
+            },
+        }
 
     def request(self, path: str) -> object:
         if path.startswith("/guard/events"):
@@ -59,8 +89,20 @@ class Scenario:
         self, name: Tool, arguments: dict[str, Any] | None = None
     ) -> tuple[dict[str, Any], bool]:
         self.calls.append(name)
+        if name in {"preview_order", "place_order"}:
+            assert arguments == {
+                "coin": "BTC",
+                "side": "buy",
+                "stop": "guard_policy",
+                "size": "0.0002",
+                "limit_price": "60120",
+                "time_in_force": "ioc",
+            }
         if name == "preview_order":
-            return {"preview": {"verdict": "veto" if self.fail == "preview" else "allow"}}, False
+            value = copy.deepcopy(self.preview)
+            if self.fail == "preview":
+                value["preview"].update(verdict="veto", code="risk", allowed_size=None)
+            return value, False
         if name == "place_order":
             self.events, self.fields = (
                 copy.deepcopy(self.opening[0]),
@@ -126,13 +168,15 @@ def test_unproved_cleanup_keeps_guard_and_never_earns_journey_credit(failure: st
     assert scenario.calls.count("close_position") <= 1
 
 
-@pytest.mark.parametrize("failure", ["mode-cap", "size-cap", "preview", "version"])
+@pytest.mark.parametrize("failure", ["mode-cap", "size-cap", "ioc-cap", "preview", "version"])
 def test_pre_entry_refusals_send_no_orders(failure: str) -> None:
     scenario = Scenario(failure)
     if failure == "mode-cap":
         scenario.writes_bound = False
     elif failure == "size-cap":
         scenario.close_size_bound = False
+    elif failure == "ioc-cap":
+        scenario.limit_price_ioc = False
     with pytest.raises(RuntimeError):
         scenario.execute()
     assert "place_order" not in scenario.calls and "close_position" not in scenario.calls
@@ -231,3 +275,82 @@ def test_failed_fee_observation_still_cleans_without_retry() -> None:
     assert result.cleaned is not None and result.guard_stopped
     assert result.failure == "entry_or_protection"
     assert scenario.calls == ["preview_order", "place_order", "close_position"]
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("source", "estimate"),
+        ("verdict", "veto"),
+        ("verdict", "other"),
+        ("code", "allowed"),
+        ("size_cut", True),
+        ("size_cut", 0),
+        ("size_cut", None),
+        ("requested_size", "max"),
+        ("requested_size", "0.0003"),
+        ("allowed_size", "0.0001"),
+        ("allowed_size", "0.0003"),
+        ("allowed_size", 0.0002),
+        ("allowed_size", "NaN"),
+        ("allowed_size", None),
+        ("order_price", "60121"),
+        ("worst_price", "60119"),
+        ("worst_price", "60121"),
+        ("stop_source", "explicit"),
+        ("time_in_force", "gtc"),
+        ("time_in_force", None),
+        ("time_in_force", "Ioc"),
+        ("stop_price", "60120"),
+        ("stop_price", "58799"),
+        ("view_age_ms", True),
+        ("view_age_ms", None),
+        ("view_age_ms", -1),
+        ("view_age_ms", 60001),
+        ("changes_quoted", None),
+        ("changes_quoted", []),
+        ("changes_quoted", [3]),
+        ("changes_quoted", ["a reduce-only stop at 58800 (2% from 60000) is attached"] * 2),
+        ("changes_quoted", ["a reduce-only stop at 58800 (2% from 70000) is attached"]),
+        ("changes_quoted", ["a reduce-only stop at 58800 (2% from 50000) is attached"]),
+    ],
+)
+def test_protected_resize_never_admits_cut_malformed_or_unbounded_preview(
+    field: str, value: Any
+) -> None:
+    scenario = Scenario()
+    scenario.preview["preview"][field] = value
+    with pytest.raises(RuntimeError):
+        scenario.execute()
+    assert scenario.calls == ["preview_order"] and not scenario.stopped
+
+
+@pytest.mark.parametrize("field", ["ok", "coin", "side", "preview"])
+def test_protected_resize_requires_exact_public_response_identity(field: str) -> None:
+    scenario = Scenario()
+    del scenario.preview[field]
+    with pytest.raises(RuntimeError):
+        scenario.execute()
+    assert scenario.calls == ["preview_order"] and not scenario.stopped
+
+
+def test_protected_resize_accepts_same_decimal_quantity_without_changing_entry() -> None:
+    scenario = Scenario()
+    scenario.preview["preview"].update(requested_size="0.00020", allowed_size="0.000200")
+    result = scenario.execute()
+    assert result.passed and result.protected_entry.filled == Decimal("0.0002")
+    assert scenario.calls == ["preview_order", "place_order", "close_position"]
+
+
+def test_preview_error_never_reaches_entry_or_cleanup_budget_admission() -> None:
+    scenario = Scenario()
+    original = scenario.tool
+
+    def tool(name: Tool, arguments: dict[str, Any] | None = None) -> tuple[dict[str, Any], bool]:
+        result, error = original(name, arguments)
+        return result, True if name == "preview_order" else error
+
+    scenario.tool = tool  # type: ignore[method-assign]
+    with pytest.raises(RuntimeError):
+        scenario.execute(admit_entry=lambda: pytest.fail("no budget admission after preview error"))
+    assert scenario.calls == ["preview_order"] and not scenario.stopped

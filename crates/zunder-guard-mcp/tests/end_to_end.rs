@@ -43,6 +43,7 @@ fn initialize_and_list_exactly_the_nine_tools() {
         json!({
             "exchange_expected_mode": {"enabled": true},
             "close_expected_size": {"enabled": true},
+            "limit_price_ioc": {"enabled": true},
         })
     );
     assert!(
@@ -156,6 +157,10 @@ fn the_initialize_capabilities_follow_mcps_schema() {
             json!({"protocolVersion": version, "capabilities": {}, "clientInfo": {"name": "test", "version": "1"}}),
         );
         assert_server_capabilities(&init["result"]["capabilities"]);
+        assert_eq!(
+            init["result"]["capabilities"]["experimental"]["limit_price_ioc"]["enabled"],
+            true
+        );
     }
     // The checker itself refuses what a client SDK refuses.
     let refused = std::panic::catch_unwind(|| {
@@ -489,6 +494,7 @@ fn guard_policy_sends_the_entry_alone_for_guard_to_protect() {
     );
     assert!(!error, "{placed}");
     assert_eq!(placed["order"]["stop"], "attached_by_guard_policy");
+    assert_eq!(placed["order"]["time_in_force"], "gtc");
     let body = &guard.exchanges()[0];
     let Some(Action::Order { orders, grouping }) = decode_action(&body["action"]) else {
         panic!("not an order");
@@ -508,6 +514,156 @@ fn guard_policy_sends_the_entry_alone_for_guard_to_protect() {
         "resize"
     );
     guard.assert_only_guarded_actions();
+}
+
+#[test]
+fn explicit_limit_ioc_is_previewed_and_signed_with_the_same_bounded_price() {
+    // BTC mid 60,000: aggressive limits stay within 0.5%, so buy 65,000
+    // becomes 60,300 and sell 55,000 becomes 59,700. Passive limits stay.
+    for (side, stop, limit, price, size) in [
+        ("buy", "58800", "60100.00000", "60100", "0.01000"),
+        ("sell", "61200", "59900", "59900", "0.01000"),
+        ("buy", "58800", "65000", "60300", "max"),
+        ("sell", "61200", "55000", "59700", "max"),
+    ] {
+        for (option, tif, name) in [(true, Tif::Ioc, "ioc"), (false, Tif::Gtc, "gtc")] {
+            let guard = MockGuard::start();
+            let (mut server, clock) = guard.server(Mode::Testnet, true, None);
+            let mut arguments = json!({
+                "coin": "BTC", "side": side, "stop": stop,
+                "size": size, "limit_price": limit,
+            });
+            if option {
+                arguments["time_in_force"] = json!("ioc");
+            }
+            let (error, shown) = call(&mut server, "preview_order", arguments.clone());
+            assert!(!error, "{shown}");
+            assert_eq!(shown["preview"]["time_in_force"], name);
+            assert_eq!(shown["preview"]["order_price"], price);
+            assert!(guard.exchanges().is_empty());
+            let Some(Action::Order { orders, grouping }) =
+                decode_action(&guard.previews()[0]["action"])
+            else {
+                panic!("not an entry preview");
+            };
+            assert_eq!(grouping, Grouping::NormalTpsl);
+            assert_eq!(orders[0].order_type, OrderType::Limit { tif });
+            assert_eq!(orders[0].price, price);
+            assert!(!orders[0].reduce_only);
+            clock.advance(1_001);
+            let (error, placed) = call(&mut server, "place_order", arguments);
+            assert!(!error, "{placed}");
+            assert_eq!(placed["sent"], true);
+            assert_eq!(placed["order"]["time_in_force"], name);
+            assert_eq!(placed["order"]["order_price"], price);
+            let bodies = guard.exchanges();
+            assert_eq!(bodies.len(), 1);
+            assert_eq!(bodies[0]["expectedMode"], "testnet");
+            let Some(Action::Order { orders, grouping }) = decode_action(&bodies[0]["action"])
+            else {
+                panic!("not an entry");
+            };
+            assert_eq!(grouping, Grouping::NormalTpsl);
+            assert_eq!(orders.len(), 2);
+            assert_eq!(orders[0].order_type, OrderType::Limit { tif });
+            assert_eq!(orders[0].price, price);
+            assert_eq!(
+                orders[0].size,
+                placed["order"]["size_sent"].as_str().unwrap()
+            );
+            if size != "max" {
+                assert_eq!(orders[0].size, "0.01");
+            }
+            assert_eq!(orders[0].is_buy, side == "buy");
+            assert!(!orders[0].reduce_only);
+            assert!(orders[1].reduce_only);
+            assert_eq!(orders[1].size, orders[0].size);
+            assert_eq!(
+                orders[1].order_type,
+                OrderType::StopMarket {
+                    trigger_px: stop.into()
+                }
+            );
+            // Explicit-size sends exactly the previewed action; max rebuilds
+            // only the quantity after Guard names its allowed size.
+            let Some(Action::Order {
+                orders: previewed, ..
+            }) = decode_action(&guard.previews()[1]["action"])
+            else {
+                panic!("not the send's preview");
+            };
+            assert_eq!(previewed[0].order_type, orders[0].order_type);
+            assert_eq!(previewed[0].price, orders[0].price);
+            assert_eq!(previewed[0].cloid, orders[0].cloid);
+            if size != "max" {
+                assert_eq!(guard.previews()[1]["action"], bodies[0]["action"]);
+            }
+            guard.assert_only_guarded_actions();
+        }
+    }
+}
+
+#[test]
+fn explicit_limit_ioc_invalid_arguments_refuse_before_any_guard_request() {
+    let guard = MockGuard::start();
+    let bad_options = [
+        json!(null),
+        json!("gtc"),
+        json!("Gtc"),
+        json!("Ioc"),
+        json!("alo"),
+        json!(""),
+        json!("ioc "),
+        json!(true),
+        json!(1),
+        json!({}),
+        json!([]),
+    ];
+    let base = json!({
+        "coin": "BTC", "side": "buy", "stop": "58800",
+        "size": "0.01", "limit_price": "60100", "time_in_force": "ioc",
+    });
+    let mut invalid = Vec::new();
+    for option in bad_options {
+        let mut arguments = base.clone();
+        arguments["time_in_force"] = option;
+        invalid.push(arguments);
+    }
+    let mut absent_limit = base.clone();
+    absent_limit.as_object_mut().unwrap().remove("limit_price");
+    invalid.push(absent_limit);
+    let mut unknown = base.clone();
+    unknown["tif"] = json!("ioc");
+    invalid.push(unknown);
+    // Decimal strings stay mandatory; no float, exponent, nonpositive,
+    // excess precision or malformed spelling becomes a bounded order.
+    for field in ["size", "limit_price"] {
+        for bad in [
+            json!(null),
+            json!(0.01),
+            json!("0"),
+            json!("-1"),
+            json!("1e-2"),
+            json!("0.000000001"),
+            json!("+1"),
+            json!("1."),
+            json!(" 1"),
+        ] {
+            let mut arguments = base.clone();
+            arguments[field] = bad;
+            invalid.push(arguments);
+        }
+    }
+    for name in ["preview_order", "place_order"] {
+        for arguments in &invalid {
+            let (mut server, _) = guard.server(Mode::Testnet, true, None);
+            let (error, refused) = call(&mut server, name, arguments.clone());
+            assert!(error, "{name}: {arguments}: {refused}");
+            assert_eq!(refused["error"]["code"], "invalid_arguments");
+            assert_eq!(refused["sent"], false);
+            guard.with(|state| assert!(state.received.is_empty(), "{name}: {arguments}"));
+        }
+    }
 }
 
 #[test]

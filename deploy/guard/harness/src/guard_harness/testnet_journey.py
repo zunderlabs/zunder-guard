@@ -4,13 +4,23 @@ import re
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
+from decimal import Decimal
+from typing import Any
 
 from guard_harness.mcp_client import MCP
 from guard_harness.paper_bot import LocalGuard
 from guard_harness.testnet_cleanup import Cleaned, cleanup
 from guard_harness.testnet_collect import collect_ownership
 from guard_harness.testnet_ownership import Ownership
-from guard_harness.testnet_protection import Entry, _need, _object, _orders
+from guard_harness.testnet_protection import (
+    Entry,
+    ProtectionError,
+    _need,
+    _object,
+    _orders,
+    _positive,
+    price_grid,
+)
 from guard_harness.testnet_reconcile import _oid
 from guard_harness.testnet_scan import Read, flat_scan
 
@@ -30,6 +40,50 @@ class Journey:
             and self.cleaned is not None
             and self.guard_stopped
         )
+
+
+def admit_preview(result: dict[str, Any], entry: Entry) -> None:
+    """Admit the unchanged planned entry with Guard's measured default stop."""
+    _need(result.get("ok") is True and result.get("coin") == "BTC" and result.get("side") == "buy")
+    preview = _object(result.get("preview"))
+    _need(
+        preview.get("source") == "guard"
+        and (preview.get("verdict"), preview.get("code"))
+        in {("allow", "allowed"), ("resize", "resized")}
+        and preview.get("size_cut") is False
+        and preview.get("stop_source") == "guard_policy"
+        and preview.get("time_in_force") == "ioc"
+    )
+    _need(
+        _positive(preview.get("requested_size")) == entry.size
+        and _positive(preview.get("allowed_size")) == entry.size
+        and _positive(preview.get("order_price")) == entry.limit
+        and _positive(preview.get("worst_price")) == entry.limit
+    )
+    age = preview.get("view_age_ms")
+    _need(type(age) is int and 0 <= age <= 60000)
+    changes = preview.get("changes_quoted")
+    if not isinstance(changes, list) or not all(isinstance(change, str) for change in changes):
+        raise ProtectionError("preview protection changes required")
+    references = [
+        match
+        for change in changes
+        if (
+            match := re.fullmatch(
+                r"a reduce-only stop at ([0-9]+(?:\.[0-9]+)?) "
+                r"\(2% from ([0-9]+(?:\.[0-9]+)?)\) is attached",
+                change,
+            )
+        )
+    ]
+    _need(len(references) == 1)
+    quoted_stop, reference = (_positive(value) for value in references[0].groups())
+    stop = _positive(preview.get("stop_price"))
+    _need(stop == quoted_stop == price_grid(reference * Decimal("0.98"), entry.precision, up=True))
+    _need(
+        stop < reference <= entry.limit
+        and entry.limit <= price_grid(reference * Decimal("1.005"), entry.precision, up=False)
+    )
 
 
 def execute(
@@ -57,7 +111,7 @@ def execute(
     An exception message or response body never enters the returned diagnostic.
     """
     entry.validate()
-    _need(mcp.writes_bound and mcp.close_size_bound)
+    _need(mcp.writes_bound and mcp.close_size_bound and mcp.limit_price_ioc)
     _need(type(process_started_ms) is int and process_started_ms > 0)
     status = _object(guard.request("/guard/status"))
     _need(status.get("mode") == "testnet" and status.get("network") == "testnet")
@@ -101,9 +155,11 @@ def execute(
             "stop": "guard_policy",
             "size": str(entry.size),
             "limit_price": str(entry.limit),
+            "time_in_force": "ioc",
         },
     )
-    _need(not error and _object(preview.get("preview")).get("verdict") == "allow")
+    _need(not error)
+    admit_preview(preview, entry)
     admit_entry()  # Reserve cleanup time after the potentially long preflight.
     begun = now_ms()
     _need(type(begun) is int and begun > 0)
@@ -126,6 +182,7 @@ def execute(
                 "stop": "guard_policy",
                 "size": str(entry.size),
                 "limit_price": str(entry.limit),
+                "time_in_force": "ioc",
             },
         )
         _need(not error and result.get("sent") is True)

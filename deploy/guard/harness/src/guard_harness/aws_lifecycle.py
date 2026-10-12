@@ -27,6 +27,46 @@ class AwsError(RuntimeError):
     """Incomplete sandbox lifecycle; diagnostics deliberately exclude physical IDs."""
 
 
+def public_failure_frame(record: dict[str, Any]) -> str:
+    """Admit only a public source coordinate from already-captured failed output."""
+    plugins = record.get("CommandPlugins")
+    if not isinstance(plugins, list) or len(plugins) != 1 or not isinstance(plugins[0], dict):
+        return "unknown"
+    output = plugins[0].get("Output")
+    if not isinstance(output, str) or len(output) > 2500:
+        return "unknown"
+    frames = [
+        line
+        for line in output.splitlines()
+        if re.match(r'^\s*File "[^"\r\n]*/guard_harness/aws_paper\.py"', line)
+    ]
+    if not frames:
+        return "unknown"
+    frame = re.fullmatch(
+        r'  File "[^"\r\n]*/guard_harness/aws_paper\.py", '
+        r"line ([1-9][0-9]{0,3}), in ([a-z_]{1,32})",
+        frames[-1],
+    )
+    if (
+        frame is None
+        or int(frame[1]) > 4096
+        or frame[2]
+        not in {
+            "command",
+            "health",
+            "sha",
+            "image",
+            "preserve",
+            "before",
+            "after",
+            "mainnet",
+            "main",
+        }
+    ):
+        return "unknown"
+    return f"aws_paper.py:{int(frame[1])} {frame[2]}"
+
+
 class AWS:
     def __init__(self, region: str, work: Path) -> None:
         if re.fullmatch(r"[a-z]{2}(?:-gov)?-[a-z]+-\d", region) is None:
@@ -275,7 +315,10 @@ class Stack:
                         raise AwsError("SSM safe receipt missing")
                     return body
                 if record.get("Status") not in ("Pending", "InProgress", "Delayed"):
-                    raise AwsError("SSM native lifecycle failed; private output withheld")
+                    raise AwsError(
+                        "SSM native lifecycle failed; private output withheld; public frame: "
+                        + public_failure_frame(record)
+                    )
             self.pause(5)
         raise AwsError("SSM execution result deadline")
 

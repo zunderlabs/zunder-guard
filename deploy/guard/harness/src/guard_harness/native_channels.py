@@ -91,7 +91,28 @@ def dialogue(
             if status is not None:
                 break
         if status != 0 or index != len(replies):
-            raise LifecycleError("literal paper loader did not finish complete interactive setup")
+            outcome = (
+                "deadline"
+                if status is None
+                else "child-nonzero"
+                if status != 0
+                else "incomplete-dialogue"
+            )
+            phases = {
+                "Keep these? [Y/edit]": "rules",
+                "Hyperliquid account address": "account",
+                "Mode: paper": "mode",
+                "Paper mode reads which network's account": "read-network",
+            }
+            phase = phases[replies[index][0]] if index < len(replies) else "setup-exit"
+            # Never include the terminal transcript, account, argv or private suffix.
+            exit_status = (
+                str(status) if type(status) is int and -255 <= status <= 255 else "unknown"
+            )
+            raise LifecycleError(
+                "literal paper loader did not finish complete interactive setup "
+                f"(outcome={outcome}, phase={phase}, exit={exit_status})"
+            )
     finally:
         if child is not None:
             child.close(force=True)

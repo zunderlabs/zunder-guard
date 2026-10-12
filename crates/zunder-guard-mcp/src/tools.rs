@@ -85,7 +85,13 @@ const LIMIT_PRICE: Param = Param {
     name: "limit_price",
     field: Field::Price,
     required: false,
-    description: "A limit price as a decimal string; the order rests (GTC). Without it the order is a market order: an IOC limit 0.5% beyond the mid, Guard's bound.",
+    description: "A limit price as a decimal string; the order rests (GTC) unless time_in_force is ioc. Without it the order is a market order: an IOC limit 0.5% beyond the mid, Guard's bound.",
+};
+const TIME_IN_FORCE: Param = Param {
+    name: "time_in_force",
+    field: Field::EntryTimeInForce,
+    required: false,
+    description: "Only ioc: an immediate-or-cancel entry at the explicit limit_price (required), still bounded by Guard. Omitted: GTC with limit_price, IOC without it. Check initialize experimental.limit_price_ioc.enabled is literal true before using this option.",
 };
 
 const TOOLS: [ToolDef; 9] = [
@@ -111,7 +117,7 @@ const TOOLS: [ToolDef; 9] = [
         name: "preview_order",
         title: "Preview an entry",
         description: "Ask Guard what it would decide about an entry, without sending anything: Guard's own judgement (allow, resize or veto, with the reason), the size it would send, the stop and the isolated leverage. Guard judges from its view of the account (at most 60 s old) and judges the real order again. Read-only.",
-        params: &[COIN, SIDE, STOP, SIZE_OPTIONAL, LIMIT_PRICE],
+        params: &[COIN, SIDE, STOP, SIZE_OPTIONAL, LIMIT_PRICE, TIME_IN_FORCE],
         read_only: true,
         destructive: false,
         sends: false,
@@ -120,7 +126,7 @@ const TOOLS: [ToolDef; 9] = [
         name: "place_order",
         title: "Place an entry with its stop",
         description: "Open or add to a position, always with a protective stop. Guard sizes the entry from the stop, may cut it, or refuses it; the result is Guard's verdict and the venue's reply. Rate-limited.",
-        params: &[COIN, SIDE, STOP, SIZE_REQUIRED, LIMIT_PRICE],
+        params: &[COIN, SIDE, STOP, SIZE_REQUIRED, LIMIT_PRICE, TIME_IN_FORCE],
         read_only: false,
         destructive: false,
         sends: true,
@@ -349,7 +355,7 @@ struct Prepared {
 }
 
 /// The entry action: an IOC limit at the price (a GTC limit with
-/// `limit_price`) and, with its own stop, a reduce-only stop-market in the
+/// `limit_price` unless explicitly opted in to IOC) and, with its own stop, a reduce-only stop-market in the
 /// same `normalTpsl` request. The same builder serves the preview and the
 /// send, so Guard previews exactly what would be sent.
 fn entry_action(
@@ -364,13 +370,7 @@ fn entry_action(
         price: prepared.price.normalize().to_string(),
         size: size.normalize().to_string(),
         reduce_only: false,
-        order_type: OrderType::Limit {
-            tif: if request.limit_price.is_some() {
-                Tif::Gtc
-            } else {
-                Tif::Ioc
-            },
-        },
+        order_type: OrderType::Limit { tif: request.tif() },
         cloid: cloid.map(str::to_owned),
     };
     Ok(match prepared.stop {
@@ -638,14 +638,27 @@ impl Server {
         run().unwrap_or_else(|outcome| outcome)
     }
 
-    fn entry_request(args: &Args, default_size: SizeSpec) -> Option<(String, EntryRequest)> {
-        Some((
-            args.text("coin")?.to_owned(),
+    fn entry_request(
+        args: &Args,
+        default_size: SizeSpec,
+    ) -> Result<(String, EntryRequest), Outcome> {
+        let limit_price = args.decimal("limit_price");
+        let time_in_force = args.text("time_in_force").map(|_| Tif::Ioc);
+        if time_in_force.is_some() && limit_price.is_none() {
+            return Err(Outcome::fail(
+                "invalid_arguments",
+                "time_in_force requires an explicit limit_price; nothing was sent",
+            ));
+        }
+        let missing = || Outcome::fail("invalid_arguments", "missing arguments");
+        Ok((
+            args.text("coin").ok_or_else(missing)?.to_owned(),
             EntryRequest {
-                side: args.side("side")?,
-                stop: args.stop("stop")?,
+                side: args.side("side").ok_or_else(missing)?,
+                stop: args.stop("stop").ok_or_else(missing)?,
                 size: args.size("size").unwrap_or(default_size),
-                limit_price: args.decimal("limit_price"),
+                limit_price,
+                time_in_force,
             },
         ))
     }
@@ -839,8 +852,7 @@ impl Server {
 
     fn preview_order(&mut self, args: &Args) -> Outcome {
         let run = |server: &mut Self| -> Result<Outcome, Outcome> {
-            let (coin, request) = Self::entry_request(args, SizeSpec::Max)
-                .ok_or_else(|| Outcome::fail("invalid_arguments", "missing arguments"))?;
+            let (coin, request) = Self::entry_request(args, SizeSpec::Max)?;
             let status = server.status()?;
             let prepared = server.prepare(&status, &coin, &request)?;
             let action = entry_action(&prepared, &request, prepared.size, None)?;
@@ -1025,8 +1037,7 @@ impl Server {
 
     fn place_order(&mut self, args: &Args) -> Outcome {
         let run = |server: &mut Self| -> Result<Outcome, Outcome> {
-            let (coin, request) = Self::entry_request(args, SizeSpec::Max)
-                .ok_or_else(|| Outcome::fail("invalid_arguments", "missing arguments"))?;
+            let (coin, request) = Self::entry_request(args, SizeSpec::Max)?;
             if server.must_check {
                 return Err(Outcome::fail(
                     "check_first",
@@ -1109,7 +1120,7 @@ impl Server {
                     "size_sent": text(size),
                     "order_price": text(prepared.price),
                     "mid_price": text(prepared.mid),
-                    "time_in_force": if request.limit_price.is_some() { "gtc" } else { "ioc" },
+                    "time_in_force": request.tif_name(),
                     "stop_price": prepared.stop.map(text),
                     "stop": if prepared.stop.is_some() { "sent_with_the_entry" } else { "attached_by_guard_policy" },
                     "client_order_id": cloid,

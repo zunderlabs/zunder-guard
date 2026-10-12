@@ -187,8 +187,10 @@ def test_journey_connects_owned_process_and_keeps_guard_on_cleanup_failure(
         )
         kwargs["admit_entry"]()
         assert read.deadline == 280
+        next_read, reservations = read.next_read, list(read.reservations)
         kwargs["begin_cleanup"]()
-        assert read.deadline == 100 + SCAN_TIMEOUT and read.next_read == 102
+        assert read.deadline == 100 + SCAN_TIMEOUT
+        assert read.next_read == next_read and read.reservations == reservations
         return Journey(None, None, "cleanup_incomplete_keep_guard_running", False)
 
     monkeypatch.setattr(process, "MCP", FakeMCP)

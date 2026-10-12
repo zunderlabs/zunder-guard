@@ -101,14 +101,19 @@ def before(
     else:
         raise RuntimeError("systemd did not recover a distinct owned process after crash")
     health(previous)
+    files = {}
+    for name in ("guard.toml", "risk-paper.jsonl", "decisions-paper.jsonl"):
+        body = (HOME / name).read_bytes()
+        # Journal writers consume their zero-filled reserve when appending.
+        # Retain every populated byte; configuration must remain byte-exact.
+        if name.endswith(".jsonl"):
+            body = body.rstrip(b"\x00")
+        files[name] = base64.b64encode(body).decode()
     state: dict[str, Any] = {
         "boot_id": Path("/proc/sys/kernel/random/boot_id").read_text().strip(),
         "client_address": pair.address,
         "client_key": pair.key,
-        "files": {
-            name: base64.b64encode((HOME / name).read_bytes()).decode()
-            for name in ("guard.toml", "risk-paper.jsonl", "decisions-paper.jsonl")
-        },
+        "files": files,
     }
     path = BASE / "private-state.json"
     with path.open("x") as state_output:

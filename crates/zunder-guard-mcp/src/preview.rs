@@ -25,6 +25,7 @@ use zunder_venue_types::{passive, toward_position};
 use crate::{
     contract::{ENTRY_PRICE_BOUND, GuardPreview, ROUND_TRIP_COST, reason_for},
     schema::{SizeSpec, StopSpec},
+    sign::Tif,
     venue::Market,
 };
 
@@ -42,6 +43,26 @@ pub struct EntryRequest {
     pub stop: StopSpec,
     pub size: SizeSpec,
     pub limit_price: Option<Decimal>,
+    /// Only `Some(Ioc)` is accepted from callers, with an explicit limit.
+    pub time_in_force: Option<Tif>,
+}
+
+impl EntryRequest {
+    /// Preserve the existing defaults unless the caller explicitly opts in.
+    pub fn tif(&self) -> Tif {
+        self.time_in_force.unwrap_or(if self.limit_price.is_some() {
+            Tif::Gtc
+        } else {
+            Tif::Ioc
+        })
+    }
+
+    pub fn tif_name(&self) -> &'static str {
+        match self.tif() {
+            Tif::Gtc => "gtc",
+            Tif::Ioc => "ioc",
+        }
+    }
 }
 
 /// How the stop was chosen.
@@ -188,6 +209,7 @@ pub fn to_json(
         "size_cut": entry.is_some_and(|entry| entry.size < entry.requested_size)
             && request.size != SizeSpec::Max,
         "order_price": text(Some(order_price)),
+        "time_in_force": request.tif_name(),
         "worst_price": text(entry.map(|entry| entry.worst_price)),
         "stop_price": text(entry.map(|entry| entry.stop)),
         "stop_source": match request.stop {
@@ -227,6 +249,7 @@ mod tests {
             stop,
             size,
             limit_price,
+            time_in_force: None,
         }
     }
 

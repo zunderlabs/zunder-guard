@@ -99,6 +99,8 @@ pub const EXPECTED_MODE_CAPABILITY: &str = "exchange_expected_mode";
 /// closes exactly that quantity, and only when the open position is exactly
 /// that size.
 pub const CLOSE_EXPECTED_SIZE_CAPABILITY: &str = "close_expected_size";
+/// An explicit-price entry can opt in to IOC with `time_in_force: "ioc"`.
+pub const LIMIT_PRICE_IOC_CAPABILITY: &str = "limit_price_ioc";
 /// The entry of the status's `capabilities` that says `/guard/kill` takes
 /// and enforces `expectedMode` as well.
 pub const KILL_EXPECTED_MODE_CAPABILITY: &str = "kill_expected_mode";

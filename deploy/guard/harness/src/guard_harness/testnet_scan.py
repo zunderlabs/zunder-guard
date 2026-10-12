@@ -130,9 +130,10 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
 class TestnetReads:
     """Fixed public endpoint, no proxies, redirects or keys; at most 600 weight/minute.
 
-    Ordinary reads reserve 20 weight with two seconds before each request. A fill-history
-    request reserves 120 weight (20 plus at most 2000/20 returned-item weight) with twelve
-    seconds before it, even on failures. Sequential only. See the official API rate limits:
+    clearinghouseState, allMids and orderStatus reserve 2 weight; other ordinary reads
+    reserve 20. A fill-history request reserves 120 (20 plus at most 2000/20 returned-item
+    weight). Each request prepays its weight at 10/second, and rolling reservations keep
+    every minute at 600, even on failures and across phases. Sequential only. See:
     https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/rate-limits-and-user-limits
     """
 
@@ -146,7 +147,8 @@ class TestnetReads:
         if not 10 < timeout <= SCAN_TIMEOUT:
             raise ScanError("bounded scan timeout required")
         self.clock, self.sleep = clock, sleep
-        self.next_read = clock() + 2
+        self.next_read = clock()
+        self.reservations: list[tuple[float, int]] = []
         self.deadline = clock() + timeout
         self.opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
 
@@ -190,11 +192,33 @@ class TestnetReads:
         ):
             raise ScanError("explicit testnet account required")
         now = self.clock()
-        wait = max(0.0, self.next_read - now) + (10 if kind == "userFillsByTime" else 0)
+        weight = (
+            120
+            if kind == "userFillsByTime"
+            else 2
+            if kind in ("clearinghouseState", "allMids", "orderStatus")
+            else 20
+        )
+        scheduled = max(now, self.next_read) + weight / 10
+        active = [(at, cost) for at, cost in self.reservations if at > scheduled - 60]
+        reserved = sum(cost for _, cost in active)
+        for at, cost in active:
+            if reserved + weight <= 600:
+                break
+            # Stay beyond the expiry boundary despite floating-clock rounding.
+            scheduled = at + 60.001
+            reserved -= cost
+        wait = scheduled - now
         if now + wait + 10 > self.deadline:
             raise ScanError("scan deadline exhausted; no incomplete flat credit")
         self.sleep(wait)
-        self.next_read = self.clock() + 2
+        self.next_read = self.clock()
+        if self.next_read + 10 > self.deadline:
+            raise ScanError("scan deadline exhausted after pacing; nothing sent")
+        self.reservations = [
+            (at, cost) for at, cost in self.reservations if at > self.next_read - 60
+        ]
+        self.reservations.append((self.next_read, weight))
         request = urllib.request.Request(
             INFO,
             data=json.dumps(payload).encode(),

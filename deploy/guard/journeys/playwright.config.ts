@@ -10,13 +10,15 @@ if (remote) {
   }
   requireHttps(remote, 'staging');
   const approvalOnly = process.env['GUARD_PAID_JOURNEY'] === 'P8';
-  const required = approvalOnly
+  const checkoutOnly = process.env['GUARD_CHECKOUT_DIAGNOSTIC'] === '1';
+  const required = approvalOnly || checkoutOnly
     ? ['GUARD_ACCESS_CLIENT_ID', 'GUARD_ACCESS_CLIENT_SECRET']
     : ['GUARD_ORDER_TOKEN', 'GUARD_INBOX_TOKEN', 'GUARD_INBOX_URL', 'GUARD_EMAIL_DOMAIN', 'GUARD_ACCESS_CLIENT_ID', 'GUARD_ACCESS_CLIENT_SECRET'];
   for (const name of required) {
     if (!process.env[name]) throw new Error(`missing environment variable: ${name}`);
   }
-  if (!approvalOnly) requireHttps(process.env['GUARD_INBOX_URL'] ?? '', 'inbox');
+  if (checkoutOnly && !process.env['GUARD_EMAIL_DOMAIN']) throw new Error('missing diagnostic email domain');
+  if (!approvalOnly && !checkoutOnly) requireHttps(process.env['GUARD_INBOX_URL'] ?? '', 'inbox');
   headers['CF-Access-Client-Id'] = process.env['GUARD_ACCESS_CLIENT_ID'] ?? '';
   headers['CF-Access-Client-Secret'] = process.env['GUARD_ACCESS_CLIENT_SECRET'] ?? '';
 }

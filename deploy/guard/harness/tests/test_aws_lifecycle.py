@@ -501,3 +501,55 @@ def test_failed_ssm_plugin_output_never_enters_phase_diagnostic() -> None:
         )
     assert "private-body-token" not in str(caught.value) + json.dumps(receipt)
     assert receipt == {"active_phase": "paper-before"}
+
+
+def test_failed_ssm_admits_last_public_coordinate_only() -> None:
+    fake = Fake()
+    sentinel = "private-token-fixture"
+    account = "0x" + "a" * 40
+    arn = "arn:aws:fixture:private-resource"
+    output = (
+        f"{sentinel} {account} {arn}\nTraceback (most recent call last):\n"
+        '  File "/opt/guard-install-e2e/guard_harness/aws_paper.py", line 230, in main\n'
+        '  File "/opt/guard-install-e2e/guard_harness/aws_paper.py", line 140, in after\n'
+        f"RuntimeError: {sentinel} {account} {arn}\n"
+    )
+    fake.result = {"Status": "Failed", "CommandPlugins": [{"ResponseCode": 1, "Output": output}]}
+    with pytest.raises(harness.AwsError) as caught:
+        owned(fake).remote("public script")
+    text = str(caught.value)
+    assert text.endswith("public frame: aws_paper.py:140 after")
+    assert all(private not in text for private in [sentinel, account, arn, "/opt/"])
+    assert all(call[:2] != ["ssm", "get-command-invocation"] for call in fake.calls)
+
+
+@pytest.mark.parametrize(
+    "output",
+    [
+        None,
+        {},
+        "",
+        "private exception only",
+        "x" * 2501,
+        '  File "/private/aws_paper.py", line 140, in after',
+        '  File "/opt/guard_harness/aws_paper.py", line 0, in after',
+        '  File "/opt/guard_harness/aws_paper.py", line 4097, in after',
+        '  File "/opt/guard_harness/aws_paper.py", line 123456789, in after',
+        '  File "/opt/guard_harness/aws_paper.py", line 140, in private_token',
+        '  File "/opt/guard_harness/aws_paper.py", line 140, in after;private-token',
+        '  File "/opt/guard_harness/aws_paper.py", line 140, in after\n'
+        '  File "/opt/guard_harness/aws_paper.py", line invalid, in health',
+    ],
+)
+def test_unknown_malformed_failed_output_stays_withheld_and_fails(output: Any) -> None:
+    fake = Fake()
+    fake.result = {"Status": "Failed", "CommandPlugins": [{"ResponseCode": 1, "Output": output}]}
+    with pytest.raises(harness.AwsError) as caught:
+        owned(fake).remote("public script")
+    assert str(caught.value).endswith("public frame: unknown")
+    assert "private-token" not in str(caught.value)
+
+
+@pytest.mark.parametrize("plugins", [None, [], [{}, {}], [None], [{"Output": []}]])
+def test_ambiguous_failed_plugins_cannot_export_coordinate(plugins: Any) -> None:
+    assert harness.public_failure_frame({"CommandPlugins": plugins}) == "unknown"
