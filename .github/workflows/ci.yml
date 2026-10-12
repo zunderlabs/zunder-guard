@@ -107,6 +107,9 @@ jobs:
         shell: pwsh
         env:
           ZUNDER_FLOWS_CASES: "400"
+          # Each test still uses native durable I/O and its deliberate concurrency.
+          # Serialize test cases so unrelated journals do not contend for one disk.
+          RUST_TEST_THREADS: "1"
         run: |
           $ErrorActionPreference = 'Stop'
           $cargo = (Get-Command cargo -CommandType Application -ErrorAction Stop).Source

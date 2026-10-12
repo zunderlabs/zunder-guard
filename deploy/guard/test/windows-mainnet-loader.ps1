@@ -5,6 +5,7 @@ param([string]$SourceRoot = (Split-Path $PSScriptRoot -Parent))
 Set-StrictMode -Version Latest
 $ErrorActionPreference='Stop'
 $tests=0
+$jsonWriters=@()
 $Network='mainnet'; $KeyStdin=$false
 function Assert([bool]$Condition,[string]$Name) { if (-not $Condition) { throw "FAIL: $Name" }; $script:tests++ }
 function Refuses([scriptblock]$Code,[string]$Name) {
@@ -17,6 +18,8 @@ foreach ($relative in @('loader/i.ps1','windows/service.ps1')) {
   $tokens=$null; $errors=$null
   $ast=[Management.Automation.Language.Parser]::ParseFile((Join-Path $SourceRoot $relative),[ref]$tokens,[ref]$errors)
   Assert ($errors.Count -eq 0) "parse $relative"
+  $jsonWriter=$ast.Find({ param($candidate) $candidate -is [Management.Automation.Language.FunctionDefinitionAst] -and $candidate.Name -eq 'Write-ZgJson' },$true)
+  $jsonWriters += @{source=$relative;code=[scriptblock]::Create($jsonWriter.Extent.Text)}
   $pathNode = $ast.Find({ param($candidate) $candidate -is [Management.Automation.Language.FunctionDefinitionAst] -and $candidate.Name -eq 'Assert-ZgPath' },$true)
   $secureNode = $ast.Find({ param($candidate) $candidate -is [Management.Automation.Language.FunctionDefinitionAst] -and $candidate.Name -eq 'New-ZgSecureFile' },$true)
   $absenceCatch = $secureNode.Find({ param($candidate) $candidate -is [Management.Automation.Language.CatchClauseAst] },$true)
@@ -114,6 +117,30 @@ if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
   }
   try {
     $script:raceDestination=$null
+    foreach ($writer in $jsonWriters) {
+      . ($writer.code)
+      $jsonPath=Join-Path $secureFixture 'transaction.json'
+      Write-ZgJson $jsonPath @{sequence=1;phase='prepared'}
+      $jsonItem=[IO.FileInfo]::new($jsonPath)
+      $jsonAcl=if ($PSVersionTable.PSVersion.Major -ge 6) { [IO.FileSystemAclExtensions]::GetAccessControl($jsonItem) } else { $jsonItem.GetAccessControl() }
+      $jsonSddl=$jsonAcl.GetSecurityDescriptorSddlForm([Security.AccessControl.AccessControlSections]::All)
+      Write-ZgJson $jsonPath @{sequence=2;phase='key-check-required'}
+      $value=[IO.File]::ReadAllText($jsonPath) | ConvertFrom-Json
+      Assert ($value.sequence -eq 2 -and $value.phase -ceq 'key-check-required') "actual transaction replacement $($writer.source)"
+      Assert (@([IO.Directory]::GetFiles($secureFixture,'transaction.json*')).Count -eq 1) "atomic replacement leaves no backup/pending file $($writer.source)"
+      $afterJsonAcl=if ($PSVersionTable.PSVersion.Major -ge 6) { [IO.FileSystemAclExtensions]::GetAccessControl($jsonItem) } else { $jsonItem.GetAccessControl() }
+      Assert ($afterJsonAcl.GetOwner([Security.Principal.SecurityIdentifier]).Value -ceq 'S-1-5-32-544' -and $afterJsonAcl.AreAccessRulesProtected) "replacement retains trusted owner and protected DACL $($writer.source)"
+      Assert ($afterJsonAcl.GetSecurityDescriptorSddlForm([Security.AccessControl.AccessControlSections]::All) -ceq $jsonSddl) "replacement retains exact ACL $($writer.source)"
+      if ($PSVersionTable.PSVersion.Major -le 5) {
+        $pending=$jsonPath+'.counterexample'
+        [IO.File]::WriteAllText($pending,'preserve-source')
+        Refuses { [IO.File]::Replace($pending,$jsonPath,$null) } 'PS5.1 bare-null backup counterexample'
+        Assert ([IO.File]::ReadAllText($pending) -ceq 'preserve-source') 'bare-null refusal preserves pending source'
+        Assert (([IO.File]::ReadAllText($jsonPath) | ConvertFrom-Json).sequence -eq 2) 'bare-null refusal preserves transaction'
+        [IO.File]::Delete($pending)
+      }
+      [IO.File]::Delete($jsonPath)
+    }
     $destination=Join-Path $secureFixture 'new.bin'
     $inputStream=[IO.MemoryStream]::new([byte[]](1,2,3,4))
     try { Copy-ZgSecureFile $inputStream $destination } finally { $inputStream.Dispose() }

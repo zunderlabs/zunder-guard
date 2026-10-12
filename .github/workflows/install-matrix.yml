@@ -13,6 +13,7 @@ on:
       diagnostic: {type: boolean, default: false}
       profile: {type: string, default: all}
       target: {type: string, default: all}
+      scenario: {type: string, default: all}
   workflow_dispatch:
     inputs:
       tag: {type: string, required: true}
@@ -22,11 +23,19 @@ on:
       diagnostic: {type: boolean, default: true}
       profile: {type: choice, options: [all, nightly], default: all}
       target: {type: choice, options: [all, linux-amd64, linux-arm64, linux-container, native, docker, aws-stack, linux-mainnet, native-mainnet, mainnet-setup], default: all}
+      scenario: {type: choice, options: [all, fresh, upgrade], default: all}
 permissions:
   contents: read
+# Only a standalone diagnostic owns the global account group here. Called jobs
+# inherit ownership from the structurally admitted verify/nightly workflow.
+concurrency:
+  group: ${{ contains(github.workflow_ref, '/.github/workflows/install-matrix.yml@') && 'guard-e2e-testnet' || format('guard-c6-install-inner-{0}', github.run_id) }}
+  cancel-in-progress: false
+  queue: max
 env:
   INSTALL_MATRIX_PROFILE: ${{ inputs.profile }}
   INSTALL_MATRIX_TARGET: ${{ inputs.target }}
+  INSTALL_MATRIX_SCENARIO: ${{ inputs.scenario }}
 jobs:
   subjects:
     runs-on: ubuntu-24.04
@@ -61,7 +70,8 @@ jobs:
           [ "$GITHUB_REPOSITORY" = zunderlabs/zunder-guard ]
           [ "$INSTALL_MATRIX_PROFILE" = all ] || [ "$INSTALL_MATRIX_PROFILE" = nightly ]
           case "$INSTALL_MATRIX_TARGET" in all|linux-amd64|linux-arm64|linux-container|native|docker|aws-stack|linux-mainnet|native-mainnet|mainnet-setup) ;; *) exit 1 ;; esac
-          if [ "$INSTALL_MATRIX_TARGET" != all ]; then
+          case "$INSTALL_MATRIX_SCENARIO" in all|fresh|upgrade) ;; *) exit 1 ;; esac
+          if [ "$INSTALL_MATRIX_TARGET" != all ] || [ "$INSTALL_MATRIX_SCENARIO" != all ]; then
             [ "$DIAGNOSTIC" = true ] || exit 1
             [ "$INSTALL_MATRIX_PROFILE" = all ] || exit 1
           fi
@@ -82,11 +92,8 @@ jobs:
     if: ${{ (inputs.target == 'all' || inputs.target == 'linux-amd64') }}
     strategy:
       fail-fast: false
-      matrix: {scenario: [fresh, upgrade]}
-    concurrency:
-      group: guard-e2e-testnet
-      cancel-in-progress: false
-      queue: max
+      matrix:
+        scenario: ${{ fromJSON(inputs.scenario == 'fresh' && '["fresh"]' || inputs.scenario == 'upgrade' && '["upgrade"]' || '["fresh","upgrade"]') }}
     needs: subjects
     environment: e2e
     runs-on: ubuntu-24.04
@@ -104,9 +111,21 @@ jobs:
           sudo chmod 666 /dev/kvm
           python -m pip install --require-hashes --only-binary=:all: -r deploy/guard/harness/requirements-runtime.lock
           python -m pip install --no-deps --no-build-isolation -e ./deploy/guard/harness
+      - name: Admit exact caller whole-run C6 ownership before custody
+        env:
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+          WORKFLOW_SHA: ${{ github.workflow_sha }}
+          CALLER_SHA: ${{ github.sha }}
+          CALLER_REF: ${{ github.ref }}
+          CALLER_REPOSITORY: ${{ github.repository }}
+          CALLER_EVENT: ${{ github.event_name }}
+          DIAGNOSTIC: ${{ inputs.diagnostic }}
+        shell: bash
+        run: python -m guard_harness.c6_owner --callee install-matrix.yml --profile "$INSTALL_MATRIX_PROFILE"
       - name: I1 authenticated paper and protected Testnet lifecycle
         shell: bash
         env:
+          DIAGNOSTIC: ${{ inputs.diagnostic }}
           ACCOUNT: ${{ vars.E2E_TESTNET_ACCOUNT }}
           PAPER_ACCOUNT: ${{ vars.E2E_TESTNET_ACCOUNT }}
           WALLET_FRAME: ${{ secrets.E2E_TESTNET_API_WALLET_KEY }}
@@ -123,11 +142,8 @@ jobs:
     if: ${{ inputs.target == 'all' || inputs.target == 'linux-container' }}
     strategy:
       fail-fast: false
-      matrix: {scenario: [fresh, upgrade]}
-    concurrency:
-      group: guard-e2e-testnet
-      cancel-in-progress: false
-      queue: max
+      matrix:
+        scenario: ${{ fromJSON(inputs.scenario == 'fresh' && '["fresh"]' || inputs.scenario == 'upgrade' && '["upgrade"]' || '["fresh","upgrade"]') }}
     needs: subjects
     environment: e2e
     runs-on: ubuntu-24.04
@@ -145,9 +161,21 @@ jobs:
           sudo chmod 666 /dev/kvm
           python -m pip install --require-hashes --only-binary=:all: -r deploy/guard/harness/requirements-runtime.lock
           python -m pip install --no-deps --no-build-isolation -e ./deploy/guard/harness
+      - name: Admit exact caller whole-run C6 ownership before custody
+        env:
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+          WORKFLOW_SHA: ${{ github.workflow_sha }}
+          CALLER_SHA: ${{ github.sha }}
+          CALLER_REF: ${{ github.ref }}
+          CALLER_REPOSITORY: ${{ github.repository }}
+          CALLER_EVENT: ${{ github.event_name }}
+          DIAGNOSTIC: ${{ inputs.diagnostic }}
+        shell: bash
+        run: python -m guard_harness.c6_owner --callee install-matrix.yml --profile "$INSTALL_MATRIX_PROFILE"
       - name: I6 authenticated paper and protected Testnet lifecycle
         shell: bash
         env:
+          DIAGNOSTIC: ${{ inputs.diagnostic }}
           ACCOUNT: ${{ vars.E2E_TESTNET_ACCOUNT }}
           PAPER_ACCOUNT: ${{ vars.E2E_TESTNET_ACCOUNT }}
           WALLET_FRAME: ${{ secrets.E2E_TESTNET_API_WALLET_KEY }}
@@ -163,11 +191,8 @@ jobs:
   linux-arm64:
     strategy:
       fail-fast: false
-      matrix: {scenario: [fresh, upgrade]}
-    concurrency:
-      group: guard-e2e-testnet
-      cancel-in-progress: false
-      queue: max
+      matrix:
+        scenario: ${{ fromJSON(inputs.scenario == 'fresh' && '["fresh"]' || inputs.scenario == 'upgrade' && '["upgrade"]' || '["fresh","upgrade"]') }}
     if: ${{ inputs.profile != 'nightly' && (inputs.target == 'all' || inputs.target == 'linux-arm64') }}
     needs: subjects
     environment: e2e
@@ -183,9 +208,21 @@ jobs:
       - run: |
           python -m pip install --require-hashes --only-binary=:all: -r deploy/guard/harness/requirements-runtime.lock
           python -m pip install --no-deps --no-build-isolation -e ./deploy/guard/harness
+      - name: Admit exact caller whole-run C6 ownership before custody
+        env:
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+          WORKFLOW_SHA: ${{ github.workflow_sha }}
+          CALLER_SHA: ${{ github.sha }}
+          CALLER_REF: ${{ github.ref }}
+          CALLER_REPOSITORY: ${{ github.repository }}
+          CALLER_EVENT: ${{ github.event_name }}
+          DIAGNOSTIC: ${{ inputs.diagnostic }}
+        shell: bash
+        run: python -m guard_harness.c6_owner --callee install-matrix.yml --profile "$INSTALL_MATRIX_PROFILE"
       - name: I2 authenticated paper and protected Testnet lifecycle
         shell: bash
         env:
+          DIAGNOSTIC: ${{ inputs.diagnostic }}
           ACCOUNT: ${{ vars.E2E_TESTNET_ACCOUNT }}
           PAPER_ACCOUNT: ${{ vars.E2E_TESTNET_ACCOUNT }}
           WALLET_FRAME: ${{ secrets.E2E_TESTNET_API_WALLET_KEY }}
@@ -202,15 +239,11 @@ jobs:
     if: ${{ (inputs.target == 'all' || inputs.target == 'native') }}
     needs: subjects
     environment: e2e
-    concurrency:
-      group: guard-e2e-testnet
-      cancel-in-progress: false
-      queue: max
     strategy:
       fail-fast: false
       matrix:
         variant: [macos, windows2022-ps51, windows2022-ps7, windows2025-ps51, windows2025-ps7]
-        scenario: [fresh, upgrade]
+        scenario: ${{ fromJSON(inputs.scenario == 'fresh' && '["fresh"]' || inputs.scenario == 'upgrade' && '["upgrade"]' || '["fresh","upgrade"]') }}
         include:
           - {os: macos-15, shell: sh, row: I3, variant: macos}
           - {os: windows-2022, shell: powershell.exe, row: I4, variant: windows2022-ps51}
@@ -231,6 +264,17 @@ jobs:
         run: |
           python -m pip install --require-hashes --only-binary=:all: -r deploy/guard/harness/requirements-runtime.lock
           python -m pip install --no-deps --no-build-isolation -e ./deploy/guard/harness
+      - name: Admit exact caller whole-run C6 ownership before custody
+        env:
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+          WORKFLOW_SHA: ${{ github.workflow_sha }}
+          CALLER_SHA: ${{ github.sha }}
+          CALLER_REF: ${{ github.ref }}
+          CALLER_REPOSITORY: ${{ github.repository }}
+          CALLER_EVENT: ${{ github.event_name }}
+          DIAGNOSTIC: ${{ inputs.diagnostic }}
+        shell: bash
+        run: python -m guard_harness.c6_owner --callee install-matrix.yml --profile "$INSTALL_MATRIX_PROFILE"
       - name: Released-byte paper and read-only native testnet lifecycles
         shell: bash
         env:
@@ -264,11 +308,9 @@ jobs:
     if: ${{ (inputs.target == 'all' || inputs.target == 'docker') }}
     strategy:
       fail-fast: false
-      matrix: {scenario: [fresh, upgrade], channel: [docker, compose]}
-    concurrency:
-      group: guard-e2e-testnet
-      cancel-in-progress: false
-      queue: max
+      matrix:
+        scenario: ${{ fromJSON(inputs.scenario == 'fresh' && '["fresh"]' || inputs.scenario == 'upgrade' && '["upgrade"]' || '["fresh","upgrade"]') }}
+        channel: [docker, compose]
     needs: subjects
     environment: e2e
     runs-on: ubuntu-24.04
@@ -288,6 +330,17 @@ jobs:
       - run: |
           python -m pip install --require-hashes --only-binary=:all: -r deploy/guard/harness/requirements-runtime.lock
           python -m pip install --no-deps --no-build-isolation -e ./deploy/guard/harness
+      - name: Admit exact caller whole-run C6 ownership before custody
+        env:
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+          WORKFLOW_SHA: ${{ github.workflow_sha }}
+          CALLER_SHA: ${{ github.sha }}
+          CALLER_REF: ${{ github.ref }}
+          CALLER_REPOSITORY: ${{ github.repository }}
+          CALLER_EVENT: ${{ github.event_name }}
+          DIAGNOSTIC: ${{ inputs.diagnostic }}
+        shell: bash
+        run: python -m guard_harness.c6_owner --callee install-matrix.yml --profile "$INSTALL_MATRIX_PROFILE"
       - name: I5 signed digest Docker and Compose paper and Testnet lifecycle
         shell: bash
         env:

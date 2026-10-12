@@ -57,14 +57,38 @@ def test_staging_accepts_template_skip_only_for_uncancelled_rc(
     assert admitted("staging", {"stable-template": result}, rc=rc, cancelled=cancelled) == expected
 
 
-@pytest.mark.parametrize("job", ("install-matrix", "journeys"))
 @pytest.mark.parametrize("cancelled,result", itertools.product((False, True), RESULTS))
-def test_rc_children_run_after_successful_staging_despite_intentionally_skipped_ancestor(
-    job: str, cancelled: bool, result: str
+def test_rc_journeys_run_after_successful_staging_despite_intentionally_skipped_ancestor(
+    cancelled: bool, result: str
 ) -> None:
     assert admitted(
-        job, {"staging": result}, rc=True, cancelled=cancelled, ancestors=("skipped",)
+        "journeys", {"staging": result}, rc=True, cancelled=cancelled, ancestors=("skipped",)
     ) == (not cancelled and result == "success")
+
+
+@pytest.mark.parametrize("rc,cancelled", itertools.product((False, True), (False, True)))
+@pytest.mark.parametrize("staging,journeys", itertools.product(RESULTS, repeat=2))
+def test_readers_require_successful_staging_and_completed_journeys(
+    rc: bool, cancelled: bool, staging: str, journeys: str
+) -> None:
+    # An intentionally skipped RC-only stable ancestor must not suppress readers,
+    # while a failed/cancelled/skipped trader result must never release them.
+    assert admitted(
+        "install-matrix",
+        {"staging": staging, "journeys": journeys},
+        rc=rc,
+        cancelled=cancelled,
+        ancestors=("skipped" if rc else "success",),
+    ) == (not cancelled and staging == "success" and journeys == "success")
+
+
+def test_journeys_remain_independent_of_install_matrix() -> None:
+    body = re.search(
+        r"^  journeys:\n(.*?)(?=^  [a-z][a-z-]*:|\Z)", WORKFLOW.read_text(), re.M | re.S
+    )
+    assert body is not None
+    assert re.search(r"^    needs: staging$", body[1], re.M)
+    assert "needs.install-matrix" not in condition("journeys")
 
 
 @pytest.mark.parametrize("cancelled", (False, True))

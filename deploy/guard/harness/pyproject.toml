@@ -6,10 +6,10 @@ build-backend = "setuptools.build_meta"
 name = "zunder-guard-harness"
 version = "0.1.0"
 requires-python = ">=3.11"
-dependencies = ["jsonschema>=4.23,<5", "hyperliquid-python-sdk==0.24.0", "eth-account>=0.13,<0.14"]
+dependencies = ["jsonschema>=4.23,<5", "hyperliquid-python-sdk==0.24.0", "eth-account>=0.13,<0.14", "PyYAML==6.0.3"]
 
 [project.optional-dependencies]
-dev = ["mypy>=1.15,<2", "pytest>=8,<10", "ruff==0.17.0", "types-jsonschema>=4.23"]
+dev = ["mypy>=1.15,<2", "pytest>=8,<10", "ruff==0.17.0", "types-jsonschema>=4.23", "types-PyYAML==6.0.12.20250915"]
 
 [tool.setuptools.packages.find]
 where = ["src"]

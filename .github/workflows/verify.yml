@@ -14,8 +14,9 @@ on:
 permissions:
   contents: read
 concurrency:
-  group: guard-release-lifecycle
+  group: guard-e2e-testnet
   cancel-in-progress: false
+  queue: max
 jobs:
   stable-template:
     # Stable immutable templates require the production-scoped S3 publisher, never e2e.
@@ -268,8 +269,8 @@ jobs:
           retention-days: 7
 
   install-matrix:
-    needs: staging
-    if: ${{ !cancelled() && needs.staging.result == 'success' }}
+    needs: [staging, journeys]
+    if: ${{ !cancelled() && needs.staging.result == 'success' && needs.journeys.result == 'success' }}
     permissions:
       contents: read
       actions: read

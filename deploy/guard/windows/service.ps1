@@ -118,7 +118,9 @@ function Write-ZgJson([string]$Path,$Value) {
   $file = [IO.FileStream]::new($next,[IO.FileMode]::CreateNew,[IO.FileAccess]::Write,[IO.FileShare]::None)
   try { $file.Write($bytes,0,$bytes.Length); $file.Flush($true) } finally { $file.Dispose() }
   Set-ZgAcl $next ''
-  if ([IO.File]::Exists($Path)) { [IO.File]::Replace($next,$Path,$null) } else { [IO.File]::Move($next,$Path) }
+  # A bare $null becomes an empty .NET string in Windows PowerShell 5.1.
+  # Preserve atomic replacement with a genuine null backup filename.
+  if ([IO.File]::Exists($Path)) { [IO.File]::Replace($next,$Path,[NullString]::Value) } else { [IO.File]::Move($next,$Path) }
 }
 function Get-ZgManifestHash([string]$Sums,[string]$Name) {
   $found = @()
@@ -377,7 +379,7 @@ function Install-ZgImage([string]$Directory) {
     [IO.File]::Copy($source,$next,$false); Set-ZgAcl $next $ZgSid
     $stream = [IO.FileStream]::new($next,[IO.FileMode]::Open,[IO.FileAccess]::ReadWrite,[IO.FileShare]::None)
     try { $stream.Flush($true) } finally { $stream.Dispose() }
-    if ([IO.File]::Exists($destination)) { [IO.File]::Replace($next,$destination,$null) } else { [IO.File]::Move($next,$destination) }
+    if ([IO.File]::Exists($destination)) { [IO.File]::Replace($next,$destination,[NullString]::Value) } else { [IO.File]::Move($next,$destination) }
   }
 }
 function Ensure-ZgService {
@@ -736,7 +738,7 @@ function Invoke-ZgLifecycle {
         $cleanupOwnedMutation = $true
         Disable-ZgService
         if ((Get-ZgJournalHash) -cne $ZgTransaction.journal_hash) { throw 'Journal changed while quiescing; rollback refused.' }
-        $next=$ZgExe+'.recover-'+[Guid]::NewGuid().ToString('N'); [IO.File]::Copy($backup,$next,$false); Set-ZgAcl $next $ZgSid; [IO.File]::Replace($next,$ZgExe,$null)
+        $next=$ZgExe+'.recover-'+[Guid]::NewGuid().ToString('N'); [IO.File]::Copy($backup,$next,$false); Set-ZgAcl $next $ZgSid; [IO.File]::Replace($next,$ZgExe,[NullString]::Value)
         Write-ZgJson $ZgBinding ([IO.File]::ReadAllText($oldBinding) | Microsoft.PowerShell.Utility\ConvertFrom-Json); Set-ZgAcl $ZgBinding $ZgSid
         Invoke-ZgGuard @('service','check','--binding',$ZgBinding)
         $ZgTransaction.tag=$ZgTransaction.old_tag; $ZgTransaction.release=$ZgTransaction.old_release; $ZgTransaction.helper_hash=$ZgTransaction.old_helper_hash; $ZgTransaction.new_hash=$ZgTransaction.old_hash
