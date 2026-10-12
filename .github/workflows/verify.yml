@@ -19,7 +19,7 @@ concurrency:
 jobs:
   stable-template:
     # Stable immutable templates require the production-scoped S3 publisher, never e2e.
-    if: ${{ !contains(inputs.tag, '-rc.') }}
+    if: ${{ !cancelled() && !contains(inputs.tag, '-rc.') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 35
     environment: promote
@@ -93,7 +93,7 @@ jobs:
         run: python3 deploy/guard/github/publish-aws-template.py --release-dir "$RUNNER_TEMP/stable-template"
   staging:
     needs: stable-template
-    if: ${{ always() && (needs.stable-template.result == 'success' || needs.stable-template.result == 'skipped') }}
+    if: ${{ !cancelled() && (needs.stable-template.result == 'success' || (contains(inputs.tag, '-rc.') && needs.stable-template.result == 'skipped')) }}
     outputs:
       previous_tag: ${{ steps.predecessor.outputs.previous_tag }}
       previous_commit: ${{ steps.predecessor.outputs.previous_commit }}
@@ -269,6 +269,7 @@ jobs:
 
   install-matrix:
     needs: staging
+    if: ${{ !cancelled() && needs.staging.result == 'success' }}
     permissions:
       contents: read
       actions: read
@@ -288,6 +289,7 @@ jobs:
   journeys:
     name: Released trading and purchase journeys
     needs: staging
+    if: ${{ !cancelled() && needs.staging.result == 'success' }}
     permissions:
       contents: read
       actions: read
@@ -313,6 +315,7 @@ jobs:
   gate:
     name: Authenticate every required journey and publish gated state
     needs: [staging, install-matrix, journeys]
+    if: ${{ !cancelled() && needs.staging.result == 'success' && needs.install-matrix.result == 'success' && needs.journeys.result == 'success' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 35
     environment: e2e
@@ -400,7 +403,7 @@ jobs:
   promote:
     name: Promote complete stable gate and smoke canonical installs
     needs: gate
-    if: ${{ !contains(inputs.tag, '-rc.') }}
+    if: ${{ !cancelled() && needs.gate.result == 'success' && !contains(inputs.tag, '-rc.') }}
     permissions:
       contents: write
       actions: read
@@ -416,3 +419,30 @@ jobs:
       commit: ${{ inputs.commit }}
       run_id: ${{ format('{0}', github.run_id) }}
       attempt: ${{ format('{0}', github.run_attempt) }}
+
+  completion:
+    name: Require the complete release verification outcome
+    if: ${{ always() }}
+    needs: [stable-template, staging, install-matrix, journeys, gate, promote]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: Refuse incomplete or skipped required release work
+        shell: python
+        env:
+          TAG: ${{ inputs.tag }}
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          import json, os, re
+          tag = os.environ['TAG']
+          if not re.fullmatch(r'v[0-9]+\.[0-9]+\.[0-9]+(?:-rc\.[1-9][0-9]*)?', tag):
+              raise RuntimeError('Invalid release tag')
+          results = json.loads(os.environ['RESULTS'])
+          expected = dict.fromkeys(('stable-template', 'staging', 'install-matrix', 'journeys', 'gate', 'promote'), 'success')
+          if '-rc.' in tag:
+              expected.update({'stable-template': 'skipped', 'promote': 'skipped'})
+          if not isinstance(results, dict) or set(results) != set(expected):
+              raise RuntimeError('Incomplete job results')
+          if not all(isinstance(results[name], dict) and results[name].get('result') == state for name, state in expected.items()):
+              raise RuntimeError('Required release work did not complete')
