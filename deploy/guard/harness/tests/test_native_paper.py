@@ -1,8 +1,159 @@
+import os
+import plistlib
+import subprocess
 from pathlib import Path
 
 import pytest
 
-from guard_harness.native_paper import LifecycleError, retained, verify_retained
+from guard_harness.native_paper import LifecycleError, Paper, retained, verify_retained
+
+
+@pytest.mark.parametrize("domains", [("user",), ("gui",), (), ("user", "gui")])
+def test_crash_discovers_only_owned_nonroot_homebrew_service_domain(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, domains: tuple[str, ...]
+) -> None:
+    paper, plist, arguments, uid = launchd_fixture(tmp_path, monkeypatch)
+    probes: list[str] = []
+    kills: list[list[str]] = []
+
+    def probe(words: list[str], **kwargs: object) -> subprocess.CompletedProcess[bytes]:
+        assert words[:2] == ["launchctl", "print"]
+        target = words[2]
+        assert target in {
+            f"user/{uid}/homebrew.mxcl.zunder-guard",
+            f"gui/{uid}/homebrew.mxcl.zunder-guard",
+        }
+        probes.append(target)
+        if target.split("/")[0] not in domains:
+            return subprocess.CompletedProcess(words, 113, b"", b"private probe body")
+        return subprocess.CompletedProcess(
+            words, 0, launchd_text(target, plist, paper, arguments), b""
+        )
+
+    monkeypatch.setattr("guard_harness.native_paper.subprocess.run", probe)
+
+    def capture_kill(words: list[str]) -> str:
+        kills.append(words)
+        return ""
+
+    monkeypatch.setattr(paper, "command", capture_kill)
+    if len(domains) == 1:
+        paper.crash()
+        assert kills == [
+            ["launchctl", "kill", "SIGKILL", f"{domains[0]}/{uid}/homebrew.mxcl.zunder-guard"]
+        ]
+    else:
+        with pytest.raises(LifecycleError, match="missing or ambiguous"):
+            paper.crash()
+        assert not kills
+    assert len(probes) == 2 and not any("system" in value for value in probes)
+    for path in tmp_path.glob("step-*.log"):
+        assert path.read_text() == "[owned launchd probe output withheld]\n"
+
+
+def launchd_fixture(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> tuple[Paper, Path, list[str], int]:
+    uid = os.getuid() or 501
+    monkeypatch.setattr("guard_harness.native_paper.os.getuid", lambda: uid)
+    paper = object.__new__(Paper)
+    paper.brew, paper.sequence, paper.work = True, 0, tmp_path
+    paper.env = {"HOME": str(tmp_path)}
+    paper.home = tmp_path / "paper-state"
+    paper.binary = tmp_path / "installed-binary"
+    paper.binary.write_bytes(b"authenticated binary fixture")
+    opt = tmp_path / "homebrew-opt-binary"
+    opt.symlink_to(paper.binary)  # Real Homebrew plist uses opt_bin, harness uses prefix/bin.
+    arguments = [str(opt), "run", "--network", "paper"]
+    agents = tmp_path / "Library/LaunchAgents"
+    agents.mkdir(parents=True)
+    plist = agents / "homebrew.mxcl.zunder-guard.plist"
+    plist.write_bytes(
+        plistlib.dumps(
+            {
+                "Label": "homebrew.mxcl.zunder-guard",
+                "ProgramArguments": arguments,
+                "EnvironmentVariables": {"ZUNDER_GUARD_HOME": str(paper.home)},
+            }
+        )
+    )
+    if os.stat(plist).st_uid != uid:
+        original = Path.lstat
+
+        def metadata(path: Path) -> os.stat_result:
+            fields = list(original(path))
+            fields[4] = uid
+            return os.stat_result(fields)
+
+        monkeypatch.setattr(Path, "lstat", metadata)
+    return paper, plist, arguments, uid
+
+
+def launchd_text(target: str, plist: Path, paper: Paper, arguments: list[str]) -> bytes:
+    return (
+        target
+        + " = {\n path = "
+        + str(plist.resolve())
+        + "\n program = "
+        + str(paper.binary)
+        + "\n arguments = {\n"
+        + "\n".join(arguments)
+        + "\n }\n environment = {\n"
+        + " ZUNDER_GUARD_HOME => "
+        + str(paper.home)
+        + "\n }\n pid = 123\n}\n"
+    ).encode()
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "root",
+        "plist-link",
+        "writable",
+        "foreign-program",
+        "foreign-home",
+        "foreign-loaded",
+        "bad-status",
+        "missing-pid",
+    ],
+)
+def test_crash_refuses_unsafe_registration_or_unknown_domain_probe(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mutation: str
+) -> None:
+    paper, plist, arguments, uid = launchd_fixture(tmp_path, monkeypatch)
+    if mutation == "root":
+        monkeypatch.setattr("guard_harness.native_paper.os.getuid", lambda: 0)
+    elif mutation == "plist-link":
+        renamed = plist.with_suffix(".actual")
+        plist.rename(renamed)
+        plist.symlink_to(renamed)
+    elif mutation == "writable":
+        plist.chmod(0o666)
+    elif mutation in {"foreign-program", "foreign-home"}:
+        data = plistlib.loads(plist.read_bytes())
+        if mutation == "foreign-program":
+            data["ProgramArguments"] = ["/foreign/never-execute", "run", "--network", "paper"]
+        else:
+            data["EnvironmentVariables"]["ZUNDER_GUARD_HOME"] = "/foreign/home"
+        plist.write_bytes(plistlib.dumps(data))
+
+    def probe(words: list[str], **kwargs: object) -> subprocess.CompletedProcess[bytes]:
+        text = launchd_text(words[2], plist, paper, arguments)
+        if mutation == "foreign-loaded":
+            text = text.replace(b"--network\npaper", b"--network\nmainnet")
+        elif mutation == "missing-pid":
+            text = text.replace(b" pid = 123\n", b"")
+        return subprocess.CompletedProcess(
+            words, 5 if mutation == "bad-status" else 0, text, b"private body"
+        )
+
+    monkeypatch.setattr("guard_harness.native_paper.subprocess.run", probe)
+    monkeypatch.setattr(
+        paper, "command", lambda words: pytest.fail("unadmitted job cannot be killed")
+    )
+    with pytest.raises(LifecycleError):
+        paper.crash()
 
 
 def paper_state(home: Path) -> dict[str, bytes]:

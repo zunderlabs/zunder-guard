@@ -115,8 +115,13 @@ for (const split of [false, true, 'mixed', 'pseudo-mixed'] as const) test(`maske
         expect(JSON.stringify(args.slice(1))).not.toContain(secret);
         return Reflect.apply(method, receiver, args);
       } });
+      page.evaluateHandle = new Proxy(page.evaluateHandle, { apply(method, receiver, args) {
+        expect(JSON.stringify(args.slice(1))).not.toContain(secret);
+        return Reflect.apply(method, receiver, args);
+      } });
       page.screenshot = new Proxy(page.screenshot, { apply(method, receiver, args) {
         for (const mask of args[0]?.mask ?? []) expect(String(mask)).not.toContain(secret);
+        expect(args[0]?.style ?? '').not.toContain(secret);
         return Reflect.apply(method, receiver, args);
       } });
       process.env['GUARD_BROWSER_DIAGNOSTICS'] = join(root, secret.slice(-4));
@@ -132,6 +137,59 @@ for (const split of [false, true, 'mixed', 'pseudo-mixed'] as const) test(`maske
         const html = await readFile(join(root, secret.slice(-4), 'pricing-buy-pro/page.html'), 'utf8');
         expect(html).not.toContain(secret);
         expect(html).not.toContain('<span>' + secret.slice(-4) + '</span>');
+        expect(await page.locator('input').evaluate(element => element === document.activeElement)).toBe(true);
+      } finally { capture.dispose(); await context.close(); }
+    }
+    expect(screenshots[0]?.equals(screenshots[1] ?? Buffer.alloc(0))).toBe(true);
+  } finally { delete process.env['GUARD_BROWSER_DIAGNOSTICS']; delete process.env['GUARD_ACCESS_CLIENT_SECRET'];
+    await rm(root, { recursive: true, force: true }); }
+});
+
+for (const transitions of [false, true]) test(`private overflowing text and positioned pseudo paint cannot escape screenshot masks (transitions=${transitions})`, async ({ browser }) => {
+  const root = await mkdtemp(join(tmpdir(), 'guard-click-overflow-'));
+  const screenshots: Buffer[] = [];
+  try {
+    for (const suffix of ['AAAA', 'BBBB']) {
+      const secret = 'private-secret-' + suffix;
+      const clip = transitions ? 'inset(-400px)' : 'none';
+      const transition = transitions ? 'transition:clip-path 60s!important;' : '';
+      process.env['GUARD_BROWSER_DIAGNOSTICS'] = join(root, suffix);
+      process.env['GUARD_ACCESS_CLIENT_SECRET'] = secret;
+      const context = await browser.newContext();
+      const page = await context.newPage();
+      const capture = stagingClickDiagnostics(page, 'pricing-buy-pro');
+      try {
+        await page.route('**/*', route => route.fulfill({ status: 200, contentType: 'text/html',
+          body: '<meta name="zunder-deployment-profile" content="staging"><h1>Public layout remains visible</h1>'
+            + '<style>#overflow{clip-path:none!important}#overflow span{clip-path:none!important}#overflow::before{content:"' + secret + '";position:absolute;left:300px;top:100px;visibility:visible}</style>'
+            + '<div id="overflow" style="width:8px;height:8px;white-space:nowrap;overflow:visible;clip-path:' + clip + '!important;' + transition + '">'
+            + '<span style="visibility:visible;display:block;width:8px;clip-path:' + clip + '!important;' + transition + '">' + secret + '</span></div>'
+            + '<button data-testid="pricing-buy-pro" style="display:none">Public control</button>' }));
+        await admitStagingDocument(page, '/pricing', ORIGIN);
+        const restored = await page.evaluateHandle(() => {
+          const entries = [...document.querySelectorAll('#overflow, #overflow span')].map(element => {
+            const bounds = element.getBoundingClientRect();
+            return { element, style: element.getAttribute('style'), clip: getComputedStyle(element).clipPath,
+              bounds: [bounds.x, bounds.y, bounds.width, bounds.height] };
+          });
+          const focused = document.activeElement;
+          return () => document.activeElement === focused && entries.every(({ element, style, clip, bounds }) => {
+            const now = element.getBoundingClientRect();
+            return element.getAttribute('style') === style && getComputedStyle(element).clipPath === clip
+              && !element.getAnimations().some(animation => animation instanceof CSSTransition && animation.transitionProperty === 'clip-path')
+              && [now.x, now.y, now.width, now.height].every((value, index) => value === bounds[index]);
+          });
+        });
+        fastFixtureClick(page, 'pricing-buy-pro');
+        await expect(capture.click()).rejects.toThrow();
+        expect(await restored.evaluate(check => check())).toBe(true);
+        await restored.dispose();
+        screenshots.push(await readFile(join(root, suffix, 'pricing-buy-pro/screenshot.png')));
+        const html = await readFile(join(root, suffix, 'pricing-buy-pro/page.html'), 'utf8');
+        expect(html).toContain('Public layout remains visible');
+        expect(html).not.toContain(secret);
+        // Screenshot CSS must be temporary and leave the live page layout/paint intact.
+        expect(await page.locator('#overflow span').isVisible()).toBe(true);
       } finally { capture.dispose(); await context.close(); }
     }
     expect(screenshots[0]?.equals(screenshots[1] ?? Buffer.alloc(0))).toBe(true);

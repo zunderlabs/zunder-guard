@@ -388,6 +388,22 @@ def validate_boundary(boundary: str, execution_role: str) -> None:
         raise AwsError("explicit same-sandbox permissions boundary required")
 
 
+def remote_phase(
+    stack: Stack,
+    receipt: dict[str, object],
+    phase: str,
+    script: str,
+    *,
+    expected_stage: str,
+    timeout: int = 900,
+) -> dict[str, Any]:
+    receipt["active_phase"] = phase
+    result = stack.remote(script, timeout=timeout)
+    if not isinstance(result, dict) or result.get("stage") != expected_stage:
+        raise AwsError("instance lifecycle phase did not produce its safe receipt")
+    return result
+
+
 def execute(
     current: Release,
     previous: Release,
@@ -442,21 +458,50 @@ def execute(
         receipt["template_launch"] = launch | {
             "template_sha256": hashlib.sha256(current.asset("cloudformation.yaml")).hexdigest()
         }
+        receipt["active_phase"] = "runtime-lock-copy"
         copy_runtime_lock(stack)
+        receipt["completed_phase"] = "runtime-lock-copy"
         setup = (
-            "set -eu\numask 077\napt-get update >/dev/null 2>&1\n"
-            "apt-get install -y python3-venv unzip >/dev/null 2>&1\n"
-            + "printf %s "
-            + shlex.quote(encoded)
-            + " | base64 -d >/opt/guard-install-e2e/payload.zip\n"
-            + "printf '%s  %s\\n' "
-            + shlex.quote(digest)
-            + " /opt/guard-install-e2e/payload.zip | sha256sum -c - >/dev/null\n"
-            + "unzip -q /opt/guard-install-e2e/payload.zip -d /opt/guard-install-e2e\n"
-            + "python3 -m venv /opt/guard-install-e2e/venv\n"
-            "/opt/guard-install-e2e/venv/bin/pip install --require-hashes --only-binary=:all: "
-            "-r /opt/guard-install-e2e/requirements-runtime.lock >/dev/null 2>&1\n"
+            (
+                "system-dependencies",
+                "apt-get update >/dev/null 2>&1\n"
+                "apt-get install -y python3-venv unzip >/dev/null 2>&1\n",
+            ),
+            (
+                "authenticated-payload",
+                "printf %s "
+                + shlex.quote(encoded)
+                + " | base64 -d >/opt/guard-install-e2e/payload.zip\n"
+                + "printf '%s  %s\\n' "
+                + shlex.quote(digest)
+                + " /opt/guard-install-e2e/payload.zip | sha256sum -c - >/dev/null\n"
+                + "unzip -q /opt/guard-install-e2e/payload.zip -d /opt/guard-install-e2e\n",
+            ),
+            ("python-venv", "python3 -m venv /opt/guard-install-e2e/venv\n"),
+            (
+                "locked-dependencies",
+                "/opt/guard-install-e2e/venv/bin/pip install "
+                "--require-hashes --only-binary=:all: "
+                "-r /opt/guard-install-e2e/requirements-runtime.lock >/dev/null 2>&1\n",
+            ),
+            (
+                "expected-config",
+                "printf %s "
+                + shlex.quote(json.dumps({"account": account, "rules": rules}))
+                + " >/opt/guard-install-e2e/expected.json\n",
+            ),
         )
+        for phase, script in setup:
+            remote_phase(
+                stack,
+                receipt,
+                phase,
+                "set -eu\numask 077\n"
+                + script
+                + "printf '%s\\n' '{\"stage\":\"setup-complete\"}'\n",
+                expected_stage="setup-complete",
+            )
+            receipt["completed_phase"] = phase
         arguments = (
             " --version "
             + current.tag[1:]
@@ -471,27 +516,39 @@ def execute(
             "cd /opt/guard-install-e2e\nPYTHONPATH=/opt/guard-install-e2e "
             "/opt/guard-install-e2e/venv/bin/python -m guard_harness.aws_paper"
         )
-        setup += (
-            "printf %s "
-            + shlex.quote(json.dumps({"account": account, "rules": rules}))
-            + " >/opt/guard-install-e2e/expected.json\n"
+        remote_phase(
+            stack,
+            receipt,
+            "paper-before",
+            "set -eu\numask 077\n" + invoke + " --phase before" + arguments,
+            expected_stage="before-reboot",
         )
-        initial = stack.remote(setup + invoke + " --phase before" + arguments, timeout=900)
-        if initial.get("stage") != "before-reboot":
-            raise AwsError("instance lifecycle did not reach reboot boundary")
+        receipt["completed_phase"] = "paper-before"
+        receipt["active_phase"] = "instance-reboot"
         aws.request(["ec2", "reboot-instances", "--instance-ids", stack.instance_id])
         stack.pause(30)
         stack.online()
-        completed = stack.remote("set -eu\n" + invoke + " --phase after" + arguments, timeout=900)
+        receipt["completed_phase"] = "instance-reboot"
+        completed = remote_phase(
+            stack,
+            receipt,
+            "paper-after",
+            "set -eu\n" + invoke + " --phase after" + arguments,
+            expected_stage="passed",
+        )
         if completed.get("stage") != "passed" or completed.get("mode") != "paper":
             raise AwsError("instance lifecycle incomplete")
-        receipt.update(result="passed", coverage=completed["coverage"])
-        activation = stack.remote(
+        receipt.update(coverage=completed["coverage"])
+        receipt["completed_phase"] = "paper-after"
+        activation = remote_phase(
+            stack,
+            receipt,
+            "mainnet-refusal",
             "set -eu\nGITHUB_ACTIONS=true RUNNER_ENVIRONMENT=github-hosted "
             + invoke.replace("cd /opt/guard-install-e2e\n", "")
             + " --phase mainnet"
             + arguments,
-            timeout=900,
+            expected_stage="refused",
         )
         if (
             activation.get("stage") != "refused"
@@ -535,6 +592,8 @@ def execute(
             service_enabled=False,
             service_started=False,
         )
+        receipt["completed_phase"] = "mainnet-refusal"
+        receipt["result"] = "passed"
     finally:
         try:
             stack.cleanup()

@@ -19,6 +19,32 @@ foreach ($relative in @('loader/i.ps1','windows/service.ps1')) {
   Assert ([bool]$policyText) "extract actual rights admission $relative"
   $policy = [scriptblock]::Create($policyText)
   $known = @('C:\FixtureData','C:\FixturePrograms','C:\')
+  # Extract and execute the actual owner branch, not a duplicate policy model.
+  $ownerText = [regex]::Match($pathNode.Extent.Text,'(?ms)^    if \(\$owner -notin .*?(?=^    foreach \(\$rule)').Value
+  Assert ([bool]$ownerText) "extract actual owner admission $relative"
+  $ownerPolicy = [scriptblock]::Create($ownerText)
+  $full='C:\FixtureData\private-path-sentinel'
+  foreach ($owner in @('S-1-5-18','S-1-5-32-544','S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464')) {
+    $current=$full
+    & $ownerPolicy
+    Assert $true "existing trusted owner accepted $relative"
+  }
+  $currentUser=[Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+  foreach ($case in @(
+    @{path=$known[2];kind='drive-root'},
+    @{path=$known[0];kind='program-data-root'},
+    @{path=$known[1];kind='program-files-root'},
+    @{path=$full;kind='protected-path'}
+  )) {
+    foreach ($owner in @($currentUser,'S-1-5-21-111-222-333-444')) {
+      if ($owner -in @('S-1-5-18','S-1-5-32-544','S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464')) { continue }
+      $current=$case.path; $message=''
+      try { & $ownerPolicy } catch { $message=$_.Exception.Message }
+      $expectedClass=if ($owner -eq $currentUser) { 'current-user' } else { 'other' }
+      Assert ($message -ceq "Untrusted machine path owner ($($case.kind), owner=$expectedClass).") "fixed owner refusal category $relative"
+      Assert (-not $message.Contains($owner) -and -not $message.Contains($current) -and -not $message.Contains('private-path-sentinel')) "no owner/path disclosure $relative"
+    }
+  }
   foreach ($case in @(
     @{path=$known[0];directory=$true;rights=0x116;allowed=$true},
     @{path=$known[0];directory=$true;rights=0x1201bf;allowed=$true},

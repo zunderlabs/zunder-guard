@@ -308,6 +308,7 @@ jobs:
       E2E_PAYER_BLOCKED_KEY: ${{ secrets.E2E_PAYER_BLOCKED_KEY }}
       E2E_TESTNET_API_WALLET_KEY: ${{ secrets.E2E_TESTNET_API_WALLET_KEY }}
       E2E_TESTNET_OWNER_KEY: ${{ secrets.E2E_TESTNET_OWNER_KEY }}
+      MONITOR_ALERT_TOKEN: ${{ secrets.MONITOR_ALERT_TOKEN }}
     with:
       tag: ${{ inputs.tag }}
       commit: ${{ inputs.commit }}

@@ -608,7 +608,20 @@ jobs:
       with:
         name: signing-subjects-${{ github.run_id }}-${{ github.run_attempt }}
         path: ${{ runner.temp }}/sdk/assets
-    - run: rustup toolchain install
+    - name: Install the pinned SDK toolchain in fresh job-private homes
+      env:
+        RUSTUP_HOME: ${{ runner.temp }}/sdk-rustup
+        CARGO_HOME: ${{ runner.temp }}/sdk-cargo
+      run: |
+        set -euo pipefail
+        [ ! -e "$RUSTUP_HOME" ]
+        [ ! -e "$CARGO_HOME" ]
+        mkdir -m 700 "$RUSTUP_HOME" "$CARGO_HOME"
+        unset RUSTUP_TOOLCHAIN
+        rustup toolchain install --no-self-update
+        python -c 'import os,tomllib; pin=tomllib.load(open("rust-toolchain.toml","rb"))["toolchain"]["channel"]; f=open(os.environ["GITHUB_ENV"],"a"); f.write("RUSTUP_TOOLCHAIN="+pin+"\n"); f.writelines(k+"="+os.environ[k]+"\n" for k in ("RUSTUP_HOME","CARGO_HOME")); f.close()'
+        rustup show active-toolchain
+        cargo --version
     - name: Run SDK vectors and native custody contracts
       if: runner.os != 'Windows'
       env:

@@ -170,11 +170,11 @@ def website_install(lifecycle: NativeLifecycle) -> dict[str, Any]:
     lifecycle.systemctl("D1-website-start-pair", "start")
     lifecycle.healthy()
     round_trip(lifecycle.guard, pair)
-    before = snapshot(HOME)
     lifecycle.systemctl("D1-website-restart", "restart")
     lifecycle.healthy()
     round_trip(lifecycle.guard, pair)
     lifecycle.systemctl("D1-website-stop", "stop")
+    before = snapshot(HOME)
     lifecycle.command(
         "D1-website-uninstall", ["sh", str(inputs.installer), "--uninstall", "--non-interactive"]
     )

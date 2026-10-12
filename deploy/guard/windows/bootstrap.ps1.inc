@@ -42,7 +42,12 @@ function Assert-ZgPath([string]$Path,[switch]$Machine,[string]$ReadSid) {
     if (-not $item.Exists -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw 'Missing or reparse machine path refused.' }
     $acl = if ($PSVersionTable.PSVersion.Major -ge 6) { [IO.FileSystemAclExtensions]::GetAccessControl($item) } else { $item.GetAccessControl() }
     $owner = $acl.GetOwner([Security.Principal.SecurityIdentifier]).Value
-    if ($owner -notin @('S-1-5-18','S-1-5-32-544','S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464')) { throw 'Untrusted machine path owner.' }
+    if ($owner -notin @('S-1-5-18','S-1-5-32-544','S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464')) {
+      # Diagnostics are fixed categories only: never export a SID or machine path.
+      $kind = if ($current -eq [IO.Path]::GetPathRoot($full)) { 'drive-root' } elseif ($current -eq $known[0]) { 'program-data-root' } elseif ($current -eq $known[1]) { 'program-files-root' } else { 'protected-path' }
+      $ownerClass = if ($owner -eq [Security.Principal.WindowsIdentity]::GetCurrent().User.Value) { 'current-user' } else { 'other' }
+      throw "Untrusted machine path owner ($kind, owner=$ownerClass)."
+    }
     foreach ($rule in $acl.GetAccessRules($true,$true,[Security.Principal.SecurityIdentifier])) {
       if ($rule.PropagationFlags -band [Security.AccessControl.PropagationFlags]::InheritOnly) { continue }
       if ($rule.AccessControlType -ne 'Allow' -or $rule.IdentityReference.Value -in @('S-1-5-18','S-1-5-32-544','S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464')) { continue }

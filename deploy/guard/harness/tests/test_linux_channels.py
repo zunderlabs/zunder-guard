@@ -253,8 +253,9 @@ def test_container_published_pipe_binds_both_heads_and_keeps_account_out_of_argv
     assert calls[1][:2] == ["/bin/sh", "-c"] and calls[1][2].startswith(command)
 
 
+@pytest.mark.parametrize("uninstall_mutates_state", [False, True])
 def test_second_linux_website_install_has_fresh_data_measured_pair_and_released_cleanup(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, uninstall_mutates_state: bool
 ) -> None:
     from types import SimpleNamespace
     from typing import cast
@@ -286,11 +287,25 @@ def test_second_linux_website_install_has_fresh_data_measured_pair_and_released_
         assert name == "D1-website-uninstall" and "--uninstall" in argv
         events.append("released uninstall")
         binary.unlink()
+        if uninstall_mutates_state:
+            (home / "guard.toml").write_bytes(b"unexpected uninstall mutation")
         return ""
 
     def issue_pair() -> Pair:
         events.append("pair")
         return pair
+
+    def systemctl(label: str, verb: str) -> None:
+        events.append(verb)
+        if verb == "stop":
+            with (home / "risk-paper.jsonl").open("a") as stream:
+                stream.write("fixture stopped event\n")
+
+    def paper_roundtrip(guard: object, observed: Pair) -> None:
+        assert observed == pair
+        events.append("pair roundtrip")
+        with (home / "decisions-paper.jsonl").open("a") as stream:
+            stream.write("fixture measured veto/allow/resize\n")
 
     lifecycle = cast(
         NativeLifecycle,
@@ -300,18 +315,17 @@ def test_second_linux_website_install_has_fresh_data_measured_pair_and_released_
             guard=object(),
             version=lambda v: events.append("version"),
             healthy=lambda: events.append("health"),
-            systemctl=lambda label, verb: events.append(verb),
+            systemctl=systemctl,
             command=command,
         ),
     )
     monkeypatch.setattr(channels, "curl_install", install)
-    monkeypatch.setattr(
-        channels,
-        "round_trip",
-        lambda guard, observed: (
-            events.append("pair roundtrip") if observed == pair else pytest.fail("pair changed")
-        ),
-    )
+    monkeypatch.setattr(channels, "round_trip", paper_roundtrip)
+    if uninstall_mutates_state:
+        with pytest.raises(LifecycleError, match="changed persistent state"):
+            channels.website_install(lifecycle)
+        assert not (tmp_path / "channels/D1.json").exists()
+        return
     result = channels.website_install(lifecycle)
     assert events == [
         "fresh install",
@@ -333,6 +347,9 @@ def test_second_linux_website_install_has_fresh_data_measured_pair_and_released_
     assert (
         tmp_path / (".guard-channel-data-" + value.marker) / "website-data/guard.toml"
     ).read_bytes() == b"website fresh config"
+    retained = tmp_path / (".guard-channel-data-" + value.marker) / "website-data"
+    assert (retained / "decisions-paper.jsonl").read_text().count("measured") == 2
+    assert (retained / "risk-paper.jsonl").read_text().count("stopped") == 2
     assert (
         result["cleanup_method"] == "released-native-uninstall"
         and result["form"] == "website-parameter"

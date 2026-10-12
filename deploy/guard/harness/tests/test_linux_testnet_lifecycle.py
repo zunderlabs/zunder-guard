@@ -240,9 +240,9 @@ def test_unknown_cleanup_preserves_live_guest_and_private_disk(
     }
 
 
-@pytest.mark.parametrize("fresh", [True, False])
+@pytest.mark.parametrize("container,fresh", [(True, True), (True, False), (False, True)])
 def test_container_installer_stdin_consumption_matches_released_setup(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fresh: bool
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, container: bool, fresh: bool
 ) -> None:
     root = tmp_path / "synthetic-root"
     marker = tmp_path / "marker"
@@ -265,6 +265,9 @@ def test_container_installer_stdin_consumption_matches_released_setup(
     unit = mapped("/etc/systemd/system/zunder-guard-container.service")
     unit.parent.mkdir(parents=True)
     unit.write_text("LoadCredentialEncrypted=guard-api-wallet:synthetic")
+    dropin = mapped("/etc/systemd/system/zunder-guard-testnet.service.d/10-install.conf")
+    dropin.parent.mkdir(parents=True)
+    dropin.write_text("LoadCredentialEncrypted=fixture\n--key-stdin --network testnet")
     monkeypatch.setattr(linux_testnet_service, "Path", mapped)
     monkeypatch.setattr(linux_testnet_service, "MARKER", marker)
     monkeypatch.setattr(os, "geteuid", lambda: 0)
@@ -287,12 +290,18 @@ def test_container_installer_stdin_consumption_matches_released_setup(
         calls.append(argv)
         assert kwargs["sensitive_output"] is True
         if argv[0] == "sh":
-            assert kwargs["stdin"] == key * (2 if fresh else 1)
+            assert kwargs["stdin"] == key * (2 if container and fresh else 1)
             assert kwargs["secrets"] == [key.decode().strip()]
-            assert "--container" in argv and "--key-stdin" in argv
-            assert "--listen" not in argv
+            assert ("--container" in argv) is container and "--key-stdin" in argv
+            assert ("--listen" in argv) is not container
             for setup_choice in ("--rules", "--equity-cap", "--ip-share"):
                 assert (setup_choice in argv) is fresh
+            if fresh:
+                assert argv[argv.index("--ip-share") + 1] == "1"
+                assert argv[argv.index("--equity-cap") + 1] == "40"
+                assert argv[argv.index("--rules") + 1] == "synthetic-rules"
+            if not container:
+                assert argv[argv.index("--service-instance") + 1] == "testnet"
             assert argv[argv.index("--network") + 1] == "testnet"
             assert argv[argv.index("--account") + 1] == account
             assert key.decode().strip() not in str(argv)
@@ -306,13 +315,14 @@ def test_container_installer_stdin_consumption_matches_released_setup(
         "d" * 64,
         account,
         "synthetic-rules",
-        8547,
+        8547 if container else 18548,
         tmp_path,
         "a" * 32,
-        container=True,
+        container=container,
     )
-    assert service.setup(key)["unit"] == "zunder-guard-container.service"
-    assert len(calls) == 2
+    expected = "zunder-guard-container.service" if container else "zunder-guard-testnet.service"
+    assert service.setup(key)["unit"] == expected
+    assert len(calls) == (2 if container else 1)
 
 
 @pytest.mark.parametrize(

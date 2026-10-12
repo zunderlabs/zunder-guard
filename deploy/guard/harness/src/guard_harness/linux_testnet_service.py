@@ -53,13 +53,14 @@ class TestnetService:
             self.account,
             "--key-stdin",
         ]
+        # The serialized release runner has a dedicated IP; admit its full request share.
         if self.container:
             command.append("--container")
             # Protected container runtime fixes its port to 8547. Existing setup
             # preserves all risk choices; the released installer rejects overrides.
             fresh = not Path("/etc/zunder-guard-container/config.json").exists()
             if fresh:
-                command.extend(["--rules", self.rules, "--equity-cap", "40", "--ip-share", "0.1"])
+                command.extend(["--rules", self.rules, "--equity-cap", "40", "--ip-share", "1"])
             # Fresh init and supervisor provisioning each consume one stdin frame.
             frames = key * (2 if fresh else 1)
         else:
@@ -70,7 +71,7 @@ class TestnetService:
                     "--equity-cap",
                     "40",
                     "--ip-share",
-                    "0.1",
+                    "1",
                     "--listen",
                     f"127.0.0.1:{self.port}",
                     "--service-instance",

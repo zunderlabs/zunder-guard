@@ -129,9 +129,48 @@ async function collect(page: Page, target: Target, secrets: string[]) {
   const indices = maskIndices(candidates, secrets);
   const html = await sanitizedHTML(page, indices);
   const masks = indices.map(index => page.locator(`[data-zg-diagnostic-node="${index}"]`));
-  const screenshot = await page.screenshot({ fullPage: true, timeout: 8000, mask: [
-    page.locator('input, textarea, select, [contenteditable], [data-private], [data-sensitive]'), ...masks,
-  ] });
+  const privateFields = 'input, textarea, select, [contenteditable], [data-private], [data-sensitive]';
+  // Border-box masks miss glyph/pseudo overhang. Inline important clipping
+  // wins over the page's stronger selectors and prior inline declarations.
+  // Original styles remain inside this browser-local restoration closure;
+  // only fixed selectors and opaque node indices enter the page.
+  const restorePaint = await page.evaluateHandle(({ masked, fields }) => {
+    const elements = new Set(document.querySelectorAll(fields));
+    for (const index of masked) {
+      const element = document.querySelector(`[data-zg-diagnostic-node="${index}"]`);
+      if (element) elements.add(element);
+    }
+    const originals = [...elements].filter((element): element is HTMLElement | SVGElement =>
+      element instanceof HTMLElement || element instanceof SVGElement,
+    ).map(element => ({ element, style: element.getAttribute('style'),
+      clip: element.style.getPropertyValue('clip-path'), priority: element.style.getPropertyPriority('clip-path') }));
+    // Cancel even a currently running transition before changing the clip target.
+    for (const { element } of originals) element.style.setProperty('transition', 'none', 'important');
+    for (const { element } of originals) void getComputedStyle(element).transitionProperty;
+    for (const { element } of originals) element.style.setProperty('clip-path', 'inset(0)', 'important');
+    return () => {
+      // Restore the old clip while transitions remain disabled, commit that
+      // computed target, then restore the exact original transition/style.
+      for (const { element, clip, priority } of originals) {
+        if (clip) element.style.setProperty('clip-path', clip, priority);
+        else element.style.removeProperty('clip-path');
+      }
+      for (const { element } of originals) void getComputedStyle(element).clipPath;
+      for (const { element, style } of originals) {
+        if (style === null) element.removeAttribute('style');
+        else element.setAttribute('style', style);
+      }
+    };
+  }, { masked: indices, fields: privateFields });
+  let screenshot: Buffer;
+  try {
+    screenshot = await page.screenshot({ fullPage: true, timeout: 8000,
+      mask: [page.locator(privateFields), ...masks],
+    });
+  } finally {
+    try { await restorePaint.evaluate(restore => restore()); }
+    finally { await restorePaint.dispose(); }
+  }
   if (screenshot.length > 8 * LIMIT) throw new Error('diagnostic screenshot exceeds bound');
   const { hitText, ...publicDetails } = details;
   if (secrets.some(value => value && hitText.includes(value))

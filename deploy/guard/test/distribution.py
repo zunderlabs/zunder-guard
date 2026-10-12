@@ -46,7 +46,7 @@ class WindowsAclPolicy(unittest.TestCase):
         # The metadata allowance remains subordinate to existing plain-path,
         # trusted-owner and post-create anchor admission, with protected ACLs.
         self.assertIn('($item.Attributes -band [IO.FileAttributes]::ReparsePoint)', source)
-        self.assertIn("throw 'Untrusted machine path owner.'", source)
+        self.assertIn('throw "Untrusted machine path owner ($kind, owner=$ownerClass)."', source)
         self.assertIn('$acl.SetAccessRuleProtection($true,$false)', source)
         self.assertIn('  Assert-ZgPath $Path\n', source)
 

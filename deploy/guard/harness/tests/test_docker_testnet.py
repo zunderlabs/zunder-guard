@@ -326,7 +326,7 @@ def test_lifecycle_receipt_requires_all_actual_observations(
             assert kwargs["stdin"] == KEY
             assert "--key-stdin" in args and "--network" in args
             assert args[args.index("--equity-cap") + 1] == "40"
-            assert args[args.index("--ip-share") + 1] == "0.1"
+            assert args[args.index("--ip-share") + 1] == "1"
         elif args[0] == "run" and "pair" in args:
             result = json.dumps(dict(client_address=CLIENT, client_key="0x" + "c" * 64))
         elif args[0] == "port":

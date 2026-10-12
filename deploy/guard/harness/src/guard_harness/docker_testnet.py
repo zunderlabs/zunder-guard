@@ -433,6 +433,7 @@ def lifecycle(
         docker.command("volume", "create", volume)
         mounted = ("--mount", f"type=volume,source={volume},target=/data")
         rules = json.loads((ROOT / "rules/vectors.json").read_bytes())["valid"][0]["canonical"]
+        # This serialized release runner has a dedicated IP, not a shared bot host.
         init = [
             "init",
             "--non-interactive",
@@ -445,7 +446,7 @@ def lifecycle(
             "--equity-cap",
             "40",
             "--ip-share",
-            "0.1",
+            "1",
             "--key-stdin",
         ]
         if compose is not None:

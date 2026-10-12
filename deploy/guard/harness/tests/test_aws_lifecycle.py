@@ -1,3 +1,4 @@
+import hashlib
 import io
 import json
 import subprocess
@@ -363,3 +364,140 @@ def test_cli_json_uses_private_regular_file_and_removes_it(
         == {}
     )
     assert len(captured) == 1 and not captured[0].exists()
+
+
+@pytest.mark.parametrize(
+    "failed_phase",
+    [
+        "system-dependencies",
+        "authenticated-payload",
+        "python-venv",
+        "locked-dependencies",
+        "expected-config",
+        "paper-before",
+        "mainnet-refusal",
+        "mainnet-admission",
+    ],
+)
+def test_failed_remote_substage_retains_safe_phase_and_cleanup_receipt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failed_phase: str
+) -> None:
+    phases = [
+        "system-dependencies",
+        "authenticated-payload",
+        "python-venv",
+        "locked-dependencies",
+        "expected-config",
+        "paper-before",
+        "paper-after",
+        "mainnet-refusal",
+    ]
+    scripts: list[str] = []
+    cleaned: list[bool] = []
+    malformed_admission = failed_phase == "mainnet-admission"
+    failed_phase = "mainnet-refusal" if malformed_admission else failed_phase
+    fake = Fake()
+    digits = "1" * 12
+    monkeypatch.setattr(fake, "request", lambda *args, **kwargs: {"Account": digits})
+    stack = owned(fake)
+    monkeypatch.setattr(stack, "create", lambda *args, **kwargs: {"stack_create_complete": True})
+    monkeypatch.setattr(stack, "cleanup", lambda: cleaned.append(True))
+    monkeypatch.setattr(stack, "online", lambda: None)
+
+    def remote(script: str, *, timeout: int = 600) -> dict[str, Any]:
+        phase = phases[len(scripts)]
+        scripts.append(script)
+        assert script.startswith("set -eu\n") and timeout == 900
+        if phase == failed_phase:
+            if malformed_admission:
+                return {
+                    "stage": "refused",
+                    "binary_sha256": hashlib.sha256(
+                        b"signed released executable fixture"
+                    ).hexdigest(),
+                    "config_written": True,
+                }
+            # Model the production remote's bounded refusal, never its private output.
+            raise harness.AwsError("SSM native lifecycle failed; private output withheld")
+        if phase == "paper-before":
+            return {"stage": "before-reboot"}
+        if phase == "paper-after":
+            return {"stage": "passed", "mode": "paper", "coverage": ["fixture"]}
+        return {"stage": "setup-complete"}
+
+    class Subjects(Release):
+        def asset(self, name: str) -> bytes:
+            assert name == "cloudformation.yaml"
+            return b"signed template fixture"
+
+        def binary(self, target: str) -> bytes:
+            assert target == "linux-arm64"
+            return b"signed released executable fixture"
+
+    monkeypatch.setattr(stack, "remote", remote)
+    monkeypatch.setattr(harness, "Stack", lambda *args, **kwargs: stack)
+    monkeypatch.setattr(harness, "template_url", lambda *args: "https://example.invalid/template")
+    monkeypatch.setattr(harness, "payload", lambda *args: b"public harness fixture")
+    monkeypatch.setattr(harness, "copy_runtime_lock", lambda *args: None)
+    account = "0x" + "a" * 40
+    with pytest.raises(
+        harness.AwsError,
+        match="retained mainnet state" if malformed_admission else "private output withheld",
+    ):
+        harness.execute(
+            Subjects("v1.0.0", "a" * 40, tmp_path),
+            Subjects("v0.9.0", "b" * 40, tmp_path),
+            aws=fake,
+            account=account,
+            rules="zr1_fixture",
+            role=f"arn:aws:iam::{digits}:role/fixture",
+            execution_role=f"arn:aws:iam::{digits}:role/fixture",
+            permissions_boundary=f"arn:aws:iam::{digits}:policy/fixture",
+            work=tmp_path,
+        )
+    body = (tmp_path / "aws.receipt.json").read_text()
+    receipt = json.loads(body)
+    assert receipt["active_phase"] == failed_phase
+    assert receipt["completed_phase"] == (
+        "runtime-lock-copy" if failed_phase == phases[0] else phases[phases.index(failed_phase) - 1]
+    )
+    assert receipt["result"] == "failed" and receipt["cleanup_complete"] is True
+    assert receipt["release_ready"] is False
+    assert not list(tmp_path.glob("mainnet/**/*.json"))
+    assert cleaned == [True] and len(scripts) == phases.index(failed_phase) + 1
+    assert account not in body and digits not in body and "CommandPlugins" not in body
+    if failed_phase == "paper-before":
+        assert "cd /opt/guard-install-e2e\nPYTHONPATH=/opt/guard-install-e2e" in scripts[-1]
+        assert "apt-get" not in scripts[-1] and " --phase before" in scripts[-1]
+        assert "--require-hashes --only-binary=:all:" in scripts[3]
+        assert "sha256sum -c -" in scripts[1]
+
+
+@pytest.mark.parametrize("response", [{"stage": "wrong"}, {}, {"stage": False}, [], None])
+def test_phase_does_not_claim_completion_from_wrong_safe_receipt(
+    monkeypatch: pytest.MonkeyPatch,
+    response: Any,
+) -> None:
+    stack = owned(Fake())
+    monkeypatch.setattr(stack, "remote", lambda *args, **kwargs: response)
+    receipt: dict[str, object] = {}
+    with pytest.raises(harness.AwsError, match="safe receipt"):
+        harness.remote_phase(
+            stack, receipt, "paper-before", "public script", expected_stage="before-reboot"
+        )
+    assert receipt == {"active_phase": "paper-before"}
+
+
+def test_failed_ssm_plugin_output_never_enters_phase_diagnostic() -> None:
+    fake = Fake()
+    fake.result = {
+        "Status": "Failed",
+        "CommandPlugins": [{"ResponseCode": 1, "Output": "private-body-token=fixture"}],
+    }
+    receipt: dict[str, object] = {}
+    with pytest.raises(harness.AwsError) as caught:
+        harness.remote_phase(
+            owned(fake), receipt, "paper-before", "public script", expected_stage="before-reboot"
+        )
+    assert "private-body-token" not in str(caught.value) + json.dumps(receipt)
+    assert receipt == {"active_phase": "paper-before"}

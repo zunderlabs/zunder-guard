@@ -8,6 +8,7 @@ import { safe, get, post, validInboxMessage } from './safe.js';
 import { command } from './subprocess.js';
 
 import { edgeAmount } from './edge-amount.js';
+import { matchEdgePayment } from './edge-payment.js';
 
 test.skip(process.env['GUARD_PAID_JOURNEY'] !== 'P5', 'explicit hosted P5 admission required');
 for (const scenario of ['under', 'over', 'late', 'blocked']) {
@@ -57,6 +58,7 @@ for (const scenario of ['under', 'over', 'late', 'blocked']) {
     });
     const receipt = JSON.parse(await safe(() => readFile(join(work, 'payment-receipt.json'), 'utf8'), 'private payment receipt')) as { nonce: number; payer: string };
     expect(Number.isSafeInteger(receipt.nonce) && /^0x[0-9a-f]{40}$/.test(receipt.payer), 'bounded payment identity').toBe(true);
+    let observedRef: string | undefined;
     let found = false;
     const deadline = Date.now() + 10 * 60_000;
     while (Date.now() < deadline) {
@@ -66,8 +68,14 @@ for (const scenario of ['under', 'over', 'late', 'blocked']) {
       const payments = await safe(() => paymentResponse.json(), 'edge payments JSON');
       expect(paymentResponse.status() === 200 && payments.ok === true && Array.isArray(payments.payments), 'C4 payments list').toBe(true);
       const amount = Number(BigInt(edgeAmount(order.usdc, scenario).slice(2)));
-      const row = payments.payments.find((p: { amount_micro: number; network: string; order_number: string | null; payer: string; paid_at_ms: number }) =>
-        p.amount_micro === amount && p.payer.toLowerCase() === receipt.payer && p.paid_at_ms === receipt.nonce && p.network === 'hyperliquid' && p.order_number === (scenario === 'blocked' ? order.number : null));
+      const row = matchEdgePayment(payments.payments, {
+        amountMicro: amount, payer: receipt.payer, nonce: receipt.nonce, network: 'hyperliquid',
+        orderNumber: scenario === 'blocked' ? order.number : null, observedAt: Date.now(),
+      });
+      if (row) {
+        expect(observedRef === undefined || observedRef === row.ref, 'same unique transfer throughout observation').toBe(true);
+        observedRef = row.ref;
+      }
       const stateResponse = await get(request, `/api/licence/test/order/${order.number}`, { headers }, 'edge state');
       const state = await safe(() => stateResponse.json(), 'edge state JSON');
       expect(stateResponse.status() === 200 && state.key_issued === false, 'edge never issues licence').toBe(true);

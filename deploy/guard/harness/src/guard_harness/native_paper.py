@@ -5,6 +5,9 @@ import hashlib
 import json
 import os
 import platform
+import plistlib
+import re
+import stat
 import subprocess
 import time
 from pathlib import Path
@@ -203,15 +206,99 @@ class Paper:
 
     def crash(self) -> None:
         if self.brew:
-            uid = str(os.getuid())
-            label = f"gui/{uid}/homebrew.mxcl.zunder-guard"
-            self.command(["launchctl", "kill", "SIGKILL", label])
+            self.command(["launchctl", "kill", "SIGKILL", self.brew_service_target()])
         elif self.child is not None:
             self.child.kill()
             self.child.wait(timeout=10)
             self.child = None
             self.output.close()
             self.start()  # The documented per-user route has no OS recovery manager.
+
+    def brew_service_target(self) -> str:
+        """Homebrew uses user/UID for SSH/sudo and gui/UID for GUI sessions."""
+        try:
+            return self._brew_service_target()
+        except (OSError, ValueError, TypeError, KeyError, subprocess.SubprocessError):
+            raise LifecycleError(
+                "owned Homebrew service registration could not be admitted"
+            ) from None
+
+    def _brew_service_target(self) -> str:
+        uid = os.getuid()
+        if uid == 0:
+            raise LifecycleError("paper Homebrew service must belong to a non-root user")
+        label = "homebrew.mxcl.zunder-guard"
+        user_home = Path(self.env["HOME"])
+        plist = user_home / "Library/LaunchAgents" / (label + ".plist")
+        for directory in (user_home, plist.parent.parent, plist.parent):
+            info = directory.lstat()
+            if not stat.S_ISDIR(info.st_mode) or info.st_uid != uid or info.st_mode & 0o022:
+                raise LifecycleError("Homebrew service directory ownership differs")
+        info = plist.lstat()
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_uid != uid
+            or info.st_nlink != 1
+            or info.st_mode & 0o022
+            or info.st_size > 65536
+        ):
+            raise LifecycleError("Homebrew service plist ownership differs")
+        registration = plistlib.loads(plist.read_bytes())
+        if not isinstance(registration, dict):
+            raise LifecycleError("Homebrew service plist shape differs")
+        arguments = registration.get("ProgramArguments")
+        environment = registration.get("EnvironmentVariables")
+        if (
+            registration.get("Label") != label
+            or not isinstance(arguments, list)
+            or len(arguments) != 4
+            or not isinstance(arguments[0], str)
+            or Path(arguments[0]).resolve(strict=True) != self.binary.resolve(strict=True)
+            or arguments[1:] != ["run", "--network", "paper"]
+            or not isinstance(environment, dict)
+            or environment.get("ZUNDER_GUARD_HOME") != str(self.home)
+        ):
+            raise LifecycleError("Homebrew service registration differs from owned paper runtime")
+        found = []
+        for domain in ("user", "gui"):
+            target = f"{domain}/{uid}/{label}"
+            result = subprocess.run(
+                ["launchctl", "print", target],
+                env=self.env,
+                capture_output=True,
+                check=False,
+                timeout=30,
+            )
+            self.sequence += 1
+            (self.work / f"step-{self.sequence}.log").write_text(
+                "[owned launchd probe output withheld]\n"
+            )
+            if result.returncode == 113:  # Service not found in this exact user domain.
+                continue
+            if result.returncode != 0 or len(result.stdout) > 65536:
+                raise LifecycleError("owned launchd service domain lookup failed")
+            text = result.stdout.decode(errors="replace")
+            paths = re.findall(r"^\s*path = (.+)$", text, re.M)
+            programs = re.findall(r"^\s*program = (.+)$", text, re.M)
+            homes = re.findall(r"^\s*ZUNDER_GUARD_HOME => (.+)$", text, re.M)
+            pids = re.findall(r"^\s*pid = ([1-9][0-9]*)$", text, re.M)
+            argument_blocks = re.findall(r"^\s*arguments = \{\n(.*?)^\s*\}", text, re.M | re.S)
+            if (
+                not text.startswith(target + " = {")
+                or len(paths) != 1
+                or Path(paths[0]).resolve(strict=True) != plist.resolve(strict=True)
+                or len(programs) != 1
+                or Path(programs[0]).resolve(strict=True) != self.binary.resolve(strict=True)
+                or homes != [str(self.home)]
+                or len(pids) != 1
+                or len(argument_blocks) != 1
+                or argument_blocks[0].split() != arguments
+            ):
+                raise LifecycleError("loaded launchd service differs from owned paper runtime")
+            found.append(target)
+        if len(found) != 1:
+            raise LifecycleError("owned Homebrew service domain missing or ambiguous")
+        return found[0]
 
     def execute(self, account: str) -> dict[str, object]:
         self.work.mkdir(mode=0o700)
