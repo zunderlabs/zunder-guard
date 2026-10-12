@@ -36,6 +36,44 @@ JOURNALS = ("guard.toml", "risk.jsonl", "decisions.jsonl")
 PRIVATE = Path("/root/.guard-testnet-lifecycle")
 
 
+def error_category(value: object) -> str:
+    """Classify public producer message templates; never return message data.
+
+    Templates come from guard/{sync,mod,observe}.rs. This is a diagnostic only:
+    every Error still refuses credit, including recognized operational failures.
+    """
+    if not isinstance(value, str) or len(value) > 16384:
+        return "unknown"
+    if value.startswith("reading the account: HIP-3 dex ") and value.endswith(
+        " could not be read; its positions go unprotected by Guard until it can be, "
+        "and no entry is judged"
+    ):
+        return "account-dex-read"
+    for prefix, category in (
+        ("reading the account: ", "account-read"),
+        (
+            "the decision journal ended in writes a crash cut short "
+            "(never synced, so nothing was sent on their strength): ",
+            "crash-cut-journal",
+        ),
+        ("the account's ledger has an entry Guard cannot account for (", "unaccounted-ledger"),
+        ("account-flow arithmetic cannot be represented: ", "flow-arithmetic"),
+        ("account value at a flow is uncertain: ", "flow-uncertain"),
+    ):
+        if value.startswith(prefix):
+            return category
+    if value.startswith("a flow of ") and value.endswith(
+        " USDC (deposit, withdrawal or transfer) kept out of the account stops"
+    ):
+        return "account-flow"
+    if value.startswith("positions on HIP-3 dex ") and value.endswith(
+        ", which the rules' markets do not name: Guard neither judges nor protects them, "
+        "and the kill switch leaves them"
+    ):
+        return "unmanaged-dex"
+    return "unknown"
+
+
 def no_exchange(home: Path) -> int:
     """Every sending path records an action-bearing event before sending.
 
@@ -91,10 +129,14 @@ def no_exchange(home: Path) -> int:
             else "unknown"
         )
         diagnostic_seq = str(sequence + 1) if sequence < 4096 else "unknown"
+        detail = (
+            f"; error_category={error_category(event.get('text'))} " if category == "error" else " "
+        )
         require(
             category in {"started", "risk", "stopped"},
-            "action-bearing or unknown event; no exchange credit "
-            f"(kind={category}, seq={diagnostic_seq})",
+            "action-bearing or unknown event; no exchange credit"
+            + detail
+            + f"(kind={category}, seq={diagnostic_seq})",
         )
         if event["kind"] == "started":
             require(event.get("mode") == "testnet", "journal contains another runtime mode")

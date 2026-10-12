@@ -65,12 +65,15 @@ def verify_auto_update(
     account: str,
     old_key: str,
     renewed_key: str,
+    *,
+    previous_expiry_ms: int,
 ) -> None:
+    if type(previous_expiry_ms) is not int or previous_expiry_ms <= 0:
+        raise ValueError("authenticated initial licence expiry required")
     with socket.socket() as reservation:
         reservation.bind(("127.0.0.1", 0))
         port = reservation.getsockname()[1]
     config = home / "guard.toml"
-    old_end: int | None = None
     with (logs / "renewal-service.log").open("wb") as output:
         process = subprocess.Popen(
             [
@@ -102,13 +105,8 @@ def verify_auto_update(
                 persisted = tomllib.loads(config.read_text()).get("licence")
                 end = status["licence"].get("expires_at_ms")
                 if persisted == old_key:
-                    old_end = end if type(end) is int else None
-                elif (
-                    persisted == renewed_key
-                    and type(end) is int
-                    and old_end is not None
-                    and end > old_end
-                ):
+                    pass
+                elif persisted == renewed_key and type(end) is int and end > previous_expiry_ms:
                     return
                 elif persisted != renewed_key:
                     raise ValueError("unexpected auto-update key")
@@ -235,7 +233,17 @@ def install(
                 process.kill()
                 process.wait(timeout=5)
     if renewal is not None:
-        verify_auto_update(binary, home, logs, cli, environment, account, key, renewal["key"])
+        verify_auto_update(
+            binary,
+            home,
+            logs,
+            cli,
+            environment,
+            account,
+            key,
+            renewal["key"],
+            previous_expiry_ms=old_end,
+        )
     receipt = {
         "schema": 1,
         "journey": journey,
