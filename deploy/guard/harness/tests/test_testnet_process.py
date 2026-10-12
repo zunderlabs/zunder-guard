@@ -1,19 +1,26 @@
+import copy
+import errno
 import hashlib
 import io
+import json
 import os
 import signal
 import subprocess
 import time
 import tomllib
+import urllib.error
+import urllib.request
 from decimal import Decimal
+from email.message import Message
 from pathlib import Path
 from typing import Any, BinaryIO
 
 import pytest
 
+import guard_harness.paper_bot as paper
 import guard_harness.testnet_process as process
 from guard_harness.cli import Pair
-from guard_harness.paper_bot import LocalGuard
+from guard_harness.paper_bot import GuardUnavailable, LocalGuard
 from guard_harness.testnet_journey import Journey
 from guard_harness.testnet_protection import Entry
 from guard_harness.testnet_scan import SCAN_TIMEOUT
@@ -259,3 +266,246 @@ def test_production_driver_defers_market_reads_to_post_scan_planner(
     monkeypatch.setattr(process, "execute", execute)
     owner.journey(read, version="1.0.0-rc.1", deadline=time.monotonic() + 10000)  # type: ignore[arg-type]
     assert timeline == ["execute", "meta", "allMids"]
+
+
+def ready_status() -> dict[str, Any]:
+    return dict(
+        mode="testnet",
+        network="testnet",
+        account=ACCOUNT,
+        started_at_ms=1000,
+        capabilities={"exchange_expected_mode": True},
+        journal={"ok": True},
+        risk={"state": "active", "journal_ready": True},
+        killed=None,
+        journal_broken=False,
+        last_error=None,
+        last_sync_ms=1100,
+        fee=dict(
+            mode="builder",
+            address=WALLET,
+            fee_tenths_bp=20,
+            paper=False,
+            charged=True,
+            entries_blocked=False,
+            approval=dict(state="approved", max_tenths_bp=20, error=None),
+        ),
+    )
+
+
+def readiness_fixture(
+    monkeypatch: pytest.MonkeyPatch,
+    statuses: list[object],
+) -> tuple[process.Foreground, list[str], list[float]]:
+    owner = process.Foreground.__new__(process.Foreground)
+    owner.account, owner.started_ms, owner.url = ACCOUNT, 1000, "http://127.0.0.1:18547"
+    calls: list[str] = []
+    clock = [0.0]
+    monkeypatch.setattr(owner, "alive", lambda: None)
+    monkeypatch.setattr(time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(time, "time_ns", lambda: 1200 * 1_000_000)
+
+    def sleep(delay: float) -> None:
+        clock[0] += delay
+
+    def request(self: LocalGuard, path: str, body: object = None) -> object:
+        assert path == "/guard/status" and body is None
+        calls.append(path)
+        item = statuses.pop(0) if len(statuses) > 1 else statuses[0]
+        if isinstance(item, BaseException):
+            raise item
+        return item
+
+    monkeypatch.setattr(time, "sleep", sleep)
+    monkeypatch.setattr(LocalGuard, "request", request)
+    return owner, calls, clock
+
+
+def test_readiness_waits_for_initial_observation_and_builder_approval(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    identity = dict(mode="testnet", network="testnet", account=ACCOUNT, started_at_ms=1000)
+    unchecked = ready_status()
+    unchecked["last_sync_ms"] = None
+    unchecked["risk"]["journal_ready"] = False
+    unchecked["fee"].update(charged=False, entries_blocked=True)
+    unchecked["fee"]["approval"].update(state="unchecked", max_tenths_bp=None)
+    synced_unchecked = copy.deepcopy(unchecked)
+    synced_unchecked["last_sync_ms"] = 1100
+    synced_unchecked["risk"]["journal_ready"] = True
+    owner, calls, clock = readiness_fixture(
+        monkeypatch, [identity, unchecked, synced_unchecked, ready_status()]
+    )
+    owner.wait_ready()
+    assert len(calls) == 4 and clock[0] == 0.75
+
+
+def test_readiness_off_compatibility_and_transport_startup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ready = ready_status()
+    ready["fee"] = {"mode": "off"}
+    owner, calls, clock = readiness_fixture(
+        monkeypatch, [GuardUnavailable("local Guard connection refused"), ready]
+    )
+    owner.wait_ready()
+    assert len(calls) == 2 and clock[0] == 0.25
+
+
+def test_readiness_initialization_deadline_is_bounded(monkeypatch: pytest.MonkeyPatch) -> None:
+    owner, calls, clock = readiness_fixture(monkeypatch, [{}])
+    with pytest.raises(process.ProcessError, match="readiness deadline"):
+        owner.wait_ready(timeout=1)
+    assert len(calls) == 4 and clock[0] == 1
+
+
+@pytest.mark.parametrize(
+    "path, value",
+    [
+        (("mode",), "mainnet"),
+        (("network",), "mainnet"),
+        (("account",), WALLET),
+        (("account",), 7),
+        (("started_at_ms",), 999),
+        (("started_at_ms",), True),
+        (("risk", "state"), "halted_for_day"),
+        (("risk", "journal_ready"), False),
+        (("risk", "journal_ready"), 1),
+        (("killed",), "SECRET"),
+        (("journal_broken",), True),
+        (("journal", "ok"), False),
+        (("last_error",), "SECRET"),
+        (("last_sync_ms",), 999),
+        (("last_sync_ms",), 1201),
+        (("last_sync_ms",), True),
+        (("capabilities", "exchange_expected_mode"), False),
+        (("fee", "mode"), "fee_free"),
+        (("fee", "mode"), []),
+        (("fee", "address"), "SECRET"),
+        (("fee", "fee_tenths_bp"), 21),
+        (("fee", "fee_tenths_bp"), True),
+        (("fee", "paper"), True),
+        (("fee", "charged"), False),
+        (("fee", "entries_blocked"), True),
+        (("fee", "approval", "state"), "not_approved"),
+        (("fee", "approval", "state"), "refused_by_venue"),
+        (("fee", "approval", "state"), []),
+        (("fee", "approval", "max_tenths_bp"), 19),
+        (("fee", "approval", "max_tenths_bp"), True),
+        (("fee", "approval", "error"), "SECRET"),
+    ],
+)
+def test_observed_fatal_status_never_polls_into_health(
+    monkeypatch: pytest.MonkeyPatch,
+    path: tuple[str, ...],
+    value: object,
+) -> None:
+    bad = ready_status()
+    target = bad
+    for part in path[:-1]:
+        target = target[part]
+    target[path[-1]] = value
+    owner, calls, clock = readiness_fixture(monkeypatch, [bad, ready_status()])
+    with pytest.raises(process.ProcessError) as error:
+        owner.wait_ready()
+    assert str(error.value) == "fresh authenticated testnet process prerequisite refused"
+    assert len(calls) == 1 and clock[0] == 0
+
+
+def test_owned_child_failure_is_never_retried(monkeypatch: pytest.MonkeyPatch) -> None:
+    owner, calls, clock = readiness_fixture(
+        monkeypatch,
+        [process.ProcessError("fresh authenticated testnet process prerequisite refused")],
+    )
+    with pytest.raises(process.ProcessError):
+        owner.wait_ready()
+    assert len(calls) == 1 and clock[0] == 0
+
+
+def test_readiness_checks_deadline_again_after_status_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    owner, calls, clock = readiness_fixture(monkeypatch, [ready_status()])
+    original = LocalGuard.request
+
+    def delayed(self: LocalGuard, path: str, body: object = None) -> object:
+        clock[0] = 1.0
+        return original(self, path, body)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(LocalGuard, "request", delayed)
+    with pytest.raises(process.ProcessError, match="readiness deadline"):
+        owner.wait_ready(timeout=1)
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize("field,value", [("charged", True), ("entries_blocked", False)])
+def test_unchecked_approval_must_have_consistent_pending_state(
+    monkeypatch: pytest.MonkeyPatch,
+    field: str,
+    value: bool,
+) -> None:
+    bad = ready_status()
+    bad["fee"].update(charged=False, entries_blocked=True)
+    bad["fee"]["approval"].update(state="unchecked", max_tenths_bp=None)
+    bad["fee"][field] = value
+    owner, calls, clock = readiness_fixture(monkeypatch, [bad, ready_status()])
+    with pytest.raises(process.ProcessError):
+        owner.wait_ready()
+    assert len(calls) == 1 and clock[0] == 0
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        b'{"private":"SECRET",',
+        b"\xffSECRET",
+        b"x" * 1_048_577,
+        paper.PaperError("Guard redirected a local request"),
+        urllib.error.HTTPError("http://127.0.0.1:18547", 401, "SECRET", Message(), None),
+        urllib.error.URLError(TimeoutError("SECRET")),
+        OSError(errno.ECONNRESET, "SECRET"),
+    ],
+)
+def test_actual_guard_protocol_failure_never_polls_into_health(
+    monkeypatch: pytest.MonkeyPatch,
+    failure: object,
+) -> None:
+    original = LocalGuard.request
+    owner, _, clock = readiness_fixture(monkeypatch, [ready_status()])
+    monkeypatch.setattr(LocalGuard, "request", original)
+    calls: list[str] = []
+
+    class Opener:
+        def open(self, request: Any, timeout: float) -> io.BytesIO:
+            calls.append(request.full_url)
+            if len(calls) == 1:
+                if isinstance(failure, BaseException):
+                    raise failure
+                assert isinstance(failure, bytes)
+                return io.BytesIO(failure)
+            return io.BytesIO(json.dumps(ready_status()).encode())
+
+    monkeypatch.setattr(urllib.request, "build_opener", lambda *args: Opener())
+    with pytest.raises((paper.PaperError, OSError)):
+        owner.wait_ready()
+    assert len(calls) == 1 and clock[0] == 0
+
+
+def test_actual_connection_refusal_can_wait_for_owned_listener(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original = LocalGuard.request
+    owner, _, clock = readiness_fixture(monkeypatch, [ready_status()])
+    monkeypatch.setattr(LocalGuard, "request", original)
+    calls: list[str] = []
+
+    class Opener:
+        def open(self, request: Any, timeout: float) -> io.BytesIO:
+            calls.append(request.full_url)
+            if len(calls) == 1:
+                raise urllib.error.URLError(ConnectionRefusedError(errno.ECONNREFUSED, "SECRET"))
+            return io.BytesIO(json.dumps(ready_status()).encode())
+
+    monkeypatch.setattr(urllib.request, "build_opener", lambda *args: Opener())
+    owner.wait_ready()
+    assert len(calls) == 2 and clock[0] == 0.25

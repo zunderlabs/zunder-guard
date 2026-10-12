@@ -1,5 +1,6 @@
 """Signed paper decisions on a local Guard, using the official venue SDK signer."""
 
+import errno
 import ipaddress
 import json
 import time
@@ -24,6 +25,10 @@ _sign = cast(Signer, sign_l1_action)
 
 class PaperError(RuntimeError):
     """A paper-only precondition or journal assertion failed."""
+
+
+class GuardUnavailable(PaperError):
+    """The owned loopback Guard has not begun listening yet."""
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -67,7 +72,12 @@ class LocalGuard:
             if len(payload) > 1_048_576:
                 raise PaperError("Guard response exceeded the size bound")
             return json.loads(payload)
-        except (urllib.error.URLError, json.JSONDecodeError, UnicodeDecodeError) as error:
+        except urllib.error.URLError as error:
+            if isinstance(error.reason, OSError) and error.reason.errno == errno.ECONNREFUSED:
+                raise GuardUnavailable("local Guard connection refused") from None
+            # HTTP errors, timeouts and protocol failures are not startup availability.
+            raise PaperError("local Guard HTTP/JSON request failed") from error
+        except (json.JSONDecodeError, UnicodeDecodeError) as error:
             # Never include a response body, credentials or the request in diagnostics.
             raise PaperError("local Guard HTTP/JSON request failed") from error
 

@@ -129,6 +129,9 @@ pub enum EventBody {
     },
     /// The kill switch latched.
     Kill { reason: String },
+    /// A successful read confirmed the account's builder fee approval.
+    /// This is an observation, not an order or a permission change.
+    FeeApproval { approved: bool, text: String },
     /// Something went wrong outside a request: a read of the account, a
     /// journal write.
     Error { text: String },
@@ -141,6 +144,23 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn fee_approval_serialises_as_an_observation() {
+        let event = GuardEvent {
+            seq: 7,
+            at_ms: 123,
+            body: EventBody::FeeApproval {
+                approved: true,
+                text: "builder fee approved".into(),
+            },
+        };
+        assert_eq!(
+            serde_json::to_value(&event).unwrap(),
+            json!({"seq": 7, "at_ms": 123, "kind": "fee_approval",
+                "approved": true, "text": "builder fee approved"})
+        );
+    }
 
     #[test]
     fn events_serialise_flat_with_their_kind() {

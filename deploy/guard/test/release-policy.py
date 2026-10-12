@@ -32,6 +32,15 @@ SERVICE_ASSETS = ['install-windows-service.ps1', 'install-macos-service.sh', 'un
 
 
 class WorkflowQueue(unittest.TestCase):
+    def test_purchase_nonce_ledgers_queue_per_chain_without_cancellation(self):
+        job = yaml.safe_load((WORKFLOWS / "journey.yml").read_text())["jobs"]["purchase"]
+        self.assertEqual(job["timeout-minutes"], 45)
+        self.assertEqual(job["concurrency"], {
+            "group": "guard-e2e-purchase-${{ (matrix.journey == 'P1' || matrix.journey == 'P5' || matrix.journey == 'P6') && 'hyperliquid' || matrix.journey == 'P2' && 'arbitrum' || matrix.journey == 'P3' && 'base' || matrix.journey }}",
+            "cancel-in-progress": False,
+            "queue": "max",
+        })
+
     def test_shared_queue_keeps_every_pending_job_without_interrupting_protection(self):
         validate = runpy.run_path(str(SCRIPT.parent.parent / "test/workflow-concurrency.py"))["validate"]
         validate(list(WORKFLOWS.glob("*.yml")))

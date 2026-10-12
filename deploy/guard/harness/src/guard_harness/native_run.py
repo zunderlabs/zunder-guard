@@ -10,21 +10,27 @@ import sys
 from pathlib import Path
 
 from guard_harness.native_channels import execute as channel_execute
-from guard_harness.native_release import Release
+from guard_harness.native_release import Release, diagnostic_mode
 from guard_harness.native_testnet import sanitize_logs
 from guard_harness.testnet_process import ProcessError
 from guard_harness.testnet_scan import TestnetReads, flat_scan
 
 
 def execute(*, subjects: Path, output: Path, scenario: str, account: str, shell: str) -> None:
+    diagnostic = diagnostic_mode()
     identity = json.loads((subjects / "input.json").read_bytes())
+    if not isinstance(identity, dict):
+        raise ProcessError("authenticated subject identity object required")
     profile = os.environ.get("INSTALL_MATRIX_PROFILE", "all")
+    harness_commit = os.environ.get("GITHUB_SHA", "")
     if (
         scenario not in {"fresh", "upgrade"}
         or profile not in {"all", "nightly"}
-        or identity.get("diagnostic") is not False
-        or identity.get("harness_commit") != os.environ.get("GITHUB_SHA")
-        or (profile == "all" and identity.get("commit") != os.environ.get("GITHUB_SHA"))
+        or (diagnostic and profile != "all")
+        or identity.get("diagnostic") is not diagnostic
+        or re.fullmatch(r"[0-9a-f]{40}", harness_commit) is None
+        or identity.get("harness_commit") != harness_commit
+        or (profile == "all" and not diagnostic and identity.get("commit") != harness_commit)
         or identity.get("loader_channel") != ("canonical" if profile == "nightly" else "staging")
         or os.environ.get("GUARD_C6_SERIALIZED") != "1"
     ):
@@ -60,6 +66,7 @@ def execute(*, subjects: Path, output: Path, scenario: str, account: str, shell:
             "GITHUB_ACTIONS",
             "RUNNER_ENVIRONMENT",
             "INSTALL_MATRIX_PROFILE",
+            "DIAGNOSTIC",
         }
     }
     common = [
@@ -129,7 +136,8 @@ def execute(*, subjects: Path, output: Path, scenario: str, account: str, shell:
         (output / "identities.json").write_text(
             json.dumps(
                 dict(
-                    diagnostic=False,
+                    diagnostic=diagnostic,
+                    **({"gate_eligible": False} if diagnostic else {}),
                     release_commit=current.commit,
                     harness_commit=os.environ["GITHUB_SHA"],
                     tag=current.tag,

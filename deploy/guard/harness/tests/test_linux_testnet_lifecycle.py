@@ -596,3 +596,102 @@ def test_validated_large_sequence_stays_unknown_in_refusal(tmp_path: Path) -> No
     journal(tmp_path, [{"kind": "started", "mode": "testnet"}] * 4096 + [{"kind": "error"}])
     with pytest.raises(LifecycleError, match=r"kind=error, seq=unknown"):
         no_exchange(tmp_path)
+
+
+@pytest.mark.parametrize(
+    "body,category",
+    [
+        ("reading the account: private-sentinel", "account-read"),
+        (
+            "reading the account: HIP-3 dex private-sentinel could not be read; its positions "
+            "go unprotected by Guard until it can be, and no entry is judged",
+            "account-dex-read",
+        ),
+        (
+            "the decision journal ended in writes a crash cut short (never synced, so nothing "
+            "was sent on their strength): 12 bytes moved to /private-sentinel",
+            "crash-cut-journal",
+        ),
+        (
+            "the account's ledger has an entry Guard cannot account for (private-sentinel)",
+            "unaccounted-ledger",
+        ),
+        ("account-flow arithmetic cannot be represented: private-sentinel", "flow-arithmetic"),
+        ("account value at a flow is uncertain: private-sentinel", "flow-uncertain"),
+        (
+            "a flow of private-sentinel USDC (deposit, withdrawal or transfer) kept out of the "
+            "account stops",
+            "account-flow",
+        ),
+        (
+            "positions on HIP-3 dex private-sentinel (private-sentinel), which the rules' markets "
+            "do not name: Guard neither judges nor protects them, and the kill switch leaves them",
+            "unmanaged-dex",
+        ),
+        ("private-sentinel", "unknown"),
+        ({"reading the account: ": "private-sentinel"}, "unknown"),
+        (None, "unknown"),
+        ("reading the account: " + "private-sentinel" * 2000, "unknown"),
+    ],
+)
+def test_error_producer_categories_remain_refused_without_private_message(
+    tmp_path: Path, body: Any, category: str
+) -> None:
+    journal(tmp_path, [{"kind": "started", "mode": "testnet"}, {"kind": "error", "text": body}])
+    with pytest.raises(LifecycleError) as caught:
+        no_exchange(tmp_path)
+    diagnostic = str(caught.value)
+    assert f"error_category={category} (kind=error, seq=2)" in diagnostic
+    assert "private-sentinel" not in diagnostic
+
+
+def test_tampered_error_template_cannot_claim_producer_category(tmp_path: Path) -> None:
+    journal(tmp_path, [{"kind": "started", "mode": "testnet"}, {"kind": "error", "text": "x"}])
+    path = tmp_path / "decisions.jsonl"
+    records = [json.loads(line) for line in path.read_text().splitlines()]
+    records[1]["event"]["text"] = "reading the account: private-sentinel"
+    path.write_text("\n".join(json.dumps(record) for record in records) + "\n")
+    with pytest.raises(LifecycleError, match="decision checksum differs") as caught:
+        no_exchange(tmp_path)
+    assert "error_category=" not in str(caught.value)
+    assert "private-sentinel" not in str(caught.value)
+
+
+def test_typed_successful_fee_read_is_not_an_exchange(tmp_path: Path) -> None:
+    event = {"kind": "fee_approval", "approved": True, "text": "builder fee approved"}
+    journal(tmp_path, [{"kind": "started", "mode": "testnet"}, event])
+    assert no_exchange(tmp_path) == 2
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        {"approved": False},
+        {"approved": 1},
+        {"approved": "true"},
+        {"text": None},
+        {"text": ""},
+        {"text": "x" * 16385},
+        {"action": {}},
+        {"sent": False},
+    ],
+)
+def test_fee_notice_cannot_hide_failed_or_action_bearing_state(
+    tmp_path: Path, mutation: dict[str, Any]
+) -> None:
+    event = {"kind": "fee_approval", "approved": True, "text": "private-sentinel"} | mutation
+    journal(tmp_path, [{"kind": "started", "mode": "testnet"}, event])
+    with pytest.raises(LifecycleError, match="fee approval journal event differs") as caught:
+        no_exchange(tmp_path)
+    assert "private-sentinel" not in str(caught.value)
+
+
+def test_legacy_builder_approval_error_still_refuses_credit(tmp_path: Path) -> None:
+    event = {
+        "kind": "error",
+        "text": "builder fee approved (private-sentinel); Guard's orders carry it",
+    }
+    journal(tmp_path, [{"kind": "started", "mode": "testnet"}, event])
+    with pytest.raises(LifecycleError, match="error_category=fee-approved") as caught:
+        no_exchange(tmp_path)
+    assert "private-sentinel" not in str(caught.value)

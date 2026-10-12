@@ -456,7 +456,7 @@ class ProtectedTestnetTransactions(Stage):
         record = self.inhibit('not-found')
         with self.calls(True), patch.object(self.wrapper, 'prompt') as prompt, \
              patch.object(self.ops, 'run') as guard, \
-             patch.object(self.wrapper, 'readiness', return_value={'fee': {'mode': 'off'}}):
+             patch.object(self.wrapper, 'readiness', return_value={'fee': {'mode': 'builder', 'approval': {'state':'approved'}}}):
             self.wrapper.activate(self.config, record, True, False, unattended=True)
         prompt.assert_not_called()
         guard.assert_not_called()
@@ -626,6 +626,42 @@ class BuilderReadiness(Stage):
              patch.object(self.wrapper.time, 'sleep'):
             return self.wrapper.readiness(self.config, expected, configured_licence)
 
+    def test_readiness_fixed_predicates_never_export_status_or_transport_details(self):
+        private = 'private-token-sentinel'
+        for predicate in ('health-transport', 'health-http', 'status-transport', 'status-http',
+                          'status-json', 'account-mode', 'risk', 'fee', 'builder-approval'):
+            status = self.status('approved')
+            if predicate == 'account-mode': status['account'] = private
+            if predicate == 'risk': status['risk']['state'] = private
+            if predicate == 'fee': status['fee']['mode'] = private
+            if predicate == 'builder-approval': status['fee']['approval']['state'] = private
+            class Response:
+                def __init__(self, path):
+                    self.path = path
+                    self.status = 503 if predicate == ('health-http' if path == '/healthz' else 'status-http') else 200
+                def read(self, *args):
+                    if self.path == '/guard/status' and predicate == 'status-json': return private.encode()
+                    return json.dumps(status if self.path == '/guard/status' else {}).encode()
+            class Connection:
+                def __init__(self, *args, **kwargs): pass
+                def request(self, method, path):
+                    self.path = path
+                    if predicate == ('health-transport' if path == '/healthz' else 'status-transport'):
+                        raise OSError(private)
+                def getresponse(self): return Response(self.path)
+                def close(self): pass
+            with self.subTest(predicate=predicate), \
+                 patch.object(self.wrapper.http.client, 'HTTPConnection', Connection), \
+                 patch.object(self.wrapper.time, 'monotonic', side_effect=[0, 1, 61]), \
+                 patch.object(self.wrapper.time, 'sleep') as sleep, \
+                 self.assertRaises(self.ops.Refused) as caught:
+                self.wrapper.readiness(self.config, False)
+            self.assertEqual(str(caught.exception),
+                'Guard did not reach the expected healthy account/risk/licence state. '
+                '(predicate=' + predicate + ').')
+            self.assertNotIn(private, str(caught.exception))
+            sleep.assert_called_once_with(1)
+
     def test_all_builder_approval_states_and_fee_free_have_honest_next_step(self):
         for state in ('approved', 'unchecked', 'not_approved', 'refused', 'refused_by_venue', 'refused_by_venue_builder', 'fee_free'):
             with self.subTest(state=state):
@@ -668,24 +704,59 @@ class BuilderReadiness(Stage):
 
 
 class ProtectedTestnetReadiness(Stage):
+    calls = BootTransactions.calls
+    inhibit = BootTransactions.inhibit
     status = BuilderReadiness.status
     read_status = BuilderReadiness.read_status
     def setUp(self):
         super().setUp()
         self.config['mode'] = 'testnet'
 
-    def test_testnet_readiness_requires_off_and_matching_network(self):
+    def test_testnet_readiness_requires_builder_and_matching_network(self):
         good = self.status('approved')
-        good.update(mode='testnet', network='testnet', fee={'mode': 'off'}, licence={'state':'none'})
-        self.assertEqual(self.read_status(good)['fee']['mode'], 'off')
-        for changes in ({'mode': 'mainnet'}, {'network': 'mainnet'}, {'fee': {'mode': 'builder'}},
+        good.update(mode='testnet', network='testnet', fee={'mode': 'builder', 'approval': {'state':'approved'}}, licence={'state':'none'})
+        self.assertEqual(self.read_status(good)['fee']['mode'], 'builder')
+        for changes in ({'mode': 'mainnet'}, {'network': 'mainnet'}, {'fee': {'mode': 'off'}},
                         {'fee': {'mode': 'fee_free'}}, {'risk': {'journal_ready': True, 'state': 'halted'}}):
             with self.subTest(changes=changes), self.assertRaises(self.ops.Refused):
                 self.read_status(dict(good, **changes))
         with self.assertRaises(self.ops.Refused):
             self.read_status(good, expected=True)
         good['licence'] = {'state': 'active'}
-        self.assertEqual(self.read_status(good, expected=True, configured_licence=self.key([]))['fee']['mode'], 'off')
+        self.assertEqual(self.read_status(good, expected=True, configured_licence=self.key([]))['fee']['mode'], 'builder')
+
+    def test_testnet_builder_approval_enum_remains_strict(self):
+        good = self.status('approved')
+        good.update(mode='testnet', network='testnet', licence={'state':'none'})
+        self.assertEqual(self.read_status(good)['fee']['mode'], 'builder')
+        good['fee']['approval']['state'] = 'private-token-sentinel'
+        with self.assertRaises(self.ops.Refused) as caught:
+            self.read_status(good)
+        self.assertIn('(predicate=builder-approval)', str(caught.exception))
+        self.assertNotIn('private-token-sentinel', str(caught.exception))
+
+    def test_testnet_licence_failure_has_only_fixed_predicate(self):
+        status = self.status('approved')
+        status.update(mode='testnet', network='testnet', fee={'mode':'builder', 'approval': {'state':'approved'}},
+                      licence={'state':'private-token-sentinel'})
+        with self.assertRaises(self.ops.Refused) as caught:
+            self.read_status(status)
+        self.assertEqual(str(caught.exception),
+            'Guard did not reach the expected healthy account/risk/licence state. (predicate=licence).')
+
+    def test_unapproved_testnet_activation_names_only_testnet(self):
+        for state in ('unchecked', 'not_approved', 'refused_by_venue'):
+            with self.subTest(state=state):
+                status = self.status(state)
+                status.update(mode='testnet', network='testnet', licence={'state':'none'})
+                validated = self.read_status(status)
+                record = self.inhibit('enabled', True)
+                output = io.StringIO()
+                with self.calls(True), patch.object(self.wrapper, 'readiness', return_value=validated), contextlib.redirect_stdout(output):
+                    self.wrapper.activate(self.config, record, False, False, unattended=True)
+                self.assertIn('Hyperliquid Testnet', output.getvalue())
+                self.assertNotIn('Hyperliquid Mainnet', output.getvalue())
+                self.assertIn('Entries remain blocked', output.getvalue())
 
     @staticmethod
     def key(features):
@@ -693,19 +764,20 @@ class ProtectedTestnetReadiness(Stage):
         return 'zgl1_'+base64.urlsafe_b64encode(payload).rstrip(b'=').decode()+'.'+base64.urlsafe_b64encode(b'0'*64).rstrip(b'=').decode()
 
     def test_exact_testnet_licence_feature_profiles_and_active_signature_state(self):
-        for features,fee in [(['fee_free'],'fee_free'),([],'off')]:
+        for features,fee in [(['fee_free'],'fee_free'),([],'builder')]:
             key=self.key(features)
-            good=self.status();good.update(mode='testnet',network='testnet',fee={'mode':fee},licence={'state':'active'})
+            good=self.status();good.update(mode='testnet',network='testnet',fee={'mode':fee, 'approval': {'state':'approved'}},licence={'state':'active'})
             self.assertEqual(self.read_status(good,expected=True,configured_licence=key)['fee']['mode'],fee)
             # Reinstallation preserves the configured licence even without a new option.
             self.assertEqual(self.read_status(good,configured_licence=key)['fee']['mode'],fee)
-            for changes in ({'fee':{'mode':'builder'}},{'fee':{'mode':'off'if fee=='fee_free'else'fee_free'}},
+            for changes in ({'fee':{'mode':'builder' if fee=='fee_free' else 'fee_free'}},
+                            {'fee':{'mode':'off'}},
                             {'licence':{'state':'none'}},{'licence':{'state':'not_used'}}):
                 with self.subTest(features=features,changes=changes),self.assertRaises(self.ops.Refused):
                     self.read_status(dict(good,**changes),expected=True,configured_licence=key)
 
     def test_invalid_configured_licence_is_not_discarded(self):
-        good=self.status();good.update(mode='testnet',network='testnet',fee={'mode':'off'},licence={'state':'active'})
+        good=self.status();good.update(mode='testnet',network='testnet',fee={'mode':'builder', 'approval': {'state':'approved'}},licence={'state':'active'})
         for key in ('bad','zgl1_broken.signature',self.key(['unknown_feature'])):
             with self.subTest(key=key),self.assertRaises(self.ops.Refused):self.read_status(good,expected=True,configured_licence=key)
 

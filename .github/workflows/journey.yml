@@ -364,10 +364,10 @@ jobs:
     if: ${{ inputs.profile == 'all' || inputs.profile == 'nightly' }}
     name: ${{ matrix.journey }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 35
+    timeout-minutes: 45
     environment: e2e
     concurrency:
-      group: guard-e2e-purchase-${{ (matrix.journey == 'P1' || matrix.journey == 'P5' || matrix.journey == 'P6') && 'hyperliquid' || (matrix.journey == 'P2' || matrix.journey == 'P3') && 'evm' || matrix.journey }}
+      group: guard-e2e-purchase-${{ (matrix.journey == 'P1' || matrix.journey == 'P5' || matrix.journey == 'P6') && 'hyperliquid' || matrix.journey == 'P2' && 'arbitrum' || matrix.journey == 'P3' && 'base' || matrix.journey }}
       cancel-in-progress: false
       queue: max
     strategy:

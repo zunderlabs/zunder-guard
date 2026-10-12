@@ -22,6 +22,7 @@ from eth_account import Account
 from guard_harness import crash_process
 from guard_harness.cli import PAIR_SCHEMA, decode_json
 from guard_harness.docker_paper import Compose, Docker
+from guard_harness.journal_diagnostics import error_category, valid_fee_approval
 from guard_harness.paper_bot import LocalGuard, PaperError
 from guard_harness.runner import RunResult, run
 from guard_harness.staged_subjects import _private
@@ -264,17 +265,46 @@ def archive_state(
             "Testnet complete journal chain differs",
         )
         previous_check = check
-        require(
-            isinstance(event, dict) and isinstance(event.get("kind"), str),
-            "Testnet decision journal event differs",
-        )
-        require(
-            event["kind"] in {"started", "risk", "stopped"},
-            "action-bearing or unknown Testnet journal event",
-        )
+        require(isinstance(event, dict), "Testnet decision journal event differs")
         require(
             type(event.get("seq")) is int and event["seq"] == sequence + 1,
             "Testnet journal sequence incomplete",
+        )
+        kind = event.get("kind")
+        category = (
+            kind
+            if isinstance(kind, str)
+            and kind
+            in {
+                "started",
+                "risk",
+                "stopped",
+                "fee_approval",
+                "decision",
+                "sent",
+                "intent",
+                "done",
+                "recovered",
+                "flatten",
+                "protect",
+                "kill",
+                "error",
+            }
+            else "unknown"
+        )
+        require(
+            category != "fee_approval" or valid_fee_approval(event),
+            "fee approval journal event differs",
+        )
+        diagnostic_seq = str(sequence + 1) if sequence < 4096 else "unknown"
+        detail = (
+            f"; error_category={error_category(event.get('text'))} " if category == "error" else " "
+        )
+        require(
+            category in {"started", "risk", "stopped", "fee_approval"},
+            "action-bearing or unknown Testnet journal event"
+            + detail
+            + f"(kind={category}, seq={diagnostic_seq})",
         )
         sequence = event["seq"]
         if event["kind"] == "started":
@@ -336,6 +366,11 @@ def lifecycle(
     read: Read | None = None,
     scenario: str = "upgrade",
 ) -> None:
+    """Reuse one full scan only across a verified stopped transition within 30 seconds.
+
+    Initial custody/start, final postflight and failure cleanup always scan freshly.
+    No running process or uncertain journal/stop can arm a reusable observation.
+    """
     require(scenario in {"fresh", "upgrade"}, "explicit Docker scenario required")
     initial_image = image if scenario == "fresh" else previous_image
     initial_version = version if scenario == "fresh" else previous_version
@@ -474,6 +509,7 @@ def lifecycle(
         if scenario == "upgrade":
             stages.append(("upgrade", image, version, compose))
         stages.append(("reinstall", image, version, compose))
+        stopped_scan_finished: float | None = None
         for stage, released_image, released_version, subject in stages:
             if stage != initial_stage:
                 docker.remove(name)
@@ -493,7 +529,17 @@ def lifecycle(
                         credential,
                     )
                 docker.secrets = (key.decode().strip(), pair["client_key"])
-            scan()
+            require(
+                os.environ.get("GUARD_C6_SERIALIZED") == "1", "shared C6 serialization required"
+            )
+            age = (
+                time.monotonic() - stopped_scan_finished
+                if stopped_scan_finished is not None
+                else None
+            )
+            if age is None or not 0 <= age <= 30:
+                scan()
+            stopped_scan_finished = None  # Consume once, before a process can start.
             active = True  # A failed request can still have started the signing process.
             docker.command(
                 "run",
@@ -579,16 +625,24 @@ def lifecycle(
                     "Testnet crash restart unconfirmed",
                 )
             scan()
+            scanned_at = time.monotonic()
             no_exchange(reads, account, started_ms)
             docker.command("stop", name)
+            require(
+                docker.command("inspect", "--format", "{{.State.Running}}", name).output.strip()
+                == "false",
+                "owned Testnet container stop unconfirmed",
+            )
             active = False
             observed = snapshot(docker, name, **scope)
             if previous is not None:
                 retained(previous, observed)
             previous = observed
+            stopped_scan_finished = scanned_at
     except BaseException as error:
         failures.append(error)
     finally:
+        cleanup_failures = len(failures)
         if active:
             try:
                 scan()
@@ -641,6 +695,21 @@ def lifecycle(
                     )
                 postflight = scan()
                 no_exchange(reads, account, started_ms)
+                if len(failures) == cleanup_failures:
+                    (work / "cleanup.json").write_text(
+                        json.dumps(
+                            dict(
+                                schema=1,
+                                result="cleanup-only",
+                                gate_eligible=False,
+                                cleanup_complete=True,
+                                owned_resources_removed=True,
+                                repair_attempted=False,
+                                postflight=postflight,
+                            )
+                        )
+                        + "\n"
+                    )
             except BaseException as error:
                 failures.append(error)
         else:

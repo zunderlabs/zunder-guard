@@ -456,36 +456,49 @@ def readiness(config, expect_fee_free, configured_licence=None):
     expected_testnet_fee = None
     if sending_mode(config) == 'testnet':
         require(not expect_fee_free or configured_licence, 'Explicit Testnet licence expectation requires the configured signed key.')
-        expected_testnet_fee = 'fee_free' if licence_fee_free(configured_licence) else 'off'
+        # C3 funded Testnet uses the builder route unless the configured licence is fee-free.
+        expected_testnet_fee = 'fee_free' if licence_fee_free(configured_licence) else 'builder'
+    last_predicate = 'health-transport'
     deadline = time.monotonic() + 60
     while time.monotonic() < deadline:
         try:
+            last_predicate = 'health-transport'
             connection = http.client.HTTPConnection('127.0.0.1', 8547, timeout=2)
             connection.request('GET', '/healthz')
             response = connection.getresponse()
+            last_predicate = 'health-http'
             require(response.status == 200, 'Guard is not healthy.')
             response.read()
             connection.close()
+            last_predicate = 'status-transport'
             connection = http.client.HTTPConnection('127.0.0.1', 8547, timeout=2)
             connection.request('GET', '/guard/status')
             response = connection.getresponse()
+            last_predicate = 'status-http'
             require(response.status == 200, 'Guard status unavailable.')
+            last_predicate = 'status-json'
             status = json.loads(response.read(1024 * 1024))
             connection.close()
+            last_predicate = 'account-mode'
             require(status.get('mode') == sending_mode(config) and status.get('network') == sending_mode(config)
                     and status.get('account', '').lower() == config['account'].lower(), 'Guard account/mode mismatch.')
+            last_predicate = 'risk'
             require(status.get('risk', {}).get('journal_ready') is True
                     and status.get('risk', {}).get('state') == 'active'
                     and 'killed' in status and status['killed'] is None,
                     'Guard risk state is not ready; no automatic resume is permitted.')
             fee = status.get('fee', {}).get('mode')
             if sending_mode(config) == 'testnet':
+                last_predicate = 'fee'
                 require(fee == expected_testnet_fee, 'Testnet fee differs from the exact configured licence features.')
+                last_predicate = 'licence'
                 require(status.get('licence', {}).get('state') == ('active' if configured_licence else 'none'),
                         'Testnet configured licence did not validate, or absent licence state differs.')
             else:
+                last_predicate = 'fee'
                 require(fee == 'fee_free' if expect_fee_free else fee in ('fee_free', 'builder'), 'Unexpected licence/fee state.')
             if fee == 'builder':
+                last_predicate = 'builder-approval'
                 require(status['fee'].get('approval', {}).get('state') in
                         ('approved', 'unchecked', 'not_approved', 'refused',
                          'refused_by_venue', 'refused_by_venue_builder'),
@@ -493,7 +506,8 @@ def readiness(config, expect_fee_free, configured_licence=None):
             return status
         except (ops.Refused, OSError, ValueError, http.client.HTTPException):
             time.sleep(1)
-    raise ops.Refused('Guard did not reach the expected healthy account/risk/licence state.')
+    raise ops.Refused('Guard did not reach the expected healthy account/risk/licence state. '
+                      '(predicate=' + last_predicate + ').')
 
 
 def activate(config, record, fresh, expect_fee_free, unattended=False, configured_licence=None):
@@ -532,7 +546,8 @@ def activate(config, record, fresh, expect_fee_free, unattended=False, configure
     if status['fee']['mode'] == 'builder' and status['fee'].get('approval', {}).get('state') != 'approved':
         print('Guard is installed and running, but pay-per-order approval is still needed (' +
               status['fee'].get('approval', {}).get('state', 'unknown') + '). Entries remain blocked.')
-        print('Open https://zunderlabs.com/approve, select Hyperliquid Mainnet, and connect the main wallet for ' +
+        approval_network = 'Testnet' if sending_mode(config) == 'testnet' else 'Mainnet'
+        print('Open https://zunderlabs.com/approve, select Hyperliquid ' + approval_network + ', and connect the main wallet for ' +
               config['account'] + ' to review the builder approval. Do not use the API wallet.')
         print('Before connecting your bot, recheck http://127.0.0.1:8547/guard/status: '
               'fee.approval.state must be approved (or fee.mode must be fee_free with a valid licence).')

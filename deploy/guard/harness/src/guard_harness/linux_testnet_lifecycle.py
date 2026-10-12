@@ -20,6 +20,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 from guard_harness.cli import PAIR_SCHEMA, decode_json
+from guard_harness.journal_diagnostics import error_category, valid_fee_approval
 from guard_harness.linux_lifecycle import (
     ROOT_PATH,
     Inputs,
@@ -78,6 +79,7 @@ def no_exchange(home: Path) -> int:
                 "started",
                 "risk",
                 "stopped",
+                "fee_approval",
                 "decision",
                 "sent",
                 "intent",
@@ -90,11 +92,19 @@ def no_exchange(home: Path) -> int:
             }
             else "unknown"
         )
-        diagnostic_seq = str(sequence + 1) if sequence < 4096 else "unknown"
         require(
-            category in {"started", "risk", "stopped"},
-            "action-bearing or unknown event; no exchange credit "
-            f"(kind={category}, seq={diagnostic_seq})",
+            category != "fee_approval" or valid_fee_approval(event),
+            "fee approval journal event differs",
+        )
+        diagnostic_seq = str(sequence + 1) if sequence < 4096 else "unknown"
+        detail = (
+            f"; error_category={error_category(event.get('text'))} " if category == "error" else " "
+        )
+        require(
+            category in {"started", "risk", "stopped", "fee_approval"},
+            "action-bearing or unknown event; no exchange credit"
+            + detail
+            + f"(kind={category}, seq={diagnostic_seq})",
         )
         if event["kind"] == "started":
             require(event.get("mode") == "testnet", "journal contains another runtime mode")

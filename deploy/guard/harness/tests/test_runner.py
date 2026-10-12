@@ -16,9 +16,19 @@ def test_success_retains_both_streams(tmp_path: Path) -> None:
     assert result.log.read_text() == "out\nerr\n"
 
 
-@pytest.mark.parametrize("label", ["rules", "private-body-fragment", "0x" + "a" * 40])
+@pytest.mark.parametrize(
+    "label,expected",
+    [
+        ("rules", "rules"),
+        ("container-readiness-risk", "container-readiness-risk"),
+        ("container-readiness-status-json", "container-readiness-status-json"),
+        ("container-readiness-risk-private-body", "unknown"),
+        ("private-body-fragment", "unknown"),
+        ("0x" + "a" * 40, "unknown"),
+    ],
+)
 def test_sensitive_failure_classifier_logs_only_fixed_categories(
-    tmp_path: Path, label: str
+    tmp_path: Path, label: str, expected: str
 ) -> None:
     log = tmp_path / "diagnostic.log"
     sentinel = "fake-key-private-body-private-path"
@@ -35,7 +45,6 @@ def test_sensitive_failure_classifier_logs_only_fixed_categories(
             sensitive_output=True,
             failure_classifier=lambda output: label,
         )
-    expected = "rules" if label == "rules" else "unknown"
     assert (
         log.read_text()
         == "[sensitive command output withheld]\nfailure category: " + expected + "\n"

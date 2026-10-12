@@ -31,8 +31,54 @@ def container_install_failure_category(output: str) -> str:
             "container-readiness"
         ),
     }
+    for predicate in (
+        "health-transport",
+        "health-http",
+        "status-transport",
+        "status-http",
+        "status-json",
+        "account-mode",
+        "risk",
+        "fee",
+        "licence",
+        "builder-approval",
+    ):
+        refusals[
+            "Guard did not reach the expected healthy account/risk/licence state. "
+            f"(predicate={predicate})."
+        ] = "container-readiness-" + predicate
     for message, category in refusals.items():
         if output == "Container installation refused: " + message + "\n":
+            return category
+    return "unknown"
+
+
+def native_install_failure_category(output: str) -> str:
+    """Only a complete fixed shell refusal line identifies a native prerequisite."""
+    if type(output) is not str or len(output) > 65536:
+        return "unknown"
+    refusals = {
+        (
+            "protected testnet stdin requires systemd-creds; plaintext fallback is refused"
+        ): "native-prerequisite",
+        (
+            "service instance requires systemd-creds; plaintext fallback is refused"
+        ): "native-prerequisite",
+        "service instance port is already listening": "native-listener",
+        "missing protected testnet key frame": "native-key-frame",
+        "protected testnet frame requires exactly 64 hex digits": "native-key-frame",
+        "invalid protected testnet key frame": "native-key-frame",
+        "the key was refused; nothing was stored": "native-key-refused",
+        "systemd-creds could not encrypt the key": "native-credential-encryption",
+        (
+            "Guard did not become healthy; see the log above (journalctl -u zunder-guard-testnet)"
+        ): "native-readiness",
+    }
+    lines = output.splitlines(keepends=True)
+    if not lines:
+        return "unknown"
+    for message, category in refusals.items():
+        if lines[-1] == "install.sh: " + message + "\n":
             return category
     return "unknown"
 
@@ -109,7 +155,11 @@ class TestnetService:
             stdin=frames,
             secrets=[key.decode().strip()],
             sensitive_output=True,
-            failure_classifier=container_install_failure_category if self.container else None,
+            failure_classifier=(
+                container_install_failure_category
+                if self.container
+                else native_install_failure_category
+            ),
             env={"PATH": ROOT_PATH, "HOME": "/root"},
         )
         if self.container:

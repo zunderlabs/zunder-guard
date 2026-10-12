@@ -649,3 +649,15 @@ complete all-DEX flat scans, durable no-exchange journals and owned cleanup. The
 executes Docker and Compose separately for both fresh installation and previous-release upgrade,
 with independent paper and testnet receipts. Full I5 admission requires all four channel/scenario
 executions against the same authenticated release; local component checks grant no channel credit.
+
+The entire verification run owns the dedicated testnet account lease. T1/P8 and T2 finish
+sequentially, including Guard termination and independent full flat scans, before no-exchange
+install lifecycles run concurrently on isolated runners. Standalone diagnostics use the same
+lease and cannot count towards a release gate. A Docker stop-to-next-start transition can share
+one full scan for at most 30 seconds from completion only after confirmed stop, empty fills,
+authenticated no-action journal and preserved state. Initial custody/start, final teardown and
+failure cleanup retain fresh full scans; uncertain or expired transitions rescan.
+On failure, a separate `cleanup.json` records only confirmed owned-resource removal,
+independent postflight and empty fills. It cannot count as passing installation evidence;
+missing or failed cleanup leaves no positive receipt. Journal diagnostics expose fixed event
+families and bounded sequence numbers while withholding private message contents.

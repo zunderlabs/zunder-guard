@@ -11,11 +11,11 @@ import time
 import tomllib
 from collections.abc import Callable
 from pathlib import Path
-from typing import BinaryIO
+from typing import Any, BinaryIO
 
 from guard_harness.cli import PAIR_SCHEMA, Pair, decode_json
 from guard_harness.mcp_client import MCP
-from guard_harness.paper_bot import LocalGuard
+from guard_harness.paper_bot import GuardUnavailable, LocalGuard
 from guard_harness.runner import run
 from guard_harness.staged_subjects import _private
 from guard_harness.testnet_journey import Journey, execute
@@ -33,6 +33,89 @@ class ProcessError(RuntimeError):
 def _need(value: bool) -> None:
     if not value:
         raise ProcessError("fresh authenticated testnet process prerequisite refused")
+
+
+def _startup_object(value: object) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise ProcessError("fresh authenticated testnet process prerequisite refused")
+    return value
+
+
+def _startup_ready(value: object, *, account: str, started_ms: int) -> bool:
+    """Only absent initial observations may wait; observed refusals remain fatal."""
+    status = _startup_object(value)
+    for name in ("mode", "network"):
+        if name in status:
+            _need(status[name] == "testnet")
+    if "account" in status:
+        _need(isinstance(status["account"], str) and status["account"].lower() == account.lower())
+    started = status.get("started_at_ms")
+    if "started_at_ms" in status:
+        _need(type(started) is int and started >= started_ms)
+    for name, expected in (("killed", None), ("journal_broken", False), ("last_error", None)):
+        if name in status:
+            _need(status[name] is expected)
+    capabilities = status.get("capabilities")
+    if "capabilities" in status:
+        capabilities = _startup_object(capabilities)
+        if "exchange_expected_mode" in capabilities:
+            _need(capabilities["exchange_expected_mode"] is True)
+    journal = status.get("journal")
+    if "journal" in status:
+        journal = _startup_object(journal)
+        _need(journal.get("ok") is True)
+    synced = status.get("last_sync_ms")
+    if synced is not None:
+        now = time.time_ns() // 1_000_000
+        _need(type(synced) is int and type(started) is int)
+        _need(started <= synced <= now and now - synced <= 60000)
+    risk = status.get("risk")
+    if "risk" in status:
+        risk = _startup_object(risk)
+        if "state" in risk:
+            _need(risk["state"] == "active")
+        if "journal_ready" in risk:
+            _need(type(risk["journal_ready"]) is bool)
+            _need(risk["journal_ready"] or synced is None)
+    fee = status.get("fee")
+    fee_ready = False
+    if "fee" in status:
+        fee = _startup_object(fee)
+        _need(fee.get("mode") in ("off", "builder"))
+        if fee["mode"] == "off":
+            fee_ready = True
+        else:
+            _need(isinstance(fee.get("address"), str))
+            _need(re.fullmatch(r"0x[0-9a-fA-F]{40}", fee["address"]) is not None)
+            _need(type(fee.get("fee_tenths_bp")) is int and fee["fee_tenths_bp"] == 20)
+            _need(fee.get("paper") is False)
+            approval = fee.get("approval")
+            approval = _startup_object(approval)
+            _need(approval.get("error") is None)
+            _need(approval.get("state") in ("unchecked", "approved"))
+            if approval["state"] == "approved":
+                maximum = approval.get("max_tenths_bp")
+                _need(type(maximum) is int and maximum >= 20)
+                _need(fee.get("charged") is True and fee.get("entries_blocked") is False)
+                fee_ready = True
+            else:
+                _need(approval.get("max_tenths_bp") is None)
+                _need(fee.get("charged") is False and fee.get("entries_blocked") is True)
+    return (
+        status.get("mode") == status.get("network") == "testnet"
+        and "account" in status
+        and type(started) is int
+        and isinstance(capabilities, dict)
+        and capabilities.get("exchange_expected_mode") is True
+        and isinstance(journal, dict)
+        and journal.get("ok") is True
+        and isinstance(risk, dict)
+        and risk.get("state") == "active"
+        and risk.get("journal_ready") is True
+        and all(name in status for name in ("killed", "journal_broken", "last_error"))
+        and synced is not None
+        and fee_ready
+    )
 
 
 def _bind_wallet(home: Path, account: str, wallet: str, listen: str, client: str) -> None:
@@ -161,20 +244,20 @@ class Foreground:
             _need(hashlib.file_digest(stream, "sha256").hexdigest() == self.sha256)
 
     def wait_ready(self, *, timeout: float = 90) -> None:
-        _need(0 < timeout <= 90)
+        _need(math.isfinite(timeout) and 0 < timeout <= 90)
         guard = OwnedLocalGuard(self)
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             self.alive()
             try:
                 status = guard.request("/guard/status")
-                if isinstance(status, dict) and status.get("mode") == "testnet":
-                    _need(status.get("account", "").lower() == self.account.lower())
-                    _need(type(status.get("started_at_ms")) is int)
-                    _need(status["started_at_ms"] >= self.started_ms)
-                    return
-            except (OSError, ValueError, RuntimeError):
-                pass
+            except GuardUnavailable:
+                time.sleep(0.25)
+                continue
+            if time.monotonic() >= deadline:
+                raise ProcessError("owned testnet Guard readiness deadline")
+            if _startup_ready(status, account=self.account, started_ms=self.started_ms):
+                return
             time.sleep(0.25)
         raise ProcessError("owned testnet Guard readiness deadline")
 

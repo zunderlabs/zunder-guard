@@ -208,10 +208,15 @@ impl<U: Upstream, C: Clock> Guard<U, C> {
             if was_approved && !inner.fee.approved() {
                 Self::add_alert(inner, now, &text, None);
             }
-            inner
-                .journal
-                .append(stamp(now), EventBody::Error { text })
-                .ok();
+            let event = if inner.fee.approved() && inner.fee.read_error().is_none() {
+                EventBody::FeeApproval {
+                    approved: true,
+                    text,
+                }
+            } else {
+                EventBody::Error { text }
+            };
+            inner.journal.append(stamp(now), event).ok();
         }
     }
 
@@ -375,6 +380,236 @@ mod tests {
             super::utc_text(1_830_297_600_000 - 60_000),
             "2027-12-31 23:59 UTC"
         );
+    }
+}
+
+#[cfg(test)]
+mod fee_event_tests {
+    #![allow(clippy::unwrap_used)]
+
+    use std::sync::Arc;
+
+    use rust_decimal::dec;
+    use zunder_guard_core::{action::Builder, auth::AuthConfig, sign::SigningNetwork};
+    use zunder_venue::PersistentRisk;
+
+    use crate::{
+        clock::SystemClock,
+        config::{GuardConfig, GuardNetwork},
+        guard::{Limits, Mode, Setup},
+        journal::DecisionJournal,
+        testdir::TestDir,
+        upstream::UpstreamError,
+    };
+
+    use super::*;
+
+    // These tests call the actual recorder and journal, with no venue I/O.
+    struct NoCalls;
+
+    impl Upstream for NoCalls {
+        async fn info(&self, _: &Value) -> Result<Value, UpstreamError> {
+            panic!("fee journal tests must not read a venue")
+        }
+
+        async fn exchange(&self, _: Vec<u8>) -> Result<Value, UpstreamError> {
+            panic!("fee journal tests must not send")
+        }
+
+        fn ws_url(&self) -> Option<String> {
+            None
+        }
+
+        fn sends_to(&self) -> Option<SigningNetwork> {
+            None
+        }
+    }
+
+    fn builder_mode() -> FeeMode {
+        FeeMode::Builder(Builder {
+            address: "0x00000000000000000000000000000000000000bb".into(),
+            fee_tenths_bp: licence::BUILDER_FEE_TENTHS_BP,
+        })
+    }
+
+    fn start() -> (TestDir, Arc<Guard<NoCalls>>) {
+        let dir = TestDir::new("fee-events");
+        let config = GuardConfig {
+            network: Some(GuardNetwork::Testnet),
+            account: Some("0x00000000000000000000000000000000000000aa".into()),
+            state_dir: dir.path().to_owned(),
+            auth: AuthConfig {
+                clients: vec!["0x00000000000000000000000000000000000000cc".into()],
+                ..AuthConfig::default()
+            },
+            ..GuardConfig::default()
+        };
+        let risk = PersistentRisk::initialise_for(
+            &config.risk_journal(true),
+            config.policy.risk_limits(),
+            &config.journal_scope(true).unwrap(),
+            stamp(SystemClock.now_ms()),
+            dec!(10000),
+            "fee event test",
+        )
+        .unwrap();
+        let journal = DecisionJournal::open(&config.decision_journal(true)).unwrap();
+        let guard = Guard::new(
+            Setup {
+                config,
+                mode: Mode::Paper,
+                risk,
+                journal,
+                fee: builder_mode(),
+                fee_warning: None,
+                limits: Limits::default(),
+            },
+            NoCalls,
+            SystemClock,
+        )
+        .unwrap();
+        (dir, guard)
+    }
+
+    async fn assert_persisted(guard: &Guard<NoCalls>) {
+        let events = guard.events(0).await;
+        let path = guard.inner.lock().await.journal.path().to_owned();
+        guard.stopped("fee event test").await;
+        let mut reopened = DecisionJournal::open(&path).unwrap();
+        let persisted = reopened.since(0);
+        let events = events.as_array().unwrap();
+        assert_eq!(&persisted[..events.len()], events);
+        reopened.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn approved_read_is_observation_but_retained_approval_read_failures_are_errors() {
+        let (_dir, guard) = start();
+        let mut inner = guard.inner.lock().await;
+        let now = SystemClock.now_ms();
+        let ticket = inner.fee.begin_check(now);
+        Guard::<NoCalls>::record_fee_check(&mut inner, ticket, now, Ok(&json!(20)));
+        let approved = inner.journal.since(1);
+        assert_eq!(approved.len(), 1);
+        assert_eq!(approved[0]["kind"], "fee_approval");
+        assert_eq!(approved[0]["approved"], true);
+        assert!(
+            approved[0]["text"]
+                .as_str()
+                .unwrap()
+                .starts_with("builder fee approved")
+        );
+        assert_eq!(inner.fee.read_error(), None);
+
+        for (offset, answer) in [
+            (1, Err("HTTP 503".into())),
+            (2, Ok(json!({"malformed": true}))),
+        ] {
+            let ticket = inner.fee.begin_check(now + offset);
+            let before = inner.journal.last_seq();
+            Guard::<NoCalls>::record_fee_check(
+                &mut inner,
+                ticket,
+                now + offset,
+                answer.as_ref().map_err(Clone::clone),
+            );
+            assert!(inner.fee.approved(), "failed reads retain prior approval");
+            let events = inner.journal.since(before);
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0]["kind"], "error");
+            assert_eq!(events[0]["text"].as_str(), inner.fee.read_error());
+            assert!(events[0].get("approved").is_none());
+            assert!(inner.alerts.is_empty());
+        }
+        drop(inner);
+        assert_persisted(&guard).await;
+    }
+
+    #[tokio::test]
+    async fn unapproved_reads_remain_errors_and_withdrawals_remain_alerts() {
+        for maximum in [0, 19] {
+            let (_dir, guard) = start();
+            let mut inner = guard.inner.lock().await;
+            let now = SystemClock.now_ms();
+            let ticket = inner.fee.begin_check(now);
+            Guard::<NoCalls>::record_fee_check(&mut inner, ticket, now, Ok(&json!(maximum)));
+            let events = inner.journal.since(1);
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0]["kind"], "error");
+            assert!(!inner.fee.approved());
+            assert_eq!(inner.fee.read_error(), None);
+            assert!(inner.alerts.is_empty());
+
+            let ticket = inner.fee.begin_check(now + 1);
+            Guard::<NoCalls>::record_fee_check(&mut inner, ticket, now + 1, Ok(&json!(20)));
+            let before = inner.journal.last_seq();
+            let ticket = inner.fee.begin_check(now + 2);
+            Guard::<NoCalls>::record_fee_check(&mut inner, ticket, now + 2, Ok(&json!(maximum)));
+            assert_eq!(inner.journal.since(before)[0]["kind"], "error");
+            assert_eq!(inner.alerts.len(), 1);
+            assert!(!inner.fee.approved());
+            drop(inner);
+            assert_persisted(&guard).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn duplicate_stale_and_old_mode_tickets_never_add_events() {
+        let (_dir, guard) = start();
+        let mut inner = guard.inner.lock().await;
+        let now = SystemClock.now_ms();
+        let stale = inner.fee.begin_check(now);
+        let current = inner.fee.begin_check(now + 1);
+        Guard::<NoCalls>::record_fee_check(&mut inner, current, now + 1, Ok(&json!(20)));
+        let before = inner.journal.last_seq();
+        for ticket in [stale, current] {
+            Guard::<NoCalls>::record_fee_check(&mut inner, ticket, now + 2, Ok(&json!(0)));
+            Guard::<NoCalls>::record_fee_check(&mut inner, ticket, now + 3, Err("HTTP 503".into()));
+        }
+        assert!(inner.journal.since(before).is_empty());
+        assert!(inner.fee.approved());
+        assert_eq!(inner.fee.read_error(), None);
+        let old_mode = inner.fee.begin_check(now + 4);
+        assert!(inner.fee.switch_mode(FeeMode::FeeFree {
+            licensee: "test".into()
+        }));
+        assert!(inner.fee.switch_mode(builder_mode()));
+        Guard::<NoCalls>::record_fee_check(&mut inner, old_mode, now + 5, Ok(&json!(20)));
+        Guard::<NoCalls>::record_fee_check(&mut inner, old_mode, now + 6, Err("HTTP 503".into()));
+        assert!(inner.journal.since(before).is_empty());
+        assert!(!inner.fee.approved());
+        assert_eq!(inner.fee.read_error(), None);
+        drop(inner);
+        assert_persisted(&guard).await;
+    }
+
+    #[tokio::test]
+    async fn unchanged_reads_and_venue_backoff_never_add_events() {
+        let (_dir, guard) = start();
+        let mut inner = guard.inner.lock().await;
+        let now = SystemClock.now_ms();
+        let ticket = inner.fee.begin_check(now);
+        Guard::<NoCalls>::record_fee_check(&mut inner, ticket, now, Ok(&json!(20)));
+        let before = inner.journal.last_seq();
+        let ticket = inner.fee.begin_check(now + 1);
+        Guard::<NoCalls>::record_fee_check(&mut inner, ticket, now + 1, Ok(&json!(20)));
+        assert!(inner.journal.since(before).is_empty());
+        inner
+            .fee
+            .record_venue_refusal(now + 2, "Builder has insufficient balance to be approved.");
+        let ticket = inner.fee.begin_check(now + 3);
+        Guard::<NoCalls>::record_fee_check(&mut inner, ticket, now + 3, Ok(&json!(20)));
+        assert!(inner.journal.since(before).is_empty());
+        assert!(!inner.fee.approved());
+        assert_eq!(inner.fee.read_error(), None);
+        let ticket = inner.fee.begin_check(now + 4);
+        Guard::<NoCalls>::record_fee_check(&mut inner, ticket, now + 4, Err("HTTP 503".into()));
+        let before = inner.journal.last_seq();
+        let ticket = inner.fee.begin_check(now + 5);
+        Guard::<NoCalls>::record_fee_check(&mut inner, ticket, now + 5, Err("HTTP 503".into()));
+        assert!(inner.journal.since(before).is_empty());
+        drop(inner);
+        assert_persisted(&guard).await;
     }
 }
 

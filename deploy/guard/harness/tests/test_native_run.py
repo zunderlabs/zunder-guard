@@ -1,4 +1,5 @@
 import json
+import os
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -24,6 +25,8 @@ def setup(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path, dict[s
     )
     (subjects / "input.json").write_text(json.dumps(identity))
     monkeypatch.setenv("GITHUB_SHA", "b" * 40)
+    monkeypatch.setenv("DIAGNOSTIC", "false")
+    monkeypatch.setenv("INSTALL_MATRIX_PROFILE", "all")
     monkeypatch.setenv("GUARD_C6_SERIALIZED", "1")
     monkeypatch.setenv("WALLET_FRAME", "e" * 64)
     monkeypatch.setenv("UNRELATED_TOKEN", "inert-token-fixture")
@@ -69,6 +72,7 @@ def test_modes_receive_private_stdin_only_and_preserve_scenario(
         assert options["check"] is True
     receipt = json.loads((output / "identities.json").read_bytes())
     assert receipt["scenario"] == scenario
+    assert receipt["diagnostic"] is False and "gate_eligible" not in receipt
     assert ("previous_tag" in receipt) is (scenario == "upgrade")
     assert ("previous_commit" in receipt) is (scenario == "upgrade")
     assert (output / "channels/D2.json").exists() is (scenario == "fresh")
@@ -130,3 +134,79 @@ def test_unadmitted_native_input_refuses_before_children(
             account="inert-private-account",
             shell="pwsh.exe",
         )
+
+
+@pytest.mark.parametrize("scenario", ["fresh", "upgrade"])
+def test_explicit_diagnostic_binds_new_harness_to_unchanged_released_source_without_gate_credit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, scenario: str
+) -> None:
+    subjects, identity = setup(tmp_path, monkeypatch)
+    identity.update(diagnostic=True, harness_commit="a" * 40)
+    (subjects / "input.json").write_text(json.dumps(identity))
+    monkeypatch.setenv("GITHUB_SHA", "a" * 40)
+    monkeypatch.setenv("DIAGNOSTIC", "true")
+    calls: list[tuple[list[str], dict[str, Any]]] = []
+    monkeypatch.setattr(
+        "guard_harness.native_run.subprocess.run", lambda words, **opts: calls.append((words, opts))
+    )
+    output = tmp_path / "output"
+    native_run.execute(
+        subjects=subjects,
+        output=output,
+        scenario=scenario,
+        account="inert-account",
+        shell="pwsh.exe",
+    )
+    assert len(calls) == 2
+    for words, opts in calls:
+        assert words[words.index("--commit") + 1] == "b" * 40
+        assert opts["env"]["DIAGNOSTIC"] == "true"
+        assert "WALLET_FRAME" not in opts["env"] and "e" * 64 not in repr(words)
+    assert calls[0][1]["input"] == b"" and calls[1][1]["input"] == b"e" * 64 + b"\n"
+    record = json.loads((output / "identities.json").read_bytes())
+    assert record["release_commit"] == "b" * 40 and record["harness_commit"] == "a" * 40
+    assert record["diagnostic"] is True and record["gate_eligible"] is False
+
+
+@pytest.mark.parametrize(
+    "mutation", ["unbound", "harness", "sha", "nightly", "channel", "boolean", "object", "mode"]
+)
+def test_diagnostic_admission_never_relaxes_harness_channel_profile_or_mode_binding(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mutation: str
+) -> None:
+    subjects, identity = setup(tmp_path, monkeypatch)
+    identity.update(diagnostic=True, harness_commit="a" * 40)
+    monkeypatch.setenv("GITHUB_SHA", "a" * 40)
+    monkeypatch.setenv("DIAGNOSTIC", "true")
+    if mutation == "unbound":
+        identity["diagnostic"] = False
+    elif mutation == "harness":
+        identity["harness_commit"] = "c" * 40
+    elif mutation == "sha":
+        monkeypatch.setenv("GITHUB_SHA", "not-a-commit")
+    elif mutation == "nightly":
+        monkeypatch.setenv("INSTALL_MATRIX_PROFILE", "nightly")
+        identity["loader_channel"] = "canonical"
+    elif mutation == "channel":
+        identity["loader_channel"] = "canonical"
+    elif mutation == "boolean":
+        identity["diagnostic"] = 1
+    elif mutation == "mode":
+        monkeypatch.setenv("DIAGNOSTIC", "True")
+    (subjects / "input.json").write_text(json.dumps([] if mutation == "object" else identity))
+
+    def forbidden(*args: Any, **kwargs: Any) -> None:
+        pytest.fail("no child, scanner or key read before admission")
+
+    monkeypatch.setattr("guard_harness.native_run.subprocess.run", forbidden)
+    monkeypatch.setattr(native_run, "flat_scan", forbidden)
+    with pytest.raises(ProcessError):
+        native_run.execute(
+            subjects=subjects,
+            output=tmp_path / "output",
+            scenario="fresh",
+            account="inert-account",
+            shell="pwsh.exe",
+        )
+    assert "WALLET_FRAME" in os.environ
+    assert not (tmp_path / "output").exists()

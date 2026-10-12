@@ -276,7 +276,25 @@ def test_real_command_key_enters_stdin_only(
 
 
 @pytest.mark.parametrize("scenario", ["fresh", "upgrade"])
-@pytest.mark.parametrize("failure", ["", "start", "nonflat-cleanup", "history"])
+@pytest.mark.parametrize(
+    "failure",
+    [
+        "",
+        "start",
+        "nonflat-cleanup",
+        "history",
+        "snapshot",
+        "action-journal",
+        "stop",
+        "stop-readback",
+        "lost-owner",
+        "age-boundary",
+        "aged",
+        "clock-rewound",
+        "cleanup-postflight",
+        "cleanup-fills",
+    ],
+)
 def test_lifecycle_receipt_requires_all_actual_observations(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, failure: str, scenario: str
 ) -> None:
@@ -292,15 +310,23 @@ def test_lifecycle_receipt_requires_all_actual_observations(
     }
     snapshots = 0
     scans = 0
+    stopped = 0
+    clock = [100.0]
+    start_scans: list[int] = []
+    scan_running: list[bool] = []
 
     def scan(*args: Any) -> dict[str, Any]:
         nonlocal scans
         scans += 1
+        scan_running.append(resources["running"])
+        if failure == "cleanup-postflight" and scans > 2 and not resources["running"]:
+            raise PaperError("postflight unavailable")
         if failure == "nonflat-cleanup" and resources["running"]:
             raise PaperError("not flat")
         return {"observations": [], "network": "testnet"}
 
     def command(self: Any, *args: str, **kwargs: Any) -> RunResult:
+        nonlocal stopped
         calls.append(args)
         result = ""
         if args[:2] == ("volume", "create"):
@@ -317,6 +343,7 @@ def test_lifecycle_receipt_requires_all_actual_observations(
             result = str(resources["name"])
         elif args[:2] == ("run", "-d"):
             assert scans > 0
+            start_scans.append(scans)
             resources["name"] = args[args.index("--name") + 1]
             resources["running"] = True
             resources["image"] = next(arg for arg in args if arg in {IMAGE, PREVIOUS})
@@ -337,11 +364,20 @@ def test_lifecycle_receipt_requires_all_actual_observations(
                 "{{.Config.Image}}": str(resources["image"]),
                 "{{.Id}}": "d" * 64,
                 "{{.RestartCount}}": str(resources["restart"]),
+                "{{.State.Running}}": (
+                    "true" if failure == "stop-readback" else str(resources["running"]).lower()
+                ),
             }[args[2]]
         elif args[0] == "top":
             result = "PID COMMAND\n234 zunder-guard\n"
         elif args[0] == "stop":
+            stopped += 1
+            if failure == "stop" and stopped == 1:
+                raise PaperError("owned stop failed")
             resources["running"] = False
+            # Delays occur after scan completion, proving freshness is never
+            # measured from the later stop/readback/snapshot operations.
+            clock[0] += {"age-boundary": 30, "aged": 30.001, "clock-rewound": -1}.get(failure, 0)
         return RunResult(0, result, tmp_path / "withheld.log")
 
     def snap(*args: Any, **kwargs: Any) -> dict[str, bytes]:
@@ -349,6 +385,13 @@ def test_lifecycle_receipt_requires_all_actual_observations(
         snapshots += 1
         if failure == "history" and snapshots == 3:
             return inspect(archive()) | {"guard.toml": b"changed"}
+        if snapshots == 3:
+            if failure in {"snapshot", "cleanup-postflight", "cleanup-fills"}:
+                raise PaperError("complete snapshot unknown")
+            if failure == "action-journal":
+                return inspect(archive(kinds=["started", "sent"]))
+            if failure == "lost-owner":
+                monkeypatch.delenv("GUARD_C6_SERIALIZED")
         return inspect(archive()) | {"risk.jsonl": b"risk\n" + b"append\n" * snapshots}
 
     def crash(argv: list[str], **kwargs: Any) -> RunResult:
@@ -359,6 +402,8 @@ def test_lifecycle_receipt_requires_all_actual_observations(
 
     def read(payload: dict[str, Any]) -> object:
         assert payload["type"] == "userFillsByTime"
+        if failure == "cleanup-fills" and not resources["running"]:
+            raise PaperError("fill observation unavailable")
         return []
 
     monkeypatch.setattr(subject, "flat_scan", scan)
@@ -366,8 +411,9 @@ def test_lifecycle_receipt_requires_all_actual_observations(
     monkeypatch.setattr(subject, "snapshot", snap)
     monkeypatch.setattr(subject, "run", crash)
     monkeypatch.setattr(subject, "ready", lambda *args, after=0, **kwargs: after + 1)
+    monkeypatch.setattr("guard_harness.docker_testnet.time.monotonic", lambda: clock[0])
     work = tmp_path / "run"
-    if failure:
+    if failure not in {"", "age-boundary", "aged", "clock-rewound"}:
         with pytest.raises((PaperError, BaseExceptionGroup)):
             subject.lifecycle(
                 IMAGE,
@@ -382,11 +428,26 @@ def test_lifecycle_receipt_requires_all_actual_observations(
                 scenario=scenario,
             )
         assert not (work / "receipt.json").exists()
+        if failure in {"snapshot", "action-journal"}:
+            cleanup = json.loads((work / "cleanup.json").read_text())
+            assert cleanup == {
+                "schema": 1,
+                "result": "cleanup-only",
+                "gate_eligible": False,
+                "cleanup_complete": True,
+                "owned_resources_removed": True,
+                "repair_attempted": False,
+                "postflight": {"observations": [], "network": "testnet"},
+            }
+        if failure in {"nonflat-cleanup", "cleanup-postflight", "cleanup-fills"}:
+            assert not (work / "cleanup.json").exists()
         if failure == "nonflat-cleanup":
             assert resources["running"] and resources["volume"]
             assert json.loads((work / "recovery.json").read_text())["cleanup_complete"] is False
         else:
             assert not resources["running"] and not resources["volume"]
+            assert len(start_scans) == 1  # No next process after an uncertain stopped transition.
+            assert scans >= 4  # Initial custody/start plus fresh failure/postflight observations.
     else:
         subject.lifecycle(
             IMAGE,
@@ -414,7 +475,17 @@ def test_lifecycle_receipt_requires_all_actual_observations(
             call[call.index("--network") + 1] for call in calls if call[:2] == ("run", "-d")
         ] == ["testnet"] * (3 if scenario == "upgrade" else 2)
         assert snapshots == (5 if scenario == "upgrade" else 4)
-        assert scans == (8 if scenario == "upgrade" else 6)
+        rescan = failure in {"aged", "clock-rewound"}
+        assert scans == (
+            (8 if scenario == "upgrade" else 6) if rescan else (6 if scenario == "upgrade" else 5)
+        )
+        assert start_scans[0] == 2  # Initial custody never replaces first-start admission.
+        assert start_scans == (
+            ([2, 4, 6] if scenario == "upgrade" else [2, 4])
+            if rescan
+            else ([2, 3, 4] if scenario == "upgrade" else [2, 3])
+        )
+        assert scan_running[-1] is False  # Independent final postflight remains fresh.
         assert receipt["scenario"] == scenario
         initial = IMAGE if scenario == "fresh" else PREVIOUS
         assert receipt["initial_image"] == initial
@@ -510,3 +581,112 @@ def test_status_health_identity_and_journal(monkeypatch: pytest.MonkeyPatch) -> 
             }
 
     assert subject.ready(Guard(), account=ACCOUNT, version="1.0.0", after=41) == 42  # type: ignore[arg-type]
+
+
+def diagnostic_journal(event: dict[str, Any], *, prefix: int = 1) -> bytes:
+    body = journal(["started"] * prefix)
+    previous = json.loads(body.splitlines()[-1])["check"]
+    text = json.dumps(dict(event, seq=prefix + 1), separators=(",", ":"))
+    check = hashlib.sha3_256((previous + text).encode()).hexdigest()
+    return (
+        body
+        + json.dumps({"check": check, "prev": previous}).removesuffix("}").encode()
+        + (',"event":' + text + "}\n").encode()
+    )
+
+
+@pytest.mark.parametrize(
+    "kind,category",
+    [
+        ("error", "error"),
+        ("sent", "sent"),
+        ("kill", "kill"),
+        ("private-token", "unknown"),
+        (None, "unknown"),
+        ({"private-token": "fixture"}, "unknown"),
+    ],
+)
+def test_archive_refusal_reports_only_authenticated_finite_kind_and_error_family(
+    kind: Any, category: str
+) -> None:
+    body = diagnostic_journal(
+        {
+            "kind": kind,
+            "text": "reading the account: private-token",
+            "account": ACCOUNT,
+            "action": {"private-payload": "fixture"},
+        }
+    )
+    with pytest.raises(PaperError) as caught:
+        inspect(archive(journal_body=body))
+    diagnostic = str(caught.value)
+    assert diagnostic.endswith(f"(kind={category}, seq=2)")
+    assert ("error_category=account-read" in diagnostic) == (category == "error")
+    assert all(value not in diagnostic for value in [ACCOUNT, "private-token", "private-payload"])
+
+
+@pytest.mark.parametrize("tamper", ["check", "prev", "seq"])
+def test_archive_corruption_cannot_claim_error_kind_or_family(tamper: str) -> None:
+    body = diagnostic_journal({"kind": "error", "text": "reading the account: private-token"})
+    lines = body.splitlines()
+    record = json.loads(lines[-1])
+    if tamper == "seq":
+        record["event"]["seq"] = 999
+        text = json.dumps(record["event"], separators=(",", ":"))
+        record["check"] = hashlib.sha3_256((record["prev"] + text).encode()).hexdigest()
+        # Keep the producer's event bytes exact so sequence validation is exercised.
+        last = json.dumps({"check": record["check"], "prev": record["prev"]}).removesuffix("}")
+        lines[-1] = (last + ',"event":' + text + "}").encode()
+    else:
+        record[tamper] = "private-token"
+        lines[-1] = json.dumps(record).encode()
+    with pytest.raises(PaperError) as caught:
+        inspect(archive(journal_body=b"\n".join(lines) + b"\n"))
+    diagnostic = str(caught.value)
+    assert "kind=" not in diagnostic and "error_category=" not in diagnostic
+    assert "private-token" not in diagnostic
+    assert ("sequence incomplete" if tamper == "seq" else "chain differs") in diagnostic
+
+
+def test_archive_error_sequence_diagnostic_is_bounded() -> None:
+    body = diagnostic_journal({"kind": "error", "text": "private-token"}, prefix=4096)
+    with pytest.raises(PaperError, match=r"error_category=unknown \(kind=error, seq=unknown\)"):
+        inspect(archive(journal_body=body))
+
+
+def test_typed_successful_fee_read_is_not_an_exchange() -> None:
+    event = {"kind": "fee_approval", "approved": True, "text": "builder fee approved"}
+    body = diagnostic_journal(dict(event, at_ms=2))
+    assert inspect(archive(journal_body=body))["decisions.jsonl"] == body
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        {"approved": False},
+        {"approved": 1},
+        {"approved": "true"},
+        {"text": None},
+        {"text": ""},
+        {"text": "x" * 16385},
+        {"action": {}},
+        {"sent": False},
+    ],
+)
+def test_fee_notice_cannot_hide_failed_or_action_bearing_state(mutation: dict[str, Any]) -> None:
+    event = {"kind": "fee_approval", "approved": True, "text": "private-sentinel"} | mutation
+    body = diagnostic_journal(dict(event, at_ms=2))
+    with pytest.raises(PaperError, match="fee approval journal event differs") as caught:
+        inspect(archive(journal_body=body))
+    assert "private-sentinel" not in str(caught.value)
+
+
+def test_legacy_builder_approval_error_still_refuses_credit() -> None:
+    event = {
+        "kind": "error",
+        "text": "builder fee approved (private-sentinel); Guard's orders carry it",
+    }
+    body = diagnostic_journal(dict(event, at_ms=2))
+    with pytest.raises(PaperError, match="error_category=fee-approved") as caught:
+        inspect(archive(journal_body=body))
+    assert "private-sentinel" not in str(caught.value)

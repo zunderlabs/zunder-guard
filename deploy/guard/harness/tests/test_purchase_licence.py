@@ -187,8 +187,9 @@ def test_renewal_refuses_repeated_key_or_malformed_token(renewal: dict[str, str]
 
 
 @pytest.mark.parametrize("applied", [True, False])
+@pytest.mark.parametrize("first_renewed_read", [1, 2])
 def test_auto_update_requires_persistence_and_applied_newer_expiry(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, applied: bool
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, applied: bool, first_renewed_read: int
 ) -> None:
     home = tmp_path / "home"
     home.mkdir()
@@ -206,7 +207,7 @@ def test_auto_update_requires_persistence_and_applied_newer_expiry(
 
         def status(self, **kwargs: Any) -> dict[str, Any]:
             self.reads += 1
-            if self.reads == 2:
+            if self.reads == first_renewed_read:
                 config.write_text(f'licence = "{NEW}"\n')
             return {
                 "mode": "paper",
@@ -215,7 +216,7 @@ def test_auto_update_requires_persistence_and_applied_newer_expiry(
                     "state": "valid",
                     "fee_free": True,
                     "source": "auto_update",
-                    "expires_at_ms": 200 if self.reads >= 2 and applied else 100,
+                    "expires_at_ms": 200 if self.reads >= first_renewed_read and applied else 100,
                 },
                 "journal": {"ok": True},
             }
@@ -249,6 +250,7 @@ def test_auto_update_requires_persistence_and_applied_newer_expiry(
             "0x" + "1" * 40,
             OLD,
             NEW,
+            previous_expiry_ms=100,
         )
 
     if applied:

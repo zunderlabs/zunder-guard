@@ -5,6 +5,7 @@ import { mkdir } from 'node:fs/promises';
 import { join } from 'node:path';
 import { renewPurchase } from './renewal.js';
 import { emailedLicence } from './licence-key.js';
+import { paidTestTimeoutMs, waitForDelivery } from './delivery-deadline.js';
 import { test, expect, type Page } from '@playwright/test';
 import { safe, get, post, validInboxMessage } from './safe.js';
 import { command } from './subprocess.js';
@@ -56,7 +57,7 @@ if (checkoutDiagnostic && !['P1', 'P2', 'P3'].includes(journey)) throw new Error
 test.skip(!['P1', 'P2', 'P3', 'P6'].includes(process.env['GUARD_PAID_JOURNEY'] ?? ''), 'paid journey requires explicit hosted release inputs');
 
 test(`${journey} pricing to paid email to installed released licence`, async ({ page, request }) => {
-  test.setTimeout(checkoutDiagnostic ? 2 * 60_000 : 15 * 60_000);
+  test.setTimeout(checkoutDiagnostic ? 2 * 60_000 : paidTestTimeoutMs(network));
   const clickDiagnostics = stagingClickDiagnostics(page, 'pricing-buy-pro');
   const root = process.env['GUARD_PURCHASE_WORK'];
   const assets = process.env['GUARD_RELEASE_ASSETS'];
@@ -157,10 +158,10 @@ test(`${journey} pricing to paid email to installed released licence`, async ({ 
       E2E_PAYER_EVM_SEPOLIA_KEY: process.env['E2E_PAYER_EVM_SEPOLIA_KEY'],
     });
   }
-  const deadline = Date.now() + 10 * 60_000;
   let licence = '';
   let renewalToken = '';
-  while (Date.now() < deadline) {
+  const deliveryProgress = { paid: false, issued: false, delivered: false };
+  licence = await waitForDelivery(network, async () => {
     const scan = await post(request, '/api/licence/order/check', {
       headers: { Origin: origin ?? '' }, data: { id: order.id, token: body.token },
     }, 'paid order check');
@@ -171,6 +172,9 @@ test(`${journey} pricing to paid email to installed released licence`, async ({ 
     const state = await safe(() => stateResponse.json(), 'paid order state JSON');
     expect(stateResponse.status() === 200 && state.network === network
       && ['quoted', 'paid', 'issued', 'delivered'].includes(state.state), 'expected paid delivery states').toBe(true);
+    deliveryProgress.paid ||= state.state === 'paid';
+    deliveryProgress.issued ||= state.state === 'issued';
+    deliveryProgress.delivered ||= state.state === 'delivered';
     const inbox = await get(request, process.env['GUARD_INBOX_URL'] ?? '', {
       params: { to: email, since: String(since) },
       headers: { Authorization: `Bearer ${process.env['GUARD_INBOX_TOKEN'] ?? ''}` },
@@ -185,9 +189,9 @@ test(`${journey} pricing to paid email to installed released licence`, async ({ 
       if (renew) renewalToken = renew[1] ?? '';
       if (key && state.state === 'delivered' && state.key_issued === true) licence = key;
     }
-    if (licence) break;
-    await new Promise(resolve => setTimeout(resolve, 5000));
-  }
+    return licence || null;
+  }) ?? '';
+  if (!licence) console.log('paid-delivery-deadline ' + JSON.stringify({ journey, network, ...deliveryProgress, emailedKey: false }));
   expect(Boolean(licence), 'licence arrived by email after delivered order').toBe(true);
   let renewalInput = '';
   if (journey === 'P6') {

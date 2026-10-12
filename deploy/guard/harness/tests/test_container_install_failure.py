@@ -38,6 +38,27 @@ REFUSALS = [
 ]
 
 
+REFUSALS.extend(
+    (
+        "Container installation refused: Guard did not reach the expected healthy "
+        f"account/risk/licence state. (predicate={predicate}).\n",
+        "container-readiness-" + predicate,
+    )
+    for predicate in (
+        "health-transport",
+        "health-http",
+        "status-transport",
+        "status-http",
+        "status-json",
+        "account-mode",
+        "risk",
+        "fee",
+        "licence",
+        "builder-approval",
+    )
+)
+
+
 @pytest.mark.parametrize("stderr,category", REFUSALS)
 def test_failed_container_setup_exports_only_exact_stage_label(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stderr: str, category: str
@@ -172,3 +193,63 @@ def test_installer_timeout_cannot_export_partial_stage(
     assert (tmp_path / "log").read_text() == (
         "[sensitive command output withheld]\nfailure category: unknown\n"
     )
+
+
+@pytest.mark.parametrize(
+    "message,category",
+    [
+        ("missing protected testnet key frame", "native-key-frame"),
+        ("systemd-creds could not encrypt the key", "native-credential-encryption"),
+        ("the key was refused; nothing was stored", "native-key-refused"),
+        (
+            "Guard did not become healthy; see the log above (journalctl -u zunder-guard-testnet)",
+            "native-readiness",
+        ),
+    ],
+)
+def test_native_fixed_terminal_refusal_withholds_all_prior_private_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, message: str, category: str
+) -> None:
+    def failed(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess[bytes]:
+        return subprocess.CompletedProcess(
+            argv,
+            1,
+            b"private-stdout",
+            ("private-token/account/path\ninstall.sh: " + message + "\n").encode(),
+        )
+
+    monkeypatch.setattr(subprocess, "run", failed)
+    with pytest.raises(RunError, match="failure category: " + category) as caught:
+        runner.run(
+            ["synthetic-native"],
+            log=tmp_path / "log",
+            timeout=1,
+            sensitive_output=True,
+            failure_classifier=linux_testnet_service.native_install_failure_category,
+        )
+    assert (tmp_path / "log").read_text() == (
+        "[sensitive command output withheld]\nfailure category: " + category + "\n"
+    )
+    assert "private" not in str(caught.value)
+
+
+@pytest.mark.parametrize(
+    "output",
+    [
+        "install.sh: missing protected testnet key frame",  # incomplete line
+        "install.sh: missing protected testnet key frame-private\n",
+        "install.sh: missing protected testnet key frame\nprivate\n",
+        "private init error\n",
+        "x" * 65537,
+    ],
+)
+def test_nonexact_native_refusal_does_not_infer_failing_phase(output: str) -> None:
+    assert linux_testnet_service.native_install_failure_category(output) == "unknown"
+
+
+def test_unknown_new_readiness_predicate_is_not_exported() -> None:
+    output = (
+        "Container installation refused: Guard did not reach the expected healthy "
+        "account/risk/licence state. (predicate=private-token).\n"
+    )
+    assert linux_testnet_service.container_install_failure_category(output) == "unknown"

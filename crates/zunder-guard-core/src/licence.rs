@@ -866,6 +866,12 @@ impl FeeState {
         }
     }
 
+    /// The last approval-read error, even when an earlier approval is
+    /// retained. A retained approval does not make a failed read successful.
+    pub fn read_error(&self) -> Option<&str> {
+        self.error.as_deref()
+    }
+
     /// The builder field Guard's orders carry now: the mode's, and only
     /// while the approval is confirmed, since the venue refuses an order
     /// with an unapproved builder and an exit must never be refused for the

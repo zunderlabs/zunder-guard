@@ -1,5 +1,6 @@
 import json
 import os
+import sys
 import time
 from pathlib import Path
 from typing import Any
@@ -229,3 +230,169 @@ def test_unconfirmed_receipt_deadline_preserves_one_attempt(
         evm.pay("base", "ZL-2026-000001", "0.180001", work)
     assert len(broadcasts) == 1 and (work / "payment-attempt.json").exists()
     assert not (work / "payment-receipt.json").exists()
+
+
+@pytest.mark.parametrize("message,family", list(evm.RPC_MESSAGES.items()))
+def test_rpc_rejection_emits_only_finite_family(
+    monkeypatch: pytest.MonkeyPatch, message: str, family: str
+) -> None:
+    sentinel = "private-wallet-transaction-token"
+    monkeypatch.setattr(
+        evm,
+        "request",
+        lambda *args, **kwargs: {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "error": {"message": message, "data": sentinel, "code": sentinel},
+        },
+    )
+    with pytest.raises(evm.RpcRejection) as caught:
+        evm.rpc("base", "eth_sendRawTransaction", [sentinel])
+    assert caught.value.family == family
+    assert str(caught.value) == "Sepolia RPC admission failed; diagnostics withheld"
+    assert sentinel not in str(caught.value)
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "nonce too low private-wallet-transaction-token",
+        "Nonce too low",
+        123,
+        None,
+        "private-wallet-transaction-token",
+        ["nonce too low"],
+    ],
+)
+def test_rpc_unknown_or_suffixed_private_error_is_unknown(message: object) -> None:
+    assert evm.rpc_family({"message": message}) == "unknown"
+
+
+@pytest.mark.parametrize(
+    "method,phase,attempt",
+    [
+        ("eth_estimateGas", "evm-gas-estimate", False),
+        ("eth_sendRawTransaction", "evm-broadcast", True),
+        ("eth_getTransactionReceipt", "evm-confirm", True),
+    ],
+)
+@pytest.mark.parametrize("family", [None, "insufficient-funds"])
+def test_actual_main_failure_stderr_and_receipt_are_private_and_finite(
+    setup: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    method: str,
+    phase: str,
+    attempt: bool,
+    family: str | None,
+) -> None:
+    _, _, broadcasts, _, work = setup
+    original = evm.rpc
+    sentinel = "private-wallet-transaction-token"
+
+    def rpc(network: str, called: str, params: list[object]) -> Any:
+        if called == method:
+            if family is not None:
+                raise evm.RpcRejection(family)
+            raise common.PaymentError(json.dumps({"error": sentinel, "data": params}))
+        return original(network, called, params)
+
+    monkeypatch.setattr(evm, "rpc", rpc)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "purchase_evm",
+            "--network",
+            "base",
+            "--order",
+            "ZL-2026-000001",
+            "--amount",
+            "0.180001",
+            "--work",
+            str(work),
+        ],
+    )
+    assert evm.main() == 1
+    captured = capsys.readouterr()
+    label = phase + ("-" + family if family is not None else "")
+    assert captured.out == ""
+    assert captured.err == (
+        "Testnet payment failed at " + label + "; reconcile private receipts; never retry\n"
+    )
+    assert len(label) <= 40
+    failure = json.loads((work / "payment-failure.json").read_text())
+    assert failure == {"phase": label, "attempt": attempt, "broadcast_started": attempt}
+    assert (work / "payment-failure.json").stat().st_mode & 0o777 == 0o600
+    assert sentinel not in captured.err and sentinel not in json.dumps(failure)
+    assert (work / "payment-attempt.json").exists() is attempt
+    assert not (work / "payment-receipt.json").exists()
+    assert len(broadcasts) == (1 if method == "eth_getTransactionReceipt" else 0)
+    if attempt:
+        with pytest.raises(common.PaymentError, match="never retry"):
+            evm.pay("base", "ZL-2026-000001", "0.180001", work)
+        assert len(broadcasts) == (1 if method == "eth_getTransactionReceipt" else 0)
+
+
+def test_phase_observer_tracks_admission_attempt_and_single_broadcast(setup: Any) -> None:
+    _, _, broadcasts, _, work = setup
+    phases: list[str] = []
+    evm.pay("base", "ZL-2026-000001", "0.180001", work, observe=phases.append)
+    assert phases == [
+        "evm-order",
+        "evm-chain",
+        "evm-custody",
+        "evm-nonce",
+        "evm-gas-estimate",
+        "evm-gas-price",
+        "evm-signing",
+        "evm-attempt",
+        "evm-broadcast",
+        "evm-confirm",
+        "evm-receipt",
+    ]
+    assert len(broadcasts) == 1
+
+
+def test_ambiguous_confirmation_cli_receipt_does_not_rebroadcast(
+    setup: Any, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _, _, broadcasts, _, work = setup
+    original = evm.rpc
+    monkeypatch.setattr(
+        evm,
+        "rpc",
+        lambda network, method, params: (
+            None if method == "eth_getTransactionReceipt" else original(network, method, params)
+        ),
+    )
+    ticks = iter([0, 91])
+    monkeypatch.setattr(time, "monotonic", lambda: next(ticks))
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "purchase_evm",
+            "--network",
+            "base",
+            "--order",
+            "ZL-2026-000001",
+            "--amount",
+            "0.180001",
+            "--work",
+            str(work),
+        ],
+    )
+    assert evm.main() == 1
+    assert capsys.readouterr().err == (
+        "Testnet payment failed at evm-confirm; reconcile private receipts; never retry\n"
+    )
+    assert json.loads((work / "payment-failure.json").read_text()) == {
+        "phase": "evm-confirm",
+        "attempt": True,
+        "broadcast_started": True,
+    }
+    assert len(broadcasts) == 1
+    with pytest.raises(common.PaymentError, match="never retry"):
+        evm.pay("base", "ZL-2026-000001", "0.180001", work)
+    assert len(broadcasts) == 1

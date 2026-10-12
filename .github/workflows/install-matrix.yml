@@ -22,7 +22,7 @@ on:
       previous_commit: {type: string, required: true}
       diagnostic: {type: boolean, default: true}
       profile: {type: choice, options: [all, nightly], default: all}
-      target: {type: choice, options: [all, linux-amd64, linux-arm64, linux-container, native, docker, aws-stack, linux-mainnet, native-mainnet, mainnet-setup], default: all}
+      target: {type: choice, options: [all, linux, linux-amd64, linux-arm64, linux-container, native, docker, aws-stack, linux-mainnet, native-mainnet, mainnet-setup], default: all}
       scenario: {type: choice, options: [all, fresh, upgrade], default: all}
 permissions:
   contents: read
@@ -69,7 +69,7 @@ jobs:
           umask 077
           [ "$GITHUB_REPOSITORY" = zunderlabs/zunder-guard ]
           [ "$INSTALL_MATRIX_PROFILE" = all ] || [ "$INSTALL_MATRIX_PROFILE" = nightly ]
-          case "$INSTALL_MATRIX_TARGET" in all|linux-amd64|linux-arm64|linux-container|native|docker|aws-stack|linux-mainnet|native-mainnet|mainnet-setup) ;; *) exit 1 ;; esac
+          case "$INSTALL_MATRIX_TARGET" in all|linux|linux-amd64|linux-arm64|linux-container|native|docker|aws-stack|linux-mainnet|native-mainnet|mainnet-setup) ;; *) exit 1 ;; esac
           case "$INSTALL_MATRIX_SCENARIO" in all|fresh|upgrade) ;; *) exit 1 ;; esac
           if [ "$INSTALL_MATRIX_TARGET" != all ] || [ "$INSTALL_MATRIX_SCENARIO" != all ]; then
             [ "$DIAGNOSTIC" = true ] || exit 1
@@ -89,7 +89,7 @@ jobs:
           if-no-files-found: error
           retention-days: 7
   linux-amd64:
-    if: ${{ (inputs.target == 'all' || inputs.target == 'linux-amd64') }}
+    if: ${{ (inputs.target == 'all' || inputs.target == 'linux' || inputs.target == 'linux-amd64') }}
     strategy:
       fail-fast: false
       matrix:
@@ -139,7 +139,7 @@ jobs:
         if: always()
         with: {name: 'install-matrix-I1-${{ matrix.scenario }}', path: '${{ runner.temp }}/I1', if-no-files-found: error}
   linux-container:
-    if: ${{ inputs.target == 'all' || inputs.target == 'linux-container' }}
+    if: ${{ inputs.target == 'all' || inputs.target == 'linux' || inputs.target == 'linux-container' }}
     strategy:
       fail-fast: false
       matrix:
@@ -193,7 +193,7 @@ jobs:
       fail-fast: false
       matrix:
         scenario: ${{ fromJSON(inputs.scenario == 'fresh' && '["fresh"]' || inputs.scenario == 'upgrade' && '["upgrade"]' || '["fresh","upgrade"]') }}
-    if: ${{ inputs.profile != 'nightly' && (inputs.target == 'all' || inputs.target == 'linux-arm64') }}
+    if: ${{ inputs.profile != 'nightly' && (inputs.target == 'all' || inputs.target == 'linux' || inputs.target == 'linux-arm64') }}
     needs: subjects
     environment: e2e
     runs-on: ubuntu-24.04-arm
