@@ -12,6 +12,40 @@ foreach ($relative in @('loader/i.ps1','windows/service.ps1')) {
   $tokens=$null; $errors=$null
   $ast=[Management.Automation.Language.Parser]::ParseFile((Join-Path $SourceRoot $relative),[ref]$tokens,[ref]$errors)
   Assert ($errors.Count -eq 0) "parse $relative"
+  $pathNode = $ast.Find({ param($candidate) $candidate -is [Management.Automation.Language.FunctionDefinitionAst] -and $candidate.Name -eq 'Assert-ZgPath' },$true)
+  # Execute the real rights-policy block with inert DirectoryInfo/FileInfo and ACE
+  # values: no filesystem ACL mutation, native binary, service or key operation.
+  $policyText = [regex]::Match($pathNode.Extent.Text,'(?ms)^      \$allowed =.*?(?=^    \}\r?$)').Value
+  Assert ([bool]$policyText) "extract actual rights admission $relative"
+  $policy = [scriptblock]::Create($policyText)
+  $known = @('C:\FixtureData','C:\FixturePrograms','C:\')
+  foreach ($case in @(
+    @{path=$known[0];directory=$true;rights=0x116;allowed=$true},
+    @{path=$known[0];directory=$true;rights=0x1201bf;allowed=$true},
+    @{path=$known[0];directory=$false;rights=0x116;allowed=$false},
+    @{path=$known[0];directory=$false;rights=0x110;allowed=$false},
+    @{path=$known[1];directory=$true;rights=0x116;allowed=$false},
+    @{path=$known[2];directory=$true;rights=0x116;allowed=$false},
+    @{path='C:\FixtureData\ZunderGuard';directory=$true;rights=0x116;allowed=$false},
+    @{path='C:\FixtureData\ZunderGuard';directory=$true;rights=0x110;allowed=$false},
+    @{path='C:\FixtureData\ZunderGuard\guard.exe';directory=$false;rights=0x110;allowed=$false},
+    @{path='C:\FixtureData\ZunderGuard';directory=$true;rights=0x1200a9;allowed=$true}
+  )) {
+    $current=$case.path
+    $item=if ($case.directory) { [IO.DirectoryInfo]::new($current) } else { [IO.FileInfo]::new($current) }
+    $rule=[pscustomobject]@{FileSystemRights=[Security.AccessControl.FileSystemRights]$case.rights}
+    $accepted=$true; try { & $policy } catch { $accepted=$false }
+    Assert ($accepted -eq $case.allowed) "directory metadata boundary $relative $($case.path) $($case.rights)"
+  }
+  # Hand-checked Windows rights: DeleteChild=0x40, Delete=0x10000,
+  # WriteDac=0x40000, WriteOwner=0x80000; none is part of stock 0x116.
+  foreach ($unsafe in @(0x40,0x10000,0x40000,0x80000)) {
+    foreach ($current in @($known[0],$known[1],$known[2],'C:\FixtureData\ZunderGuard')) {
+      $item=[IO.DirectoryInfo]::new($current)
+      $rule=[pscustomobject]@{FileSystemRights=[Security.AccessControl.FileSystemRights](0x1201bf -bor $unsafe)}
+      Refuses { & $policy } "unsafe ancestor/anchor bit $relative $unsafe"
+    }
+  }
   foreach ($node in $ast.FindAll({ param($candidate) $candidate -is [Management.Automation.Language.FunctionDefinitionAst] },$true)) {
     . ([scriptblock]::Create($node.Extent.Text))
   }

@@ -87,7 +87,10 @@ class ContainerLifecycle(NativeLifecycle):
         from guard_harness.linux_lifecycle import wait_healthy
 
         wait_healthy(self.guard)
-        raw = self.command("status", self.docker(["status", "--json", "--url", self.guard.url]))
+        # The signed image sets ZUNDER_GUARD_LISTEN=127.0.0.1:8547; --url
+        # conflicts with that CLI environment argument. Host networking shares
+        # this fixed endpoint, so retain the image's accepted listen semantics.
+        raw = self.command("status", self.docker(["status", "--json"]))
         status = decode_json(raw, STATUS_SCHEMA)
         require(
             status["mode"] == "paper" and status["journal"]["ok"] is True,

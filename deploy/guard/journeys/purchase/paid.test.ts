@@ -8,6 +8,7 @@ import { test, expect } from '@playwright/test';
 import { safe, get, post, validInboxMessage } from './safe.js';
 import { command } from './subprocess.js';
 import { admitStagingDocument, pricingPreflight, restrictAccessHeaders } from './browser-access.js';
+import { stagingClickDiagnostics } from './staging-click-diagnostics.js';
 
 
 const journey = process.env['GUARD_PAID_JOURNEY'] ?? 'P1';
@@ -16,6 +17,7 @@ test.skip(!['P1', 'P2', 'P3', 'P6'].includes(process.env['GUARD_PAID_JOURNEY'] ?
 
 test(`${journey} pricing to paid email to installed released licence`, async ({ page, request }) => {
   test.setTimeout(15 * 60_000);
+  const clickDiagnostics = stagingClickDiagnostics(page, 'pricing-buy-pro');
   const root = process.env['GUARD_PURCHASE_WORK'];
   const assets = process.env['GUARD_RELEASE_ASSETS'];
   const tag = process.env['GUARD_RELEASE_TAG'];
@@ -43,7 +45,7 @@ test(`${journey} pricing to paid email to installed released licence`, async ({ 
     id: process.env['GUARD_ACCESS_CLIENT_ID'] ?? '', secret: process.env['GUARD_ACCESS_CLIENT_SECRET'] ?? '',
   });
   await admitStagingDocument(page, '/pricing', new URL(origin ?? '').origin);
-  await safe(() => page.getByTestId('pricing-buy-pro').click(), 'pricing purchase link');
+  await safe(() => clickDiagnostics.click(), 'pricing purchase link');
   await safe(() => page.getByTestId('checkout-plan-pro').check(), 'checkout selection');
   await safe(() => page.getByTestId('checkout-term-month').check(), 'checkout selection');
   for (const [field, value] of Object.entries({ accounts: account ?? '', company: 'Synthetic journey business',

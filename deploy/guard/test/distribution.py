@@ -4,6 +4,7 @@ import io
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import shlex
 import stat
@@ -16,6 +17,38 @@ GUARD = Path(__file__).resolve().parents[1]
 TAG = 'v0.0.0'
 IMAGE = 'ghcr.io/zunderlabs/zunder-guard@sha256:' + 'b' * 64
 NOTICES = ('LICENSE', 'NOTICE', 'THIRD_PARTY_LICENSES.md')
+
+
+class WindowsAclPolicy(unittest.TestCase):
+    """Offline bit-contract check; real PowerShell selector execution is in its fixture."""
+
+    def test_programdata_exception_cannot_grant_destructive_or_anchor_rights(self):
+        source = (GUARD / 'windows/bootstrap.ps1.inc').read_text()
+        base = int(re.search(r'\$allowed = (0x[0-9a-f]+) #', source)[1], 16)
+        self.assertIn("if ($current -in $known) { $allowed = $allowed -bor 6 }", source)
+        extra = re.search(
+            r'if \(\$item -is \[IO.DirectoryInfo\] -and \$current -eq \$known\[0\]\) '
+            r'\{ \$allowed = \$allowed -bor (0x[0-9a-f]+) \}', source,
+        )
+        self.assertIsNotNone(extra)
+        metadata = int(extra[1], 16)
+        # Microsoft FileSystemRights: read/execute=0xa9, ReadControl=0x20000,
+        # Synchronize=0x100000; create children=0x6, WriteEA=0x10, WriteAttrs=0x100.
+        self.assertEqual(base, 0x1200a9)
+        self.assertEqual(metadata, 0x110)
+        root = base | 6 | metadata
+        self.assertEqual(root, 0x1201bf)
+        self.assertEqual(0x116 & ~root, 0)
+        self.assertNotEqual(0x116 & ~(base | 6), 0)
+        self.assertNotEqual(0x116 & ~base, 0)
+        for destructive in (0x40, 0x10000, 0x40000, 0x80000):
+            self.assertEqual(root & destructive, 0)
+        # The metadata allowance remains subordinate to existing plain-path,
+        # trusted-owner and post-create anchor admission, with protected ACLs.
+        self.assertIn('($item.Attributes -band [IO.FileAttributes]::ReparsePoint)', source)
+        self.assertIn("throw 'Untrusted machine path owner.'", source)
+        self.assertIn('$acl.SetAccessRuleProtection($true,$false)', source)
+        self.assertIn('  Assert-ZgPath $Path\n', source)
 
 
 class DockerBuildContext(unittest.TestCase):
@@ -332,13 +365,17 @@ class InstallerNotices(unittest.TestCase):
             'identity': f'https://github.com/zunderlabs/zunder-guard/.github/workflows/release.yml@refs/tags/{TAG}',
             'sha256': hashlib.sha256(sums.read_bytes()).hexdigest()}))
 
-    def install(self, prefix=None):
+    def install(self, prefix=None, *, without_home=False, without_guard_home=False):
         args = ['/bin/sh', str(self.script), '--non-interactive', '--network', 'paper',
                 '--rules', 'zr1_fixture', '--no-service', '--force']
         if prefix is not None:
             args += ['--prefix', str(prefix)]
         env = dict(os.environ, HOME=str(self.home), PATH=str(self.fakebin) + os.pathsep + os.environ['PATH'],
                    ZUNDER_GUARD_BASE_URL=self.release.as_uri(), ZUNDER_GUARD_HOME=str(self.home / 'guard'))
+        if without_home:
+            env.pop('HOME', None)
+        if without_guard_home:
+            env.pop('ZUNDER_GUARD_HOME', None)
         return subprocess.run(args, env=env, capture_output=True, text=True,
                               preexec_fn=lambda: os.umask(0o077))
 
@@ -368,6 +405,45 @@ class InstallerNotices(unittest.TestCase):
         prefix = self.root / 'programs'
         self.assertEqual(self.install(prefix).returncode, 0)
         self.assert_notices(prefix / 'share/licenses/zunder-guard')
+
+    def test_actual_root_prefix_selection_does_not_require_home(self):
+        source = (GUARD / 'install.sh').read_text()
+        block = 'if [ -z "$PREFIX" ]; then' + source.rsplit('if [ -z "$PREFIX" ]; then', 1)[1].split('# Use the binary', 1)[0]
+        result = subprocess.run(['/bin/sh', '-eu', '-c',
+            'id() { printf "0\\n"; };\n' + block + '\nprintf "%s:%s\\n" "$PREFIX" "$SUDO_BIN"'],
+            env={'PATH': os.defpath, 'PREFIX': '', 'SUDO': ''}, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), '/usr/local/bin:')
+
+    def test_nonroot_missing_home_refuses_before_install_mutation(self):
+        if os.getuid() == 0:
+            self.skipTest('non-root admission checked by the user fixture')
+        prefix = self.root / 'missing-home-prefix'
+        result = self.install(prefix, without_home=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('HOME is required for native installation by a non-root user', result.stderr)
+        self.assertNotIn('downloading', result.stdout)
+        self.assertFalse(prefix.exists())
+        self.assertFalse((self.home / 'guard').exists())
+
+    def test_root_explicit_guard_home_without_home(self):
+        if os.getuid() != 0:
+            self.skipTest('root admission uses a private explicit temp prefix fixture')
+        prefix = self.root / 'home-free-prefix/bin'
+        result = self.install(prefix, without_home=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((prefix / 'zunder-guard').is_file())
+        self.assertIn(str(self.home / 'guard'), result.stdout)
+
+    def test_root_foreground_missing_both_homes_refuses_before_files(self):
+        if os.getuid() != 0:
+            self.skipTest('root admission uses a private explicit temp prefix fixture')
+        prefix = self.root / 'missing-both-prefix/bin'
+        result = self.install(prefix, without_home=True, without_guard_home=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('HOME or explicit ZUNDER_GUARD_HOME is required', result.stderr)
+        self.assertNotIn('downloading', result.stdout)
+        self.assertFalse(prefix.exists())
 
     def test_default_user_prefix(self):
         if os.getuid() == 0:

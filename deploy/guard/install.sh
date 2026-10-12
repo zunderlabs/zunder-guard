@@ -200,7 +200,12 @@ if [ "$UNINSTALL" -eq 1 ]; then
     [ "$(id -u)" -eq 0 ] || die "managed uninstall requires root; run with sudo explicitly"
   fi
   if [ -z "$PREFIX" ]; then
-    if [ "$(id -u)" -eq 0 ]; then PREFIX=/usr/local/bin; else PREFIX=$HOME/.local/bin; fi
+    if [ "$(id -u)" -eq 0 ]; then
+      PREFIX=/usr/local/bin
+    else
+      [ -n "${HOME:-}" ] || die "HOME is required to select the default user uninstall prefix; pass --prefix explicitly"
+      PREFIX=$HOME/.local/bin
+    fi
   fi
   PREFIX=${PREFIX%/}
   case "$PREFIX" in
@@ -398,6 +403,23 @@ case "$OS-$ARCH" in
   darwin-arm64) COSIGN_SHA256=5cf948c2f4dfe59687bdd0b8523709067383e03982cc543475c8a7dc70e92a76 ;;
 esac
 ARCHIVE="zunder-guard-$VERSION-$OS-$ARCH.tar.gz"
+# Native user destinations and setup state must never be inferred as /.local or
+# /.zunder-guard when an automation environment omits the user's home.
+if [ "$CONTAINER" -eq 0 ] && [ -z "${HOME:-}" ] && [ "$(id -u)" -ne 0 ]; then
+  die "HOME is required for native installation by a non-root user; set HOME explicitly"
+fi
+
+# Managed native setup uses its fixed service home; install-only needs no state.
+# Refuse a missing foreground home before downloading or replacing any files.
+if [ "$CONTAINER" -eq 0 ] && [ "$INSTALL_ONLY" -eq 0 ] \
+  && [ -z "${HOME:-}" ] && [ -z "${ZUNDER_GUARD_HOME:-}" ]; then
+  if ! { [ "$NO_SERVICE" -eq 0 ] && {
+    { [ "$OS" = linux ] && [ -d /run/systemd/system ]; } \
+      || { [ "$OS" = darwin ] && { [ "$NETWORK" = testnet ] || [ "$NETWORK" = mainnet ]; }; }
+  }; }; then
+    die "HOME or explicit ZUNDER_GUARD_HOME is required for foreground setup"
+  fi
+fi
 command -v curl >/dev/null 2>&1 || die "curl is required"
 
 TMP=$(mktemp -d)
@@ -624,7 +646,10 @@ fi
 if [ -z "$PREFIX" ]; then
   if [ -n "$SUDO" ] || [ "$(id -u)" -eq 0 ]; then PREFIX=/usr/local/bin; else PREFIX=$HOME/.local/bin; fi
 fi
-case "$PREFIX" in "$HOME"/*) SUDO_BIN="" ;; *) SUDO_BIN=$SUDO ;; esac
+SUDO_BIN=$SUDO
+if [ -n "${HOME:-}" ]; then
+  case "$PREFIX" in "$HOME"/*) SUDO_BIN="" ;; esac
+fi
 # Use the binary's privilege policy for the accompanying distribution notices. Replace only
 # our three files, using staged renames so an interrupted upgrade never truncates a notice.
 # Symlinks are refused rather than following a destination outside the selected prefix.
@@ -771,7 +796,12 @@ if [ "$SERVICE" -eq 1 ]; then
   $SUDO install -d -m 0700 -o "$SERVICE_USER" -g "$SERVICE_USER" "$SERVICE_HOME"
   $SUDO install -d -m 0755 "$SERVICE_CONFIG"
 else
-  GUARD_HOME=${ZUNDER_GUARD_HOME:-$HOME/.zunder-guard}
+  if [ -n "${ZUNDER_GUARD_HOME:-}" ]; then
+    GUARD_HOME=$ZUNDER_GUARD_HOME
+  else
+    [ -n "${HOME:-}" ] || die "HOME or explicit ZUNDER_GUARD_HOME is required for foreground setup"
+    GUARD_HOME=$HOME/.zunder-guard
+  fi
   RUN_AS=""
 fi
 

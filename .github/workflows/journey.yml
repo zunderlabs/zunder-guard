@@ -116,6 +116,7 @@ jobs:
         env:
           GUARD_PAID_JOURNEY: P8
           GUARD_PURCHASE_WORK: ${{ runner.temp }}/guard-release/P8-approval
+          GUARD_BROWSER_DIAGNOSTICS: ${{ runner.temp }}/guard-release/P8-click-diagnostics
           GUARD_RELEASE_COMMIT: ${{ inputs.commit }}
           GUARD_BUILDER_APPROVAL_ACCOUNT: ${{ vars.E2E_TESTNET_ACCOUNT }}
           GUARD_BUILDER_APPROVAL_OWNER_KEY: ${{ secrets.E2E_TESTNET_OWNER_KEY }}
@@ -183,6 +184,9 @@ jobs:
             ${{ runner.temp }}/guard-release/P8-assets.log
             ${{ runner.temp }}/guard-release/P8-boundary.log
             ${{ runner.temp }}/guard-release/P8-browser.log
+            ${{ runner.temp }}/guard-release/P8-click-diagnostics/approve-network-testnet/screenshot.png
+            ${{ runner.temp }}/guard-release/P8-click-diagnostics/approve-network-testnet/page.html
+            ${{ runner.temp }}/guard-release/P8-click-diagnostics/approve-network-testnet/diagnostics.json
             ${{ steps.fee-evidence.outputs.bundle-path }}
           if-no-files-found: warn
           retention-days: 7
@@ -432,6 +436,7 @@ jobs:
           GUARD_PAY_TO_BASE: ${{ vars.E2E_PAY_TO_BASE }}
           GUARD_PAID_JOURNEY: ${{ matrix.journey }}
           GUARD_PURCHASE_WORK: ${{ runner.temp }}/quote-evidence/${{ matrix.journey }}
+          GUARD_BROWSER_DIAGNOSTICS: ${{ runner.temp }}/quote-evidence/click-diagnostics
           GUARD_RELEASE_ASSETS: ${{ runner.temp }}/quote-evidence/assets
           GUARD_RELEASE_TAG: ${{ inputs.tag }}
           GUARD_RELEASE_COMMIT: ${{ inputs.commit }}
@@ -503,6 +508,9 @@ jobs:
             ${{ runner.temp }}/quote-evidence/journey.log
             ${{ runner.temp }}/quote-evidence/browser-proof.json
             ${{ runner.temp }}/quote-evidence/browser-boundary.log
+            ${{ runner.temp }}/quote-evidence/click-diagnostics/pricing-buy-pro/screenshot.png
+            ${{ runner.temp }}/quote-evidence/click-diagnostics/pricing-buy-pro/page.html
+            ${{ runner.temp }}/quote-evidence/click-diagnostics/pricing-buy-pro/diagnostics.json
             ${{ runner.temp }}/quote-evidence/predicate.json
             ${{ runner.temp }}/quote-evidence/P*/payment/payment-attempt.json
             ${{ runner.temp }}/quote-evidence/P*/payment/payment-receipt.json

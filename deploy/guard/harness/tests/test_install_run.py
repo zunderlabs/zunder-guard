@@ -103,7 +103,7 @@ def prepared(
         assert KEY not in repr(kwargs.get("env"))
         assert set(kwargs["env"]) <= {"PATH", "HOME", "GUARD_C6_SERIALIZED"}
         assert "WALLET_FRAME" not in os.environ
-        return subprocess.CompletedProcess(argv, 0)
+        return subprocess.CompletedProcess(argv, 0, stdout=b"{}")
 
     monkeypatch.setattr(install_run, "Release", AuthenticatedRelease)
     monkeypatch.setattr("guard_harness.install_run.subprocess.run", run)
@@ -136,10 +136,14 @@ def test_both_modes_use_exact_subjects_and_only_private_testnet_stdin(
             == hashlib.sha256((tag + target).encode()).hexdigest()
         )
     if row == "I2":
-        assert len(calls) == 3
+        assert len(calls) == 5
         assert calls[0][0] == ["sudo", "tee", "/etc/zunder-native-disposable"]
         assert calls[0][1]["stdout"] == subprocess.DEVNULL
         assert "--phase" in paper[0] and "all-no-reboot" in paper[0]
+        for argv, _ in lifecycle:
+            assert Path(argv[argv.index("--output") + 1]).is_relative_to(install_run.I2_PRIVATE)
+        assert (tmp_path / "evidence/paper/upgrade").is_dir()
+        assert (tmp_path / "evidence/testnet/upgrade").is_dir()
         assert (
             paper[0][paper[0].index("--installer-sha256") + 1]
             == hashlib.sha256(b"signed candidate loader").hexdigest()
@@ -287,3 +291,114 @@ def test_guest_scenario_outputs_match_independent_and_combined_artifact_layouts(
                 (tmp_path / "evidence/channels" / (channel + ".json")).read_bytes()
             )
             assert receipt["channel"] == channel and receipt["commit"] == COMMIT
+
+
+def test_private_export_allowlist_redacts_logs_without_touching_custody(tmp_path: Path) -> None:
+    source = tmp_path / "private"
+    source.mkdir(mode=0o700)
+    receipt = '{"stage":"passed","binary_sha256":"' + "a" * 64 + '"}\n'
+    (source / "testnet-lifecycle.json").write_text(receipt)
+    (source / "testnet-service-install.log").write_text(
+        "account=0x" + "1" * 40 + " key=0x" + "2" * 64
+    )
+    (source / "pair.json").write_text("private pairing fixture")
+    (source / "guard.toml").write_text("private custody fixture")
+    before = {p.name: (p.read_bytes(), p.stat().st_mode) for p in source.iterdir()}
+    payload = install_run.evidence_payload(source)
+    assert set(payload) == {"testnet-lifecycle.json", "testnet-service-install.log"}
+    assert payload["testnet-lifecycle.json"] == receipt
+    assert payload["testnet-service-install.log"] == "[sensitive command output withheld]\n"
+    assert before == {p.name: (p.read_bytes(), p.stat().st_mode) for p in source.iterdir()}
+    assert source.stat().st_mode & 0o777 == 0o700
+
+
+@pytest.mark.parametrize(
+    "attack", ["symlink", "hardlink", "oversize", "directory", "identifier", "escaped-identifier"]
+)
+def test_private_export_refuses_unsafe_allowlisted_file(tmp_path: Path, attack: str) -> None:
+    source = tmp_path / "private"
+    source.mkdir(mode=0o700)
+    target = source / "testnet-lifecycle.json"
+    if attack == "symlink":
+        hidden = tmp_path / "hidden"
+        hidden.write_text("private")
+        target.symlink_to(hidden)
+    elif attack == "hardlink":
+        hidden = tmp_path / "hidden"
+        hidden.write_text("{}")
+        target.hardlink_to(hidden)
+    elif attack == "directory":
+        target.mkdir()
+    elif attack == "oversize":
+        target.write_bytes(b" " * 65537)
+    else:
+        target.write_text(
+            json.dumps({"account": "0x" + "1" * 40}).replace("0x", "\\u0030\\u0078")
+            if attack == "escaped-identifier"
+            else json.dumps({"account": "0x" + "1" * 40})
+        )
+    with pytest.raises(ProcessError):
+        install_run.evidence_payload(source)
+
+
+def test_i2_failure_exports_readable_safe_diagnostics_and_preserves_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "root-private"
+    source.mkdir(mode=0o700)
+    (source / "testnet-service-install.log").write_text("[sensitive command output withheld]\n")
+    destination = tmp_path / "runner-evidence"
+    calls: list[list[str]] = []
+
+    def run(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess[bytes]:
+        calls.append(argv)
+        if "--output" in argv:
+            raise subprocess.CalledProcessError(2, argv)
+        assert kwargs["stdout"] == subprocess.PIPE and kwargs["stderr"] == subprocess.DEVNULL
+        assert kwargs["input"] == b"" and KEY not in repr(argv)
+        return subprocess.CompletedProcess(
+            argv, 0, stdout=json.dumps(install_run.evidence_payload(source)).encode()
+        )
+
+    monkeypatch.setattr("guard_harness.install_run.subprocess.run", run)
+    with pytest.raises(ProcessError, match="exit 2"):
+        install_run.i2_child(
+            ["sudo", "fixture", "--output", str(source)],
+            destination=destination,
+            env={},
+            input=KEY.encode(),
+        )
+    assert len(calls) == 2
+    assert (destination / "testnet-service-install.log").read_text().startswith("[sensitive")
+    assert (destination / "testnet-service-install.log").stat().st_uid == os.geteuid()
+    assert source.stat().st_mode & 0o777 == 0o700
+    assert not list(destination.rglob("*.json"))
+
+
+def test_raw_nonhex_credentials_are_withheld(tmp_path: Path) -> None:
+    source = tmp_path / "private"
+    source.mkdir(mode=0o700)
+    (source / "service-journal.log").write_text("zgl1_private-sentinel bearer=private-token")
+    assert install_run.evidence_payload(source) == {
+        "service-journal.log": "[sensitive command output withheld]\n"
+    }
+
+
+@pytest.mark.parametrize("error_type", [ProcessError, OSError, ValueError])
+def test_secondary_export_refusal_preserves_primary_child_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, error_type: type[Exception]
+) -> None:
+    def fail_child(*args: Any, **kwargs: Any) -> None:
+        raise ProcessError("install lifecycle child failed (exit 2)")
+
+    def fail_export(*args: Any, **kwargs: Any) -> None:
+        raise error_type("export failed")
+
+    monkeypatch.setattr(install_run, "child", fail_child)
+    monkeypatch.setattr(install_run, "export_i2", fail_export)
+    with pytest.raises(ProcessError, match=r"exit 2.*diagnostic export refused"):
+        install_run.i2_child(
+            ["fixture", "--output", str(tmp_path / "private")],
+            destination=tmp_path / "public",
+            env={},
+        )

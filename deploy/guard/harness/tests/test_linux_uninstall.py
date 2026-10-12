@@ -64,15 +64,19 @@ class Installation:
         path.chmod(0o755)
 
     def run(self, *args: str, **environment: str) -> subprocess.CompletedProcess[str]:
+        without_home = environment.pop("FIXTURE_UNSET_HOME", "") == "1"
+        env = {
+            **os.environ,
+            "PATH": f"{self.shims}:{os.environ['PATH']}",
+            "FIXTURE_UNIT": str(self.unit),
+            "FIXTURE_CALLS": str(self.calls),
+            **environment,
+        }
+        if without_home:
+            env.pop("HOME", None)
         return subprocess.run(
             ["sh", str(self.script), "--uninstall", *args],
-            env={
-                **os.environ,
-                "PATH": f"{self.shims}:{os.environ['PATH']}",
-                "FIXTURE_UNIT": str(self.unit),
-                "FIXTURE_CALLS": str(self.calls),
-                **environment,
-            },
+            env=env,
             capture_output=True,
             text=True,
             timeout=10,
@@ -206,3 +210,28 @@ def test_named_uninstall_does_not_touch_default_service(installation: Installati
     assert not (prefix / "zunder-guard").exists()
     assert "disable --now zunder-guard-testnet.service" in installation.calls.read_text()
     installation.assert_installed()
+
+
+def test_missing_home_default_user_uninstall_refuses_without_mutation(
+    installation: Installation,
+) -> None:
+    result = installation.run("--no-service", FIXTURE_UNSET_HOME="1", FIXTURE_UID="1000")
+    assert result.returncode != 0
+    assert "HOME is required to select the default user uninstall prefix" in result.stderr
+    assert not installation.calls.exists()
+    installation.assert_installed()
+
+
+def test_explicit_local_uninstall_prefix_needs_no_home(installation: Installation) -> None:
+    result = installation.run(
+        "--no-service",
+        "--prefix",
+        str(installation.prefix),
+        FIXTURE_UNSET_HOME="1",
+        FIXTURE_UID="1000",
+    )
+    assert result.returncode == 0, result.stderr
+    assert not installation.calls.exists()
+    assert not (installation.prefix / "zunder-guard").exists()
+    assert installation.unit.is_file() and installation.dropin.is_file()
+    installation.assert_preserved()

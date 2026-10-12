@@ -982,5 +982,72 @@ class NativeCleanupAcknowledgement(unittest.TestCase):
             self.assertNotIn('PRIVATE', str(caught.exception))
 
 
+@unittest.skipUnless(os.name == 'posix', 'real controlling-terminal fixture requires POSIX')
+class TerminalConsent(unittest.TestCase):
+    def setUp(self):
+        self.stage = Stage()
+        self.stage.setUp()
+        self.addCleanup(self.stage.tearDown)
+
+    def test_real_controlling_terminal_displays_literal_consent_and_refuses_wrong_or_eof(self):
+        import errno
+        import pty
+        import select
+        import signal
+        prompt = 'Type CREATE synthetic-fixture to create this NEW persistent volume:'
+        for answer in (b'CREATE synthetic-fixture\n', b'wrong\n', b'\x04'):
+            with self.subTest(answer=answer):
+                pid, descriptor = pty.fork()
+                if pid == 0:
+                    try:
+                        self.stage.wrapper.confirm(prompt, 'CREATE synthetic-fixture')
+                    except self.stage.ops.Refused:
+                        os._exit(2)
+                    except BaseException:
+                        os._exit(3)
+                    os._exit(0)
+                status = None
+                body = b''
+                sent = False
+                deadline = time.monotonic() + 5
+                try:
+                    while time.monotonic() < deadline:
+                        readable, _, _ = select.select([descriptor], [], [], 0.1)
+                        if readable:
+                            try:
+                                chunk = os.read(descriptor, 4096)
+                            except OSError as error:
+                                if error.errno != errno.EIO:
+                                    raise
+                                chunk = b''
+                            body += chunk
+                            if not sent and prompt.encode() + b' ' in body:
+                                os.write(descriptor, answer)
+                                sent = True
+                        finished, observed = os.waitpid(pid, os.WNOHANG)
+                        if finished:
+                            status = observed
+                            break
+                    self.assertTrue(sent, 'actual prompt must be displayed before any reply')
+                    self.assertIsNotNone(status, 'terminal fixture must finish within its bound')
+                    self.assertEqual(os.waitstatus_to_exitcode(status), 0 if answer.startswith(b'CREATE') else 2)
+                finally:
+                    if status is None:
+                        os.kill(pid, signal.SIGKILL)
+                        os.waitpid(pid, 0)
+                    os.close(descriptor)
+
+    def test_missing_controlling_terminal_cannot_admit_confirmation(self):
+        code = ("import runpy\n"
+                "namespace=runpy.run_path(" + repr(str(self.stage.path / 'install-container.py')) + ")\n"
+                "try: namespace['confirm']('Type CREATE synthetic-fixture:', 'CREATE synthetic-fixture')\n"
+                "except OSError: raise SystemExit(2)\n"
+                "raise SystemExit(3)\n")
+        result = subprocess.run([os.environ.get('PYTHON', 'python3'), '-c', code],
+            start_new_session=True, stdin=subprocess.DEVNULL, capture_output=True, timeout=10)
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stdout, b'')
+
+
 if __name__ == '__main__':
     unittest.main()

@@ -279,16 +279,24 @@ def test_second_linux_website_install_has_fresh_data_measured_pair_and_released_
         events.append("fresh install")
 
     def command(name: str, argv: list[str]) -> str:
+        if name == "D1-website-pair-owner":
+            assert argv == ["chown", "-R", "zunder-guard:zunder-guard", str(home)]
+            events.append("restore service ownership")
+            return ""
         assert name == "D1-website-uninstall" and "--uninstall" in argv
         events.append("released uninstall")
         binary.unlink()
         return ""
 
+    def issue_pair() -> Pair:
+        events.append("pair")
+        return pair
+
     lifecycle = cast(
         NativeLifecycle,
         SimpleNamespace(
             inputs=value,
-            cli=SimpleNamespace(pair=lambda: pair),
+            cli=SimpleNamespace(pair=issue_pair),
             guard=object(),
             version=lambda v: events.append("version"),
             healthy=lambda: events.append("health"),
@@ -308,6 +316,11 @@ def test_second_linux_website_install_has_fresh_data_measured_pair_and_released_
     assert events == [
         "fresh install",
         "version",
+        "health",
+        "stop",
+        "pair",
+        "restore service ownership",
+        "start",
         "health",
         "pair roundtrip",
         "restart",

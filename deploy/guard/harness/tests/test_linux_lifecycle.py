@@ -7,6 +7,7 @@ from typing import Any
 
 import pytest
 
+from guard_harness.linux_container_lifecycle import ContainerLifecycle
 from guard_harness.linux_guest import Guest
 from guard_harness.linux_lifecycle import (
     Inputs,
@@ -19,6 +20,70 @@ from guard_harness.linux_lifecycle import (
 )
 from guard_harness.linux_testnet_service import TestnetService as ProtectedService
 from guard_harness.paper_bot import LocalGuard
+
+
+@pytest.mark.parametrize("mutation", [None, "mode", "account", "journal"])
+def test_container_status_uses_image_listen_without_url_and_preserves_admission(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mutation: str | None
+) -> None:
+    inputs = Inputs(
+        tmp_path / "candidate",
+        "a" * 64,
+        tmp_path / "previous",
+        "b" * 64,
+        "v1.2.3",
+        "v1.2.2",
+        "rules",
+        "0x" + "1" * 40,
+        tmp_path,
+        "a" * 32,
+    )
+    instance = object.__new__(ContainerLifecycle)
+    instance.inputs = inputs
+    instance.guard = LocalGuard("http://127.0.0.1:8547")
+    image = "ghcr.io/zunderlabs/zunder-guard@sha256:" + "c" * 64
+    monkeypatch.setattr(instance, "image", lambda: image)
+    monkeypatch.setattr("guard_harness.linux_lifecycle.wait_healthy", lambda guard: None)
+    status: dict[str, Any] = {
+        "version": "1.2.3",
+        "network": "paper",
+        "account": inputs.account,
+        "mode": "paper",
+        "halted": False,
+        "kill_switch": False,
+        "journal": {"ok": True},
+        "licence": {
+            "state": "none",
+            "licensee": None,
+            "expires_at_ms": None,
+            "fee_free": False,
+            "source": "file",
+        },
+    }
+    if mutation == "mode":
+        status["mode"] = "testnet"
+    elif mutation == "account":
+        status["account"] = "0x" + "2" * 40
+    elif mutation == "journal":
+        status["journal"] = {"ok": False}
+    captured: list[list[str]] = []
+
+    def command(name: str, words: list[str]) -> str:
+        assert name == "status"
+        captured.append(words)
+        return json.dumps(status)
+
+    monkeypatch.setattr(instance, "command", command)
+    if mutation is None:
+        instance.healthy()
+    else:
+        with pytest.raises(LifecycleError, match="journal|account"):
+            instance.healthy()
+    assert len(captured) == 1
+    assert "--network=host" in captured[0]
+    assert captured[0][-3:] == [image, "status", "--json"]
+    assert "--url" not in captured[0]
+    assert not any("ZUNDER_GUARD_LISTEN" in word for word in captured[0])
 
 
 def test_installer_bytes_and_symlink(tmp_path: Path) -> None:

@@ -16,6 +16,90 @@ def test_success_retains_both_streams(tmp_path: Path) -> None:
     assert result.log.read_text() == "out\nerr\n"
 
 
+@pytest.mark.parametrize("label", ["rules", "private-body-fragment", "0x" + "a" * 40])
+def test_sensitive_failure_classifier_logs_only_fixed_categories(
+    tmp_path: Path, label: str
+) -> None:
+    log = tmp_path / "diagnostic.log"
+    sentinel = "fake-key-private-body-private-path"
+    with pytest.raises(RunError) as error:
+        run(
+            [
+                sys.executable,
+                "-c",
+                "import sys; s=sys.stdin.read(); print(s); print(s,file=sys.stderr); sys.exit(2)",
+            ],
+            log=log,
+            timeout=10,
+            stdin=sentinel.encode(),
+            sensitive_output=True,
+            failure_classifier=lambda output: label,
+        )
+    expected = "rules" if label == "rules" else "unknown"
+    assert (
+        log.read_text()
+        == "[sensitive command output withheld]\nfailure category: " + expected + "\n"
+    )
+    assert str(error.value) == "command failed with exit 2; failure category: " + expected
+    assert sentinel not in log.read_text() + str(error.value)
+    assert str(log) not in str(error.value)
+
+
+def test_classifier_exception_cannot_expose_diagnostic_input(tmp_path: Path) -> None:
+    def classifier(output: str) -> str:
+        raise ValueError("private-prefix-" + output)
+
+    with pytest.raises(RunError, match="category: unknown") as error:
+        run(
+            [sys.executable, "-c", "print('private-body'); raise SystemExit(2)"],
+            log=tmp_path / "log",
+            timeout=10,
+            sensitive_output=True,
+            failure_classifier=classifier,
+        )
+    assert "private" not in str(error.value) + (tmp_path / "log").read_text()
+
+
+def test_classifier_string_subclass_cannot_override_fixed_label_formatting(tmp_path: Path) -> None:
+    class PrivateLabel(str):
+        def __format__(self, format_spec: str) -> str:
+            return "private-body"
+
+    with pytest.raises(RunError, match="category: unknown") as error:
+        run(
+            [sys.executable, "-c", "raise SystemExit(2)"],
+            log=tmp_path / "log",
+            timeout=10,
+            sensitive_output=True,
+            failure_classifier=lambda output: PrivateLabel("rules"),
+        )
+    assert "private" not in str(error.value) + (tmp_path / "log").read_text()
+
+
+def test_failure_classifier_requires_withholding_and_is_not_called_on_success(
+    tmp_path: Path,
+) -> None:
+    def classifier(output: str) -> str:
+        pytest.fail("successful output must not be classified")
+
+    with pytest.raises(ValueError, match="complete output withholding"):
+        run(
+            [sys.executable, "-c", "pass"],
+            log=tmp_path / "unsafe",
+            timeout=10,
+            failure_classifier=classifier,
+        )
+    assert not (tmp_path / "unsafe").exists()
+    run(
+        [sys.executable, "-c", "print('private-success')"],
+        log=tmp_path / "safe",
+        timeout=10,
+        sensitive_output=True,
+        failure_classifier=classifier,
+    )
+    assert (tmp_path / "safe").read_text() == "[sensitive command output withheld]\n"
+
+
 def test_failure_retains_redacted_output(tmp_path: Path) -> None:
     log = tmp_path / "failure.log"
     with pytest.raises(RunError, match="exit 7"):

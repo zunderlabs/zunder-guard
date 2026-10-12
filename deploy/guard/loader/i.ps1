@@ -89,6 +89,11 @@ function Assert-ZgPath([string]$Path,[switch]$Machine,[string]$ReadSid) {
       if ($rule.AccessControlType -ne 'Allow' -or $rule.IdentityReference.Value -in @('S-1-5-18','S-1-5-32-544','S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464')) { continue }
       $allowed = 0x1200a9 # read/execute/synchronize; no delete, ACL or owner writes
       if ($current -in $known) { $allowed = $allowed -bor 6 } # standard root create-child only; each created anchor rechecked
+      # Stock ProgramData grants Users create-child (0x6), WriteExtendedAttributes
+      # (0x10) and WriteAttributes (0x100) on the directory itself. This exception
+      # never applies to Guard anchors/files, ProgramFiles, or the drive root.
+      # Delete/DeleteChild, WriteDac and WriteOwner remain forbidden everywhere.
+      if ($item -is [IO.DirectoryInfo] -and $current -eq $known[0]) { $allowed = $allowed -bor 0x110 }
       if (([int]$rule.FileSystemRights -band (-bnot $allowed)) -ne 0) {
         $kind = if ($current -eq [IO.Path]::GetPathRoot($full)) { 'drive-root' } elseif ($current -eq $known[0]) { 'program-data-root' } elseif ($current -eq $known[1]) { 'program-files-root' } else { 'protected-path' }
         $rights = '{0:x8}' -f [int]$rule.FileSystemRights

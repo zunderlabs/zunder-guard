@@ -6,6 +6,7 @@ import json
 import os
 import re
 import secrets
+import stat
 import subprocess
 import sys
 from pathlib import Path
@@ -13,6 +14,128 @@ from pathlib import Path
 from guard_harness.native_release import Release
 from guard_harness.testnet_process import ProcessError
 from guard_harness.testnet_run import ROOT
+
+I2_PRIVATE = Path("/root/.guard-install-I2")
+EVIDENCE_FILES = (
+    "linux-lifecycle.json",
+    "testnet-lifecycle.json",
+    "channels/D1.json",
+    "channels/D5.json",
+    "status.log",
+    "service-journal.log",
+    "testnet-service-install.log",
+)
+
+
+def receipt_identifier(value: object) -> bool:
+    if isinstance(value, str):
+        return re.search(r"0x[0-9a-f]{40,64}\b", value, re.IGNORECASE) is not None
+    if isinstance(value, list):
+        return any(receipt_identifier(item) for item in value)
+    if isinstance(value, dict):
+        return any(receipt_identifier(item) for item in (*value.keys(), *value.values()))
+    return False
+
+
+def evidence_payload(source: Path) -> dict[str, str]:
+    """Read only fixed evidence files, leaving root custody and permissions untouched."""
+    payload = {}
+    for name in EVIDENCE_FILES:
+        path = source / name
+        for ancestor in (path.parent, *path.parent.parents):
+            if ancestor.is_symlink():
+                raise ProcessError("evidence ancestor is a symlink")
+            if ancestor.exists():
+                info = ancestor.stat()
+                if info.st_uid != os.geteuid() or info.st_mode & 0o022:
+                    # Shared ancestors such as /tmp are allowed only outside the source.
+                    if ancestor == source or source in ancestor.parents:
+                        raise ProcessError("untrusted evidence directory")
+        try:
+            descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        except FileNotFoundError:
+            continue
+        except OSError:
+            raise ProcessError("unsafe evidence file") from None
+        info = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_nlink != 1
+            or info.st_uid != os.geteuid()
+            or info.st_size > 65536
+        ):
+            os.close(descriptor)
+            raise ProcessError("unsafe evidence file")
+        with os.fdopen(descriptor, "rb") as stream:
+            body = stream.read(65537).decode("utf-8")
+        if len(body.encode()) > 65536:
+            raise ProcessError("evidence file exceeds bound")
+        if name.endswith(".json"):
+            if receipt_identifier(json.loads(body)):
+                raise ProcessError("private identifier in factual receipt")
+        else:
+            body = "[sensitive command output withheld]\n"
+        payload[name] = body
+    return payload
+
+
+def export_i2(source: Path, destination: Path, env: dict[str, str]) -> None:
+    script = (
+        "import json,sys; from pathlib import Path; "
+        "from guard_harness.install_run import evidence_payload; "
+        "print(json.dumps(evidence_payload(Path(sys.argv[1]))))"
+    )
+    try:
+        result = subprocess.run(
+            [
+                "sudo",
+                "env",
+                "PYTHONPATH=" + str(ROOT / "harness/src"),
+                sys.executable,
+                "-c",
+                script,
+                str(source),
+            ],
+            env=env,
+            input=b"",
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            check=True,
+        )
+    except subprocess.CalledProcessError:
+        raise ProcessError("private lifecycle evidence export refused") from None
+    payload = json.loads(result.stdout)
+    if not isinstance(payload, dict) or set(payload) - set(EVIDENCE_FILES):
+        raise ProcessError("unexpected lifecycle evidence export")
+    destination.mkdir(mode=0o700, parents=True)
+    for name, body in payload.items():
+        if not isinstance(body, str) or len(body.encode()) > 65536:
+            raise ProcessError("invalid lifecycle evidence export")
+        path = destination / name
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        with path.open("x", encoding="utf-8") as stream:
+            os.chmod(path, 0o600)
+            stream.write(body)
+
+
+def i2_child(
+    words: list[str], *, destination: Path, env: dict[str, str], input: bytes = b""
+) -> None:
+    source = Path(words[words.index("--output") + 1])
+    failure = None
+    try:
+        child(words, env=env, input=input)
+    except ProcessError as error:
+        failure = error
+    finally:
+        try:
+            export_i2(source, destination, env)
+        except (ProcessError, OSError, ValueError):
+            if failure is not None:
+                raise ProcessError(f"{failure}; diagnostic export refused") from None
+            raise ProcessError("private lifecycle evidence export refused") from None
+    if failure is not None:
+        raise failure
 
 
 def child(
@@ -189,7 +312,7 @@ def main() -> None:
             "--phase",
             "all-no-reboot",
         ]
-        child(
+        i2_child(
             [
                 *base,
                 "guard_harness.linux_lifecycle",
@@ -199,12 +322,12 @@ def main() -> None:
                 "--account-network",
                 "testnet",
                 "--output",
-                str(args.output / "paper" / args.scenario),
+                str(I2_PRIVATE / marker / "paper" / args.scenario),
                 *paper_identity,
                 "--archive",
                 str(current.assets / archive_name),
             ],
-            check=True,
+            destination=args.output / "paper" / args.scenario,
             env=env,
         )
         target = "linux-arm64"
@@ -217,7 +340,7 @@ def main() -> None:
             "--account",
             args.account,
             "--output",
-            str(args.output / "testnet" / args.scenario),
+            str(I2_PRIVATE / marker / "testnet" / args.scenario),
         ]
     if args.row in {"I1", "I2"} and args.scenario in {"fresh", "both"}:
         (args.output / "channels").mkdir()
@@ -243,7 +366,10 @@ def main() -> None:
             hashlib.sha256(previous.binary(target)).hexdigest(),
         ]
     )
-    child(testnet, input=key, check=True, env=env)
+    if args.row == "I2":
+        i2_child(testnet, destination=args.output / "testnet" / args.scenario, input=key, env=env)
+    else:
+        child(testnet, input=key, check=True, env=env)
 
 
 if __name__ == "__main__":

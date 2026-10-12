@@ -32,6 +32,55 @@ IMAGE = r"ghcr\.io/zunderlabs/zunder-guard@sha256:[0-9a-f]{64}"
 MAX_ARCHIVE = 32 * 1024 * 1024
 
 
+def init_failure_category(output: str) -> str:
+    """Only fixed labels from shipped Init prefixes; never return private suffixes."""
+    if len(output) > 65536:
+        return "unknown"
+    prefixes = {
+        "rules": ("the rules code is refused:",),
+        "account": (
+            "the account must be 0x and 40 hex digits",
+            "--account is required with --non-interactive",
+            "the account's equity could not be read:",
+        ),
+        "venue-role": ("the venue could not be asked:",),
+        "key-frame": (
+            "service refused: supervised key frame ",
+            "service refused: invalid key frame",
+            "that is not a private key:",
+            "the key is too long",
+            "the key is not text",
+            "input ended",
+        ),
+        "policy": (
+            "protected key check requires explicit testnet,",
+            "protected key-check setup requires testnet and no key storage",
+            "the licence key is refused:",
+        ),
+        "filesystem": (
+            "the API wallet key could not be stored:",
+            "Permission denied (os error 13)",
+            "Read-only file system (os error 30)",
+        ),
+        "process-custody": (
+            "service refused: could not disable service core dumps",
+            "service refused: service requires soft and hard core limits of zero",
+            "service refused: core-dump protection is unsupported on this platform",
+        ),
+    }
+    found: list[str] = []
+    for line in output.splitlines():
+        if not line.startswith("zunder-guard: "):
+            continue
+        message = line.removeprefix("zunder-guard: ")
+        for category, values in prefixes.items():
+            if message.startswith(values):
+                found.append(category)
+        if re.match(r"0x[0-9a-fA-F]{40} is not an API wallet of 0x[0-9a-fA-F]{40}(?: |$)", message):
+            found.append("venue-role")
+    return found[0] if len(found) == 1 else "unknown"
+
+
 def require(value: bool, reason: str) -> None:
     if not value:
         raise PaperError(reason)
@@ -49,6 +98,7 @@ class TestnetDocker(Docker):
             stdin=stdin,
             secrets=self.secrets,
             sensitive_output=True,
+            failure_classifier=init_failure_category if "init" in args else None,
         )
 
     def remove(self, name: str) -> None:

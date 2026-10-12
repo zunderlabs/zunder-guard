@@ -12,7 +12,7 @@ from eth_account import Account
 from guard_harness import docker_testnet as subject
 from guard_harness.install_evidence import DOCKER_TESTNET, completed
 from guard_harness.paper_bot import PaperError
-from guard_harness.runner import RunResult
+from guard_harness.runner import RunError, RunResult
 from guard_harness.testnet_run import ROOT
 
 KEY = ("0" * 63 + "1\n").encode()
@@ -21,6 +21,70 @@ ACCOUNT = "0x" + "a" * 40
 CLIENT = "0x" + "b" * 40
 IMAGE = "ghcr.io/zunderlabs/zunder-guard@sha256:" + "a" * 64
 PREVIOUS = IMAGE.replace("a" * 64, "b" * 64)
+
+
+@pytest.mark.parametrize(
+    "message,category",
+    [
+        ("the rules code is refused: private-body", "rules"),
+        ("the account's equity could not be read: private-account", "account"),
+        ("the venue could not be asked: private-response", "venue-role"),
+        (
+            ACCOUNT + " is not an API wallet of " + WALLET + " (the venue says: private)",
+            "venue-role",
+        ),
+        ("service refused: supervised key frame ended before newline", "key-frame"),
+        ("protected key check requires explicit testnet, private-suffix", "policy"),
+        ("Permission denied (os error 13): /private/file", "filesystem"),
+        ("service refused: could not disable service core dumps", "process-custody"),
+        ("unknown-private-body", "unknown"),
+    ],
+)
+def test_init_classifier_retains_only_finite_label(message: str, category: str) -> None:
+    assert subject.init_failure_category("zunder-guard: " + message + "\n") == category
+
+
+@pytest.mark.parametrize(
+    "output",
+    [
+        "private-body the rules code is refused: payload",
+        "zunder-guard: fragment the rules code is refused: payload",
+        "zunder-guard: the rules code is refused: one\n"
+        "zunder-guard: the rules code is refused: two",
+        "zunder-guard: the rules code is refused: one\nzunder-guard: input ended",
+        "zunder-guard: input ended\n" + "x" * 65536,
+    ],
+)
+def test_unknown_fragment_ambiguous_or_oversized_init_output_stays_withheld(output: str) -> None:
+    assert subject.init_failure_category(output) == "unknown"
+
+
+def test_actual_runner_withholds_key_bearing_init_failure_and_never_classifies_pair(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import subprocess
+
+    def process(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess[bytes]:
+        assert kwargs["input"] == KEY
+        if "pair" in argv:
+            return subprocess.CompletedProcess(argv, 0, b"private-pair-output", b"")
+        return subprocess.CompletedProcess(
+            argv,
+            2,
+            KEY + b"private-body",
+            (b"zunder-guard: the venue could not be asked: private-path " + ACCOUNT.encode()),
+        )
+
+    monkeypatch.setattr("guard_harness.runner.subprocess.run", process)
+    docker = subject.TestnetDocker(tmp_path)
+    with pytest.raises(RunError, match="category: venue-role") as error:
+        docker.command("run", "-i", IMAGE, "init", "--key-stdin", stdin=KEY)
+    assert str(error.value) == "command failed with exit 2; failure category: venue-role"
+    assert (tmp_path / "docker-1.log").read_text() == (
+        "[sensitive command output withheld]\nfailure category: venue-role\n"
+    )
+    docker.command("run", IMAGE, "pair", "--json", stdin=KEY)
+    assert (tmp_path / "docker-2.log").read_text() == "[sensitive command output withheld]\n"
 
 
 def journal(kinds: list[str]) -> bytes:

@@ -82,10 +82,12 @@ def file_write(path, data, mode=0o644):
 
 
 def prompt(text):
-    with open('/dev/tty', 'r+') as terminal:
-        terminal.write(text + ' ')
-        terminal.flush()
-        answer = terminal.readline()
+    # A tty is not seekable: text r+ would require BufferedRandom and fail
+    # before displaying the consent. Keep separate controlling-terminal streams.
+    with open('/dev/tty', 'r') as terminal_input, open('/dev/tty', 'w') as terminal_output:
+        terminal_output.write(text + ' ')
+        terminal_output.flush()
+        answer = terminal_input.readline()
     require(bool(answer), 'Terminal closed; activation remains inhibited.')
     return answer.strip()
 

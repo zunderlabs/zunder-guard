@@ -162,7 +162,13 @@ def website_install(lifecycle: NativeLifecycle) -> dict[str, Any]:
     curl_install(inputs, website=True)
     lifecycle.version(inputs.version)
     lifecycle.healthy()
+    lifecycle.systemctl("D1-website-stop-pair", "stop")
     pair = lifecycle.cli.pair()
+    lifecycle.command(
+        "D1-website-pair-owner", ["chown", "-R", "zunder-guard:zunder-guard", str(HOME)]
+    )
+    lifecycle.systemctl("D1-website-start-pair", "start")
+    lifecycle.healthy()
     round_trip(lifecycle.guard, pair)
     before = snapshot(HOME)
     lifecycle.systemctl("D1-website-restart", "restart")

@@ -5,6 +5,7 @@ import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { test, expect } from '@playwright/test';
 import { admitStagingDocument, restrictAccessHeaders } from './browser-access.js';
+import { stagingClickDiagnostics } from './staging-click-diagnostics.js';
 import { get, safe } from './safe.js';
 import { STAGING_ORIGIN, TESTNET_ORIGIN, WALLET_CHAIN,
   admittedDescriptor, approvalBody, canonical, validateApproval } from './approval-policy.js';
@@ -38,6 +39,7 @@ test.skip(process.env['GUARD_PAID_JOURNEY'] !== 'P8', 'explicit staged P8 owner-
 
 test('P8 staging approve page signs one pinned testnet builder approval', async ({ page, request }) => {
   test.setTimeout(120_000);
+  const clickDiagnostics = stagingClickDiagnostics(page, 'approve-network-testnet');
   expect(process.env['GUARD_STAGING_URL'], 'literal isolated C4 origin').toBe(STAGING_ORIGIN);
   const account = (process.env['GUARD_BUILDER_APPROVAL_ACCOUNT'] ?? '').toLowerCase();
   const builder = (process.env['GUARD_BUILDER_APPROVAL_ADDRESS'] ?? '').toLowerCase();
@@ -143,7 +145,7 @@ test('P8 staging approve page signs one pinned testnet builder approval', async 
   });
   try {
     await admitStagingDocument(page, `/approve?builder=${builder}`, STAGING_ORIGIN);
-    await safe(() => page.getByTestId('approve-network-testnet').click(), 'P8 testnet selection');
+    await safe(() => clickDiagnostics.click(), 'P8 testnet selection');
     expect((await safe(() => page.getByTestId('approve-builder-address').textContent(), 'P8 builder display'))?.trim()
       .toLowerCase() === builder, 'displayed pinned builder').toBe(true);
     await safe(() => page.getByTestId('approve-wallets').getByRole('button').first().click(), 'P8 connect injected wallet');
