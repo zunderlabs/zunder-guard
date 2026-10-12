@@ -93,8 +93,10 @@ class TestnetService:
     output: Path
     marker: str
     container: bool = False
+    ip_share: str = "1"
 
     def setup(self, key: bytes) -> dict[str, str]:
+        require(self.ip_share in {"1", "0.4"}, "request allocation refused")
         require(os.geteuid() == 0 and Path("/run/systemd/system").is_dir(), "root systemd required")
         require(
             MARKER.is_file() and MARKER.read_text().strip() == self.marker,
@@ -122,14 +124,16 @@ class TestnetService:
             self.account,
             "--key-stdin",
         ]
-        # The serialized release runner has a dedicated IP; admit its full request share.
+        # T2 shares its IP with the independent scanner; its caller reserves that share.
         if self.container:
             command.append("--container")
             # Protected container runtime fixes its port to 8547. Existing setup
             # preserves all risk choices; the released installer rejects overrides.
             fresh = not Path("/etc/zunder-guard-container/config.json").exists()
             if fresh:
-                command.extend(["--rules", self.rules, "--equity-cap", "40", "--ip-share", "1"])
+                command.extend(
+                    ["--rules", self.rules, "--equity-cap", "40", "--ip-share", self.ip_share]
+                )
             # Fresh init and supervisor provisioning each consume one stdin frame.
             frames = key * (2 if fresh else 1)
         else:
@@ -140,7 +144,7 @@ class TestnetService:
                     "--equity-cap",
                     "40",
                     "--ip-share",
-                    "1",
+                    self.ip_share,
                     "--listen",
                     f"127.0.0.1:{self.port}",
                     "--service-instance",

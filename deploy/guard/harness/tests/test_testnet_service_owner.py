@@ -23,6 +23,7 @@ def test_service_pairs_as_owner_and_mcp_home_stays_private(
     config = home / "guard.toml"
     config.write_text(
         f'mode="testnet"\nnetwork="testnet"\naccount="{account}"\napi_wallet="{wallet}"\n'
+        'ip_share="0.4"\n'
     )
     original_mode = home.stat().st_mode
     calls: list[list[str]] = []
@@ -34,6 +35,7 @@ def test_service_pairs_as_owner_and_mcp_home_stays_private(
 
     def setup(self: Any, key: bytes) -> dict[str, str]:
         assert key == b"a" * 64 + b"\n"
+        assert self.ip_share == "0.4"
         return {
             "binary": str(binary),
             "home": str(home),

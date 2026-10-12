@@ -14,7 +14,7 @@ from guard_harness.testnet_protection import (
     _orders,
     prove_stop,
 )
-from guard_harness.testnet_scan import Read, amount, digest, inventory
+from guard_harness.testnet_scan import Read, amount, digest
 
 
 def _holdings(
@@ -51,16 +51,15 @@ def collect_ownership(
     started_ms: int,
     cleanup: bool = False,
 ) -> Ownership:
-    """Collect twice-bound fills, exposure and inventory; no mutation or flat credit.
+    """Collect twice-bound main-DEX fills/exposure; no whole-account flat credit.
 
     Run serialization and prior exclusive all-DEX flat preflight remain controller duties.
-    Readbacks cannot form an atomic venue snapshot. Racing fills/orders/inventory refuse,
+    Readbacks cannot form an atomic venue snapshot. Racing main fills/orders refuse,
     and the controller must recollect before each mutation. Cleanup accounts for owned exits.
     """
     _need(bool(re.fullmatch(r"0x[0-9a-fA-F]{40}", account)))
     _need(type(started_ms) is int and started_ms > 0)
     _need(read({"type": "userAbstraction", "user": account}) == "disabled")
-    dexes = inventory(read({"type": "perpDexs"}))
     markets = _orders(_object(read({"type": "meta"})).get("universe"))
     proof = prove_stop(events, client, entry, markets=markets, filled=Decimal(0), mark=entry.limit)
     lookup = _object(read({"type": "orderStatus", "user": account, "oid": proof.entry_cloid}))
@@ -88,13 +87,10 @@ def collect_ownership(
             if not isinstance(cloid, str) or not re.fullmatch(r"0x7a6d[0-9a-f]{28}", cloid):
                 raise ProtectionError("durable close cloid required")
             _need(cloid != proof.entry_cloid and cloid not in exit_lookups)
-            _need(len(exit_lookups) < 16)
+            _need(len(exit_lookups) < 3)
             exit_lookups[cloid] = _object(
                 read({"type": "orderStatus", "user": account, "oid": cloid})
             )
-    for dex in dexes[1:]:
-        secondary_positions, secondary_orders = _holdings(read, account, dex)
-        _need(not secondary_positions and not secondary_orders)
     after_positions, after_orders = _holdings(read, account)
     # Marks/equity can change between reads without an execution; compare accounting exposure.
     _need(
@@ -103,10 +99,6 @@ def collect_ownership(
     )
     _need(digest(orders) == digest(after_orders))
     _need(digest(fills) == digest(_fills(read, account, started_ms)))
-    for dex in dexes[1:]:
-        secondary_positions, secondary_orders = _holdings(read, account, dex)
-        _need(not secondary_positions and not secondary_orders)
-    _need(inventory(read({"type": "perpDexs"})) == dexes)
     return reconcile_ownership(
         events,
         client,

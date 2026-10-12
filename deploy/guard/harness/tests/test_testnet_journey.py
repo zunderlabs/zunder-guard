@@ -462,3 +462,108 @@ def test_failed_flat_scan_never_invokes_planner_or_preview(monkeypatch: pytest.M
     with pytest.raises(RuntimeError, match="offline scan refusal"):
         scenario.execute(entry=lambda: pytest.fail("no market planning after unknown flat scan"))
     assert scenario.calls == [] and not scenario.stopped
+
+
+@pytest.mark.parametrize("secondary", ["position", "unreadable", "inventory"])
+def test_secondary_final_uncertainty_does_not_block_owned_main_reduce_but_refuses_guard_stop(
+    secondary: str,
+) -> None:
+    scenario = Scenario()
+    original = scenario.read
+    inventories = 0
+
+    def read(payload: dict[str, Any]) -> object:
+        nonlocal inventories
+        kind = payload["type"]
+        if kind == "perpDexs":
+            inventories += 1
+            if inventories == 3 and secondary == "inventory":
+                return [None, {"name": "fixture"}, {"name": "changed"}]
+        if "close_position" in scenario.calls and payload.get("dex"):
+            if secondary == "unreadable":
+                return None
+            if secondary == "position" and kind == "clearinghouseState":
+                return {
+                    "assetPositions": [{"position": {"coin": "fixture:OTHER", "szi": "1"}}],
+                    "marginSummary": {"accountValue": "0"},
+                }
+        if "close_position" in scenario.calls and secondary == "inventory" and inventories >= 4:
+            return [None] if kind == "perpDexs" else original(payload)
+        return original(payload)
+
+    scenario.read = read  # type: ignore[method-assign]
+    result = scenario.execute()
+    assert scenario.calls == ["preview_order", "place_order", "close_position"]
+    assert not result.passed and not result.guard_stopped and not scenario.stopped
+    assert scenario.fields["positions"] == []
+    assert result.cleaned is None
+
+
+def test_shared_work_deadline_response_overrun_never_attempts_next_mutation() -> None:
+    scenario = Scenario()
+    checks = [0]
+
+    def exhausted() -> None:
+        checks[0] += 1
+        if checks[0] >= 3:
+            raise RuntimeError("absolute owned-work deadline expired")
+
+    result = scenario.execute(check_owned_work=exhausted)
+    assert not result.passed and not result.guard_stopped
+    assert scenario.calls == ["preview_order", "place_order"]
+
+
+@pytest.mark.parametrize("stalled_hook", ["attempt", "phase"])
+def test_durable_persistence_stall_expires_work_before_entry_send(stalled_hook: str) -> None:
+    scenario = Scenario()
+    clock = [0.0]
+    absolute = 1280.0
+
+    def check() -> None:
+        if clock[0] >= absolute:
+            raise RuntimeError("shared owned work expired")
+
+    def record(entry: Entry, begun: int) -> None:
+        assert "place_order" not in scenario.calls and begun == 1000
+        if stalled_hook == "attempt":
+            clock[0] = absolute
+
+    def phase(value: str) -> None:
+        if value == "entry-attempt" and stalled_hook == "phase":
+            clock[0] = absolute
+
+    if stalled_hook == "attempt":
+        with pytest.raises(RuntimeError, match="shared owned work expired"):
+            scenario.execute(record_attempt=record, observe_phase=phase, check_owned_work=check)
+    else:
+        result = scenario.execute(
+            record_attempt=record, observe_phase=phase, check_owned_work=check
+        )
+        assert not result.passed and not result.guard_stopped
+    assert scenario.calls == ["preview_order"]
+    assert not scenario.stopped
+
+
+def test_owned_snapshot_persistence_stall_prevents_collection_and_close() -> None:
+    scenario = Scenario()
+    clock = [0.0]
+    paced_after_entry = [0]
+    reader = scenario.read
+
+    def check() -> None:
+        if clock[0] >= 1280:
+            raise RuntimeError("shared owned work expired")
+
+    def persist(events: Any, entry: Entry, begun: int) -> None:
+        clock[0] = 1280
+
+    def read(payload: dict[str, Any]) -> object:
+        if "place_order" in scenario.calls:
+            paced_after_entry[0] += 1
+        return reader(payload)
+
+    scenario.read = read  # type: ignore[method-assign]
+    result = scenario.execute(persist_ownership=persist, check_owned_work=check)
+    assert not result.passed and not result.guard_stopped
+    assert scenario.calls == ["preview_order", "place_order"]
+    assert paced_after_entry[0] == 0

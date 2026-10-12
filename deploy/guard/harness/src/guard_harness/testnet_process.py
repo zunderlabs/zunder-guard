@@ -22,8 +22,10 @@ from guard_harness.testnet_journey import Journey, execute
 from guard_harness.testnet_ownership import Ownership
 from guard_harness.testnet_protection import Entry, _object, _orders, entry_plan
 from guard_harness.testnet_scan import SCAN_TIMEOUT, TestnetReads
+from guard_harness.testnet_snapshot import OwnershipStore
 
-ENTRY_REMAINING = SCAN_TIMEOUT + 480
+OWNED_WORK_TIMEOUT = 1280
+ENTRY_REMAINING = OWNED_WORK_TIMEOUT + SCAN_TIMEOUT + 60
 
 
 class ProcessError(RuntimeError):
@@ -158,6 +160,7 @@ class Foreground:
         api_wallet: str,
         port: int,
         key_stdin: BinaryIO,
+        admit_start: Callable[[], None] | None = None,
     ) -> None:
         _need(re.fullmatch(r"[0-9a-f]{64}", sha256) is not None)
         _need(all(re.fullmatch(r"0x[0-9a-fA-F]{40}", a) is not None for a in (account, api_wallet)))
@@ -180,6 +183,8 @@ class Foreground:
         self.env = {"PATH": os.defpath, "HOME": str(work), "LANG": "C.UTF-8"}
         self._initialize(api_wallet, f"127.0.0.1:{port}")
         self.started_ms = time.time_ns() // 1_000_000
+        if admit_start is not None:
+            admit_start()
         self.child = subprocess.Popen(
             [
                 str(self.binary),
@@ -207,6 +212,8 @@ class Foreground:
                 "init",
                 "--non-interactive",
                 "--no-key",
+                "--ip-share",
+                "0.4",
                 "--network",
                 "testnet",
                 "--rules",
@@ -287,14 +294,33 @@ class Foreground:
             markets = _orders(_object(read({"type": "meta"})).get("universe"))
             return entry_plan(markets, _object(read({"type": "allMids"})))
 
+        work_deadline: float | None = None
+        store = OwnershipStore(
+            self.work,
+            account=self.account,
+            client=self.pair.address,
+            source=self.sha256,
+            version=version,
+        )
+
         def admit_entry() -> None:
+            nonlocal work_deadline
             self.alive()
-            # Full all-DEX cleanup plus 480 seconds for entry/proof and shutdown margin.
+            # The single owned-work reserve plus independent all-DEX scan and shutdown.
             _need(deadline - time.monotonic() >= ENTRY_REMAINING)
-            read.start_phase(timeout=180)
+            work_deadline = time.monotonic() + OWNED_WORK_TIMEOUT
+            read.start_phase(timeout=OWNED_WORK_TIMEOUT)
 
         def begin_cleanup() -> None:
+            _need(work_deadline is not None and time.monotonic() < work_deadline)
+            # Preserve the same absolute deadline and rolling reservations.
+
+        def begin_final_scan() -> None:
+            _need(deadline - time.monotonic() >= SCAN_TIMEOUT + 60)
             read.start_phase(timeout=SCAN_TIMEOUT)
+
+        def check_owned_work() -> None:
+            _need(work_deadline is not None and time.monotonic() < work_deadline)
 
         observe_phase("mcp-initialize")
         with MCP(
@@ -317,6 +343,10 @@ class Foreground:
                 stop_guard=self.stop_after_flat,
                 admit_entry=admit_entry,
                 begin_cleanup=begin_cleanup,
+                begin_final_scan=begin_final_scan,
+                check_owned_work=check_owned_work,
+                record_attempt=store.begin,
+                persist_ownership=store.capture,
                 capture_entry=capture_entry,
                 observe_phase=observe_phase,
             )

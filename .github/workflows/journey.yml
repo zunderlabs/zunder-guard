@@ -143,6 +143,8 @@ jobs:
           umask 077
           GUARD_BROWSER_BOUNDARY_TEST=1 npm test -- browser-boundary.test.ts > "$RUNNER_TEMP/guard-release/P8-boundary.log" 2>&1
           npm test -- approval.test.ts > "$RUNNER_TEMP/guard-release/P8-browser.log" 2>&1
+      - name: Age out approval reads before the shared Guard and scanner budget
+        run: sleep 60
       - name: Reserve cleanup against the recorded job start
         env:
           GH_TOKEN: ${{ github.token }}
@@ -222,6 +224,8 @@ jobs:
             ${{ runner.temp }}/guard-release/T1/runtime/pair.log
             ${{ runner.temp }}/guard-release/T1/runtime/process.log
             ${{ runner.temp }}/guard-release/T1/runtime/mcp.log
+            ${{ runner.temp }}/guard-release/T1/runtime/entry-attempt.json
+            ${{ runner.temp }}/guard-release/T1/runtime/ownership.json
             ${{ runner.temp }}/guard-release/T1/T1.predicate.json
             ${{ steps.evidence.outputs.bundle-path }}
           if-no-files-found: warn
@@ -320,7 +324,7 @@ jobs:
           ROOT_WORK="/root/guard-release-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT/T2"
           install -d -m 700 "$RUNNER_TEMP/guard-release/T2"
           FILES=()
-          for FILE in assets/release-manifest.json receipt.json assets.log runtime/init.log runtime/pair.log runtime/process.log runtime/mcp.log T2.predicate.json; do
+          for FILE in assets/release-manifest.json receipt.json assets.log runtime/init.log runtime/pair.log runtime/process.log runtime/mcp.log runtime/entry-attempt.json runtime/ownership.json T2.predicate.json; do
             if sudo test -f "$ROOT_WORK/$FILE" && ! sudo test -L "$ROOT_WORK/$FILE"; then
               FILES+=("$FILE")
             fi
@@ -355,6 +359,8 @@ jobs:
             ${{ runner.temp }}/guard-release/T2/runtime/pair.log
             ${{ runner.temp }}/guard-release/T2/runtime/process.log
             ${{ runner.temp }}/guard-release/T2/runtime/mcp.log
+            ${{ runner.temp }}/guard-release/T2/runtime/entry-attempt.json
+            ${{ runner.temp }}/guard-release/T2/runtime/ownership.json
             ${{ runner.temp }}/guard-release/T2/T2.predicate.json
             ${{ steps.evidence.outputs.bundle-path }}
           if-no-files-found: warn

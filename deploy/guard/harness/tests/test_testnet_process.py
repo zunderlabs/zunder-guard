@@ -105,6 +105,29 @@ def test_actual_child_custody_private_copy_and_config_preservation(
             owner.child.wait(timeout=5)
 
 
+def test_recovery_admission_runs_after_setup_before_any_guard_runtime(
+    subject: tuple[Path, str], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    original = subprocess.Popen
+    runtime_calls: list[object] = []
+
+    def popen(args: Any, **kwargs: Any) -> Any:
+        if "run" in args:
+            runtime_calls.append(args)
+            raise AssertionError("expired recovery must not start Guard")
+        return original(args, **kwargs)
+
+    def refuse_after_setup() -> None:
+        assert (tmp_path / "work/home/guard.toml").exists()
+        assert (tmp_path / "work/client-key").exists()
+        raise process.ProcessError("recovery budget exhausted during setup")
+
+    monkeypatch.setattr(subprocess, "Popen", popen)
+    with pytest.raises(process.ProcessError, match="budget exhausted"):
+        start(subject, tmp_path, io.BytesIO(b"unconsumed"), admit_start=refuse_after_setup)
+    assert runtime_calls == []
+
+
 @pytest.mark.parametrize(
     "change",
     [dict(sha256="0" * 64), dict(account="mainnet"), dict(port=1), dict(api_wallet="invalid")],
@@ -193,9 +216,11 @@ def test_journey_connects_owned_process_and_keeps_guard_on_cleanup_failure(
             kwargs["stop_guard"] == owner.stop_after_flat and kwargs["process_started_ms"] == 1000
         )
         kwargs["admit_entry"]()
-        assert read.deadline == 280
+        assert read.deadline == 100 + process.OWNED_WORK_TIMEOUT
         next_read, reservations = read.next_read, list(read.reservations)
         kwargs["begin_cleanup"]()
+        assert read.deadline == 100 + process.OWNED_WORK_TIMEOUT
+        kwargs["begin_final_scan"]()
         assert read.deadline == 100 + SCAN_TIMEOUT
         assert read.next_read == next_read and read.reservations == reservations
         return Journey(None, None, "cleanup_incomplete_keep_guard_running", False)

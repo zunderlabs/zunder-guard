@@ -15,6 +15,7 @@ from eth_account import Account
 from eth_account.signers.local import LocalAccount
 from hyperliquid.utils.signing import sign_l1_action
 
+from guard_harness.bounded_http_read import ReadOpener
 from guard_harness.cli import Pair
 
 Verdict = Literal["allow", "resize", "veto"]
@@ -66,8 +67,13 @@ class LocalGuard:
         data = None if body is None else json.dumps(body, allow_nan=False).encode()
         headers = {"Content-Type": "application/json"}
         request = urllib.request.Request(self.url + path, data=data, headers=headers)
+        opener: Any = self.opener
+        # Signed paper POST behavior remains unchanged; T1/T2 read-only status/events
+        # use a stdlib child whose total lifetime, including download, is bounded.
+        if body is None and type(opener) is urllib.request.OpenerDirector:
+            opener = ReadOpener()
         try:
-            with self.opener.open(request, timeout=5) as response:
+            with opener.open(request, timeout=5) as response:
                 payload = response.read(1_048_577)
             if len(payload) > 1_048_576:
                 raise PaperError("Guard response exceeded the size bound")
@@ -77,9 +83,9 @@ class LocalGuard:
                 raise GuardUnavailable("local Guard connection refused") from None
             # HTTP errors, timeouts and protocol failures are not startup availability.
             raise PaperError("local Guard HTTP/JSON request failed") from error
-        except (json.JSONDecodeError, UnicodeDecodeError) as error:
+        except (ValueError, UnicodeDecodeError):
             # Never include a response body, credentials or the request in diagnostics.
-            raise PaperError("local Guard HTTP/JSON request failed") from error
+            raise PaperError("local Guard HTTP/JSON request failed") from None
 
 
 @dataclass(frozen=True)

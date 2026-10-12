@@ -11,6 +11,8 @@ from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
+from guard_harness.bounded_http_read import ReadOpener
+
 SCAN_TIMEOUT = 1800
 
 INFO = "https://api.hyperliquid-testnet.xyz/info"
@@ -150,7 +152,7 @@ class TestnetReads:
         self.next_read = clock()
         self.reservations: list[tuple[float, int]] = []
         self.deadline = clock() + timeout
-        self.opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
+        self.opener = ReadOpener()
 
     def start_phase(self, *, timeout: float) -> None:
         """New bounded stage deadline without resetting the shared request pacing."""
@@ -229,6 +231,8 @@ class TestnetReads:
                 raw = response.read(1_048_577)
             if len(raw) > 1_048_576:
                 raise ScanError("oversized testnet response")
+            if self.clock() >= self.deadline:
+                raise ScanError("scan deadline exhausted after response; no flat credit")
             return json.loads(raw)
         except (OSError, UnicodeDecodeError, ValueError):
             raise ScanError("testnet HTTP/JSON read failed") from None
