@@ -3,12 +3,14 @@ import json
 import os
 import subprocess
 import sys
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
 import pytest
 
 from guard_harness import install_run
+from guard_harness.install_evidence import EvidenceError, predicate
 from guard_harness.testnet_process import ProcessError
 from guard_harness.testnet_run import ROOT
 
@@ -40,6 +42,7 @@ def prepared(
     )
     monkeypatch.setenv("GITHUB_SHA", COMMIT)
     monkeypatch.setenv("INSTALL_MATRIX_PROFILE", "all")
+    monkeypatch.setenv("DIAGNOSTIC", "false")
     monkeypatch.setenv("GUARD_C6_SERIALIZED", "1")
     monkeypatch.setenv("WALLET_FRAME", KEY)
     monkeypatch.setenv("GH_TOKEN", "caller-token-fixture")
@@ -126,6 +129,7 @@ def test_both_modes_use_exact_subjects_and_only_private_testnet_stdin(
     assert testnet[1]["input"] == KEY.encode() + b"\n"
     for argv, kwargs in lifecycle:
         assert kwargs["check"] is True
+        assert "--diagnostic" not in argv
         assert str(subjects / "i-staging") in argv
         assert str(subjects / "previous/assets/install.sh") in argv
         assert "v1.0.0" in argv and "v0.9.0" in argv
@@ -193,6 +197,160 @@ def test_invalid_identity_or_custody_inputs_refuse_before_any_runtime(
     with pytest.raises(ProcessError):
         install_run.main()
     assert calls == []
+    if mutation != "key":
+        assert os.environ["WALLET_FRAME"] == KEY
+        assert not (tmp_path / "evidence").exists()
+
+
+@pytest.mark.parametrize("row", ["I1", "I2", "I6"])
+def test_explicit_diagnostic_runs_authenticated_old_release_with_current_bound_harness(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, row: str
+) -> None:
+    subjects, calls = prepared(tmp_path, monkeypatch, row)
+    identity_path = subjects / "input.json"
+    identity = json.loads(identity_path.read_bytes())
+    harness = "f" * 40
+    identity.update(diagnostic=True, harness_commit=harness)
+    identity_path.write_text(json.dumps(identity))
+    monkeypatch.setenv("GITHUB_SHA", harness)
+    monkeypatch.setenv("DIAGNOSTIC", "true")
+    install_run.main()
+    lifecycle = [(argv, kwargs) for argv, kwargs in calls if "-m" in argv]
+    assert len(lifecycle) == 2
+    for argv, _ in lifecycle:
+        assert ("--diagnostic" in argv) is (row != "I2")
+        assert str(subjects / "i-staging") in argv
+        assert "v1.0.0" in argv and "v0.9.0" in argv
+    assert lifecycle[0][1]["input"] == b""
+    assert lifecycle[1][1]["input"] == KEY.encode() + b"\n"
+    marker = json.loads((tmp_path / "evidence/diagnostic-only.json").read_bytes())
+    assert marker == {
+        "schema": 1,
+        "status": "diagnostic_only",
+        "diagnostic": True,
+        "row": row,
+        "scenario": "upgrade",
+        "commit": COMMIT,
+        "harness_commit": harness,
+    }
+    assert KEY not in json.dumps(marker)
+    # Formal admission refuses at the identity boundary, before attempting
+    # runtime receipts or a manifest, even after the diagnostic completed.
+    with pytest.raises(EvidenceError, match="released source and harness identity differ"):
+        predicate(row, tmp_path / "evidence", subjects, tmp_path / "unused-manifest", COMMIT)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "true-with-false-subject",
+        "false-with-true-subject",
+        "numeric-true",
+        "numeric-false",
+        "string-true",
+        "missing-diagnostic",
+        "missing-harness",
+        "harness-mismatch",
+        "missing-github-sha",
+        "invalid-github-sha",
+        "nightly-diagnostic",
+        "nonliteral-true",
+        "nonliteral-false",
+        "empty-mode",
+        "unknown-profile",
+        "malformed-object",
+    ],
+)
+def test_diagnostic_admission_mismatch_refuses_before_wallet_or_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mutation: str
+) -> None:
+    subjects, calls = prepared(tmp_path, monkeypatch, "I1")
+    path = subjects / "input.json"
+    identity = json.loads(path.read_bytes())
+    if mutation == "true-with-false-subject":
+        monkeypatch.setenv("DIAGNOSTIC", "true")
+    elif mutation == "false-with-true-subject":
+        identity["diagnostic"] = True
+    elif mutation in {"numeric-true", "numeric-false", "string-true"}:
+        identity["diagnostic"] = {"numeric-true": 1, "numeric-false": 0, "string-true": "true"}[
+            mutation
+        ]
+        monkeypatch.setenv("DIAGNOSTIC", "true" if mutation != "numeric-false" else "false")
+    elif mutation in {"missing-diagnostic", "missing-harness"}:
+        identity.pop("diagnostic" if mutation == "missing-diagnostic" else "harness_commit")
+    elif mutation == "harness-mismatch":
+        identity.update(diagnostic=True, harness_commit="f" * 40)
+        monkeypatch.setenv("DIAGNOSTIC", "true")
+    elif mutation == "missing-github-sha":
+        monkeypatch.delenv("GITHUB_SHA")
+        identity.update(diagnostic=True, harness_commit=None)
+        monkeypatch.setenv("DIAGNOSTIC", "true")
+    elif mutation == "invalid-github-sha":
+        monkeypatch.setenv("GITHUB_SHA", "invalid")
+        identity.update(diagnostic=True, harness_commit="invalid")
+        monkeypatch.setenv("DIAGNOSTIC", "true")
+    elif mutation == "nightly-diagnostic":
+        identity.update(diagnostic=True, loader_channel="canonical")
+        monkeypatch.setenv("DIAGNOSTIC", "true")
+        monkeypatch.setenv("INSTALL_MATRIX_PROFILE", "nightly")
+    elif mutation in {"nonliteral-true", "nonliteral-false", "empty-mode"}:
+        monkeypatch.setenv(
+            "DIAGNOSTIC",
+            {"nonliteral-true": "True", "nonliteral-false": "0", "empty-mode": ""}[mutation],
+        )
+    elif mutation == "unknown-profile":
+        monkeypatch.setenv("INSTALL_MATRIX_PROFILE", "unexpected")
+    path.write_text(json.dumps([] if mutation == "malformed-object" else identity))
+    with pytest.raises(ProcessError):
+        install_run.main()
+    assert calls == []
+    assert os.environ["WALLET_FRAME"] == KEY
+    assert not (tmp_path / "evidence").exists()
+
+
+def test_diagnostic_loader_is_still_authenticated_before_wallet_or_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    subjects, calls = prepared(tmp_path, monkeypatch, "I6")
+    path = subjects / "input.json"
+    identity = json.loads(path.read_bytes())
+    identity.update(diagnostic=True, harness_commit="f" * 40)
+    path.write_text(json.dumps(identity))
+    monkeypatch.setenv("DIAGNOSTIC", "true")
+    monkeypatch.setenv("GITHUB_SHA", "f" * 40)
+    (subjects / "i-staging").write_bytes(b"unauthenticated override")
+    with pytest.raises(ProcessError, match="loader snapshot differs from signed release"):
+        install_run.main()
+    assert calls == []
+    assert os.environ["WALLET_FRAME"] == KEY
+    assert not (tmp_path / "evidence").exists()
+
+
+@pytest.mark.parametrize("previous", [False, True])
+def test_diagnostic_cannot_skip_released_binary_authentication(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, previous: bool
+) -> None:
+    subjects, calls = prepared(tmp_path, monkeypatch, "I6")
+    path = subjects / "input.json"
+    identity = json.loads(path.read_bytes())
+    identity.update(diagnostic=True, harness_commit="f" * 40)
+    path.write_text(json.dumps(identity))
+    monkeypatch.setenv("DIAGNOSTIC", "true")
+    monkeypatch.setenv("GITHUB_SHA", "f" * 40)
+    release_type = vars(install_run)["Release"]
+    original_binary: Callable[[Any, str], bytes] = release_type.binary
+
+    def refused_binary(release: Any, target: str) -> bytes:
+        if (release.tag == "v0.9.0") is previous:
+            raise ProcessError("release snapshot differs from authenticated C2 bytes")
+        return original_binary(release, target)
+
+    monkeypatch.setattr(release_type, "binary", refused_binary)
+    with pytest.raises(ProcessError, match="release snapshot differs from authenticated C2 bytes"):
+        install_run.main()
+    assert calls == []
+    assert os.environ["WALLET_FRAME"] == KEY
+    assert not (tmp_path / "evidence").exists()
 
 
 @pytest.mark.parametrize("failed_mode", ["paper", "testnet"])

@@ -13,6 +13,7 @@ on:
       diagnostic: {type: boolean, default: false}
       profile: {type: string, default: all}
       target: {type: string, default: all}
+      scenario: {type: string, default: all}
   workflow_dispatch:
     inputs:
       tag: {type: string, required: true}
@@ -22,11 +23,13 @@ on:
       diagnostic: {type: boolean, default: true}
       profile: {type: choice, options: [all, nightly], default: all}
       target: {type: choice, options: [all, linux-amd64, linux-arm64, linux-container, native, docker, aws-stack, linux-mainnet, native-mainnet, mainnet-setup], default: all}
+      scenario: {type: choice, options: [all, fresh, upgrade], default: all}
 permissions:
   contents: read
 env:
   INSTALL_MATRIX_PROFILE: ${{ inputs.profile }}
   INSTALL_MATRIX_TARGET: ${{ inputs.target }}
+  INSTALL_MATRIX_SCENARIO: ${{ inputs.scenario }}
 jobs:
   subjects:
     runs-on: ubuntu-24.04
@@ -61,7 +64,8 @@ jobs:
           [ "$GITHUB_REPOSITORY" = zunderlabs/zunder-guard ]
           [ "$INSTALL_MATRIX_PROFILE" = all ] || [ "$INSTALL_MATRIX_PROFILE" = nightly ]
           case "$INSTALL_MATRIX_TARGET" in all|linux-amd64|linux-arm64|linux-container|native|docker|aws-stack|linux-mainnet|native-mainnet|mainnet-setup) ;; *) exit 1 ;; esac
-          if [ "$INSTALL_MATRIX_TARGET" != all ]; then
+          case "$INSTALL_MATRIX_SCENARIO" in all|fresh|upgrade) ;; *) exit 1 ;; esac
+          if [ "$INSTALL_MATRIX_TARGET" != all ] || [ "$INSTALL_MATRIX_SCENARIO" != all ]; then
             [ "$DIAGNOSTIC" = true ] || exit 1
             [ "$INSTALL_MATRIX_PROFILE" = all ] || exit 1
           fi
@@ -82,7 +86,8 @@ jobs:
     if: ${{ (inputs.target == 'all' || inputs.target == 'linux-amd64') }}
     strategy:
       fail-fast: false
-      matrix: {scenario: [fresh, upgrade]}
+      matrix:
+        scenario: ${{ fromJSON(inputs.scenario == 'fresh' && '["fresh"]' || inputs.scenario == 'upgrade' && '["upgrade"]' || '["fresh","upgrade"]') }}
     concurrency:
       group: guard-e2e-testnet
       cancel-in-progress: false
@@ -107,6 +112,7 @@ jobs:
       - name: I1 authenticated paper and protected Testnet lifecycle
         shell: bash
         env:
+          DIAGNOSTIC: ${{ inputs.diagnostic }}
           ACCOUNT: ${{ vars.E2E_TESTNET_ACCOUNT }}
           PAPER_ACCOUNT: ${{ vars.E2E_TESTNET_ACCOUNT }}
           WALLET_FRAME: ${{ secrets.E2E_TESTNET_API_WALLET_KEY }}
@@ -123,7 +129,8 @@ jobs:
     if: ${{ inputs.target == 'all' || inputs.target == 'linux-container' }}
     strategy:
       fail-fast: false
-      matrix: {scenario: [fresh, upgrade]}
+      matrix:
+        scenario: ${{ fromJSON(inputs.scenario == 'fresh' && '["fresh"]' || inputs.scenario == 'upgrade' && '["upgrade"]' || '["fresh","upgrade"]') }}
     concurrency:
       group: guard-e2e-testnet
       cancel-in-progress: false
@@ -148,6 +155,7 @@ jobs:
       - name: I6 authenticated paper and protected Testnet lifecycle
         shell: bash
         env:
+          DIAGNOSTIC: ${{ inputs.diagnostic }}
           ACCOUNT: ${{ vars.E2E_TESTNET_ACCOUNT }}
           PAPER_ACCOUNT: ${{ vars.E2E_TESTNET_ACCOUNT }}
           WALLET_FRAME: ${{ secrets.E2E_TESTNET_API_WALLET_KEY }}
@@ -163,7 +171,8 @@ jobs:
   linux-arm64:
     strategy:
       fail-fast: false
-      matrix: {scenario: [fresh, upgrade]}
+      matrix:
+        scenario: ${{ fromJSON(inputs.scenario == 'fresh' && '["fresh"]' || inputs.scenario == 'upgrade' && '["upgrade"]' || '["fresh","upgrade"]') }}
     concurrency:
       group: guard-e2e-testnet
       cancel-in-progress: false
@@ -186,6 +195,7 @@ jobs:
       - name: I2 authenticated paper and protected Testnet lifecycle
         shell: bash
         env:
+          DIAGNOSTIC: ${{ inputs.diagnostic }}
           ACCOUNT: ${{ vars.E2E_TESTNET_ACCOUNT }}
           PAPER_ACCOUNT: ${{ vars.E2E_TESTNET_ACCOUNT }}
           WALLET_FRAME: ${{ secrets.E2E_TESTNET_API_WALLET_KEY }}
@@ -210,7 +220,7 @@ jobs:
       fail-fast: false
       matrix:
         variant: [macos, windows2022-ps51, windows2022-ps7, windows2025-ps51, windows2025-ps7]
-        scenario: [fresh, upgrade]
+        scenario: ${{ fromJSON(inputs.scenario == 'fresh' && '["fresh"]' || inputs.scenario == 'upgrade' && '["upgrade"]' || '["fresh","upgrade"]') }}
         include:
           - {os: macos-15, shell: sh, row: I3, variant: macos}
           - {os: windows-2022, shell: powershell.exe, row: I4, variant: windows2022-ps51}
@@ -264,7 +274,9 @@ jobs:
     if: ${{ (inputs.target == 'all' || inputs.target == 'docker') }}
     strategy:
       fail-fast: false
-      matrix: {scenario: [fresh, upgrade], channel: [docker, compose]}
+      matrix:
+        scenario: ${{ fromJSON(inputs.scenario == 'fresh' && '["fresh"]' || inputs.scenario == 'upgrade' && '["upgrade"]' || '["fresh","upgrade"]') }}
+        channel: [docker, compose]
     concurrency:
       group: guard-e2e-testnet
       cancel-in-progress: false
