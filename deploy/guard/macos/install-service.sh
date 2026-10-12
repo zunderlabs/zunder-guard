@@ -89,6 +89,17 @@ for dir in '/Library/Application Support' "$base" "$base/releases" "$base/$bindi
   if [ ! -e "$dir" ]; then mkdir -m 0755 "$dir"; fi
   trusted "$dir"
 done
+if [ "$network" = testnet ]; then
+  trusted "$stage/uninstall-macos-testnet.py"
+  expected=$(awk '$2 == "uninstall-macos-testnet.py" || $2 == "*uninstall-macos-testnet.py" { print $1 }' "$stage/SHA256SUMS")
+  if ! { [ "${#expected}" = 64 ] && [ "$(shasum -a 256 "$stage/uninstall-macos-testnet.py" | awk '{print $1}')" = "$expected" ]; }; then
+    fail 'signed Testnet uninstall helper differs'
+  fi
+  if [ ! -e "$base/management" ]; then mkdir -m 0755 "$base/management"; fi
+  trusted "$base/management"
+  if [ -e "$base/management/uninstall-testnet.py" ]; then trusted "$base/management/uninstall-testnet.py"; fi
+  install -o root -g wheel -m 0700 "$stage/uninstall-macos-testnet.py" "$base/management/uninstall-testnet.py"
+fi
 release="$base/releases/$sha"
 if [ ! -e "$release" ]; then mkdir -m 0755 "$release"; fi
 trusted "$release"

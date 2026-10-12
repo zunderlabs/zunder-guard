@@ -19,6 +19,8 @@ def setup(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Any:
         "GUARD_ACCESS_CLIENT_ID": "access-id",
         "GUARD_ACCESS_CLIENT_SECRET": "access-secret",
         "GUARD_ORDER_TOKEN": "order-secret",
+        "GUARD_PAY_TO_BASE": "0x" + "2" * 40,
+        "GUARD_PAY_TO_ARBITRUM": "0x" + "2" * 40,
         "E2E_PAYER_EVM_SEPOLIA_KEY": "offline-key",
     }.items():
         monkeypatch.setenv(name, value)

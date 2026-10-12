@@ -6,6 +6,7 @@ import pytest
 
 import guard_harness.journey_evidence as evidence
 from guard_harness.attestation import AttestationError, VerifiedPredicate
+from guard_harness.lifecycle_coverage import LIFECYCLE_COVERAGE
 from guard_harness.release_state import GATE_JOURNEYS
 from guard_harness.state_verifier import VerifiedState
 
@@ -56,7 +57,7 @@ def install_verifier(
             "manifest_sha256": hashlib.sha256(expected).hexdigest(),
             "result": "passed",
             "tier": "guest" if row in {"I1", "I6", "M1"} else "e2e",
-            "coverage": sorted(evidence.MAINNET_COVERAGE.get(row, frozenset())),
+            "coverage": sorted(evidence.JOURNEY_COVERAGE[row]),
         }
         if row == bad_row and changes:
             predicate.update(changes)
@@ -78,6 +79,32 @@ def test_every_row_verified_with_fixed_signer_and_captured_subject(
     calls = install_verifier(monkeypatch, inputs[0], replace_original=True)
     assert authenticate(inputs) == GATE_JOURNEYS
     assert set(calls) == GATE_JOURNEYS and len(calls) == len(GATE_JOURNEYS)
+
+
+@pytest.mark.parametrize(
+    "missing",
+    ["staging-approve", "testnet-owner-approval", "guard-builder-wire", "actual-builder-fee"],
+)
+def test_p8_requires_each_observed_approval_and_fee(
+    inputs: tuple[Path, dict[str, evidence.JourneyBundle]],
+    monkeypatch: pytest.MonkeyPatch,
+    missing: str,
+) -> None:
+    coverage = {
+        "signed-release",
+        "protected-entry",
+        "owned-cleanup",
+        "all-dex-flat",
+        "staging-approve",
+        "testnet-owner-approval",
+        "guard-builder-wire",
+        "actual-builder-fee",
+    }
+    install_verifier(
+        monkeypatch, inputs[0], bad_row="P8", changes={"coverage": sorted(coverage - {missing})}
+    )
+    with pytest.raises(AttestationError, match="builder approval coverage"):
+        authenticate(inputs)
 
 
 @pytest.mark.parametrize("row", sorted(GATE_JOURNEYS))
@@ -133,6 +160,24 @@ def test_mainnet_aggregate_requires_every_route_case_and_signing_check(
         changes={"coverage": sorted(evidence.MAINNET_COVERAGE[row] - {check})},
     )
     with pytest.raises(AttestationError, match="required check"):
+        authenticate(inputs)
+
+
+@pytest.mark.parametrize("row", sorted(LIFECYCLE_COVERAGE))
+@pytest.mark.parametrize("mutation", ["omit", "add"])
+def test_install_aggregate_requires_exact_measured_coverage(
+    inputs: tuple[Path, dict[str, evidence.JourneyBundle]],
+    monkeypatch: pytest.MonkeyPatch,
+    row: str,
+    mutation: str,
+) -> None:
+    coverage = set(LIFECYCLE_COVERAGE[row])
+    if mutation == "omit":
+        coverage.remove(sorted(coverage)[0])
+    else:
+        coverage.add("unmeasured-install-claim")
+    install_verifier(monkeypatch, inputs[0], bad_row=row, changes={"coverage": sorted(coverage)})
+    with pytest.raises(AttestationError, match="install coverage"):
         authenticate(inputs)
 
 

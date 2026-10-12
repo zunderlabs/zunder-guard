@@ -11,7 +11,7 @@ Metadata:
   AWS::CloudFormation::Interface:
     ParameterGroups:
       - Label: { default: Guard }
-        Parameters: [Rules, Account]
+        Parameters: [Rules, Account, InstallerChannel]
       - Label: { default: Instance }
         Parameters: [InstanceType, ImageId, PermissionsBoundaryArn]
       - Label: { default: "Public access (off by default; read the warning)" }
@@ -27,6 +27,11 @@ Parameters:
     Type: String
     AllowedPattern: "^0x[0-9a-fA-F]{40}$"
     Description: Public Hyperliquid account address to observe in paper mode. Never a private key.
+  InstallerChannel:
+    Type: String
+    Default: canonical
+    AllowedValues: [canonical, staging]
+    Description: Signed installer channel. Staging is for release verification before canonical promotion.
   InstanceType:
     Type: String
     Default: t4g.small
@@ -64,6 +69,7 @@ Rules:
 
 Conditions:
   HasPermissionsBoundary: !Not [!Equals [!Ref PermissionsBoundaryArn, ""]]
+  StagingInstaller: !Equals [!Ref InstallerChannel, staging]
   Expose: !Equals [!Ref ExposePort, "yes"]
   NotTokyo: !Not [!Equals [!Ref "AWS::Region", ap-northeast-1]]
 
@@ -206,8 +212,6 @@ Resources:
             # Paper only. No key, licence or credential in CloudFormation parameters or logs.
             set -euo pipefail
             export DEBIAN_FRONTEND=noninteractive
-            apt-get update
-            apt-get install -y curl ca-certificates awscli
             umask 077
             loader=
             install_log=
@@ -224,14 +228,20 @@ Resources:
               fi
               status=FAILURE
               if [ "$result" -eq 0 ]; then status=SUCCESS; fi
-              aws cloudformation signal-resource --region '${AWS::Region}' \
+              /snap/bin/aws cloudformation signal-resource --region '${AWS::Region}' \
                 --stack-name '${AWS::StackId}' --logical-resource-id Instance \
                 --unique-id guard-bootstrap --status "$status" || exit 1
               exit "$result"
             }
             trap finish EXIT
+            apt-get update
+            apt-get install -y curl ca-certificates snapd
+            # Official AWS-supported CLI; Ubuntu 24.04 has no apt awscli package.
+            # https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html
+            snap wait system seed.loaded
+            snap install aws-cli --classic
             loader=$(mktemp)
-            curl -fsSL --proto '=https' --retry 3 -o "$loader" https://zunderlabs.com/i
+            curl -fsSL --proto '=https' --retry 3 -o "$loader" https://zunderlabs.com/${InstallerPath}
             install_log=$(mktemp)
             sh "$loader" --non-interactive --network paper --rules '${Rules}' \
               --account '${Account}' ${ListenArg} >"$install_log" 2>&1
@@ -240,6 +250,7 @@ Resources:
             curl -fsS --retry 30 --retry-all-errors --retry-delay 2 \
               http://127.0.0.1:8547/healthz >/dev/null
           - ListenArg: !If [Expose, "--listen 0.0.0.0:8547", ""]
+            InstallerPath: !If [StagingInstaller, i-staging, i]
 
 Outputs:
   InstanceId:

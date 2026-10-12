@@ -17,14 +17,94 @@ concurrency:
   group: guard-release-lifecycle
   cancel-in-progress: false
 jobs:
+  stable-template:
+    # Stable immutable templates require the production-scoped S3 publisher, never e2e.
+    if: ${{ !contains(inputs.tag, '-rc.') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    environment: promote
+    concurrency:
+      group: guard-release-channel-mutation
+      cancel-in-progress: false
+      queue: max
+    permissions:
+      contents: read
+      actions: read
+      packages: read
+      id-token: write
+    steps:
+      - name: Bind stable template publication to the exact released source
+        env:
+          SOURCE: ${{ inputs.commit }}
+          TAG: ${{ inputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [ "$GITHUB_REPOSITORY" = zunderlabs/zunder-guard ]
+          [[ $SOURCE =~ ^[0-9a-f]{40}$ && $TAG =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          [ "$SOURCE" = "$GITHUB_SHA" ]
+          case "$GITHUB_REF" in refs/heads/main|"refs/tags/$TAG") ;; *) exit 1 ;; esac
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: {ref: '${{ inputs.commit }}', persist-credentials: false}
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with: {python-version: '3.13'}
+      - uses: slsa-framework/slsa-verifier/actions/installer@ea584f4502babc6f60d9bc799dbbb13c1caa9ee6 # v2.7.1
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with: {cosign-release: v3.1.3}
+      - run: |
+          python -m pip install --require-hashes --only-binary=:all: -r deploy/guard/harness/requirements-runtime.lock
+          python -m pip install --no-deps --no-build-isolation -e ./deploy/guard/harness
+      - name: Authenticate immutable stable template and full release manifest
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+          SOURCE: ${{ inputs.commit }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          bash deploy/guard/github/verify-release-assets.sh "$TAG" "$RUNNER_TEMP/stable-template" > "$RUNNER_TEMP/stable-template.log" 2>&1
+          python - <<'PY'
+          import os
+          from pathlib import Path
+          from guard_harness.testnet_run import verified_asset
+          verified_asset(Path(os.environ['RUNNER_TEMP']) / 'stable-template', 'cloudformation.yaml', tag=os.environ['TAG'], commit=os.environ['SOURCE'])
+          PY
+      - name: Bind stable publisher configuration to the authenticated descriptor
+        env:
+          ROLE: ${{ vars.AWS_TEMPLATE_ROLE_ARN }}
+          BUCKET: ${{ vars.AWS_TEMPLATE_BUCKET }}
+          BASE: ${{ vars.AWS_TEMPLATE_BASE_URL }}
+          REGION: ${{ vars.AWS_TEMPLATE_REGION || 'ap-northeast-1' }}
+          TAG: ${{ inputs.tag }}
+        run: python -m guard_harness.template_target --assets "$RUNNER_TEMP/stable-template"
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ vars.AWS_TEMPLATE_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_TEMPLATE_REGION || 'ap-northeast-1' }}
+          role-session-name: guard-stable-template-${{ github.run_id }}
+          role-duration-seconds: 900
+      - name: Publish and read back immutable stable template
+        env:
+          TAG: ${{ inputs.tag }}
+          AWS_TEMPLATE_BUCKET: ${{ vars.AWS_TEMPLATE_BUCKET }}
+          AWS_REGION: ${{ vars.AWS_TEMPLATE_REGION || 'ap-northeast-1' }}
+          AWS_TEMPLATE_BASE_URL: ${{ vars.AWS_TEMPLATE_BASE_URL }}
+        run: python3 deploy/guard/github/publish-aws-template.py --release-dir "$RUNNER_TEMP/stable-template"
   staging:
+    needs: stable-template
+    if: ${{ always() && (needs.stable-template.result == 'success' || needs.stable-template.result == 'skipped') }}
     outputs:
       previous_tag: ${{ steps.predecessor.outputs.previous_tag }}
       previous_commit: ${{ steps.predecessor.outputs.previous_commit }}
     name: Authenticate and publish initial staged state
     runs-on: ubuntu-24.04
     timeout-minutes: 35
-    environment: promote
+    environment: e2e
+    concurrency:
+      group: guard-release-channel-mutation
+      cancel-in-progress: false
+      queue: max
     permissions:
       contents: read
       actions: read
@@ -54,7 +134,9 @@ jobs:
       - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
         with:
           cosign-release: v3.1.3
-      - run: python -m pip install -e ./deploy/guard/harness
+      - run: |
+          python -m pip install --require-hashes --only-binary=:all: -r deploy/guard/harness/requirements-runtime.lock
+          python -m pip install --no-deps --no-build-isolation -e ./deploy/guard/harness
       - name: Authenticate assembled release and prepare unavailable staged genesis
         env:
           GH_TOKEN: ${{ github.token }}
@@ -104,7 +186,7 @@ jobs:
             --work "$RUNNER_TEMP/guard-release/homebrew"
       - name: Require the environment-scoped template publishing configuration
         env:
-          ROLE: ${{ vars.AWS_TEMPLATE_ROLE_ARN }}
+          ROLE: ${{ vars.AWS_TEMPLATE_STAGING_ROLE_ARN }}
           BUCKET: ${{ vars.AWS_TEMPLATE_BUCKET }}
           BASE: ${{ vars.AWS_TEMPLATE_BASE_URL }}
           REGION: ${{ vars.AWS_TEMPLATE_REGION || 'ap-northeast-1' }}
@@ -112,17 +194,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          test -n "$ROLE" && test -n "$BUCKET" && test -n "$BASE"
-          python - <<'PY'
-          import json, os
-          from pathlib import Path
-          root = Path(os.environ['RUNNER_TEMP']) / 'guard-release/staging/assets'
-          build = json.loads((root / 'release-manifest.json').read_bytes())
-          suffix = '/guard/' + os.environ['TAG'] + '/cloudformation.yaml'
-          expected = 'https://' + os.environ['BUCKET'] + '.s3.' + os.environ['REGION'] + '.amazonaws.com' + suffix
-          if expected != os.environ['BASE'].rstrip('/') + suffix or expected != build['distribution']['aws_template']['url']:
-              raise SystemExit('Template publishing target differs from the signed distribution descriptor')
-          PY
+          python -m guard_harness.template_target --assets "$RUNNER_TEMP/guard-release/staging/assets"
       - name: Authenticate the new attestation and publish initial staging head
         env:
           GH_TOKEN: ${{ github.token }}
@@ -138,12 +210,14 @@ jobs:
           python -m guard_harness.staging_publish --tag "$TAG" --commit "$SOURCE" \
             --work "$RUNNER_TEMP/guard-release/staging" --bundle "$BUNDLE"
       - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        if: ${{ contains(inputs.tag, '-rc.') }}
         with:
-          role-to-assume: ${{ vars.AWS_TEMPLATE_ROLE_ARN }}
+          role-to-assume: ${{ vars.AWS_TEMPLATE_STAGING_ROLE_ARN }}
           aws-region: ${{ vars.AWS_TEMPLATE_REGION || 'ap-northeast-1' }}
           role-session-name: guard-staging-${{ github.run_id }}
           role-duration-seconds: 900
       - name: Publish the signed template under its immutable version and verify public bytes
+        if: ${{ contains(inputs.tag, '-rc.') }}
         env:
           TAG: ${{ inputs.tag }}
           AWS_TEMPLATE_BUCKET: ${{ vars.AWS_TEMPLATE_BUCKET }}
@@ -201,7 +275,7 @@ jobs:
       packages: read
       id-token: write
       attestations: write
-    uses: ./.github/workflows/install-matrix.yml
+    uses: ./.github/workflows/install-matrix.yml # zizmor: ignore[self-repository]
     secrets:
       E2E_TESTNET_API_WALLET_KEY: ${{ secrets.E2E_TESTNET_API_WALLET_KEY }}
     with:
@@ -220,7 +294,7 @@ jobs:
       packages: read
       id-token: write
       attestations: write
-    uses: ./.github/workflows/journey.yml
+    uses: ./.github/workflows/journey.yml # zizmor: ignore[self-repository]
     # Forward named capabilities; each called job selects its scoped e2e values.
     secrets:
       E2E_ACCESS_CLIENT_ID: ${{ secrets.E2E_ACCESS_CLIENT_ID }}
@@ -241,13 +315,27 @@ jobs:
     needs: [staging, install-matrix, journeys]
     runs-on: ubuntu-24.04
     timeout-minutes: 35
-    environment: promote
+    environment: e2e
+    concurrency:
+      group: guard-release-channel-mutation
+      cancel-in-progress: false
+      queue: max
     permissions:
       contents: read
       actions: read
       id-token: write
       attestations: write
     steps:
+      - name: Refuse preview staging publication and gated attestation
+        env:
+          SOURCE: ${{ inputs.commit }}
+          TAG: ${{ inputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [ "$GITHUB_REPOSITORY" = zunderlabs/zunder-guard ]
+          [ "$SOURCE" = "$GITHUB_SHA" ]
+          case "$GITHUB_REF" in refs/heads/main|"refs/tags/$TAG") ;; *) exit 1 ;; esac
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with: {ref: '${{ inputs.commit }}', persist-credentials: false}
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
@@ -255,7 +343,9 @@ jobs:
       - uses: slsa-framework/slsa-verifier/actions/installer@ea584f4502babc6f60d9bc799dbbb13c1caa9ee6 # v2.7.1
       - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
         with: {cosign-release: v3.1.3}
-      - run: python -m pip install -e ./deploy/guard/harness
+      - run: |
+          python -m pip install --require-hashes --only-binary=:all: -r deploy/guard/harness/requirements-runtime.lock
+          python -m pip install --no-deps --no-build-isolation -e ./deploy/guard/harness
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           path: ${{ runner.temp }}/gate-evidence
@@ -317,7 +407,7 @@ jobs:
       packages: write
       id-token: write
       attestations: write
-    uses: ./.github/workflows/promote.yml
+    uses: ./.github/workflows/promote.yml # zizmor: ignore[self-repository]
     secrets:
       HOMEBREW_APP_PRIVATE_KEY: ${{ secrets.HOMEBREW_APP_PRIVATE_KEY }}
       INSTALLER_PUBLISH_TOKEN: ${{ secrets.INSTALLER_PUBLISH_TOKEN }}

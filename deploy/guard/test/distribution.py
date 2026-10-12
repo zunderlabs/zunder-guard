@@ -104,7 +104,10 @@ class ReleaseRendering(unittest.TestCase):
                                 capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn('version "1.0.0-rc.12"', (self.dist / 'zunder-guard.rb').read_text())
-        self.assertIn(f'/releases/download/{tag}/i', (self.dist / 'cloudformation.yaml').read_text())
+        cloud = (self.dist / 'cloudformation.yaml').read_text()
+        self.assertIn(f'only this signed release ({tag})', cloud)
+        self.assertIn(hashlib.sha256((self.dist / 'i').read_bytes()).hexdigest(), cloud)
+        self.assertIn(f'V={tag} ', (self.dist / 'i').read_text())
         for target, ext in [('linux-amd64', 'tar.gz'), ('windows-amd64', 'zip')]:
             self.assertIn(f'zunder-guard-{tag}-{target}.{ext}', (self.dist / 'SHA256SUMS').read_text())
 
@@ -131,11 +134,13 @@ class ReleaseRendering(unittest.TestCase):
         sha = hashlib.sha256((self.dist / 'i').read_bytes()).hexdigest()
         for name in ('cloudformation.yaml',):
             text = (self.dist / name).read_text()
-            self.assertIn(f'/releases/download/{TAG}/i', text)
+            self.assertIn(f'only this signed release ({TAG})', text)
             self.assertIn(sha, text)
             self.assertIn('sha256sum -c -', text)
             self.assertIn('sh "$loader" --non-interactive --network paper', text)
-            self.assertNotIn('https://zunderlabs.com/i', text)
+            self.assertIn('https://zunderlabs.com/${InstallerPath}', text)
+            self.assertIn('InstallerPath: !If [StagingInstaller, i-staging, i]', text)
+            self.assertLess(text.index('sha256sum -c -'), text.index('sh "$loader"'))
             self.assertIn(f'/blob/{TAG}/deploy/guard/systemd/ACTIVATION.md', text)
             self.assertIn('source commit in this release\'s provenance', text)
             self.assertIn('--service-instance testnet or --service-instance mainnet with matching --network', text)
@@ -195,7 +200,10 @@ class ReleaseRendering(unittest.TestCase):
         template = fixture / 'templates/cloudformation.yaml'
         original = template.read_text()
         guide = "Follow deploy/guard/systemd/ACTIVATION.md at the source commit named in this release."
-        for changed in (original.replace(guide, 'unknown guide'), original + '\n# ' + guide + '\n'):
+        download = 'curl -fsSL --proto \'=https\' --retry 3 -o "$loader" https://zunderlabs.com/${InstallerPath}'
+        for changed in (original.replace(guide, 'unknown guide'), original + '\n# ' + guide + '\n',
+                        original.replace(download, download.replace('zunderlabs.com', 'example.invalid')),
+                        original + '\n# ' + download + '\n'):
             with self.subTest(changed=changed):
                 template.write_text(changed)
                 result = subprocess.run(['bash', str(fixture / 'packaging/render.sh'), TAG, str(self.dist)],
@@ -237,22 +245,30 @@ class ReleaseRendering(unittest.TestCase):
         shell = fakebin / 'sh'
         shell.write_text('#!/bin/sh\nprintf "%s\\n" "$*" > "$EXECUTED"\n')
         shell.chmod(0o755)
-        for name in ('apt-get', 'systemctl'):
+        for name in ('apt-get', 'snap', 'systemctl'):
             path = fakebin / name
-            path.write_text('#!/bin/sh\nexit 0\n')
+            path.write_text('#!/bin/sh\n[ "${FAIL_TOOL:-}" != "' + name + '" ]\n')
             path.chmod(0o755)
         aws = fakebin / 'aws'
         aws.write_text('#!/bin/sh\nprintf "%s\\n" "$*" > "$SIGNAL"\n')
         aws.chmod(0o755)
+        self.assertIn('/snap/bin/aws cloudformation signal-resource', command)
+        self.assertLess(command.index('trap finish EXIT'), command.index('apt-get update'))
+        command = command.replace('/snap/bin/aws', shlex.quote(str(aws)))
         env = dict(os.environ, PATH=str(fakebin) + os.pathsep + os.environ['PATH'],
                    TEST_LOADER=str(self.dist / 'i'), EXECUTED=str(marker),
                    SIGNAL=str(self.root / 'signal'), TEMP_PATH=str(self.root / 'temp-path'))
         original = (self.dist / 'i').read_bytes()
-        for mode in ('valid', 'tampered', 'download-fails'):
-            with self.subTest(mode=mode):
+        for channel in ('i', 'i-staging'):
+          for mode in ('valid', 'tampered', 'download-fails', 'apt-fails', 'snap-fails'):
+            with self.subTest(channel=channel, mode=mode):
+                for old in ('signal', 'temp-path'):
+                    (self.root / old).unlink(missing_ok=True)
                 (self.dist / 'i').write_bytes(original if mode != 'tampered' else b'tampered fixture')
                 env['FAIL_DOWNLOAD'] = '1' if mode == 'download-fails' else '0'
-                result = subprocess.run(['bash', '-c', command], env=env, capture_output=True, text=True)
+                env['FAIL_TOOL'] = 'apt-get' if mode == 'apt-fails' else 'snap' if mode == 'snap-fails' else ''
+                result = subprocess.run(['bash', '-c', command.replace('${InstallerPath}', channel)], env=env,
+                                        capture_output=True, text=True)
                 self.assertEqual(result.returncode == 0, mode == 'valid', result.stderr)
                 signal = (self.root / 'signal').read_text()
                 self.assertIn('--status ' + ('SUCCESS' if mode == 'valid' else 'FAILURE'), signal)
@@ -260,7 +276,10 @@ class ReleaseRendering(unittest.TestCase):
                 if marker.exists():
                     self.assertIn('--non-interactive --network paper --rules zr1_fixture --account 0x', marker.read_text())
                     marker.unlink()
-                self.assertFalse(Path((self.root / 'temp-path').read_text().strip()).exists())
+                if mode in ('apt-fails', 'snap-fails'):
+                    self.assertFalse((self.root / 'temp-path').exists())
+                else:
+                    self.assertFalse(Path((self.root / 'temp-path').read_text().strip()).exists())
                 if mode != 'valid':
                     import re
                     diagnostic = re.search(r'root-only file (\S+);', result.stdout)

@@ -81,7 +81,8 @@ and activation condition. A foreign service, helper, drop-in or volume user is r
 The named Docker volume (configuration, pairings and journals), encrypted credential,
 `/etc/zunder-guard-container` configuration/managed receipt/operation history, and root-only
 runtime lock data remain for recovery. Shared cached immutable Docker images also remain;
-no image or volume is deleted. Reinstall with the same named volume and account using a new
+no image or volume is deleted. The pinned `/usr/local/bin/cosign` verifier also remains
+as a shared host tool; the managed receipt does not grant exclusive ownership of it. Reinstall with the same named volume and account using a new
 authenticated release; never recreate its journals or automatically resume a risk halt.
 Stopping/disabling a supervisor alone is a pause and does not uninstall its software.
 

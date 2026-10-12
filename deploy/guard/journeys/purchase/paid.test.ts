@@ -7,7 +7,7 @@ import { renewPurchase } from './renewal.js';
 import { test, expect } from '@playwright/test';
 import { safe, get, post, validInboxMessage } from './safe.js';
 import { command } from './subprocess.js';
-import { restrictAccessHeaders } from './browser-access.js';
+import { admitStagingDocument, pricingPreflight, restrictAccessHeaders } from './browser-access.js';
 
 
 const journey = process.env['GUARD_PAID_JOURNEY'] ?? 'P1';
@@ -22,20 +22,27 @@ test(`${journey} pricing to paid email to installed released licence`, async ({ 
   const commit = process.env['GUARD_RELEASE_COMMIT'];
   const account = process.env['GUARD_LICENSE_ACCOUNT'];
   const origin = process.env['GUARD_STAGING_URL'];
+  expect(origin === 'https://staging.zunderlabs.com', 'literal C4 staging origin before navigation').toBe(true);
   const domain = process.env['GUARD_EMAIL_DOMAIN'];
   expect(Boolean(root && assets && tag && commit && account && origin && domain), 'complete paid release inputs').toBe(true);
   expect(/^0x[0-9a-fA-F]{40}$/.test(account ?? ''), 'covered account shape').toBe(true);
+  const pinnedPayTo = process.env['GUARD_PAY_TO_' + network.toUpperCase()] ?? '';
+  expect(/^0x[0-9a-fA-F]{40}$/.test(pinnedPayTo), 'independently pinned staging merchant').toBe(true);
   const statusResponse = await get(request, '/api/licence/status', {}, 'paid staging admission');
   const status = await safe(() => statusResponse.json(), 'paid staging JSON');
   expect(statusResponse.status() === 200 && status.ok === true && status.open === true
     && status.chain === 'testnet' && status.profile === 'staging' && status.priceDivisor === 1000
-    && status.emailDomain === domain && status.networks?.includes(network), 'C4 testnet admission before quote or payer key').toBe(true);
+    && status.emailDomain === domain && status.networks?.includes(network)
+    && typeof status.payTo?.[network] === 'string' && status.payTo[network].toLowerCase() === pinnedPayTo.toLowerCase(), 'C4 testnet admission before quote or payer key').toBe(true);
   await restrictAccessHeaders(page.context(), new URL(origin ?? '').origin, {
     id: process.env['GUARD_ACCESS_CLIENT_ID'] ?? '', secret: process.env['GUARD_ACCESS_CLIENT_SECRET'] ?? '',
   });
   const since = Date.now();
   const email = `paid-${randomUUID()}@${domain}`;
-  await safe(() => page.goto('/pricing'), 'pricing page');
+  if (journey === 'P1') await pricingPreflight(page, new URL(origin ?? '').origin, {
+    id: process.env['GUARD_ACCESS_CLIENT_ID'] ?? '', secret: process.env['GUARD_ACCESS_CLIENT_SECRET'] ?? '',
+  });
+  await admitStagingDocument(page, '/pricing', new URL(origin ?? '').origin);
   await safe(() => page.getByTestId('pricing-buy-pro').click(), 'pricing purchase link');
   await safe(() => page.getByTestId('checkout-plan-pro').check(), 'checkout selection');
   await safe(() => page.getByTestId('checkout-term-month').check(), 'checkout selection');
@@ -66,6 +73,7 @@ test(`${journey} pricing to paid email to installed released licence`, async ({ 
   const clean = { PATH: process.env['PATH'], HOME: privateWork };
   await mkdir(join(privateWork, 'payment'), { mode: 0o700 });
   const paymentEnv = { ...clean, GUARD_STAGING_URL: origin,
+    ['GUARD_PAY_TO_' + network.toUpperCase()]: pinnedPayTo,
     GUARD_ACCESS_CLIENT_ID: process.env['GUARD_ACCESS_CLIENT_ID'],
     GUARD_ACCESS_CLIENT_SECRET: process.env['GUARD_ACCESS_CLIENT_SECRET'],
     GUARD_ORDER_TOKEN: process.env['GUARD_ORDER_TOKEN'],

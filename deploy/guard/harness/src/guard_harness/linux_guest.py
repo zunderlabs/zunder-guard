@@ -23,6 +23,7 @@ from pathlib import Path
 
 from guard_harness.linux_lifecycle import require
 from guard_harness.runner import RunError, run
+from guard_harness.testnet_scan import SCAN_TIMEOUT
 
 IMAGE_DIR = "https://cloud-images.ubuntu.com/releases/noble/release-20260911/"
 IMAGE = "ubuntu-24.04-server-cloudimg-amd64.img"
@@ -69,7 +70,10 @@ class Guest:
         """Unknown/hanging cleanup preserves the live guest and its private disk."""
         try:
             observed = json.loads(
-                self.remote(self.testnet_command(arguments) + " --phase check-flat", timeout=900)
+                self.remote(
+                    self.testnet_command(arguments) + " --phase check-flat",
+                    timeout=SCAN_TIMEOUT + 120,
+                )
             )
             require(observed == {"flat": True}, "guest cleanup flat readback differs")
         except (RunError, ValueError, RuntimeError):
@@ -250,21 +254,28 @@ class Guest:
         )
         self.remote(
             "sudo python3 -m venv /opt/guard-release-harness/venv && "
-            "sudo /opt/guard-release-harness/venv/bin/pip install "
-            "/opt/guard-release-harness/harness",
+            "sudo /opt/guard-release-harness/venv/bin/python -m pip install "
+            "--require-hashes --only-binary=:all: "
+            "-r /opt/guard-release-harness/harness/requirements-runtime.lock && "
+            "sudo /opt/guard-release-harness/venv/bin/python -m pip install "
+            "--no-deps --no-build-isolation /opt/guard-release-harness/harness",
             timeout=600,
         )
         if testnet_key is not None:
             command = self.testnet_command(arguments)
-            self.private_remote(command + " --phase before-reboot", testnet_key, timeout=2400)
-            self.remote(command + " --phase check-flat", timeout=900)
+            self.private_remote(
+                command + " --phase before-reboot", testnet_key, timeout=4 * SCAN_TIMEOUT + 1800
+            )
+            self.remote(command + " --phase check-flat", timeout=SCAN_TIMEOUT + 120)
             boot = self.remote("cat /proc/sys/kernel/random/boot_id")
             try:
                 self.remote("sudo systemctl reboot", timeout=10)
             except RunError:
                 pass
             self.wait(process, previous_boot=boot)
-            self.private_remote(command + " --phase after-reboot", testnet_key, timeout=2400)
+            self.private_remote(
+                command + " --phase after-reboot", testnet_key, timeout=4 * SCAN_TIMEOUT + 1800
+            )
             return
         if refusals_only:
             refusal_args = []
@@ -343,6 +354,18 @@ class Guest:
         )
 
 
+def scenario_arguments(words: list[str], scenario: str, output: Path) -> list[str]:
+    result = []
+    index = 0
+    while index < len(words):
+        if words[index] in {"--scenario", "--output"}:
+            index += 2
+        else:
+            result.append(words[index])
+            index += 1
+    return [*result, "--scenario", scenario, "--output", str(output)]
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     for flag in ("candidate", "previous", "output"):
@@ -356,6 +379,9 @@ def main() -> None:
     parser.add_argument("--source-paper-script", type=Path)
     parser.add_argument("--candidate-image", type=Path)
     parser.add_argument("--previous-image", type=Path)
+    parser.add_argument("--candidate-archive", type=Path)
+    parser.add_argument("--archive-sha256", default="")
+    parser.add_argument("--loader-channel", choices=("staging", "canonical"), default="staging")
     parser.add_argument("--mainnet-refusals-only", action="store_true")
     parser.add_argument("--testnet-lifecycle", action="store_true")
     parser.add_argument("--previous-binary-sha256", default="")
@@ -370,6 +396,7 @@ def main() -> None:
         parser.add_argument("--" + flag)
     parser.add_argument("--release-image", default="")
     parser.add_argument("--diagnostic", action="store_true")
+    parser.add_argument("--scenario", choices=("fresh", "upgrade", "both"), default="both")
     args = parser.parse_args()
     key = None
     if args.testnet_lifecycle:
@@ -414,6 +441,27 @@ def main() -> None:
             "image overrides are diagnostic-only",
         )
     args.output.mkdir(parents=True, exist_ok=True)
+    if args.scenario == "both" and not args.mainnet_refusals_only:
+        child_env = {
+            name: os.environ[name]
+            for name in ("PATH", "HOME", "GUARD_C6_SERIALIZED")
+            if name in os.environ
+        }
+        for scenario in ("fresh", "upgrade"):
+            run(
+                [
+                    sys.executable,
+                    "-m",
+                    "guard_harness.linux_guest",
+                    *scenario_arguments(sys.argv[1:], scenario, args.output / scenario),
+                ],
+                log=args.output / (scenario + "-driver.log"),
+                timeout=8 * SCAN_TIMEOUT + 3600,
+                stdin=key or b"",
+                env=child_env,
+                sensitive_output=True,
+            )
+        return
     # Testnet guests survive unknown cleanup outcomes. Never delete their encrypted
     # custody/protection or disk solely because the harness failed.
     folder_context = (
@@ -439,6 +487,8 @@ def main() -> None:
             )
             tar.add(args.candidate, arcname="candidate-install.sh")
             tar.add(args.previous, arcname="previous-install.sh")
+            if args.candidate_archive:
+                tar.add(args.candidate_archive, arcname="candidate-archive.tar.gz")
             if args.source_paper_script:
 
                 def root_owned(info: tarfile.TarInfo) -> tarfile.TarInfo:
@@ -491,6 +541,21 @@ def main() -> None:
             "--marker",
             marker,
         ]
+        if not args.mainnet_refusals_only:
+            arguments.extend(["--scenario", args.scenario])
+            if not args.testnet_lifecycle:
+                for name, value in (
+                    ("release-commit", args.release_commit),
+                    ("manifest-sha256", args.manifest_sha256),
+                    ("binary-sha256", args.binary_sha256),
+                    ("loader-channel", args.loader_channel),
+                    ("archive-sha256", args.archive_sha256),
+                ):
+                    if value:
+                        arguments.extend(["--" + name, value])
+                if args.candidate_archive:
+                    arguments.extend(["--archive", prefix + "candidate-archive.tar.gz"])
+
         if args.testnet_lifecycle:
             arguments = arguments[4:]  # Sending driver uses route, never paper account mode.
             arguments.extend(
@@ -595,6 +660,29 @@ def main() -> None:
                     and not args.diagnostic
                 )
                 (args.output / receipt_name).write_text(json.dumps(receipt, indent=2) + "\n")
+                if (
+                    args.scenario == "fresh"
+                    and args.mode == "native"
+                    and not args.testnet_lifecycle
+                    and not args.mainnet_refusals_only
+                ):
+                    (args.output / "channels").mkdir(exist_ok=True)
+                    for channel in ("D1", "D5"):
+                        channel_body = guest.remote(
+                            "sudo cat /opt/guard-release-harness/evidence/channels/"
+                            + channel
+                            + ".json",
+                            timeout=10,
+                        )
+                        channel_receipt = json.loads(channel_body)
+                        require(
+                            channel_receipt.get("channel") == channel
+                            and channel_receipt.get("result") == "passed",
+                            "fresh channel receipt differs",
+                        )
+                        (args.output / "channels" / (channel + ".json")).write_text(
+                            json.dumps(channel_receipt) + "\n"
+                        )
             except RunError:
                 pass
             if args.testnet_lifecycle:

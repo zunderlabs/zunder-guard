@@ -17,6 +17,7 @@ def setup(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Any:
         "GUARD_ACCESS_CLIENT_ID": "access-id",
         "GUARD_ACCESS_CLIENT_SECRET": "access-secret",
         "GUARD_ORDER_TOKEN": "order-secret",
+        "GUARD_PAY_TO_HYPERLIQUID": "0x" + "1" * 40,
         "E2E_PAYER_HYPERLIQUID_TESTNET_KEY": "dummy-secret",
     }.items():
         monkeypatch.setenv(name, value)
@@ -160,3 +161,15 @@ def test_blocked_uses_only_dedicated_blocked_payer(
     receipt = payment.pay("ZL-2026-000001", "0.180001", work, scenario="blocked")
     assert receipt["scenario"] == "blocked" and len(sends) == 1
     assert "E2E_PAYER_BLOCKED_KEY" not in os.environ
+
+
+@pytest.mark.parametrize("pin", ["", "0x" + "3" * 40])
+def test_unpinned_or_changed_merchant_refuses_before_key_or_send(
+    setup: Any, monkeypatch: pytest.MonkeyPatch, pin: str
+) -> None:
+    _, _, sends, _, work = setup
+    monkeypatch.setenv("GUARD_PAY_TO_HYPERLIQUID", pin)
+    with pytest.raises(payment.PaymentError, match="payment target"):
+        payment.pay("ZL-2026-000001", "0.180001", work)
+    assert "E2E_PAYER_HYPERLIQUID_TESTNET_KEY" in os.environ
+    assert not sends and not list(work.iterdir())

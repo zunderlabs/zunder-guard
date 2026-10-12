@@ -11,6 +11,7 @@ let runtime: Miniflare;
 let source: string;
 let persistedDirectory: string | undefined;
 const secret = 'synthetic-publication-fixture';
+const stagingSecret = 'synthetic-staging-fixture';
 test.beforeAll(async () => {
   const result = await build({ entryPoints: ['../loader/worker/store.ts'], bundle: true, write: false,
     format: 'esm', platform: 'neutral', target: 'es2022' });
@@ -19,7 +20,7 @@ test.beforeAll(async () => {
 test.beforeEach(async () => {
   test.skip(Boolean(process.env['GUARD_STAGING_URL']), 'publication storage tests are local only');
   runtime = new Miniflare({ modules: true, script: source, compatibilityDate: '2026-08-06',
-    bindings: { INSTALLER_PUBLISH_TOKEN: secret },
+    bindings: { INSTALLER_PUBLISH_TOKEN: secret, STAGING_INSTALLER_PUBLISH_TOKEN: stagingSecret },
     durableObjects: { RELEASE_STATE: { className: 'ReleaseStore', useSQLite: true } } });
 });
 test.afterEach(async () => {
@@ -28,12 +29,12 @@ test.afterEach(async () => {
 });
 function capsule(revision = 1, previous: string | null = null, stage = 'staged', expected: string | null = null) {
   return { channel: stage === 'promoted' || stage === 'withdrawn' ? 'canonical' : 'staging', expected,
-    predicate: JSON.stringify({ manifest_sha256: 'a'.repeat(64), revision, previous, stage }),
+    predicate: JSON.stringify({ version: '1.0.0', tag: 'v1.0.0', manifest_sha256: 'a'.repeat(64), revision, previous, stage }),
     bundle: `synthetic-fixture-bundle-${revision}`, unix: `fixture-unix-${revision}`, windows: `fixture-windows-${revision}` };
 }
 function publish(value: ReturnType<typeof capsule>, authenticated = true) {
   return runtime.dispatchFetch('https://zunderlabs.com/guard/publish', { method: 'POST',
-    headers: authenticated ? { authorization: `Bearer ${secret}` } : {}, body: JSON.stringify(value) });
+    headers: authenticated ? { authorization: `Bearer ${value.channel === 'staging' ? stagingSecret : secret}` } : {}, body: JSON.stringify(value) });
 }
 async function publishDigest(value: ReturnType<typeof capsule>): Promise<string> {
   const response = await publish(value); expect(response.status).toBe(201);
@@ -50,10 +51,14 @@ test('competing genesis proposals have one winner and serve a matched capsule', 
   expect(responses.map(r => r.status).sort()).toEqual([201, 409]);
   const winner = proposals[responses.findIndex(r => r.status === 201)];
   const state = await runtime.dispatchFetch('https://zunderlabs.com/guard/release-staging.json');
+  const stateBody = await state.text();
   const bundle = await runtime.dispatchFetch('https://zunderlabs.com/guard/release-staging.json.sigstore');
+  const bundleBody = await bundle.text();
   const loader = await runtime.dispatchFetch('https://zunderlabs.com/i-staging');
-  expect(await state.text()).toBe(winner?.predicate); expect(await bundle.text()).toBe(winner?.bundle);
-  expect(await loader.text()).toBe(winner?.unix);
+  const loaderBody = await loader.text();
+  expect([state.status, bundle.status, loader.status]).toEqual([200, 200, 200]);
+  expect(stateBody).toBe(winner?.predicate); expect(bundleBody).toBe(winner?.bundle);
+  expect(loaderBody).toBe(winner?.unix);
   expect(state.headers.get('x-zunder-state-sha256')).toBe(bundle.headers.get('x-zunder-state-sha256'));
   expect(state.headers.get('cache-control')).toBe('no-cache');
   expect(state.headers.get('access-control-allow-origin')).toBe('*');
@@ -66,6 +71,7 @@ test('stage gate promotion withdrawal refuses replay and competing revisions', a
   expect((await runtime.dispatchFetch('https://zunderlabs.com/i')).status).toBe(200);
   const withdrawn = await publishDigest(capsule(4, promoted, 'withdrawn', promoted));
   expect((await runtime.dispatchFetch('https://zunderlabs.com/i')).status).toBe(410);
+  expect((await runtime.dispatchFetch('https://zunderlabs.com/i-staging')).status).toBe(410);
   const metadata = await runtime.dispatchFetch('https://zunderlabs.com/guard/release.json');
   expect(metadata.headers.get('x-zunder-state-sha256')).toBe(withdrawn);
   expect((await metadata.json() as { stage: string }).stage).toBe('withdrawn');
@@ -95,7 +101,7 @@ test('durable head survives a runtime restart and still rejects a stale publishe
   const directory = await mkdtemp(join(tmpdir(), 'guard-publication-'));
   persistedDirectory = directory;
   const options = { modules: true, script: source, compatibilityDate: '2026-08-06',
-    bindings: { INSTALLER_PUBLISH_TOKEN: secret }, durableObjectsPersist: directory,
+    bindings: { INSTALLER_PUBLISH_TOKEN: secret, STAGING_INSTALLER_PUBLISH_TOKEN: stagingSecret }, durableObjectsPersist: directory,
     durableObjects: { RELEASE_STATE: { className: 'ReleaseStore', useSQLite: true } } };
   await runtime.dispose(); runtime = new Miniflare(options);
     const staged = await publishDigest(capsule());
@@ -171,7 +177,7 @@ test('first promotion has no rollback target and remains truthfully withdrawn', 
 test('a withdrawn prior channel is never a rollback target', async () => {
   const first = await promoteBuild('a', null, null);
   const oldWithdrawal = await publishDigest(first.withdrawal());
-  const next = await promoteBuild('b', first.gate, oldWithdrawal);
+  const next = await promoteBuild('b', oldWithdrawal, oldWithdrawal);
   const withdrawn = await publishDigest(next.withdrawal());
   expect((await restore(withdrawn, first.promoted)).status).toBe(409);
 });
@@ -181,4 +187,28 @@ test('restore payloads are bounded and cannot accept caller replacement bytes', 
     body: JSON.stringify({ expected: 'a'.repeat(64), restore: 'b'.repeat(64), unix: 'replacement' }) })).status).toBe(400);
   expect((await runtime.dispatchFetch('https://zunderlabs.com/guard/restore', { method: 'POST',
     headers: { authorization: `Bearer ${secret}` }, body: 'x'.repeat(1025) })).status).toBe(413);
+});
+
+test('staging publisher cannot publish or restore canonical state', async () => {
+  const staged = await publishDigest(capsule());
+  const gated = await publishDigest(capsule(2, staged, 'gated', staged));
+  for (const token of [stagingSecret, secret]) {
+    const wrong = token === secret ? capsule(2, staged, 'gated', staged) : capsule(3, gated, 'promoted');
+    expect((await runtime.dispatchFetch('https://zunderlabs.com/guard/publish', {method: 'POST',
+      headers: {authorization: `Bearer ${token}`}, body: JSON.stringify(wrong)})).status).toBe(401);
+  }
+  expect((await runtime.dispatchFetch('https://zunderlabs.com/guard/restore', {method: 'POST',
+    headers: {authorization: `Bearer ${stagingSecret}`},
+    body: JSON.stringify({expected: 'a'.repeat(64), restore: 'b'.repeat(64)})})).status).toBe(401);
+});
+test('release candidate cannot become promoted even with canonical authority', async () => {
+  const candidate = capsule();
+  candidate.predicate = JSON.stringify({...JSON.parse(candidate.predicate), version: '1.0.0-rc.7', tag: 'v1.0.0-rc.7'});
+  const staged = await publishDigest(candidate);
+  const next = capsule(2, staged, 'gated', staged);
+  next.predicate = JSON.stringify({...JSON.parse(next.predicate), version: '1.0.0-rc.7', tag: 'v1.0.0-rc.7'});
+  const gated = await publishDigest(next);
+  const promoted = capsule(3, gated, 'promoted');
+  promoted.predicate = JSON.stringify({...JSON.parse(promoted.predicate), version: '1.0.0-rc.7', tag: 'v1.0.0-rc.7'});
+  expect((await publish(promoted)).status).toBe(400);
 });

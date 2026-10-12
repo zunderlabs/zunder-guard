@@ -10,7 +10,27 @@ from pathlib import Path
 from guard_harness.mainnet_terminal import TerminalError, refusal
 from guard_harness.native_paper import Paper
 from guard_harness.native_release import Release, staged_loader
+from guard_harness.runner import run
 from guard_harness.testnet_run import ROOT
+
+
+def mac_absent(paths: tuple[Path, ...], log: Path) -> None:
+    """Only the privileged owner can prove absence beneath protected installer roots."""
+    run(
+        [
+            "sudo",
+            "-n",
+            "/bin/sh",
+            "-c",
+            'for path do [ ! -e "$path" ] && [ ! -L "$path" ] || exit 2; done',
+            "guard-mainnet-absence",
+            *map(str, paths),
+        ],
+        log=log,
+        timeout=30,
+        stdin=b"",
+        sensitive_output=True,
+    )
 
 
 def receipt(release: Release, route: str, log: Path, code: int, work: Path) -> None:
@@ -65,8 +85,7 @@ def exercise(release: Release, *, account: str, work: Path, shell: str) -> None:
         base = Path("/Library/Application Support/Zunder Guard")
         config, binding = base / "state/guard.toml", base / "bindings/active.json"
         plist = Path("/Library/LaunchDaemons/com.zunderlabs.guard.mainnet.plist")
-        if any(path.exists() for path in (config, binding, plist)):
-            raise TerminalError("protected mainnet route already exists")
+        mac_absent((config, binding, plist), work / "macos-before-absence.log")
         keychain = "/Library/Keychains/System.keychain"
 
         def absent() -> None:
@@ -116,8 +135,7 @@ def exercise(release: Release, *, account: str, work: Path, shell: str) -> None:
             log=log,
         )
         absent()
-        if any(path.exists() for path in (config, binding, plist)):
-            raise TerminalError("refused macOS setup wrote mainnet state or registration")
+        mac_absent((config, binding, plist), work / "macos-after-absence.log")
         expected = release.binary("darwin-arm64")
         installed = base / "releases" / hashlib.sha256(expected).hexdigest() / "zunder-guard"
         if installed.is_symlink() or installed.read_bytes() != expected:

@@ -41,6 +41,24 @@ def test_testnet_journals_cannot_substitute_for_missing_paper_journals(
         retained(tmp_path)
 
 
+def test_paper_append_consumes_zero_reserve_without_erasing_history(tmp_path: Path) -> None:
+    expected = paper_state(tmp_path)
+    for name in ("risk-paper.jsonl", "decisions-paper.jsonl"):
+        (tmp_path / name).write_bytes(expected[name] + b"\x00" * 4096)
+    before = retained(tmp_path)
+    assert before == expected
+    for name in ("risk-paper.jsonl", "decisions-paper.jsonl"):
+        (tmp_path / name).write_bytes(
+            expected[name] + b"durable appended record\n" + b"\x00" * 4000
+        )
+    verify_retained(before, tmp_path)
+    (tmp_path / "decisions-paper.jsonl").write_bytes(
+        b"replaced populated prefix\n" + b"\x00" * 4096
+    )
+    with pytest.raises(LifecycleError, match="journal history changed"):
+        verify_retained(before, tmp_path)
+
+
 @pytest.mark.parametrize("name", ["guard.toml", "risk-paper.jsonl", "decisions-paper.jsonl"])
 def test_paper_lifecycle_rejects_replaced_config_or_journal_prefix(
     tmp_path: Path, name: str

@@ -30,7 +30,12 @@ def retained(home: Path) -> dict[str, bytes]:
     required = ("guard.toml", "risk-paper.jsonl", "decisions-paper.jsonl")
     if any(not (home / name).is_file() for name in required):
         raise LifecycleError("configuration or journal missing")
-    return {name: (home / name).read_bytes() for name in required}
+    return {
+        name: (home / name).read_bytes().rstrip(b"\x00")
+        if name.endswith(".jsonl")
+        else (home / name).read_bytes()
+        for name in required
+    }
 
 
 def verify_retained(before: dict[str, bytes], home: Path) -> None:
@@ -62,12 +67,24 @@ def healthy(guard: LocalGuard, *, version: str, timeout: float = 90) -> dict[str
 
 
 class Paper:
-    def __init__(self, *, release: Release, previous: Release, work: Path, shell: str) -> None:
+    def __init__(
+        self,
+        *,
+        release: Release,
+        previous: Release,
+        work: Path,
+        shell: str,
+        scenario: str = "upgrade",
+    ) -> None:
         self.release, self.previous, self.work, self.shell = release, previous, work, shell
         self.sequence = 0
         self.child: subprocess.Popen[bytes] | None = None
         self.output: Any = None
         self.brew = platform.system() == "Darwin"
+        if scenario not in {"fresh", "upgrade"}:
+            raise LifecycleError("native paper scenario refused")
+        self.scenario = scenario
+        self.observed: dict[str, dict[str, str]] = {}
         self.home = work / "home"
         self.binary = work / "bin/zunder-guard.exe"
         self.env = dict(os.environ)
@@ -88,13 +105,13 @@ class Paper:
             sensitive_output=sensitive,
         ).output.strip()
 
-    def install(self, release: Release, *, upgrade: bool = False) -> None:
+    def install(self, release: Release, *, upgrade: bool = False, reinstall: bool = False) -> None:
         target = "darwin-arm64" if self.brew else "windows-amd64"
         expected = hashlib.sha256(release.binary(target)).hexdigest()
         if self.brew:
             if not upgrade:
-                self.command(["brew", "tap", "zunderlabs/homebrew-tap"])
-                self.tap = Path(self.command(["brew", "--repo", "zunderlabs/homebrew-tap"]))
+                self.command(["brew", "tap", "zunderlabs/tap"])
+                self.tap = Path(self.command(["brew", "--repo", "zunderlabs/tap"]))
                 branch = (
                     "main" if os.environ.get("INSTALL_MATRIX_PROFILE") == "nightly" else "staging"
                 )
@@ -115,8 +132,8 @@ class Paper:
             self.command(
                 [
                     "brew",
-                    "upgrade" if upgrade else "install",
-                    "zunderlabs/homebrew-tap/zunder-guard",
+                    "reinstall" if reinstall else "upgrade" if upgrade else "install",
+                    "zunderlabs/tap/zunder-guard",
                 ]
             )
             prefix = Path(self.command(["brew", "--prefix"]))
@@ -125,7 +142,7 @@ class Paper:
             self.env["ZUNDER_GUARD_HOME"] = str(self.home)
         else:
             loader = self.work / f"loader-{release.tag}.ps1"
-            if upgrade:
+            if release == self.release:
                 staged_loader(
                     release,
                     windows=True,
@@ -151,6 +168,12 @@ class Paper:
             )
         if digest(self.binary) != expected:
             raise LifecycleError("installed binary differs from authenticated released bytes")
+        version = self.command([str(self.binary), "--version"])
+        if version != "zunder-guard " + release.tag.removeprefix("v"):
+            raise LifecycleError("installed paper version differs from release")
+        self.observed[release.tag] = dict(
+            commit=release.commit, version=version, binary_sha256=expected
+        )
 
     def start(self) -> None:
         if self.brew:
@@ -196,7 +219,8 @@ class Paper:
         guard = LocalGuard("http://127.0.0.1:8547")
         checks: list[str] = []
         try:
-            self.install(self.previous)
+            initial = self.release if self.scenario == "fresh" else self.previous
+            self.install(initial)
             self.home.mkdir(mode=0o700, parents=True, exist_ok=False)
             rules = json.loads((ROOT / "rules/vectors.json").read_bytes())["valid"][0]["canonical"]
             self.command(
@@ -220,31 +244,40 @@ class Paper:
             )
             pair = GuardCLI(self.binary, self.work, self.home).pair()
             self.start()
-            healthy(guard, version=self.previous.tag[1:])
+            healthy(guard, version=initial.tag[1:])
             round_trip(guard, pair)
             self.stop()
             before = retained(self.home)
             checks.extend(["install", "init", "pair", "health", "paper-allow-resize-veto"])
             self.start()
-            healthy(guard, version=self.previous.tag[1:])
+            healthy(guard, version=initial.tag[1:])
             self.crash()
-            healthy(guard, version=self.previous.tag[1:])
+            healthy(guard, version=initial.tag[1:])
             self.stop()
             verify_retained(before, self.home)
-            checks += ["restart", "crash-recovery", "journal-prefix", "pairing-retained"]
+            checks += [
+                "restart",
+                "crash-recovery" if self.brew else "manual-crash-restart",
+                "journal-prefix",
+                "pairing-retained",
+            ]
             self.install(self.release, upgrade=True)
             verify_retained(before, self.home)
             self.start()
             healthy(guard, version=self.release.tag[1:])
             round_trip(guard, pair)
             self.stop()
-            self.install(self.release, upgrade=True)
+            self.install(self.release, upgrade=True, reinstall=True)
             verify_retained(before, self.home)
             self.start()
             healthy(guard, version=self.release.tag[1:])
             round_trip(guard, pair)
             self.stop()
-            checks += ["upgrade", "reinstall", "old-client-signature-after-upgrade"]
+            checks += [
+                "fresh-candidate" if self.scenario == "fresh" else "upgrade",
+                "reinstall",
+                "old-client-signature-after-upgrade",
+            ]
             # Refusals are separate from paper orders and never call /exchange.
             from guard_harness.native_refusals import setup_refusals
 
@@ -288,16 +321,40 @@ class Paper:
             if self.brew:
                 self.command(["brew", "uninstall", "zunder-guard"])
             else:
-                self.binary.unlink()
-                for name in ("LICENSE", "NOTICE", "THIRD_PARTY_LICENSES.md"):
-                    path = self.binary.parent / name
-                    if path.exists():
-                        path.unlink()
+                self.command(
+                    [
+                        self.shell,
+                        "-NoProfile",
+                        "-ExecutionPolicy",
+                        "Bypass",
+                        "-File",
+                        str(self.work / f"loader-{self.release.tag}.ps1"),
+                        "-Uninstall",
+                        "-NonInteractive",
+                        "-InstallDir",
+                        str(self.binary.parent),
+                    ]
+                )
             if self.binary.exists():
                 raise LifecycleError("uninstall retained executable")
             verify_retained(before, self.home)
             checks += ["uninstall", "documented-data-retained"]
-            return {"result": "passed", "coverage": checks, "mode": "paper"}
+            return {
+                "schema": 1,
+                "result": "passed",
+                "coverage": checks,
+                "mode": "paper",
+                "scenario": self.scenario,
+                "tag": self.release.tag,
+                "commit": self.release.commit,
+                "manifest_sha256": hashlib.sha256(
+                    self.release.asset("release-manifest.json")
+                ).hexdigest(),
+                "observed_releases": self.observed,
+                "channel_coverage": ["D3:homebrew"]
+                if self.brew and self.scenario == "fresh"
+                else [],
+            }
         finally:
             self.stop()
             # Pairing output never enters evidence; retain only non-secret service logs.
@@ -311,6 +368,7 @@ def main() -> None:
     parser.add_argument("--assets", type=Path, required=True)
     parser.add_argument("--work", type=Path, required=True)
     parser.add_argument("--shell", default="powershell.exe")
+    parser.add_argument("--scenario", choices=("fresh", "upgrade"), default="upgrade")
     args = parser.parse_args()
     if (
         os.environ.get("GITHUB_ACTIONS") != "true"
@@ -322,6 +380,7 @@ def main() -> None:
         previous=Release(args.previous_tag, args.previous_commit, args.assets / "previous/assets"),
         work=args.work,
         shell=args.shell,
+        scenario=args.scenario,
     )
     receipt = paper.execute(args.account)
     # This receipt proves only paper; it cannot claim complete I3/I4 or testnet custody.

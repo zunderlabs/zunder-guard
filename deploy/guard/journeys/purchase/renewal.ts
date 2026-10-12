@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { expect, type Page, type APIRequestContext } from '@playwright/test';
 import { get, post, safe, validInboxMessage } from './safe.js';
 import { command } from './subprocess.js';
+import { admitStagingDocument } from './browser-access.js';
 
 export async function renewPurchase(page: Page, request: APIRequestContext, input: {
   origin: string; domain: string; since: number; email: string; token: string; oldKey: string;
@@ -12,7 +13,7 @@ export async function renewPurchase(page: Page, request: APIRequestContext, inpu
 }): Promise<string> {
   // The delivered order is remembered per tab; renewal starts a fresh customer session.
   await safe(() => page.evaluate(() => sessionStorage.clear()), 'fresh renewal session');
-  await safe(() => page.goto(`/licence#renew=${input.token}`), 'emailed renewal link');
+  await safe(() => admitStagingDocument(page, `/licence#renew=${input.token}`, new URL(input.origin).origin), 'emailed renewal link');
   await safe(() => page.getByTestId('renewal-panel').waitFor({ state: 'visible' }), 'renewal panel');
   const licenceNumber = await safe(() => page.getByTestId('renewal-licence-number').textContent(), 'renewal licence identity');
   expect(Boolean(licenceNumber?.trim()), 'renewal licence shown').toBe(true);

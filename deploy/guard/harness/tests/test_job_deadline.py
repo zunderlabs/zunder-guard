@@ -4,6 +4,7 @@ from typing import Any
 import pytest
 
 from guard_harness.job_deadline import deadline
+from guard_harness.testnet_scan import SCAN_TIMEOUT
 
 
 def values() -> dict[str, Any]:
@@ -32,7 +33,7 @@ def values() -> dict[str, Any]:
 
 
 def test_deadline_counts_setup_time_and_reserves_upload() -> None:
-    assert deadline(**values()) == 2110  # 100 + 2700 - 90 - ten minutes setup.
+    assert deadline(**values()) == 100 + 7200 - SCAN_TIMEOUT - 90 - 600
 
 
 @pytest.mark.parametrize("change", ["runner", "attempt", "commit", "duplicate", "future", "late"])

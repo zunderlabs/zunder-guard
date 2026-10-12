@@ -9,6 +9,7 @@ from test_staged_state import COMMIT, build_bytes
 
 from guard_harness import gate_state, promotion, promotion_channels, promotion_state, staged_state
 from guard_harness.attestation import AttestationError
+from guard_harness.journey_evidence import JOURNEY_COVERAGE
 from guard_harness.release_state import GATE_JOURNEYS, predicate_digest
 from guard_harness.state_verifier import VerifiedState
 
@@ -24,6 +25,7 @@ def complete(tag: str = "v1.0.0") -> tuple[VerifiedState, dict[str, Any]]:
             row: "https://github.com/zunderlabs/zunder-guard/actions/runs/1/attempts/1"
             for row in GATE_JOURNEYS
         },
+        coverage=dict(JOURNEY_COVERAGE),
     )
     return VerifiedState(gated, hashlib.sha256(raw).hexdigest()), build
 

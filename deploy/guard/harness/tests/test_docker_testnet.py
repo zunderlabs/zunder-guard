@@ -10,6 +10,7 @@ import pytest
 from eth_account import Account
 
 from guard_harness import docker_testnet as subject
+from guard_harness.install_evidence import DOCKER_TESTNET, completed
 from guard_harness.paper_bot import PaperError
 from guard_harness.runner import RunResult
 from guard_harness.testnet_run import ROOT
@@ -25,8 +26,11 @@ PREVIOUS = IMAGE.replace("a" * 64, "b" * 64)
 def journal(kinds: list[str]) -> bytes:
     result = b""
     prev = ""
-    for seq, kind in enumerate(kinds):
-        event = json.dumps(dict(seq=seq, kind=kind), separators=(",", ":"))
+    for seq, kind in enumerate(kinds, 1):
+        fields = dict(seq=seq, kind=kind)
+        if kind == "started":
+            fields["mode"] = "testnet"
+        event = json.dumps(fields, separators=(",", ":"))
         check = hashlib.sha3_256((prev + event).encode()).hexdigest()
         result += (
             '{"check":"' + check + '","prev":"' + prev + '","event":' + event + "}\n"
@@ -42,6 +46,8 @@ def archive(
     mode: int = 0o600,
     link: bool = False,
     tamper: bool = False,
+    journal_body: bytes | None = None,
+    emergency: bool = False,
 ) -> bytes:
     config = (
         f'mode="testnet"\nnetwork="testnet"\naccount="{ACCOUNT}"\n'
@@ -50,10 +56,14 @@ def archive(
     files = {
         "guard.toml": config,
         "risk.jsonl": b"risk\n",
-        "decisions.jsonl": journal(kinds or ["started", "error", "stopped"]),
+        "decisions.jsonl": journal(kinds or ["started", "stopped"]),
     }
     if key:
         files["api-wallet-key"] = KEY
+    if journal_body is not None:
+        files["decisions.jsonl"] = journal_body
+    if emergency:
+        files["emergency/attempt"] = b"unknown protective attempt"
     if tamper:
         files["decisions.jsonl"] = files["decisions.jsonl"].replace(b'"started"', b'"error"')
     output = io.BytesIO()
@@ -73,9 +83,11 @@ def inspect(body: bytes, *, volume_key: bool = True) -> dict[str, bytes]:
     )
 
 
-@pytest.mark.parametrize("kind", ["decision", "intent", "sent", "recovered", "protect", "flatten"])
+@pytest.mark.parametrize(
+    "kind", ["decision", "intent", "sent", "recovered", "protect", "flatten", "unknown", "error"]
+)
 def test_complete_journal_refuses_exchange_events(kind: str) -> None:
-    with pytest.raises(PaperError, match="exchange"):
+    with pytest.raises(PaperError, match="action-bearing"):
         inspect(archive(kinds=["started"] * 200 + [kind]))
 
 
@@ -89,6 +101,19 @@ def test_chain_and_custody() -> None:
         inspect(archive(key=False))
     with pytest.raises(PaperError):
         inspect(archive(), volume_key=False)
+
+
+@pytest.mark.parametrize("failure", ["missing-start", "truncated", "sequence", "emergency"])
+def test_journal_uncertainty_never_authorizes_same_run_controls(failure: str) -> None:
+    body = journal(["started", "stopped"])
+    if failure == "missing-start":
+        body = journal(["stopped"])
+    elif failure == "truncated":
+        body = body.rstrip(b"\n")
+    elif failure == "sequence":
+        body = body.replace(b'"seq":2', b'"seq":3')
+    with pytest.raises(PaperError):
+        inspect(archive(journal_body=body, emergency=failure == "emergency"))
 
 
 def test_retained_requires_config_and_journal_prefix() -> None:
@@ -186,9 +211,10 @@ def test_real_command_key_enters_stdin_only(
     subject.TestnetDocker(tmp_path).command("run", "-i", IMAGE, "init", "--key-stdin", stdin=KEY)
 
 
+@pytest.mark.parametrize("scenario", ["fresh", "upgrade"])
 @pytest.mark.parametrize("failure", ["", "start", "nonflat-cleanup", "history"])
 def test_lifecycle_receipt_requires_all_actual_observations(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, failure: str
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, failure: str, scenario: str
 ) -> None:
     tmp_path.chmod(0o700)
     monkeypatch.setenv("GUARD_C6_SERIALIZED", "1")
@@ -289,6 +315,7 @@ def test_lifecycle_receipt_requires_all_actual_observations(
                 version="1.0.0",
                 previous_version="0.9.0",
                 read=read,
+                scenario=scenario,
             )
         assert not (work / "receipt.json").exists()
         if failure == "nonflat-cleanup":
@@ -307,15 +334,31 @@ def test_lifecycle_receipt_requires_all_actual_observations(
             version="1.0.0",
             previous_version="0.9.0",
             read=read,
+            scenario=scenario,
         )
         receipt = json.loads((work / "receipt.json").read_text())
+        required = (
+            DOCKER_TESTNET
+            if scenario == "upgrade"
+            else (DOCKER_TESTNET - {"upgrade"} | {"fresh-candidate-testnet"})
+        )
+        completed(receipt, required, mode="testnet")
         assert receipt["result"] == "passed" and receipt["no_exchange"] is True
         assert receipt["custody"] == "documented-volume"
         assert receipt["cleanup_complete"] is True and not resources["volume"]
         assert [
             call[call.index("--network") + 1] for call in calls if call[:2] == ("run", "-d")
-        ] == ["testnet"] * 3
-        assert snapshots == 4 and scans >= 8
+        ] == ["testnet"] * (3 if scenario == "upgrade" else 2)
+        assert snapshots == (5 if scenario == "upgrade" else 4)
+        assert scans == (8 if scenario == "upgrade" else 6)
+        assert receipt["scenario"] == scenario
+        initial = IMAGE if scenario == "fresh" else PREVIOUS
+        assert receipt["initial_image"] == initial
+        first_init = next(call for call in calls if "init" in call)
+        assert initial in first_init
+        first_run = next(call for call in calls if call[:2] == ("run", "-d"))
+        assert initial in first_run
+        assert ("upgrade" in receipt["coverage"]) == (scenario == "upgrade")
         assert len(receipt["decision_journal_sha256"]) == 64
 
 

@@ -10,6 +10,7 @@ from typing import Any
 
 from guard_harness.attestation import AttestationError
 from guard_harness.journey_evidence import JourneyBundle, authenticate_journeys
+from guard_harness.lifecycle_coverage import CHANNEL_COVERAGE
 from guard_harness.release_state import GATE_JOURNEYS, canonical_bytes, validate_state
 from guard_harness.state_verifier import authenticate_state
 from guard_harness.testnet_run import ROOT
@@ -48,10 +49,22 @@ def bundles(evidence: Path, *, run_id: str, attempt: str) -> dict[str, JourneyBu
 
 
 def successor(
-    previous: dict[str, Any], build: dict[str, Any], references: dict[str, str]
+    previous: dict[str, Any],
+    build: dict[str, Any],
+    references: dict[str, str],
+    *,
+    coverage: dict[str, frozenset[str]],
 ) -> dict[str, Any]:
     if previous.get("stage") != "staged":
         raise AttestationError("gate must advance an authenticated staged release")
+    if set(coverage) != GATE_JOURNEYS:
+        raise AttestationError("complete authenticated measured journey coverage required")
+    for channel in build["distribution"]:
+        required = CHANNEL_COVERAGE.get(channel)
+        if required is None or any(
+            not checks <= coverage.get(row, frozenset()) for row, checks in required.items()
+        ):
+            raise AttestationError("distribution channel lacks measured documented execution")
     state = dict(previous)
     state.update(
         stage="gated",
@@ -96,6 +109,7 @@ def execute(
         expected_run_attempt=attempt,
     )
     journeys = bundles(evidence, run_id=run_id, attempt=attempt)
+    coverage: dict[str, frozenset[str]] = {}
     authenticate_journeys(
         manifest,
         journeys,
@@ -104,11 +118,13 @@ def execute(
         logs=work / "gate-logs",
         expected_run_id=run_id,
         expected_run_attempt=attempt,
+        coverage_out=coverage,
     )
     state = successor(
         verified.predicate,
         json.loads(manifest.read_bytes()),
         {row: bundle.reference for row, bundle in journeys.items()},
+        coverage=coverage,
     )
     with (work / "gated.predicate.json").open("xb") as stream:
         stream.write(canonical_bytes(state))

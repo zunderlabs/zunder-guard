@@ -11,6 +11,14 @@ python3 -m venv .venv
 .venv/bin/pytest
 ```
 
+Hosted evidence and publishing jobs install `requirements-runtime.lock` with
+`--require-hashes --only-binary=:all:` before installing this package with
+`--no-deps --no-build-isolation`. The lock includes the SDK, every transitive runtime
+requirement, the build backend and Windows terminal support. Regenerate with
+`pip-tools==7.5.0` / `pip==25.1.1` and `pip-compile --allow-unsafe --generate-hashes`,
+then include all PyPI wheel hashes for the conditional Windows dependency and verify
+wheel availability on every hosted platform. Development dependencies remain separate.
+
 `guard_harness.manifest.validate_manifest` validates C2 and refuses verified channel claims
 unless the caller supplies the independently authenticated journey set and expected public
 commit. Attestation URLs in JSON alone grant no trust. The release gate must verify attestation

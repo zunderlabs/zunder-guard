@@ -26,7 +26,7 @@ if not WORKFLOWS.is_dir():
 TAG = 'v1.0.0'
 SHA = 'a' * 40
 REF = 'ghcr.io/zunderlabs/zunder-guard@sha256:' + 'b' * 64
-SERVICE_ASSETS = ['install-windows-service.ps1', 'install-macos-service.sh', 'install-container.py', 'container-supervisor.py',
+SERVICE_ASSETS = ['install-windows-service.ps1', 'install-macos-service.sh', 'uninstall-macos-testnet.py', 'install-container.py', 'container-supervisor.py',
                   'container-operations.py', 'zunder-guard-container.service',
                   'zunder-guard-setup-guardian.service']
 
@@ -197,14 +197,16 @@ if os.environ.get('TEST_FAIL_AFTER_SLSA') == command:
             with self.subTest(asset=asset):
                 path = self.assets / asset
                 original = path.read_bytes()
-                path.unlink()
-                self.checksums()
-                result = self.run_gate()
-                self.assertNotEqual(result.returncode, 0)
-                self.assertIn(asset + ' is missing or repeated', result.stderr)
-                shutil.rmtree(self.root / 'download')
-                path.write_bytes(original)
-                self.checksums()
+                try:
+                    path.unlink()
+                    self.checksums()
+                    result = self.run_gate()
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn(asset + ' is missing or repeated', result.stderr)
+                finally:
+                    shutil.rmtree(self.root / 'download', ignore_errors=True)
+                    path.write_bytes(original)
+                    self.checksums()
 
     def test_unsigned_image_reference_refuses(self):
         image = f'zunder-guard-{TAG}.image.txt'

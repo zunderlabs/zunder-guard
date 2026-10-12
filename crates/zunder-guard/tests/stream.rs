@@ -2047,11 +2047,13 @@ async fn a_ledger_entry_guard_cannot_account_for_is_money_in_or_refuses_entries(
         "{status}"
     );
     // The day over (the later entry's, should the read have crossed
-    // midnight), entries are no longer refused for them.
+    // midnight), entries are no longer refused for them. The test clock
+    // starts at the wall clock and runs about ten minutes ahead here, so a
+    // run started just before UTC midnight finds the first refusal already
+    // over (null) by now.
     let until = status["risk"]["entries_refused_until_ms"]
         .as_u64()
-        .unwrap()
-        .max(until);
+        .map_or(until, |later| later.max(until));
     let left = until.saturating_sub(running.clock.now_ms());
     running.clock.advance(left + 1);
     let status = running.guard.status().await;

@@ -160,6 +160,28 @@ if [ "$UNINSTALL$CONTAINER" = 11 ]; then
 fi
 
 # Uninstall is entirely local: never download, initialize, read a key or start Guard.
+if [ "$UNINSTALL" -eq 1 ] && [ "$(uname -s)" = Darwin ]; then
+  if ! { [ "$SERVICE_INSTANCE" = testnet ] && [ "$NO_SERVICE" -eq 0 ]; }; then
+    die "macOS managed uninstall requires service-instance testnet"
+  fi
+  if ! { [ -z "$RULES$NETWORK$ACCOUNT_NETWORK$ACCOUNT$KEY_FILE$CONFIRM$CAP$PREFIX$LISTEN$SHARE$LICENCE$VOLUME$REGISTRY_AUTH$SOURCE_COMMIT" ] \
+    && [ "$KEY_STDIN$FORCE$INSTALL_ONLY$CONTAINER$PREPARE_IMAGE$PREPARED_IMAGE" = 000000 ]; }; then
+    die "macOS uninstall accepts no setup inputs"
+  fi
+  [ "$(id -u)" -eq 0 ] || die "macOS managed uninstall requires root"
+  helper='/Library/Application Support/Zunder Guard/management/uninstall-testnet.py'
+  cursor=$helper
+  while :; do
+    if ! { [ ! -L "$cursor" ] && [ -e "$cursor" ] && [ "$(stat -f %u "$cursor")" = 0 ]; }; then
+      die "untrusted macOS uninstall path"
+    fi
+    mode=$(stat -f %Lp "$cursor")
+    [ "$((0$mode & 022))" -eq 0 ] || die "writable macOS uninstall path"
+    [ "$cursor" = / ] && break
+    cursor=$(dirname "$cursor")
+  done
+  exec /usr/bin/python3 -I -B "$helper" --network testnet
+fi
 if [ "$UNINSTALL" -eq 1 ]; then
   [ "$(uname -s)" = Linux ] || die "--uninstall supports native Linux only"
   if ! { [ -z "$RULES$NETWORK$ACCOUNT_NETWORK$ACCOUNT$KEY_FILE$CONFIRM$CAP$LISTEN$SHARE$LICENCE$VOLUME$REGISTRY_AUTH$SOURCE_COMMIT" ] \
@@ -682,6 +704,7 @@ if [ "$OS" = darwin ] && { [ "$NETWORK" = mainnet ] || [ "$NETWORK" = testnet ];
     MAC_SUDO=""
   fi
   fetch install-macos-service.sh "$BASE_URL/install-macos-service.sh"
+  fetch uninstall-macos-testnet.py "$BASE_URL/uninstall-macos-testnet.py"
   # Always use the exact pinned verifier, even if a different cosign verified
   # the unprivileged download. It is checked again after root-private copying.
   fetch macos-service-cosign "$COSIGN_URL/cosign-darwin-$ARCH"
@@ -708,7 +731,7 @@ done
 mktemp -d '/Library/Application Support/Zunder Guard/staging/install.XXXXXXXX'
 ROOT_STAGE
   ) || die "could not establish root-private macOS staging"
-  for asset in SHA256SUMS SHA256SUMS.sigstore.json "$ARCHIVE" install-macos-service.sh; do
+  for asset in SHA256SUMS SHA256SUMS.sigstore.json "$ARCHIVE" install-macos-service.sh uninstall-macos-testnet.py; do
     $MAC_SUDO /usr/bin/install -o root -g wheel -m 0600 "$TMP/$asset" "$MAC_STAGE/$asset"
   done
   $MAC_SUDO /usr/bin/install -o root -g wheel -m 0700 "$TMP/macos-service-cosign" "$MAC_STAGE/cosign"

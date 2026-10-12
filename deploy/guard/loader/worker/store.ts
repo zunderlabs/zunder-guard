@@ -10,11 +10,12 @@ interface Stub { fetch(request: Request): Promise<Response> }
 interface Environment {
   RELEASE_STATE: { idFromName(name: string): unknown; get(id: unknown): Stub };
   INSTALLER_PUBLISH_TOKEN: string;
+  STAGING_INSTALLER_PUBLISH_TOKEN: string;
 }
 type Stage = 'staged' | 'gated' | 'promoted' | 'withdrawn';
 type Channel = 'staging' | 'canonical';
 interface Predicate {
-  manifest_sha256: string; revision: number; previous: string | null; stage: Stage;
+  version: string; tag: string; manifest_sha256: string; revision: number; previous: string | null; stage: Stage;
 }
 interface Capsule {
   channel: Channel; expected: string | null; predicate: string; bundle: string;
@@ -60,7 +61,8 @@ function parse(value: unknown): { capsule: Capsule; state: Predicate } {
     state.revision < 1 || typeof state.stage !== 'string' || !Object.hasOwn(transitions, state.stage) ||
     !(state.previous === null || (typeof state.previous === 'string' && hex.test(state.previous)))) throw new Error();
   const capsule = v as unknown as Capsule;
-  if (state.stage === 'promoted' && capsule.channel !== 'canonical') throw new Error();
+  if (state.stage === 'promoted' && (capsule.channel !== 'canonical' ||
+    !/^\d+\.\d+\.\d+$/.test(state.version) || state.tag !== `v${state.version}`)) throw new Error();
   if (['staged', 'gated'].includes(state.stage) && capsule.channel !== 'staging') throw new Error();
   return { capsule, state };
 }
@@ -129,6 +131,13 @@ export class ReleaseStore {
         }
         // One capsule contains both metadata and bundle plus the associated loader bytes.
         await txn.put(capsule.channel, stored);
+        if (state.stage === 'withdrawn' && capsule.channel === 'canonical') {
+          const staging = await txn.get<Stored>('staging');
+          // Keep any newer candidate. The same failed build must be unavailable on both loaders.
+          if (staging?.state.manifest_sha256 === state.manifest_sha256) {
+            await txn.put('staging', stored);
+          }
+        }
         await txn.put(`build:${state.manifest_sha256}`, stored);
         await txn.put(`capsule:${currentDigest}`, stored);
         return response(JSON.stringify({ digest: currentDigest }), 201);
@@ -153,8 +162,16 @@ export default {
   async fetch(request: Request, env: Environment): Promise<Response> {
     const url = new URL(request.url);
     if (url.hostname !== 'zunderlabs.com') return response(null, 404);
-    if (['/guard/publish', '/guard/restore'].includes(url.pathname) && (!env.INSTALLER_PUBLISH_TOKEN ||
-      request.headers.get('authorization') !== `Bearer ${env.INSTALLER_PUBLISH_TOKEN}`)) return response(null, 401);
+    if (['/guard/publish', '/guard/restore'].includes(url.pathname)) {
+      let body: string; let channel: Channel;
+      try {
+        body = await readBody(request, url.pathname === '/guard/restore' ? 1024 : 2 * 1024 * 1024);
+        channel = url.pathname === '/guard/restore' ? 'canonical' : parse(JSON.parse(body)).capsule.channel;
+      } catch (error) { return response(null, error instanceof RangeError ? 413 : 400); }
+      const token = channel === 'staging' ? env.STAGING_INSTALLER_PUBLISH_TOKEN : env.INSTALLER_PUBLISH_TOKEN;
+      if (!token || request.headers.get('authorization') !== `Bearer ${token}`) return response(null, 401);
+      request = new Request(request.url, { method: request.method, headers: request.headers, body });
+    }
     return env.RELEASE_STATE.get(env.RELEASE_STATE.idFromName('release-publication-v1')).fetch(request);
   },
 };

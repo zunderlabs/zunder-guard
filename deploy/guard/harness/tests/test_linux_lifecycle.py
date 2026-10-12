@@ -1,6 +1,7 @@
 """Fail closed on wrong bytes, mode, missing state and absent systemd recovery."""
 
 import hashlib
+import json
 from pathlib import Path
 from typing import Any
 
@@ -32,6 +33,40 @@ def test_installer_bytes_and_symlink(tmp_path: Path) -> None:
     alias.symlink_to(installer)
     with pytest.raises(LifecycleError, match="regular file"):
         authenticated_file(alias, digest)
+
+
+@pytest.mark.parametrize("tamper", [False, True])
+def test_candidate_runtime_version_also_binds_installed_binary_bytes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, tamper: bool
+) -> None:
+    from guard_harness import linux_lifecycle as source
+
+    binary = tmp_path / "binary"
+    binary.write_bytes(b"released candidate")
+    digest = hashlib.sha256(binary.read_bytes()).hexdigest()
+    value = Inputs(
+        tmp_path / "candidate",
+        "a" * 64,
+        tmp_path / "previous",
+        "b" * 64,
+        "v1.2.3",
+        "v1.2.2",
+        "rules",
+        "0x" + "1" * 40,
+        tmp_path,
+        "a" * 32,
+        binary_sha256=digest,
+    )
+    instance = object.__new__(NativeLifecycle)
+    instance.inputs = value
+    monkeypatch.setattr(source, "BINARY", binary)
+    monkeypatch.setattr(instance, "command", lambda *a: "zunder-guard 1.2.3")
+    if tamper:
+        binary.write_bytes(b"same version; altered executable")
+        with pytest.raises(LifecycleError, match="digest differs"):
+            instance.version("v1.2.3")
+    else:
+        instance.version("v1.2.3")
 
 
 @pytest.mark.parametrize("digest", ["", "a" * 63, "A" * 64, "f" * 65])
@@ -113,6 +148,7 @@ def test_failed_reboot_never_emits_success(tmp_path: Path, monkeypatch: pytest.M
     )
     record: dict[str, Any] = {
         "stage": "awaiting-reboot",
+        "scenario": "upgrade",
         "boot_id": boot,
         "installer_sha256": "a" * 64,
         "previous_installer_sha256": "b" * 64,
@@ -177,3 +213,251 @@ def test_testnet_service_never_places_key_in_argv_or_environment(
         with pytest.raises(LifecycleError, match="not encrypted"):
             service.setup(key)
     assert len(observed) == 1
+
+
+@pytest.mark.parametrize("scenario,expected", [("fresh", "candidate"), ("upgrade", "previous")])
+def test_fresh_and_upgrade_initial_bytes_are_distinct(
+    tmp_path: Path, scenario: str, expected: str
+) -> None:
+    inputs = Inputs(
+        tmp_path / "candidate",
+        "a" * 64,
+        tmp_path / "previous",
+        "b" * 64,
+        "v1.2.3",
+        "v1.2.2",
+        "rules",
+        "0x" + "1" * 40,
+        tmp_path,
+        "a" * 32,
+        scenario=scenario,
+    )
+    assert inputs.initial[0] == tmp_path / expected
+    assert inputs.initial[1] == ("a" if scenario == "fresh" else "b") * 64
+    assert inputs.initial[2] == ("v1.2.3" if scenario == "fresh" else "v1.2.2")
+
+
+def test_guest_scenarios_keep_independent_disks_and_evidence_arguments(tmp_path: Path) -> None:
+    from guard_harness.linux_guest import scenario_arguments
+
+    words = [
+        "--candidate",
+        "signed-current",
+        "--previous",
+        "signed-old",
+        "--scenario",
+        "both",
+        "--output",
+        str(tmp_path),
+        "--testnet-lifecycle",
+    ]
+    for scenario in ("fresh", "upgrade"):
+        args = scenario_arguments(words, scenario, tmp_path / scenario)
+        assert args.count("--scenario") == args.count("--output") == 1
+        assert args[args.index("--scenario") + 1] == scenario
+        assert args[args.index("--output") + 1] == str(tmp_path / scenario)
+        assert args[args.index("--candidate") + 1] == "signed-current"
+        assert "--testnet-lifecycle" in args
+
+
+@pytest.mark.parametrize("scenario", ["fresh", "upgrade"])
+def test_initial_lifecycle_installs_selected_release_before_pair_crash_reboot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, scenario: str
+) -> None:
+    from types import SimpleNamespace
+
+    from guard_harness import linux_lifecycle as source
+    from guard_harness.cli import Pair
+
+    inputs = Inputs(
+        tmp_path / "candidate",
+        "a" * 64,
+        tmp_path / "previous",
+        "b" * 64,
+        "v1.2.3",
+        "v1.2.2",
+        "rules",
+        "0x" + "1" * 40,
+        tmp_path,
+        "a" * 32,
+        scenario=scenario,
+    )
+    instance = object.__new__(NativeLifecycle)
+    instance.inputs = inputs
+    instance.guard = LocalGuard("http://127.0.0.1:8547")
+    pair = Pair("0x" + "c" * 40, "0x" + "d" * 64)
+    instance.cli = SimpleNamespace(pair=lambda: pair)  # type: ignore[assignment]
+    observed: list[Any] = []
+    monkeypatch.setattr(source, "HOME", tmp_path / "fresh-home")
+    monkeypatch.setattr(source, "BINARY", tmp_path / "fresh-binary")
+    monkeypatch.setattr(instance, "install", lambda name, path: observed.append(("install", path)))
+    monkeypatch.setattr(instance, "version", lambda version: observed.append(("version", version)))
+    monkeypatch.setattr(instance, "healthy", lambda: observed.append("healthy"))
+    monkeypatch.setattr(instance, "command", lambda *a, **k: "")
+    monkeypatch.setattr(instance, "keep_pair", lambda value: observed.append(("pair", value)))
+    monkeypatch.setattr(instance, "recover", lambda seqs: observed.append(("recover", seqs)))
+    monkeypatch.setattr(
+        source, "round_trip", lambda *a: [SimpleNamespace(seq=1), SimpleNamespace(seq=2)]
+    )
+
+    def control(name: str, *args: str) -> str:
+        observed.append(name)
+        return (
+            "123"
+            if name == "pid-before-crash"
+            else "456"
+            if name == "pid-after-crash"
+            else "enabled"
+        )
+
+    monkeypatch.setattr(instance, "systemctl", control)
+    original_read = Path.read_text
+    monkeypatch.setattr(
+        Path,
+        "read_text",
+        lambda path, *a, **k: (
+            "synthetic-boot" if str(path).endswith("/boot_id") else original_read(path, *a, **k)
+        ),
+    )
+    instance.before_reboot()
+    record = __import__("json").loads((tmp_path / "linux-lifecycle.json").read_bytes())
+    assert observed[0] == ("install", inputs.initial[0])
+    assert observed[1] == ("version", inputs.initial[2])
+    assert observed.index(("pair", pair)) < observed.index("crash")
+    assert record["scenario"] == scenario and record["stage"] == "awaiting-reboot"
+    assert record["initial_release"] == {
+        "version": inputs.initial[2],
+        "installer_sha256": inputs.initial[1],
+    }
+
+
+@pytest.mark.parametrize("scenario", ["fresh", "upgrade"])
+def test_post_reboot_reuses_original_pair_for_every_candidate_roundtrip(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, scenario: str
+) -> None:
+    from types import SimpleNamespace
+
+    from guard_harness import linux_channels
+    from guard_harness import linux_lifecycle as source
+    from guard_harness.cli import Pair
+
+    inputs = Inputs(
+        tmp_path / "candidate",
+        "a" * 64,
+        tmp_path / "previous",
+        "b" * 64,
+        "v1.2.3",
+        "v1.2.2",
+        "rules",
+        "0x" + "1" * 40,
+        tmp_path,
+        "a" * 32,
+        scenario=scenario,
+    )
+    instance = object.__new__(NativeLifecycle)
+    instance.inputs = inputs
+    instance.guard = LocalGuard("http://127.0.0.1:8547")
+    original_pair = Pair("0x" + "c" * 40, "0x" + "d" * 64)
+    private = tmp_path / "private-pair"
+    private.touch()
+    home = tmp_path / "retained-home"
+    home.mkdir()
+    (home / "guard.toml").write_bytes(b"original paired config")
+    monkeypatch.setattr(source, "HOME", home)
+    monkeypatch.setattr(source, "BINARY", tmp_path / "removed-binary")
+    record = dict(
+        stage="awaiting-reboot",
+        scenario=scenario,
+        boot_id="old",
+        installer_sha256="a" * 64,
+        previous_installer_sha256="b" * 64,
+        decision_seqs=[1, 2],
+    )
+    (tmp_path / "linux-lifecycle.json").write_text(json.dumps(record))
+    observed: list[Any] = []
+    monkeypatch.setattr(instance, "restored_pair", lambda: original_pair)
+    monkeypatch.setattr(instance, "private_pair", lambda: private)
+    monkeypatch.setattr(instance, "version", lambda version: observed.append(("version", version)))
+    monkeypatch.setattr(instance, "healthy", lambda: None)
+    monkeypatch.setattr(instance, "systemctl", lambda name, *a: observed.append(name))
+    monkeypatch.setattr(instance, "install", lambda name, path, **k: observed.append((name, path)))
+    monkeypatch.setattr(instance, "command", lambda *a: "")
+    monkeypatch.setattr(instance, "recover", lambda seqs: None)
+    monkeypatch.setattr(linux_channels, "curl_receipt", lambda value, execution: None)
+    monkeypatch.setattr(linux_channels, "website_install", lambda value: {})
+    monkeypatch.setattr(linux_channels, "manual", lambda value: None)
+    reads = Path.read_text
+    monkeypatch.setattr(
+        Path,
+        "read_text",
+        lambda path, *a, **k: "new" if str(path).endswith("/boot_id") else reads(path, *a, **k),
+    )
+    pairs: list[Pair] = []
+
+    def roundtrip(guard: LocalGuard, pair: Pair) -> list[Any]:
+        pairs.append(pair)
+        return [SimpleNamespace(seq=2 + len(pairs))]
+
+    monkeypatch.setattr(source, "round_trip", roundtrip)
+    instance.after_reboot()
+    steps = [
+        event[0]
+        for event in observed
+        if isinstance(event, tuple) and event[0] in {"upgrade", "reinstall"}
+    ]
+    assert steps == (["upgrade", "reinstall"] if scenario == "upgrade" else ["reinstall"])
+    assert pairs == [original_pair] * len(steps)
+    assert observed[0] == ("version", inputs.initial[2])
+    receipt = json.loads((tmp_path / "linux-lifecycle.json").read_bytes())
+    from guard_harness.install_evidence import PAPER, completed
+
+    required = (
+        PAPER
+        if scenario == "upgrade"
+        else PAPER - {"upgrade", "paper-post-upgrade-allow-resize-veto"} | {"fresh-candidate-paper"}
+    )
+    required |= {"kernel-reboot"}
+    assert completed(receipt, required, mode="paper") == required
+    assert receipt["result"] == "passed" and len(receipt["decision_seqs"]) == 2 + len(steps)
+    assert not private.exists() and (home / "guard.toml").read_bytes() == b"original paired config"
+
+
+@pytest.mark.parametrize("fail_locked_install", [False, True])
+def test_guest_requires_hashed_binary_dependencies_and_locked_build_tools_before_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fail_locked_install: bool
+) -> None:
+    import subprocess
+    from typing import cast
+
+    guest = Guest(tmp_path, tmp_path)
+    observed: list[str] = []
+    monkeypatch.setattr(guest, "wait", lambda *args, **kwargs: "boot")
+
+    def remote(command: str, **kwargs: Any) -> str:
+        observed.append(command)
+        if " -m pip install " in command:
+            assert "--require-hashes --only-binary=:all:" in command
+            assert "harness/requirements-runtime.lock && " in command
+            assert "--no-deps --no-build-isolation" in command
+            if fail_locked_install:
+                raise RuntimeError("locked install refused")
+        return "boot"
+
+    def private(command: str, key: bytes, **kwargs: Any) -> str:
+        assert any("--require-hashes" in entry for entry in observed)
+        assert key == b"a" * 64 + b"\n"
+        observed.append("private lifecycle input")
+        return ""
+
+    monkeypatch.setattr(guest, "remote", remote)
+    monkeypatch.setattr(guest, "private_remote", private)
+    monkeypatch.setattr(guest, "testnet_command", lambda args: "released protected service")
+    if fail_locked_install:
+        with pytest.raises(RuntimeError, match="locked install"):
+            guest.exercise(
+                [], cast(subprocess.Popen[bytes], object()), testnet_key=b"a" * 64 + b"\n"
+            )
+        assert "private lifecycle input" not in observed
+    else:
+        guest.exercise([], cast(subprocess.Popen[bytes], object()), testnet_key=b"a" * 64 + b"\n")
+        assert observed.count("private lifecycle input") == 2

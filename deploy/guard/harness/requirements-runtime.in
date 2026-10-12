@@ -1,0 +1,7 @@
+# Resolve with pip-compile --generate-hashes; runtime and local build backend only.
+jsonschema>=4.23,<5
+hyperliquid-python-sdk==0.24.0
+eth-account>=0.13,<0.14
+setuptools>=80
+wheel
+pywinpty==3.0.5 ; sys_platform == "win32"

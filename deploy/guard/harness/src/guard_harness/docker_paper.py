@@ -120,6 +120,8 @@ def lifecycle(
     compose: Path | None = None,
     previous_image: str | None = None,
     previous_compose: Path | None = None,
+    version: str | None = None,
+    previous_version: str | None = None,
 ) -> None:
     """No venue key. A caller must verify release/cosign binding before E2E admission."""
     if not re.fullmatch(r"(?:ghcr\.io/zunderlabs/zunder-guard@)?sha256:[0-9a-f]{64}", image):
@@ -152,6 +154,27 @@ def lifecycle(
         if initial_compose is None
         else Compose(work, initial_compose, initial_image, name, volume, host_port)
     )
+    expected_version = previous_version if previous_image else version
+    running_image = initial_image
+
+    def ready(guard: LocalGuard, *, after: int | None = None) -> dict[str, object]:
+        state = _ready(guard, after=after)
+        if version is not None:
+            journal = state.get("journal")
+            if (
+                state.get("version") != expected_version
+                or str(state.get("account", "")).lower() != account.lower()
+                or not isinstance(journal, dict)
+                or journal.get("ok") is not True
+            ):
+                raise PaperError("paper runtime release/account/journal differs")
+            if (
+                docker.command("inspect", "--format", "{{.Config.Image}}", name).output.strip()
+                != running_image
+            ):
+                raise PaperError("paper runtime immutable image differs")
+        return state
+
     failures: list[BaseException] = []
     try:
         docker.command("volume", "create", volume)
@@ -210,7 +233,7 @@ def lifecycle(
         if address != expected_address:
             raise PaperError("container loopback port refused")
         guard = LocalGuard("http://" + address)
-        first = _ready(guard)
+        first = ready(guard)
         decisions = round_trip(guard, pair)
         if previous_image is not None:
             # Stop the old version before switching images. Retain its state volume,
@@ -234,14 +257,15 @@ def lifecycle(
                 != image
             ):
                 raise PaperError("upgraded container image differs from candidate")
-            first = _ready(guard, after=int(str(first["started_at_ms"])))
+            expected_version, running_image = version, image
+            first = ready(guard, after=int(str(first["started_at_ms"])))
             _journal(guard, decisions)
             # The old client must still sign successfully using retained config;
             # journal presence alone cannot prove pairing survived the upgrade.
             decisions = [*decisions, *round_trip(guard, pair)]
         last_seq = decisions[-1].seq
         docker.command("restart", name)
-        restarted = _ready(guard, after=int(str(first["started_at_ms"])))
+        restarted = ready(guard, after=int(str(first["started_at_ms"])))
         _journal(guard, decisions)
         before = int(docker.command("inspect", "--format", "{{.RestartCount}}", name).output)
         # Docker's kill API is an operator stop and suppresses restart policy. On the
@@ -262,7 +286,7 @@ def lifecycle(
             timeout=10,
             stdin=b"",
         )
-        recovered = _ready(guard, after=int(str(restarted["started_at_ms"])))
+        recovered = ready(guard, after=int(str(restarted["started_at_ms"])))
         after = int(docker.command("inspect", "--format", "{{.RestartCount}}", name).output)
         if after <= before:
             raise PaperError("Docker did not recover the crashed paper container")
@@ -274,7 +298,7 @@ def lifecycle(
         docker.command(*launch)
         if docker.command("port", name, "8547/tcp").output.strip() != expected_address:
             raise PaperError("reinstalled container loopback port refused")
-        _ready(guard, after=int(str(recovered["started_at_ms"])))
+        ready(guard, after=int(str(recovered["started_at_ms"])))
         _journal(guard, decisions)
         # A reused volume alone cannot prove the old client still authenticates.
         _journal(guard, round_trip(guard, pair))
@@ -307,11 +331,17 @@ def lifecycle(
                 "pairing_preserved": True,
                 "journal_preserved": True,
                 "mode": "paper",
+                "scenario": "upgrade" if previous_image else "fresh",
+                "initial_image": initial_image,
+                "initial_version": previous_version if previous_image else version,
+                "version": version,
                 "channel": "docker" if compose is None else "compose",
                 "image": image,
                 "previous_image": previous_image,
                 "checks": (
-                    ["upgrade", "upgrade-journal", "upgrade-pairing"] if previous_image else []
+                    ["upgrade", "upgrade-journal", "upgrade-pairing"]
+                    if previous_image
+                    else ["fresh-candidate-paper"]
                 )
                 + [
                     "init",

@@ -2,12 +2,14 @@
 
 import argparse
 import base64
+import gzip
 import hashlib
 import io
 import json
 import os
 import re
 import shlex
+import tempfile
 import time
 import uuid
 import zipfile
@@ -17,7 +19,7 @@ from typing import Any
 from urllib.request import Request, urlopen
 
 from guard_harness.native_release import Release
-from guard_harness.runner import run
+from guard_harness.runner import RunResult, run
 from guard_harness.testnet_run import ROOT
 
 
@@ -35,13 +37,29 @@ class AWS:
         self, words: list[str], *, body: dict[str, Any] | None = None, timeout: float = 60
     ) -> dict[str, Any]:
         self.sequence += 1
-        result = run(
-            ["aws", "--region", self.region, "--no-cli-pager", "--output", "json", *words],
-            log=self.work / f"aws-{self.sequence}.log",
-            timeout=timeout,
-            sensitive_output=True,
-            stdin=json.dumps(body).encode() if body else None,
-        )
+        if "--cli-input-json" in words:
+            raise AwsError("controller owns the private CLI JSON input path")
+        argv = ["aws", "--region", self.region, "--no-cli-pager", "--output", "json", *words]
+
+        def execute(arguments: list[str]) -> RunResult:
+            return run(
+                arguments,
+                log=self.work / f"aws-{self.sequence}.log",
+                timeout=timeout,
+                sensitive_output=True,
+            )
+
+        if body is None:
+            result = execute(argv)
+        else:
+            # AWS CLI v2 does not accept file:///dev/stdin; no IDs or payload in argv.
+            with tempfile.NamedTemporaryFile(
+                mode="w", dir=self.work, prefix="aws-input-", encoding="utf-8"
+            ) as input_file:
+                os.chmod(input_file.name, 0o600)
+                json.dump(body, input_file)
+                input_file.flush()
+                result = execute(argv + ["--cli-input-json", "file://" + input_file.name])
         if not result.output.strip():
             return {}
         value = json.loads(result.output)
@@ -114,7 +132,7 @@ class Stack:
 
     def create(
         self, url: str, *, account: str, rules: str, execution_role: str, permissions_boundary: str
-    ) -> None:
+    ) -> dict[str, object]:
         validate_boundary(permissions_boundary, execution_role)
         if any(
             value.get("StackName") == self.name and value.get("StackStatus") != "DELETE_COMPLETE"
@@ -123,7 +141,7 @@ class Stack:
             raise AwsError("fresh stack name already exists")
         self.armed = True  # Arm before a request whose outcome could be unknown.
         value = self.aws.request(
-            ["cloudformation", "create-stack", "--cli-input-json", "file:///dev/stdin"],
+            ["cloudformation", "create-stack"],
             body={
                 "StackName": self.name,
                 "TemplateURL": url,
@@ -136,6 +154,7 @@ class Stack:
                     {"ParameterKey": "Rules", "ParameterValue": rules},
                     {"ParameterKey": "InstanceType", "ParameterValue": "t4g.micro"},
                     {"ParameterKey": "ExposePort", "ParameterValue": "no"},
+                    {"ParameterKey": "InstallerChannel", "ParameterValue": "staging"},
                     {
                         "ParameterKey": "PermissionsBoundaryArn",
                         "ParameterValue": permissions_boundary,
@@ -163,6 +182,13 @@ class Stack:
             raise AwsError("stack instance output missing/ambiguous")
         self.instance_id = values[0]
         self.online()
+        return dict(
+            channel="cloudformation",
+            template_url=url,
+            installer_channel="staging",
+            stack_create_complete=True,
+            instance_online=True,
+        )
 
     def owned(self) -> dict[str, Any]:
         value = self.aws.request(
@@ -208,7 +234,7 @@ class Stack:
 
     def remote(self, script: str, *, timeout: int = 600) -> dict[str, Any]:
         response = self.aws.request(
-            ["ssm", "send-command", "--cli-input-json", "file:///dev/stdin"],
+            ["ssm", "send-command"],
             body={
                 "InstanceIds": [self.instance_id],
                 "DocumentName": "AWS-RunShellScript",
@@ -324,6 +350,35 @@ class Stack:
             raise AwsError("stack survived sandbox cleanup")
 
 
+def copy_runtime_lock(stack: Stack) -> None:
+    """Copy the checked-out lock in bounded SSM commands before dependency installation."""
+    lock = ROOT / "harness/requirements-runtime.lock"
+    if lock.is_symlink() or not lock.is_file():
+        raise AwsError("public runtime dependency lock refused")
+    captured = lock.read_bytes()
+    if not captured or len(captured) > 256 * 1024:
+        raise AwsError("public runtime dependency lock size refused")
+    encoded = base64.b64encode(gzip.compress(captured, mtime=0)).decode()
+    directory = "/opt/guard-install-e2e"
+    chunks = [encoded[offset : offset + 24000] for offset in range(0, len(encoded), 24000)]
+    for index, chunk in enumerate(chunks):
+        script = "set -eu\numask 077\n"
+        if index == 0:
+            script += f"test ! -e {directory}\nmkdir -m 700 {directory}\n"
+        script += f"printf %s {shlex.quote(chunk)} >>{directory}/runtime-lock.b64\n"
+        if index == len(chunks) - 1:
+            script += (
+                f"base64 -d <{directory}/runtime-lock.b64 | gzip -d "
+                f">{directory}/requirements-runtime.lock\n"
+                f"printf '%s  %s\\n' {hashlib.sha256(captured).hexdigest()} "
+                f"{directory}/requirements-runtime.lock | sha256sum -c - >/dev/null\n"
+                f"rm {directory}/runtime-lock.b64\n"
+            )
+        script += "printf '%s\\n' '{\"stage\":\"runtime-lock-copied\"}'\n"
+        if stack.remote(script, timeout=120) != {"stage": "runtime-lock-copied"}:
+            raise AwsError("instance runtime dependency lock copy failed")
+
+
 def validate_boundary(boundary: str, execution_role: str) -> None:
     if (
         re.fullmatch(r"arn:aws:iam::[0-9]{12}:policy/[A-Za-z0-9_+=,.@/-]+", boundary) is None
@@ -377,16 +432,19 @@ def execute(
         "diagnostic": os.environ.get("DIAGNOSTIC") == "true",
     }
     try:
-        stack.create(
+        launch = stack.create(
             template,
             account=account,
             rules=rules,
             execution_role=execution_role,
             permissions_boundary=permissions_boundary,
         )
+        receipt["template_launch"] = launch | {
+            "template_sha256": hashlib.sha256(current.asset("cloudformation.yaml")).hexdigest()
+        }
+        copy_runtime_lock(stack)
         setup = (
-            "set -eu\numask 077\ntest ! -e /opt/guard-install-e2e\n"
-            "mkdir -m 700 /opt/guard-install-e2e\n" + "apt-get update >/dev/null 2>&1\n"
+            "set -eu\numask 077\napt-get update >/dev/null 2>&1\n"
             "apt-get install -y python3-venv unzip >/dev/null 2>&1\n"
             + "printf %s "
             + shlex.quote(encoded)
@@ -396,8 +454,8 @@ def execute(
             + " /opt/guard-install-e2e/payload.zip | sha256sum -c - >/dev/null\n"
             + "unzip -q /opt/guard-install-e2e/payload.zip -d /opt/guard-install-e2e\n"
             + "python3 -m venv /opt/guard-install-e2e/venv\n"
-            "/opt/guard-install-e2e/venv/bin/pip install 'jsonschema>=4.23,<5' "
-            "hyperliquid-python-sdk==0.24.0 'eth-account>=0.13,<0.14' >/dev/null 2>&1\n"
+            "/opt/guard-install-e2e/venv/bin/pip install --require-hashes --only-binary=:all: "
+            "-r /opt/guard-install-e2e/requirements-runtime.lock >/dev/null 2>&1\n"
         )
         arguments = (
             " --version "

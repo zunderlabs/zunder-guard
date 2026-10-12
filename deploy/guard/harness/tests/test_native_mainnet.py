@@ -8,6 +8,7 @@ import pytest
 from guard_harness import native_mainnet
 from guard_harness.mainnet_terminal import TerminalError
 from guard_harness.native_release import Release
+from guard_harness.runner import RunError
 
 
 def test_nested_refusal_workspace_is_private_before_loader(
@@ -66,3 +67,34 @@ def test_refusal_workspace_rejects_reuse_and_symlinks_before_loader(
             shell="fixture-shell",
         )
     assert not (base / "target" / "M1").exists()
+
+
+@pytest.mark.parametrize("existing", [False, True])
+def test_mac_absence_uses_privileged_probe_without_unprivileged_stat(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, existing: bool
+) -> None:
+    import subprocess
+
+    from guard_harness.runner import RunResult
+
+    private = tmp_path / "private"
+    private.mkdir()
+    target = private / "guard.toml"
+    if existing:
+        target.write_bytes(b"retained config fixture")
+
+    def run(argv: list[str], **kwargs: Any) -> RunResult:
+        assert argv[:4] == ["sudo", "-n", "/bin/sh", "-c"]
+        assert kwargs["sensitive_output"] is True and kwargs["stdin"] == b""
+        result = subprocess.run(argv[2:], capture_output=True, check=False)
+        if result.returncode:
+            raise RunError("privileged absence refused")
+        return RunResult(0, "", kwargs["log"])
+
+    monkeypatch.setattr(native_mainnet, "run", run)
+    if existing:
+        with pytest.raises(RunError, match="absence refused"):
+            native_mainnet.mac_absent((target,), tmp_path / "log")
+        assert target.read_bytes() == b"retained config fixture"
+    else:
+        native_mainnet.mac_absent((target,), tmp_path / "log")

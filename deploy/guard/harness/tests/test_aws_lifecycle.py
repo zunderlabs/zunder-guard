@@ -1,5 +1,6 @@
 import io
 import json
+import subprocess
 import zipfile
 from pathlib import Path
 from typing import Any
@@ -9,6 +10,7 @@ import pytest
 import guard_harness.aws_lifecycle as harness
 from guard_harness.native_release import Release
 from guard_harness.runner import RunResult
+from guard_harness.testnet_run import ROOT
 
 
 class Fake(harness.AWS):
@@ -194,6 +196,46 @@ def test_payload_contains_only_public_code_and_authenticated_loaders(
     assert len(package) < 48 * 1024
 
 
+def test_copied_runtime_lock_reassembles_exact_bytes_in_bounded_commands(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    stack = owned(Fake())
+    destination = tmp_path / "instance-runtime"
+    scripts: list[str] = []
+
+    def remote(script: str, *, timeout: int = 600) -> dict[str, Any]:
+        scripts.append(script)
+        assert len(script.encode()) < 25000
+        assert timeout == 120
+        result = subprocess.run(
+            ["sh", "-c", script.replace("/opt/guard-install-e2e", str(destination))],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        value: dict[str, Any] = json.loads(result.stdout)
+        return value
+
+    monkeypatch.setattr(stack, "remote", remote)
+    harness.copy_runtime_lock(stack)
+    assert len(scripts) > 1
+    assert (destination / "requirements-runtime.lock").read_bytes() == (
+        ROOT / "harness/requirements-runtime.lock"
+    ).read_bytes()
+    assert not (destination / "runtime-lock.b64").exists()
+    with pytest.raises(subprocess.CalledProcessError):
+        harness.copy_runtime_lock(stack)
+
+
+def test_runtime_lock_copy_failure_stops_before_installation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stack = owned(Fake())
+    monkeypatch.setattr(stack, "remote", lambda *args, **kwargs: {"stage": "failed"})
+    with pytest.raises(harness.AwsError, match="lock copy failed"):
+        harness.copy_runtime_lock(stack)
+
+
 @pytest.mark.parametrize("failure", ["changed-bytes", "redirect"])
 def test_template_requires_exact_authenticated_public_bytes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str
@@ -250,16 +292,26 @@ def test_create_passes_execution_role_and_owned_sandbox_name(
     account_id = "1" * 12
     role = f"arn:aws:iam::{account_id}:role/fixture-execution"
     boundary = f"arn:aws:iam::{account_id}:policy/fixture-boundary"
-    stack.create(
+    launch = stack.create(
         "https://example.invalid/template",
         account="0x" + "a" * 40,
         rules="zr1_fixture",
         execution_role=role,
         permissions_boundary=boundary,
     )
+    assert launch == dict(
+        channel="cloudformation",
+        template_url="https://example.invalid/template",
+        installer_channel="staging",
+        stack_create_complete=True,
+        instance_online=True,
+    )
     assert captured["RoleARN"] == role
     assert captured["StackName"] == "zunder-e2e-" + fake.marker
     assert {"ParameterKey": "ExposePort", "ParameterValue": "no"} in captured["Parameters"]
+    assert {"ParameterKey": "InstallerChannel", "ParameterValue": "staging"} in captured[
+        "Parameters"
+    ]
     assert captured["Parameters"][-1] == {
         "ParameterKey": "PermissionsBoundaryArn",
         "ParameterValue": boundary,
@@ -284,3 +336,30 @@ def test_boundary_refuses_before_any_cloud_call(boundary: str) -> None:
         )
     assert fake.calls == []
     assert stack.armed is False
+
+
+@pytest.mark.parametrize("command", ["create-stack", "send-command"])
+def test_cli_json_uses_private_regular_file_and_removes_it(
+    command: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    captured: list[Path] = []
+
+    def execute(argv: list[str], **options: Any) -> RunResult:
+        assert "file:///dev/stdin" not in argv and options.get("stdin") is None
+        path = Path(argv[argv.index("--cli-input-json") + 1].removeprefix("file://"))
+        assert path.is_file() and not path.is_symlink()
+        assert path.stat().st_mode & 0o777 == 0o600
+        assert json.loads(path.read_text()) == {"private_fixture": "never-in-argv"}
+        assert "never-in-argv" not in str(argv)
+        captured.append(path)
+        return RunResult(0, "{}", tmp_path / "api.log")
+
+    monkeypatch.setattr(harness, "run", execute)
+    assert (
+        harness.AWS("eu-west-1", tmp_path).request(
+            ["cloudformation" if command == "create-stack" else "ssm", command],
+            body={"private_fixture": "never-in-argv"},
+        )
+        == {}
+    )
+    assert len(captured) == 1 and not captured[0].exists()

@@ -9,6 +9,7 @@ import getpass
 import hashlib
 import importlib.util
 import json
+import marshal
 import os
 from pathlib import Path
 import re
@@ -16,7 +17,10 @@ import resource
 import stat
 import subprocess
 import sys
+
+sys.dont_write_bytecode = True
 import tempfile
+import types
 import uuid
 
 BASE = Path('/etc/zunder-guard-container')
@@ -244,7 +248,9 @@ def operations():
         trusted(parent, directory=True)
     spec = importlib.util.spec_from_file_location('guard_container_operations', path)
     module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    source = spec.loader.get_source(spec.name)
+    require(source is not None, "Operation source is missing.")
+    exec(compile(source, str(path), "exec", dont_inherit=True), module.__dict__)
     return module
 
 
@@ -436,6 +442,49 @@ def uninstall_assets():
             HELPER.with_name('operations.py'), HELPER]
 
 
+def owned_bytecode_cache(allowed):
+    cache = HELPER.parent / '__pycache__'
+    if not cache.exists() and not cache.is_symlink():
+        return []
+    trusted(cache, directory=True)
+    files = []
+    for path in cache.iterdir():
+        match = re.fullmatch(r'(supervisor|operations)\.' + re.escape(sys.implementation.cache_tag)
+                             + r'(?:\.opt-([12]))?\.pyc', path.name)
+        require(match is not None, 'Unknown compiled helper cache; refusing removal.')
+        trusted(path)
+        info = path.stat()
+        require(info.st_nlink == 1 and 16 < info.st_size <= 8 * 1024 * 1024,
+                'Unexpected compiled helper cache metadata.')
+        source = HELPER.with_name(match[1] + '.py')
+        trusted(source)
+        body = source.read_bytes()
+        require(len(body) <= 1024 * 1024 and hashlib.sha256(body).hexdigest()
+                in allowed.get(str(source), []), 'Cache source lacks managed release ownership.')
+        expected = compile(body, str(source), 'exec', dont_inherit=True, optimize=int(match[2] or 0))
+        compiled = path.read_bytes()
+        require(compiled[:4] == importlib.util.MAGIC_NUMBER
+                and int.from_bytes(compiled[4:8], 'little') in (0, 1, 3), 'Unknown compiled helper format.')
+        try:
+            payload = marshal.loads(compiled[16:])
+        except (ValueError, EOFError, TypeError, MemoryError):
+            raise Refused('Compiled helper cache is malformed.') from None
+        require(isinstance(payload, types.CodeType) and payload == expected
+                and payload.co_filename == str(source), 'Compiled helper differs from admitted source.')
+        files.append(path)
+    return files
+
+
+def remove_owned_bytecode_cache(receipt):
+    # No cached code is executed. Authenticate every payload before any unlink.
+    files = owned_bytecode_cache(receipt['allowed_files'])
+    for path in files:
+        path.unlink()
+    cache = HELPER.parent / '__pycache__'
+    if cache.exists():
+        cache.rmdir()
+
+
 def uninstall_admit(config, *, guardian_only=False):
     receipt = private_json(BASE / 'managed-install.json')
     fields = {'version', 'account', 'volume', 'allowed_files', 'config_refs'}
@@ -466,7 +515,10 @@ def uninstall_admit(config, *, guardian_only=False):
             require(path.stat().st_nlink == 1
                     and hashlib.sha256(path.read_bytes()).hexdigest() in allowed[str(path)],
                     'Owned software hash changed; refusing uninstall.')
-    require(set(HELPER.parent.iterdir()) <= {HELPER, HELPER.with_name('operations.py'), UNIT_SOURCE},
+    if not guardian_only:
+        owned_bytecode_cache(allowed)
+    require(set(HELPER.parent.iterdir()) <= {HELPER, HELPER.with_name('operations.py'), UNIT_SOURCE,
+                                           HELPER.parent / '__pycache__'},
             'Unknown installed helper file requires separate review.')
     dropin = UNIT_PATH.with_name(UNIT + '.d') / '10-install-transaction.conf'
     gate = BASE / 'install-transaction.json'
@@ -516,7 +568,6 @@ def uninstall(network):
     # The installer-wide lock precedes all installation/operation/configuration reads.
     lock = private_lock(BASE / 'installer.lock')
     guardian_lock = None
-    guardian_stopped = False
     try:
         directory(BASE / 'docker-config')
         require(not list((BASE / 'docker-config').iterdir()), 'Docker configuration directory must remain empty.')
@@ -541,15 +592,14 @@ def uninstall(network):
                             if states[GUARDIAN] == 'loaded' else 'not-found')
         require(guardian_enabled in ('enabled', 'disabled', 'not-found'),
                 'Guardian boot configuration requires separate review.')
-        if states[UNIT] == 'loaded':
-            execute([SYSTEMCTL, 'stop', UNIT])
-            execute([SYSTEMCTL, 'disable', UNIT])
-        service_inactive(UNIT)
-        cleanup(config)
-        require(not uninstall_pending(), 'Setup operations appeared; guardian remains installed.')
         try:
+            if states[UNIT] == 'loaded':
+                execute([SYSTEMCTL, 'stop', UNIT])
+                execute([SYSTEMCTL, 'disable', UNIT])
+            service_inactive(UNIT)
+            cleanup(config)
+            require(not uninstall_pending(), 'Setup operations appeared; guardian remains installed.')
             if states[GUARDIAN] == 'loaded':
-                guardian_stopped = True  # Unknown stop outcome must also preserve recovery.
                 execute([SYSTEMCTL, 'stop', GUARDIAN])
                 execute([SYSTEMCTL, 'disable', GUARDIAN])
             service_inactive(GUARDIAN)
@@ -560,11 +610,12 @@ def uninstall(network):
             require(not gate.exists() and not gate.is_symlink(), 'Installer transaction appeared.')
             require(not ids('name=^/' + NAME + '$') and not ids('volume=' + config['volume']),
                     'Container/volume is still in use; software is preserved.')
+            remove_owned_bytecode_cache(private_json(BASE / 'managed-install.json'))
         except BaseException:
             if guardian_lock is not None:
                 os.close(guardian_lock)
                 guardian_lock = None
-            if guardian_stopped:
+            if states[GUARDIAN] == "loaded":
                 try:
                     uninstall_admit(config, guardian_only=True)
                 except BaseException:

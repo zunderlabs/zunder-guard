@@ -13,6 +13,8 @@ from guard_harness.attestation import (
     invocation_run,
     verify_predicate,
 )
+from guard_harness.lifecycle_coverage import LIFECYCLE_COVERAGE
+from guard_harness.purchase_coverage import PURCHASE_COVERAGE
 from guard_harness.release_state import GATE_JOURNEYS
 from guard_harness.state_verifier import VerifiedState, authenticate_state
 
@@ -43,6 +45,25 @@ MAINNET_COVERAGE: Mapping[str, frozenset[str]] = {
         }
     ),
     "M3": frozenset({"sdk-vectors", "key-wrappers", "testnet-order-path"}),
+}
+JOURNEY_COVERAGE: Mapping[str, frozenset[str]] = {
+    **MAINNET_COVERAGE,
+    **LIFECYCLE_COVERAGE,
+    **PURCHASE_COVERAGE,
+    "T1": frozenset({"signed-release", "protected-entry", "owned-cleanup", "all-dex-flat"}),
+    "T2": frozenset({"signed-release", "protected-entry", "owned-cleanup", "all-dex-flat"}),
+    "P8": frozenset(
+        {
+            "signed-release",
+            "protected-entry",
+            "owned-cleanup",
+            "all-dex-flat",
+            "staging-approve",
+            "testnet-owner-approval",
+            "guard-builder-wire",
+            "actual-builder-fee",
+        }
+    ),
 }
 
 
@@ -81,6 +102,14 @@ def _check(predicate: dict[str, Any], journey: str, commit: str, digest: str) ->
         raise AttestationError("journey coverage contains duplicate checks")
     if journey in MAINNET_COVERAGE and set(coverage) != MAINNET_COVERAGE[journey]:
         raise AttestationError("mainnet coverage omits or changes a required check")
+    if journey in LIFECYCLE_COVERAGE and set(coverage) != LIFECYCLE_COVERAGE[journey]:
+        raise AttestationError("install coverage omits or changes a required check")
+    if journey == "P8" and set(coverage) != JOURNEY_COVERAGE[journey]:
+        raise AttestationError("builder approval coverage omits or changes a required check")
+    if journey not in JOURNEY_COVERAGE or not JOURNEY_COVERAGE[journey] <= set(coverage):
+        raise AttestationError("journey coverage omits measured required checks")
+    if journey in {"I1", "I6"} and predicate["tier"] != "guest":
+        raise AttestationError("Linux reboot rows require actual guest evidence")
 
 
 def journey_invocation(bundles: Mapping[str, JourneyBundle]) -> tuple[str, str]:
@@ -99,6 +128,7 @@ def authenticate_journeys(
     logs: Path,
     expected_run_id: str | None = None,
     expected_run_attempt: str | None = None,
+    coverage_out: dict[str, frozenset[str]] | None = None,
 ) -> frozenset[str]:
     """Return a complete set only after each bundle passes the official verifier.
 
@@ -114,6 +144,7 @@ def authenticate_journeys(
         raise AttestationError("journey references identify a different requested run or attempt")
     manifest_bytes = manifest.read_bytes()
     digest = hashlib.sha256(manifest_bytes).hexdigest()
+    authenticated_coverage: dict[str, frozenset[str]] = {}
     with TemporaryDirectory(prefix="guard-evidence-") as directory:
         subject = Path(directory) / "release-manifest.json"
         subject.write_bytes(manifest_bytes)
@@ -140,6 +171,9 @@ def authenticate_journeys(
                 expected_run_attempt=attempt,
             )
             _check(verified.predicate, journey, commit, digest)
+            authenticated_coverage[journey] = frozenset(verified.predicate["coverage"])
+    if coverage_out is not None:
+        coverage_out.update(authenticated_coverage)
     return GATE_JOURNEYS
 
 

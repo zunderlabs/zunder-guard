@@ -89,12 +89,31 @@ def admitted(
     return values
 
 
+def scheduled(work: Path, *, previous: bool = False) -> dict[str, Any]:
+    """A missing head skips only before public stable publication; unknown always fails."""
+    from guard_harness.channel_head import published_stable, read
+
+    digest, state = read("canonical")
+    if digest is None and state is None:
+        if published_stable() is not None:
+            raise AttestationError("canonical head missing after public stable publication")
+        if not work.is_absolute() or work.exists():
+            raise AttestationError("fresh absolute monitor workspace required")
+        work.mkdir(mode=0o700)
+        values = {"promoted": False, "reason": "canonical-head-and-public-stable-absent"}
+        (work / "receipt.json").write_bytes(canonical_bytes(values))
+        return values
+    values = admitted(work, previous=previous)
+    return {**values, "promoted": True}
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--tag")
     parser.add_argument("--commit")
     parser.add_argument("--work", type=Path)
     parser.add_argument("--previous", action="store_true")
+    parser.add_argument("--skip-unpromoted", action="store_true")
     parser.add_argument("--alert", action="store_true")
     parser.add_argument("--check", default="P9.monitor")
     parser.add_argument("--run-url", default="")
@@ -107,13 +126,21 @@ def main() -> None:
         else:
             if args.work is None:
                 raise AttestationError("monitor workspace is required")
-            values = admitted(args.work, tag=args.tag, commit=args.commit, previous=args.previous)
+            if args.skip_unpromoted:
+                if args.tag or args.commit:
+                    raise AttestationError("scheduled admission cannot choose a release")
+                values = scheduled(args.work, previous=args.previous)
+            else:
+                values = admitted(
+                    args.work, tag=args.tag, commit=args.commit, previous=args.previous
+                )
             target = os.environ.get("GITHUB_OUTPUT")
             if target:
                 with Path(target).open("a") as stream:
-                    for key in ("tag", "commit", "previous_tag", "previous_commit"):
+                    for key in ("promoted", "tag", "commit", "previous_tag", "previous_commit"):
                         if key in values:
-                            stream.write(f"{key}={values[key]}\n")
+                            value = str(values[key]).lower() if key == "promoted" else values[key]
+                            stream.write(f"{key}={value}\n")
     except (AttestationError, OSError, ValueError, RuntimeError):
         # Remote certificate, HTTP and subprocess exceptions can contain opaque
         # response data. The private workspace holds diagnostics; stdout does not.

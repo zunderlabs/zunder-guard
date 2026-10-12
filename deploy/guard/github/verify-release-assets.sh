@@ -47,7 +47,7 @@ fi
 gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir . "${ASSET_PATTERNS[@]}"
 # All checksummed assets must be present. --ignore-missing could hide omissions.
 sha256sum -c SHA256SUMS
-for asset in install-windows-service.ps1 install-macos-service.sh install-container.py container-supervisor.py container-operations.py \
+for asset in install-windows-service.ps1 install-macos-service.sh uninstall-macos-testnet.py install-container.py container-supervisor.py container-operations.py \
   zunder-guard-container.service zunder-guard-setup-guardian.service \
   "zunder-guard-$TAG.image.txt" zunder-guard.rb \
   ZunderLabs.ZunderGuard.yaml ZunderLabs.ZunderGuard.installer.yaml ZunderLabs.ZunderGuard.locale.en-US.yaml; do

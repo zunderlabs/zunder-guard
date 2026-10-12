@@ -17,8 +17,8 @@ from typing import Any, BinaryIO
 from guard_harness.release_state import validate_build
 from guard_harness.runner import run
 from guard_harness.staged_subjects import _private
-from guard_harness.testnet_process import Foreground, ProcessError
-from guard_harness.testnet_scan import TestnetReads
+from guard_harness.testnet_process import ENTRY_REMAINING, Foreground, ProcessError
+from guard_harness.testnet_scan import SCAN_TIMEOUT, TestnetReads
 
 ROOT = Path(__file__).resolve().parents[3]
 REPOSITORY = "zunderlabs/zunder-guard"
@@ -140,7 +140,7 @@ def execute_release(
         or not re.fullmatch(r"0x[0-9a-fA-F]{40}", api_wallet)
         or not 1024 <= port <= 65535
         or not math.isfinite(deadline)
-        or deadline - time.monotonic() < 1200
+        or deadline - time.monotonic() < SCAN_TIMEOUT + ENTRY_REMAINING
     ):
         raise ProcessError("explicit release and testnet identity required")
     _private(work.parent, directory=True)
@@ -178,6 +178,8 @@ def execute_release(
         digest, manifest_digest = signed_binary(
             work / "assets", work / "subject", tag=tag, commit=commit
         )
+        if deadline - time.monotonic() < SCAN_TIMEOUT + ENTRY_REMAINING:
+            raise ProcessError("complete scan and cleanup budget expired before custody")
         receipt.update(binary_sha256=digest, manifest_sha256=manifest_digest, stage="foreground")
         _receipt(work, receipt)
         if service_marker is None:
@@ -284,6 +286,8 @@ def execute_release(
                                 "result": "passed",
                                 "tier": "e2e",
                                 "coverage": [
+                                    "signed-release",
+                                    "protected-entry",
                                     "staging-approve",
                                     "testnet-owner-approval",
                                     "guard-builder-wire",

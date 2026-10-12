@@ -11,6 +11,8 @@ from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
+SCAN_TIMEOUT = 1800
+
 INFO = "https://api.hyperliquid-testnet.xyz/info"
 Read = Callable[[dict[str, Any]], object]
 
@@ -139,9 +141,9 @@ class TestnetReads:
         *,
         clock: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], None] = time.sleep,
-        timeout: float = 720,
+        timeout: float = SCAN_TIMEOUT,
     ) -> None:
-        if not 10 < timeout <= 720:
+        if not 10 < timeout <= SCAN_TIMEOUT:
             raise ScanError("bounded scan timeout required")
         self.clock, self.sleep = clock, sleep
         self.next_read = clock() + 2
@@ -150,7 +152,7 @@ class TestnetReads:
 
     def start_phase(self, *, timeout: float) -> None:
         """New bounded stage deadline without resetting the shared request pacing."""
-        if not 10 < timeout <= 720:
+        if not 10 < timeout <= SCAN_TIMEOUT:
             raise ScanError("bounded scan timeout required")
         self.deadline = self.clock() + timeout
 

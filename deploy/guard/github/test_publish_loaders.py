@@ -132,7 +132,7 @@ class PublicationWiringTest(unittest.TestCase):
         if not workflows.is_dir():
             workflows = Path(__file__).resolve().parents[3] / '.github/workflows'
         document = yaml.safe_load((workflows / 'promote.yml').read_text())
-        self.assertEqual(document['concurrency'], {'group': 'guard-release-promotion', 'cancel-in-progress': False})
+        self.assertEqual(document['concurrency'], {'group': 'guard-release-promotion', 'cancel-in-progress': False, 'queue': 'max'})
         self.assertEqual(document['jobs']['promote']['environment'], 'promote')
         steps = document['jobs']['promote']['steps']
         admission = next(i for i, step in enumerate(steps) if '--phase prepare' in step.get('run', ''))

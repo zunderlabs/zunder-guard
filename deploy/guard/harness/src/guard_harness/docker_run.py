@@ -61,6 +61,8 @@ def execute(
     testnet_key: bytes | None = None,
     testnet_account: str | None = None,
     diagnostic: bool = False,
+    scenario: str | None = None,
+    channel: str = "both",
 ) -> None:
     if (
         not re.fullmatch(r"v\d+\.\d+\.\d+(?:-rc\.[1-9]\d*)?", tag)
@@ -68,6 +70,10 @@ def execute(
         or not re.fullmatch(r"0x[0-9a-fA-F]{40}", account)
     ):
         raise ValueError("explicit release/public account identity required")
+    if scenario not in {None, "fresh", "upgrade"} or channel not in {"both", "docker", "compose"}:
+        raise ValueError("explicit Docker scenario/channel required")
+    if scenario == "upgrade" and previous_tag is None:
+        raise ValueError("upgrade predecessor required")
     if (previous_tag is None) != (previous_commit is None):
         raise ValueError("previous release tag and commit must be supplied together")
     if previous_tag is not None and (
@@ -153,42 +159,69 @@ def execute(
             timeout=300,
             stdin=b"",
         )
-        if previous_image is None:
-            lifecycle(image, account, work=work / "docker-paper")
-            lifecycle(image, account, work=work / "compose-paper", compose=compose)
-        else:
-            lifecycle(image, account, work=work / "docker-paper", previous_image=previous_image)
-            lifecycle(
-                image,
-                account,
-                work=work / "compose-paper",
-                compose=compose,
-                previous_image=previous_image,
-                previous_compose=previous_compose,
+        selected = ("docker", "compose") if channel == "both" else (channel,)
+        selected_scenario = scenario or ("upgrade" if previous_image else "fresh")
+        for selected_channel in selected:
+            source = compose if selected_channel == "compose" else None
+            predecessor = previous_compose if selected_channel == "compose" else None
+            paper_work = (
+                work / (selected_channel + "-paper")
+                if scenario is None
+                else work / "paper" / selected_scenario / selected_channel
             )
-        if testnet_key is not None:
-            assert api_wallet is not None and testnet_account is not None
-            assert previous_image is not None and previous_tag is not None
-            for channel, source, predecessor in (
-                ("docker", None, None),
-                ("compose", compose, previous_compose),
-            ):
+            paper_work.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            paper_version = tag.removeprefix("v") if scenario is not None else None
+            paper_previous_version = (
+                previous_tag.removeprefix("v") if scenario is not None and previous_tag else None
+            )
+            if selected_scenario == "fresh":
+                lifecycle(
+                    image,
+                    account,
+                    work=paper_work,
+                    compose=source,
+                    version=paper_version,
+                    previous_version=paper_previous_version,
+                )
+            else:
+                lifecycle(
+                    image,
+                    account,
+                    work=paper_work,
+                    compose=source,
+                    previous_image=previous_image,
+                    previous_compose=predecessor,
+                    version=paper_version,
+                    previous_version=paper_previous_version,
+                )
+            if testnet_key is not None:
+                assert api_wallet is not None and testnet_account is not None
+                assert previous_image is not None and previous_tag is not None
+                testnet_work = (
+                    work / (selected_channel + "-testnet")
+                    if scenario is None
+                    else work / "testnet" / selected_scenario / selected_channel
+                )
+                testnet_work.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
                 testnet_lifecycle(
                     image,
                     testnet_account,
                     api_wallet=api_wallet,
                     key=testnet_key,
-                    work=work / (channel + "-testnet"),
+                    work=testnet_work,
                     previous_image=previous_image,
                     version=tag.removeprefix("v"),
                     previous_version=previous_tag.removeprefix("v"),
                     compose=source,
                     previous_compose=predecessor,
+                    scenario=selected_scenario,
                 )
         (work / "receipt.json").write_text(
             json.dumps(
                 {
                     "harness_commit": os.environ.get("GITHUB_SHA"),
+                    "scenario": selected_scenario,
+                    "channel": channel,
                     "diagnostic": diagnostic or os.environ.get("GITHUB_SHA") != commit,
                     "tag": tag,
                     "commit": commit,
@@ -203,8 +236,8 @@ def execute(
                         "manifest_sha256": previous_digest,
                         "image": previous_image,
                     },
-                    "checks": ["signed-release", "docker-paper", "compose-paper"]
-                    + (["docker-testnet", "compose-testnet"] if testnet_key is not None else []),
+                    "checks": ["signed-release", *[name + "-paper" for name in selected]]
+                    + ([name + "-testnet" for name in selected] if testnet_key is not None else []),
                     "release_ready": False,
                 }
             )
@@ -225,6 +258,8 @@ def main() -> None:
     parser.add_argument("--testnet-account")
     parser.add_argument("--testnet-key-stdin", action="store_true")
     parser.add_argument("--diagnostic", action="store_true")
+    parser.add_argument("--scenario", choices=("fresh", "upgrade"), required=True)
+    parser.add_argument("--channel", choices=("docker", "compose"), required=True)
     args = vars(parser.parse_args())
     if args.pop("testnet_key_stdin"):
         key = sys.stdin.buffer.read(68)

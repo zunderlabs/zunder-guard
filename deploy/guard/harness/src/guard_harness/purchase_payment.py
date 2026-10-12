@@ -15,6 +15,7 @@ from urllib.parse import urlsplit
 from eth_account import Account
 from hyperliquid.utils.signing import sign_usd_transfer_action
 
+from guard_harness.actions_artifacts import ArtifactError
 from guard_harness.staged_subjects import _private
 
 TESTNET = "https://api.hyperliquid-testnet.xyz/exchange"
@@ -96,6 +97,7 @@ def admit_order(
     status = request(base + "/api/licence/status", headers=headers)
     targets = status.get("payTo")
     destination = targets.get(network) if isinstance(targets, dict) else None
+    pinned = os.environ.get("GUARD_PAY_TO_" + network.upper(), "")
     if (
         status.get("ok") is not True
         or status.get("open") is not True
@@ -105,6 +107,8 @@ def admit_order(
         or status["priceDivisor"] != 1000
         or not isinstance(destination, str)
         or not re.fullmatch(r"0x[0-9a-fA-F]{40}", destination)
+        or not re.fullmatch(r"0x[0-9a-fA-F]{40}", pinned)
+        or destination.lower() != pinned.lower()
     ):
         raise PaymentError("open testnet staging and payment target required")
     order = request(
@@ -190,9 +194,25 @@ def main() -> int:
         pay(args.order, args.amount, args.work, scenario=args.scenario)
         print("Hyperliquid testnet payment accepted; follow C4 order and inbox to completion")
         return 0
-    except Exception:
+    except Exception as error:
+        # Only authored fixed labels; SDK/HTTP exception text is never emitted.
+        labels = {
+            "staging ancestor is unsafe": "unsafe-workspace-ancestor",
+            "staging path must be private and owned": "private-workspace-required",
+            "payment endpoint failed; sensitive diagnostics withheld": "admission-http",
+            "open testnet staging and payment target required": "staging-target",
+            "exact unpaid testnet order required": "order-binding",
+            "dedicated testnet payer key required": "missing-payer",
+            "testnet payment signing failed; diagnostics withheld": "signing",
+            "testnet payment not confirmed; reconcile order, never retry": "send-unconfirmed",
+        }
+        label = (
+            labels.get(str(error), "unknown")
+            if isinstance(error, (PaymentError, ArtifactError))
+            else "unknown"
+        )
         print(
-            "Testnet payment failed; inspect private attempt receipt and reconcile; never retry",
+            "Testnet payment failed at " + label + "; reconcile private receipts; never retry",
             file=sys.stderr,
         )
         return 1

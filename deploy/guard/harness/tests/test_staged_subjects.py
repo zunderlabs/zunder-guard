@@ -1,12 +1,28 @@
 import hashlib
 import os
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Literal
 
 import pytest
 
 from guard_harness.actions_artifacts import ArtifactError
-from guard_harness.staged_subjects import copy
+from guard_harness.staged_subjects import _private, copy
+
+
+def test_root_custody_keeps_trusted_root_ancestors_and_refuses_runner_work(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(os, "geteuid", lambda: 0)
+
+    def metadata(path: Path) -> SimpleNamespace:
+        runner_owned = str(path).startswith("/home/runner")
+        return SimpleNamespace(st_uid=1001 if runner_owned else 0, st_mode=0o40700)
+
+    monkeypatch.setattr(Path, "lstat", metadata)
+    _private(Path("/root/guard-release-123-1"), directory=True)
+    with pytest.raises(ArtifactError, match="ancestor is unsafe"):
+        _private(Path("/home/runner/work/_temp/guard-release"), directory=True)
 
 
 @pytest.fixture

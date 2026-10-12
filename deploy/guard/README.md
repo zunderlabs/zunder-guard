@@ -106,6 +106,30 @@ For a foreground installation, stop Guard yourself, then run
 it does not inspect or modify services. Uninstall needs no release download, wallet input or
 setup flags. Homebrew, macOS and Windows use their platform-specific uninstall procedures.
 
+For the macOS managed testnet installation, use the signed installer from that release:
+`sudo sh install.sh --uninstall --service-instance testnet`. It requires `/usr/bin/python3`,
+stops the owned LaunchDaemon and retains configuration, journals and System Keychain credentials.
+If it refuses because `/usr/local/bin/zunder-guard` belongs to another installation, stop that
+foreground Guard and remove it through its original installation procedure first; retain its
+data and notices for recovery, then retry the testnet uninstall. Do not replace bindings or
+remove ownership checks to get past a refusal. If the required Python executable is absent,
+restore that platform prerequisite before retrying the signed helper.
+
+macOS foreground paper has no managed uninstall command. Stop its owned process, remove the
+binary and distribution notices installed by that foreground installation, and retain
+`~/.zunder-guard` (configuration, pairings and journals). Homebrew installations instead use
+`brew services stop zunder-guard` and `brew uninstall zunder-guard`.
+
+Container-native removal authenticates any legacy compiled helper cache against the recorded
+owned source before deleting it. A cache from another Python minor version is refused. For
+recovery, stop the owned container service and setup guardian, retain their data, and invoke
+the installed signed supervisor with the original trusted Python interpreter:
+`sudo /path/to/original/python3 -I -B /usr/local/libexec/zunder-guard-container/supervisor.py uninstall --network testnet`.
+That interpreter must match the cache's version; all normal ownership checks still apply.
+Then reinstall from the authenticated release with the current interpreter. If the original
+interpreter or matching owned source is unavailable, preserve the cache for manual review;
+do not delete unknown files or substitute an ownership receipt.
+
 Without root the installer uses `sudo` for the service; without either it installs to
 `~/.local/bin`, lets the binary ask for the key and store it its own way, and prints how to
 start Guard for paper/testnet. Mainnet requires its protected service path. macOS mainnet
@@ -501,7 +525,10 @@ and assembles a prerelease. `verify.yml` stages authenticated subjects and calls
 purchase, testnet and SDK matrix; its aggregate independently verifies all required evidence.
 Only a stable tag with its own complete gate can enter `promote.yml`. Promotion publishes the
 canonical channels, runs fresh-runner installation smoke, and withdraws and restores captured
-prior subjects when publication or smoke fails. A release candidate cannot promote channels.
+prior subjects when publication or smoke fails. Recovery uses `promote.yml` rollback mode
+with the original promotion run and attempt and authenticates its signed immutable snapshot;
+see [the rollback runbook](release/canonical-rollback.md). Each channel is attempted independently.
+A release candidate cannot promote channels.
 
 `nightly.yml` first authenticates the latest promoted complete gate and exact canonical bytes,
 then reruns I1/I3/I4/I5 and staging P1 using those subjects, plus property tests on the promoted
@@ -617,5 +644,8 @@ PUBLIC_TESTNET_ADDRESS --work /absolute/fresh-directory` command performs that a
 it invokes the release asset verifier (Cosign image/checksum signatures, SLSA and exact source
 CI), requires descriptor/C2/Compose image agreement, pulls by digest, then runs both paper
 lifecycles on captured payload bytes. Its receipt explicitly remains `release_ready: false`.
-This component does not yet cover testnet mode, upgrade
-or the full I5 row; local image checks alone grant no channel admission.
+`guard_harness.docker_run` also runs the testnet lifecycle with protected runtime key input,
+complete all-DEX flat scans, durable no-exchange journals and owned cleanup. The release matrix
+executes Docker and Compose separately for both fresh installation and previous-release upgrade,
+with independent paper and testnet receipts. Full I5 admission requires all four channel/scenario
+executions against the same authenticated release; local component checks grant no channel credit.

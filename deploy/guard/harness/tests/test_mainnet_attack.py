@@ -98,3 +98,107 @@ def test_invalid_paper_read_network_refuses_before_subject_or_process(
             account_network=network,
         )
     assert not (tmp_path / "work").exists()
+
+
+def test_key_option_and_environment_cannot_earn_generic_missing_stdin_credit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import subprocess
+
+    binary = tmp_path / "signed-subject"
+    binary.write_bytes(b"fixture")
+    release = Release("v1.0.0-rc.7", "a" * 40, tmp_path / "assets")
+    monkeypatch.setattr(Release, "binary", lambda *_: b"fixture")
+
+    def setup(argv: list[str], **kwargs: Any) -> None:
+        if "init" in argv:
+            (Path(argv[2]) / "guard.toml").write_text(CONFIG)
+
+    monkeypatch.setattr(attacks, "run", setup)
+    commands: list[tuple[list[str], dict[str, Any]]] = []
+
+    def refuse(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess[bytes]:
+        commands.append((argv, kwargs))
+        assert kwargs["input"] == b""
+        assert "ZUNDER_MAINNET_CONFIRM" not in kwargs["env"]
+        return subprocess.CompletedProcess(argv, 1, stdout=b"", stderr=attacks.LITERAL.encode())
+
+    monkeypatch.setattr(subprocess, "run", refuse)
+    proofs: list[dict[str, Any]] = []
+
+    def capture(*args: Any, **kwargs: Any) -> None:
+        proofs.append(kwargs)
+        if len(proofs) == 3:
+            raise RuntimeError("three-key-refusals-observed")
+
+    monkeypatch.setattr(attacks, "record", capture)
+    with pytest.raises(RuntimeError, match="three-key-refusals-observed"):
+        attacks.execute(
+            release, binary, account="0x" + "1" * 40, rules="zr1_fixture", work=tmp_path / "work"
+        )
+    assert [proof["passed"] for proof in proofs] == [True, False, False]
+    assert proofs[1]["literal"] == proofs[2]["literal"] == "cannot be used with"
+    assert "--key-stdin" in commands[1][0] and "--key-file" in commands[1][0]
+    assert "--key-stdin" in commands[2][0]
+    assert "ZUNDER_GUARD_KEY_FILE" in commands[2][1]["env"]
+    assert "ZUNDER_API_WALLET_KEY" not in commands[2][1]["env"]
+
+
+@pytest.mark.parametrize("output", [attacks.LITERAL, "cannot be used with"])
+def test_container_refusals_require_the_boundary_actually_exercised(
+    output: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import io
+    import json
+    import subprocess
+    import tarfile
+
+    release = Release("v1.0.0-rc.7", "b" * 40, tmp_path / "assets")
+    image = "example.invalid/guard@sha256:" + "a" * 64
+    binary = b"signed binary fixture"
+    manifest = {
+        "distribution": {
+            "docker": {
+                "image": "example.invalid/guard",
+                "digest": "sha256:" + "a" * 64,
+            }
+        }
+    }
+    monkeypatch.setattr(
+        Release,
+        "asset",
+        lambda self, name: (
+            json.dumps(manifest).encode() if name == "release-manifest.json" else b"services: {}"
+        ),
+    )
+    monkeypatch.setattr(Release, "binary", lambda self, target: binary)
+    home = tmp_path / "home"
+    home.mkdir()
+    for name in ("guard.toml", "api-wallet-key"):
+        (home / name).write_bytes(b"public negative fixture")
+    captured = io.BytesIO()
+    with tarfile.open(fileobj=captured, mode="w") as archive:
+        entry = tarfile.TarInfo("zunder-guard")
+        entry.size = len(binary)
+        archive.addfile(entry, io.BytesIO(binary))
+    calls: list[list[str]] = []
+    records: list[dict[str, Any]] = []
+    monkeypatch.setattr(attacks, "run", lambda *args, **kwargs: None)
+    monkeypatch.setattr(attacks, "record", lambda release, **kwargs: records.append(kwargs))
+
+    def process(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess[bytes]:
+        if argv[:2] == ["docker", "cp"]:
+            return subprocess.CompletedProcess(argv, 0, captured.getvalue(), b"")
+        calls.append(argv)
+        assert "--key-stdin" not in argv
+        assert argv[-5:] == ["run", "--network", "mainnet", "--key-file", "/data/api-wallet-key"]
+        assert kwargs["input"] == b""
+        assert "ZUNDER_MAINNET_CONFIRM" not in kwargs["env"]
+        return subprocess.CompletedProcess(argv, 1, b"", output.encode())
+
+    monkeypatch.setattr(subprocess, "run", process)
+    attacks.containers(release, image=image, home=home, work=tmp_path / "work", account="public")
+    assert len(calls) == 2
+    assert {item["case"] for item in records} == {"plain-docker", "compose"}
+    assert all(item["literal"] == attacks.LITERAL for item in records)
+    assert all(item["passed"] is (output == attacks.LITERAL) for item in records)

@@ -6,6 +6,7 @@ from typing import Any
 import pytest
 
 import guard_harness.docker_paper as container
+from guard_harness.install_evidence import DOCKER_PAPER, completed
 from guard_harness.paper_bot import Decision, LocalGuard, PaperError
 from guard_harness.runner import RunResult
 
@@ -70,6 +71,34 @@ def install_fakes(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(container, "round_trip", lambda *a: [Decision(100, 1, "allow", "allowed")])
 
 
+@pytest.mark.parametrize("change", ["", "version", "account", "journal"])
+def test_fresh_candidate_requires_runtime_identity_before_restart_and_receipt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, change: str
+) -> None:
+    install_fakes(monkeypatch)
+    state: dict[str, Any] = dict(
+        started_at_ms=1, version="1.2.3", account="0x" + "1" * 40, journal={"ok": True}
+    )
+    if change:
+        state[change] = "different" if change != "journal" else {"ok": False}
+    monkeypatch.setattr(container, "_ready", lambda *a, **k: state)
+    work = tmp_path / "fresh"
+    image = "sha256:" + "a" * 64
+    if change:
+        with pytest.raises(PaperError, match="release/account/journal"):
+            container.lifecycle(image, "0x" + "1" * 40, work=work, version="1.2.3")
+        assert not (work / "receipt.json").exists()
+        assert not any(args[0] == "restart" for args, _ in FakeDocker.calls)
+    else:
+        container.lifecycle(image, "0x" + "1" * 40, work=work, version="1.2.3")
+        record = json.loads((work / "receipt.json").read_bytes())
+        assert record["scenario"] == "fresh" and record["initial_image"] == image
+        assert record["initial_version"] == "1.2.3"
+        assert "fresh-candidate-paper" in record["checks"] and "upgrade" not in record["checks"]
+        first = next(args for args, _ in FakeDocker.calls if "init" in args)
+        assert image in first
+
+
 def test_paper_lifecycle_has_no_key_and_cleans_only_owned_objects(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -95,6 +124,12 @@ def test_paper_lifecycle_has_no_key_and_cleans_only_owned_objects(
     receipt = (work / "receipt.json").read_text()
     assert "client_key" not in receipt and "2" * 64 not in receipt
     assert json.loads(receipt)["mode"] == "paper"
+    completed(
+        json.loads(receipt),
+        DOCKER_PAPER - {"upgrade", "upgrade-journal", "upgrade-pairing"}
+        | {"fresh-candidate-paper"},
+        mode="paper",
+    )
 
 
 def test_crash_without_restart_never_gets_a_passing_receipt(
@@ -145,6 +180,7 @@ def test_upgrade_keeps_state_and_client_and_refuses_incomplete_upgrade(
     else:
         container.lifecycle(new, "0x" + "1" * 40, work=work, previous_image=old)
         receipt = json.loads((work / "receipt.json").read_bytes())
+        completed(receipt, DOCKER_PAPER, mode="paper")
         assert receipt["previous_image"] == old and receipt["image"] == new
         assert {"upgrade", "upgrade-journal", "upgrade-pairing"} <= set(receipt["checks"])
         assert {"reinstall-pairing", "cleanup"} <= set(receipt["checks"])

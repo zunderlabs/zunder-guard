@@ -21,7 +21,9 @@ from guard_harness.staged_subjects import _private
 from guard_harness.testnet_journey import Journey, execute
 from guard_harness.testnet_ownership import Ownership
 from guard_harness.testnet_protection import Entry, _object, _orders, entry_plan
-from guard_harness.testnet_scan import TestnetReads
+from guard_harness.testnet_scan import SCAN_TIMEOUT, TestnetReads
+
+ENTRY_REMAINING = SCAN_TIMEOUT + 480
 
 
 class ProcessError(RuntimeError):
@@ -201,12 +203,12 @@ class Foreground:
 
         def admit_entry() -> None:
             self.alive()
-            # 225 entry/proof + 900 cleanup + 45 in-flight MCP + 20 exits + 10 margin.
-            _need(deadline - time.monotonic() >= 1200)
+            # Full all-DEX cleanup plus 480 seconds for entry/proof and shutdown margin.
+            _need(deadline - time.monotonic() >= ENTRY_REMAINING)
             read.start_phase(timeout=180)
 
         def begin_cleanup() -> None:
-            read.start_phase(timeout=720)
+            read.start_phase(timeout=SCAN_TIMEOUT)
 
         with MCP(
             self.binary,

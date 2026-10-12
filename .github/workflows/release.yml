@@ -390,7 +390,9 @@ jobs:
           test -n "$AWS_TEMPLATE_BASE_URL" || { echo "AWS_TEMPLATE_BASE_URL is required" >&2; exit 1; }
           deploy/guard/packaging/render.sh "$VERSION" dist --payloads-only
           python3 -m venv "$RUNNER_TEMP/release-metadata-venv"
-          "$RUNNER_TEMP/release-metadata-venv/bin/pip" install ./deploy/guard/harness
+          "$RUNNER_TEMP/release-metadata-venv/bin/pip" install --require-hashes --only-binary=:all: \
+            -r deploy/guard/harness/requirements-runtime.lock
+          "$RUNNER_TEMP/release-metadata-venv/bin/pip" install --no-deps --no-build-isolation ./deploy/guard/harness
           assets=()
           for payload in dist/*; do assets+=(--asset "$payload"); done
           "$RUNNER_TEMP/release-metadata-venv/bin/python" -m guard_harness.build_manifest \

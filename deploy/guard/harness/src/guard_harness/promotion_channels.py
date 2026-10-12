@@ -70,9 +70,23 @@ def image_digest(tag: str) -> str | None:
 
 
 class Channels:
-    def __init__(self, release: Release, previous: Release | None, work: Path, tap: Tap) -> None:
-        self.release, self.previous, self.work, self.tap = release, previous, work, tap
+    def __init__(
+        self, release: Release, previous: Release | None, work: Path, tap: Tap | None
+    ) -> None:
+        self.release, self.previous, self.work, self._tap = release, previous, work, tap
         self.sequence = 0
+
+    @property
+    def tap(self) -> Tap:
+        if self._tap is None:
+            raise AttestationError(
+                "tap credential unavailable; other rollback channels remain independent"
+            )
+        return self._tap
+
+    @tap.setter
+    def tap(self, value: Tap) -> None:
+        self._tap = value
 
     def github(self, method: str, endpoint: str, body: dict[str, Any] | None = None) -> Any:
         self.sequence += 1
@@ -225,13 +239,22 @@ class Channels:
                 promoted_tree = self.tap_tree(
                     snapshot["tap_tree_before"], self.release.asset("zunder-guard.rb")
                 )
-                if parents != [snapshot["tap_before"]] or commit["tree"]["sha"] != promoted_tree:
+                already_restored = False
+                if commit["tree"]["sha"] == snapshot["tap_tree_before"] and len(parents) == 1:
+                    parent = self.tap.request("GET", f"git/commits/{parents[0]}")
+                    already_restored = [item["sha"] for item in parent["parents"]] == [
+                        snapshot["tap_before"]
+                    ] and parent["tree"]["sha"] == promoted_tree
+                if not already_restored and (
+                    parents != [snapshot["tap_before"]] or commit["tree"]["sha"] != promoted_tree
+                ):
                     raise AttestationError("tap head changed outside this promotion")
-                self.tap_commit(
-                    current,
-                    snapshot["tap_tree_before"],
-                    "Rollback zunder-guard " + self.release.tag,
-                )
+                if not already_restored:
+                    self.tap_commit(
+                        current,
+                        snapshot["tap_tree_before"],
+                        "Rollback zunder-guard " + self.release.tag,
+                    )
         except Exception:
             failures.append("tap")
         try:
@@ -255,10 +278,32 @@ class Channels:
                     build["distribution"]["docker"]["digest"],
                 }:
                     raise AttestationError("OCI latest changed outside this promotion")
-                self.image(snapshot["image_before"])
+                if image_digest("latest") != snapshot["image_before"]:
+                    self.image(snapshot["image_before"])
         except Exception:
             failures.append("image")
         try:
+            observed = public_get(f"https://api.github.com/repos/{REPOSITORY}/releases/latest")
+            latest_id = None if observed is None else json.loads(observed[0]).get("id")
+            allowed = {
+                None if snapshot["github_before"] is None else snapshot["github_before"]["id"],
+                snapshot["candidate_release_id"],
+            }
+            if latest_id not in allowed:
+                raise AttestationError("GitHub latest changed outside this promotion")
+            candidate = self.github("GET", f"releases/{snapshot['candidate_release_id']}")
+            if (
+                candidate.get("id") != snapshot["candidate_release_id"]
+                or candidate.get("tag_name") != self.release.tag
+            ):
+                raise AttestationError("captured GitHub release identity changed")
+            if snapshot["github_before"] is not None:
+                old = self.github("GET", f"releases/{snapshot['github_before']['id']}")
+                if (
+                    old.get("id") != snapshot["github_before"]["id"]
+                    or old.get("tag_name") != snapshot["github_before"]["tag_name"]
+                ):
+                    raise AttestationError("prior GitHub release identity changed")
             self.github(
                 "PATCH",
                 f"releases/{snapshot['candidate_release_id']}",

@@ -14,6 +14,8 @@ import resource
 import stat
 import subprocess
 import sys
+
+sys.dont_write_bytecode = True
 import time
 import tomllib
 from decimal import Decimal
@@ -34,7 +36,10 @@ ENV = {'PATH': '/usr/sbin:/usr/bin:/sbin:/bin', 'HOME': '/root', 'LANG': 'C.UTF-
 def load_module(name, file):
     spec = importlib.util.spec_from_file_location(name, file)
     module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    source = spec.loader.get_source(spec.name)
+    if source is None:
+        raise RuntimeError("Verified helper source is missing.")
+    exec(compile(source, str(file), "exec", dont_inherit=True), module.__dict__)
     return module
 
 
@@ -380,6 +385,11 @@ def prepare_receipt(config):
 
 def install_files(config):
     admit_services(config)
+    cache_owner = load_module("guard_bytecode_cleanup", STAGE / "container-supervisor.py")
+    cache_owner.Refused = ops.Refused
+    receipt = ownership_receipt()
+    if receipt is not None:
+        cache_owner.remove_owned_bytecode_cache(receipt)
     mkdir(Path('/usr/local/libexec'), 0o755)
     mkdir(LIB, 0o755)
     for src, dst in [('container-supervisor.py', 'supervisor.py'),
@@ -553,6 +563,7 @@ def main():
     for tool in (SYSTEMCTL, '/usr/bin/docker', '/usr/bin/systemd-creds', '/usr/bin/python3', '/usr/local/bin/cosign'):
         ops.executable(tool)
     sup = load_module('container_supervisor', STAGE / 'container-supervisor.py')
+    sup.Refused = ops.Refused  # One safe source-owned refusal boundary; never replay subprocess output.
     if args.prepare_image:
         prepare_image(args, sup)
         return
@@ -588,10 +599,16 @@ def main():
     if args.prepared_image:
         sup.prepared_image(config, manifest, args.source_commit)
     else:
-        sup.execute([sup.COSIGN, 'verify', image, '--certificate-identity',
-                     'https://github.com/zunderlabs/zunder-guard/.github/workflows/release.yml@refs/tags/' + args.version,
-                     '--certificate-oidc-issuer', 'https://token.actions.githubusercontent.com'])
-        sup.docker('pull', image)
+        try:
+            sup.execute([sup.COSIGN, 'verify', image, '--certificate-identity',
+                         'https://github.com/zunderlabs/zunder-guard/.github/workflows/release.yml@refs/tags/' + args.version,
+                         '--certificate-oidc-issuer', 'https://token.actions.githubusercontent.com'])
+        except ops.Refused:
+            raise ops.Refused('Verified image signature admission failed before wallet input.') from None
+        try:
+            sup.docker('pull', image)
+        except ops.Refused:
+            raise ops.Refused('Verified image pull failed before wallet input.') from None
     sup.image_ready(config)
     fresh = not existing and not pending_record and volume not in volume_names()
     if not fresh and not existing and not pending_record:
@@ -638,6 +655,7 @@ def main():
         verify_volume(config)
     # Use the installed module so its trusted operation helper is the release-installed one.
     sup = load_module('installed_supervisor', LIB / 'supervisor.py')
+    sup.Refused = ops.Refused  # One safe source-owned refusal boundary; never replay subprocess output.
     sup.check_config(config, transient=True)
     public_config = tomllib.loads(ops.run(config, ['check-config'], read_config=True).decode())
     cap = public_config.get('policy', {}).get('max_trading_equity_usd')

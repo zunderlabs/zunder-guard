@@ -17,7 +17,8 @@ import guard_harness.testnet_run as command
 from guard_harness.testnet_cleanup import Cleaned
 from guard_harness.testnet_journey import Journey
 from guard_harness.testnet_ownership import Ownership
-from guard_harness.testnet_process import ProcessError
+from guard_harness.testnet_process import ENTRY_REMAINING, ProcessError
+from guard_harness.testnet_scan import SCAN_TIMEOUT
 
 TAG = "v1.0.0"
 COMMIT = "b" * 40
@@ -120,7 +121,7 @@ def args(tmp_path: Path, key: io.BytesIO) -> dict[str, Any]:
         api_wallet=WALLET,
         work=tmp_path / "run",
         port=18547,
-        deadline=time.monotonic() + 2400,
+        deadline=time.monotonic() + 6000,
         key_stdin=key,
     )
 
@@ -274,8 +275,9 @@ def test_installed_entrypoint_resolves_release_resources(tmp_path: Path) -> None
     assert result.returncode == 0
 
 
-def test_failed_fee_proof_after_flat_cleanup_cannot_publish_success(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("proof_passed", [True, False])
+def test_real_fee_producer_output_must_pass_gate_after_flat_cleanup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, proof_passed: bool
 ) -> None:
     from types import SimpleNamespace
 
@@ -308,15 +310,63 @@ def test_failed_fee_proof_after_flat_cleanup_cannot_publish_success(
 
     def refuse(*args: Any, **kwargs: Any) -> Any:
         assert args[2]["result"] == "passed" and args[2]["guard_stopped"] is True
+        if proof_passed:
+            return {"result": "passed", "actual_fee": "synthetic offline proof"}
         raise ValueError("fee evidence incomplete")
 
     monkeypatch.setattr(command, "run", verify)
     monkeypatch.setattr(command, "Foreground", Owner)
     monkeypatch.setattr(builder, "produce_descriptor", lambda *a, **k: descriptor)
     monkeypatch.setattr(builder, "correlate_fee", refuse)
-    assert command.execute_release(**args(tmp_path, io.BytesIO()), builder_approval=approval) == 1
+    assert command.execute_release(**args(tmp_path, io.BytesIO()), builder_approval=approval) == (
+        0 if proof_passed else 1
+    )
     receipt = json.loads((tmp_path / "run/receipt.json").read_bytes())
-    assert receipt["result"] == "failed" and receipt["cleanup_complete"] is True
+    assert receipt["result"] == ("passed" if proof_passed else "failed")
+    assert receipt["cleanup_complete"] is True
     assert receipt["guard_stopped"] is True
-    assert not (tmp_path / "run/T1.predicate.json").exists()
-    assert not (tmp_path / "run/P8.predicate.json").exists()
+    if proof_passed:
+        from guard_harness.journey_evidence import _check
+
+        # Exercise execute_release's actual producer, not a predicate built from the gate mapping.
+        for row in ("T1", "P8"):
+            produced = json.loads((tmp_path / "run" / f"{row}.predicate.json").read_bytes())
+            _check(produced, row, COMMIT, receipt["manifest_sha256"])
+        produced = json.loads((tmp_path / "run/P8.predicate.json").read_bytes())
+        assert {"signed-release", "protected-entry"} <= set(produced["coverage"])
+    else:
+        assert not (tmp_path / "run/T1.predicate.json").exists()
+        assert not (tmp_path / "run/P8.predicate.json").exists()
+
+
+@pytest.mark.parametrize("marker", [None, "a" * 32])
+def test_verification_elapsed_budget_refuses_both_owners_before_key_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, marker: str | None
+) -> None:
+    from guard_harness import testnet_service_owner
+
+    key = io.BytesIO(b"FIXTURE-PRIVATE-INPUT")
+    now = [100.0]
+    monkeypatch.setattr(time, "monotonic", lambda: now[0])
+
+    def verify(argv: list[str], **kwargs: Any) -> None:
+        assets(Path(argv[-1]))
+        now[0] += 600
+
+    monkeypatch.setattr(command, "run", verify)
+    monkeypatch.setattr(
+        command,
+        "Foreground",
+        lambda *a, **k: pytest.fail("no custody after verification exhausts budget"),
+    )
+    monkeypatch.setattr(
+        testnet_service_owner,
+        "ServiceOwner",
+        lambda *a, **k: pytest.fail("no service custody after verification exhausts budget"),
+    )
+    values = args(tmp_path, key)
+    values["deadline"] = 100 + SCAN_TIMEOUT + ENTRY_REMAINING + 300
+    values["service_marker"] = marker
+    assert command.execute_release(**values) == 1
+    assert key.tell() == 0
+    assert json.loads((tmp_path / "run/receipt.json").read_bytes())["stage"] == "authenticate"

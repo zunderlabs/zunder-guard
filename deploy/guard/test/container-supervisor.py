@@ -12,6 +12,7 @@ import importlib.util
 import io
 import json
 import os
+import py_compile
 import signal
 from pathlib import Path
 import subprocess
@@ -874,6 +875,53 @@ class UninstallTests(unittest.TestCase):
                 self.foreign_command = False
                 self.guardian_enabled = 'enabled'
                 self.guardian_active = 'active'
+
+    def test_authenticated_legacy_bytecode_removed_unknown_cache_refuses(self):
+        cache = self.lib / '__pycache__'
+        py_compile.compile(str(self.operations), doraise=True)
+        self.assertTrue(cache.exists())
+        original = list(cache.iterdir())[0].read_bytes()
+        path = next(cache.iterdir())
+        path.write_bytes(original[:-1] + bytes([original[-1] ^ 1]))
+        with self.assertRaises(supervisor.Refused):
+            self.uninstall()
+        self.assertTrue(path.exists())
+        self.assertFalse(any(call[1] == 'stop' for call in self.host.calls))
+        path.write_bytes(original)
+        self.uninstall()
+        self.assertFalse(cache.exists() or self.lib.exists())
+
+    def test_isolated_real_imports_without_B_never_create_helper_cache(self):
+        stage = self.root / 'stage'
+        stage.mkdir()
+        for original, name in [('install-container.py', 'install-container.py'),
+                               ('operations.py', 'container-operations.py'),
+                               ('supervisor.py', 'container-supervisor.py')]:
+            (stage / name).write_bytes(SOURCE.with_name(original).read_bytes())
+        script = ("import runpy, pathlib; values=runpy.run_path(" + repr(str(stage / 'install-container.py'))
+                  + "); module=values['load_module']('cache_fixture', " + repr(str(self.helper))
+                  + "); module.HELPER=pathlib.Path(" + repr(str(self.helper))
+                  + "); module.trusted=lambda *a,**k:None; module.operations()")
+        result = subprocess.run([sys.executable, '-I', '-c', script], capture_output=True, check=False)
+        self.assertEqual(result.returncode, 0, result.stderr.decode())
+        self.assertFalse((self.lib / '__pycache__').exists())
+        self.assertFalse((stage / '__pycache__').exists())
+
+    def test_runtime_stop_or_disable_failure_preserves_admitted_guardian(self):
+        original = self.execute
+        for command in ('stop', 'disable'):
+            with self.subTest(command=command):
+                def execute(argv, *, data=None):
+                    if argv[:3] == [supervisor.SYSTEMCTL, command, supervisor.UNIT]:
+                        raise supervisor.Refused('synthetic runtime control failure')
+                    return original(argv, data=data)
+                with patch.object(supervisor, 'execute', execute):
+                    with self.assertRaises(supervisor.Refused):
+                        self.uninstall()
+                self.assertEqual(self.guardian_enabled, 'enabled')
+                self.assertEqual(self.guardian_active, 'active')
+                self.assertTrue(all(p.exists() for p in self.assets))
+                self.assertNotIn([supervisor.SYSTEMCTL, 'start', supervisor.UNIT], self.host.calls)
 
     def test_installer_lock_blocks_without_reading_or_stopping(self):
         lock = self.lock(self.base / 'installer.lock')

@@ -99,7 +99,15 @@ def test_runtime_requires_verifier_and_both_cleanup_results(
             assert "GH_TOKEN" not in kwargs["env"]
         return RunResult(0, "", kwargs["log"])
 
-    def lifecycle(image: str, account: str, *, work: Path, compose: Path | None = None) -> None:
+    def lifecycle(
+        image: str,
+        account: str,
+        *,
+        work: Path,
+        compose: Path | None = None,
+        version: str | None = None,
+        previous_version: str | None = None,
+    ) -> None:
         calls.append("compose" if compose else "docker")
         assert image == IMAGE and account == "0x" + "1" * 40
         if compose:
@@ -292,4 +300,70 @@ def test_testnet_both_channels_require_authenticated_previous_subjects(
         assert receipt["checks"][-2:] == ["docker-testnet", "compose-testnet"]
         assert receipt["harness_commit"] == COMMIT and receipt["diagnostic"] is False
         assert receipt["release_ready"] is False  # Admission belongs to the independent adapter.
-        assert calls[-2:] == ["docker-testnet", "compose-testnet"]
+        assert [call for call in calls if call.endswith("-testnet")] == [
+            "docker-testnet",
+            "compose-testnet",
+        ]
+
+
+@pytest.mark.parametrize("scenario", ["fresh", "upgrade"])
+@pytest.mark.parametrize("channel", ["docker", "compose"])
+def test_explicit_matrix_routes_are_independent_and_only_executed_modes_are_claimed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, scenario: str, channel: str
+) -> None:
+    tmp_path.chmod(0o700)
+    monkeypatch.setenv("GITHUB_SHA", COMMIT)
+    monkeypatch.setenv("GUARD_C6_SERIALIZED", "1")
+    old_tag, old_commit = "v0.9.0", "c" * 40
+    old_image = IMAGE.replace("a" * 64, "d" * 64)
+    observed: list[tuple[str, dict[str, Any]]] = []
+    admitted: list[str] = []
+
+    def runner(argv: list[str], **kwargs: Any) -> RunResult:
+        if argv[0] == "bash":
+            admitted.append(argv[2])
+            fixture_assets(
+                Path(argv[3]),
+                tag=argv[2],
+                commit=COMMIT if argv[2] == TAG else old_commit,
+                image=IMAGE if argv[2] == TAG else old_image,
+            )
+        else:
+            assert admitted == [TAG, old_tag]
+        return RunResult(0, "", kwargs["log"])
+
+    def paper(image: str, account: str, **kwargs: Any) -> None:
+        assert image == IMAGE and admitted == [TAG, old_tag]
+        assert kwargs["work"] == tmp_path / "run/paper" / scenario / channel
+        assert bool(kwargs["compose"]) == (channel == "compose")
+        assert kwargs.get("previous_image") == (old_image if scenario == "upgrade" else None)
+        assert kwargs["version"] == TAG[1:]
+        observed.append(("paper", kwargs))
+
+    def testnet(image: str, account: str, **kwargs: Any) -> None:
+        assert image == IMAGE and kwargs["scenario"] == scenario
+        assert kwargs["work"] == tmp_path / "run/testnet" / scenario / channel
+        assert bool(kwargs["compose"]) == (channel == "compose")
+        assert kwargs["previous_image"] == old_image
+        observed.append(("testnet", kwargs))
+
+    monkeypatch.setattr(docker_run, "run", runner)
+    monkeypatch.setattr(docker_run, "lifecycle", paper)
+    monkeypatch.setattr(docker_run, "testnet_lifecycle", testnet)
+    docker_run.execute(
+        tag=TAG,
+        commit=COMMIT,
+        account="0x" + "1" * 40,
+        work=tmp_path / "run",
+        previous_tag=old_tag,
+        previous_commit=old_commit,
+        scenario=scenario,
+        channel=channel,
+        testnet_key=b"b" * 64 + b"\n",
+        api_wallet="0x" + "2" * 40,
+        testnet_account="0x" + "3" * 40,
+    )
+    receipt = json.loads((tmp_path / "run/receipt.json").read_bytes())
+    assert receipt["checks"] == ["signed-release", channel + "-paper", channel + "-testnet"]
+    assert receipt["scenario"] == scenario and receipt["channel"] == channel
+    assert [mode for mode, _ in observed] == ["paper", "testnet"]

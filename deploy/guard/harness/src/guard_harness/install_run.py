@@ -37,6 +37,7 @@ def main() -> None:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--account", required=True)
     parser.add_argument("--paper-account", required=True)
+    parser.add_argument("--scenario", choices=("fresh", "upgrade", "both"), default="both")
     args = parser.parse_args()
     profile = os.environ.get("INSTALL_MATRIX_PROFILE", "all")
     if profile not in {"all", "nightly"}:
@@ -50,7 +51,10 @@ def main() -> None:
         raise ProcessError("non-diagnostic authenticated harness identity required")
     if os.environ.get("GUARD_C6_SERIALIZED") != "1":
         raise ProcessError("serialized Testnet runtime required")
-    key = os.environ.pop("WALLET_FRAME", "").strip().encode() + b"\n"
+    framed = os.environ.pop("WALLET_FRAME", "").strip()
+    key = framed.removeprefix("0x").encode() + b"\n"
+    if args.row == "I2" and args.scenario == "both":
+        raise ProcessError("I2 needs independently fresh runners for each explicit scenario")
     if re.fullmatch(rb"[0-9a-fA-F]{64}\n", key) is None:
         raise ProcessError("private framed Testnet key required")
     if not args.output.is_absolute() or args.output.exists():
@@ -68,7 +72,32 @@ def main() -> None:
     old_installer = previous.assets / "install.sh"
     previous.asset("install.sh")
     rules = json.loads((ROOT / "rules/vectors.json").read_bytes())["valid"][0]["canonical"]
-    common = ["--version", current.tag, "--previous-version", previous.tag, "--rules", rules]
+    common = [
+        "--version",
+        current.tag,
+        "--previous-version",
+        previous.tag,
+        "--rules",
+        rules,
+        "--scenario",
+        args.scenario,
+    ]
+    target = "linux-arm64" if args.row == "I2" else "linux-amd64"
+    archive_name = f"zunder-guard-{current.tag}-{target}.tar.gz"
+    archive_digest = hashlib.sha256(current.asset(archive_name)).hexdigest()
+    candidate_binary_digest = hashlib.sha256(current.binary(target)).hexdigest()
+    paper_identity = [
+        "--release-commit",
+        current.commit,
+        "--manifest-sha256",
+        hashlib.sha256(current.asset("release-manifest.json")).hexdigest(),
+        "--binary-sha256",
+        candidate_binary_digest,
+        "--loader-channel",
+        identity["loader_channel"],
+        "--archive-sha256",
+        archive_digest,
+    ]
     env = {
         name: os.environ[name]
         for name in ("PATH", "HOME", "GUARD_C6_SERIALIZED")
@@ -98,7 +127,14 @@ def main() -> None:
                 "--account-network",
                 "testnet",
                 "--output",
-                str(args.output / "paper"),
+                str(
+                    args.output / "paper"
+                    if args.scenario == "both"
+                    else args.output / "paper" / args.scenario
+                ),
+                *paper_identity,
+                "--candidate-archive",
+                str(current.assets / archive_name),
             ],
             check=True,
             env=env,
@@ -113,7 +149,11 @@ def main() -> None:
             "--account-network",
             "testnet",
             "--output",
-            str(args.output / "testnet"),
+            str(
+                args.output / "testnet"
+                if args.scenario == "both"
+                else args.output / "testnet" / args.scenario
+            ),
             "--testnet-lifecycle",
         ]
         if mode == "container":
@@ -159,7 +199,10 @@ def main() -> None:
                 "--account-network",
                 "testnet",
                 "--output",
-                str(args.output / "paper"),
+                str(args.output / "paper" / args.scenario),
+                *paper_identity,
+                "--archive",
+                str(current.assets / archive_name),
             ],
             check=True,
             env=env,
@@ -174,8 +217,24 @@ def main() -> None:
             "--account",
             args.account,
             "--output",
-            str(args.output / "testnet"),
+            str(args.output / "testnet" / args.scenario),
         ]
+    if args.row in {"I1", "I2"} and args.scenario in {"fresh", "both"}:
+        (args.output / "channels").mkdir()
+        for channel in ("D1", "D5"):
+            source = args.output / "paper/fresh/channels" / (channel + ".json")
+            if source.is_symlink() or not source.is_file() or source.stat().st_size > 65536:
+                raise ProcessError("actual fresh channel receipt required")
+            body = source.read_bytes()
+            receipt = json.loads(body)
+            if (
+                receipt.get("channel") != channel
+                or receipt.get("result") != "passed"
+                or receipt.get("tag") != current.tag
+                or receipt.get("commit") != current.commit
+            ):
+                raise ProcessError("actual fresh channel identity differs")
+            (args.output / "channels" / (channel + ".json")).write_bytes(body)
     testnet.extend(
         [
             "--binary-sha256",

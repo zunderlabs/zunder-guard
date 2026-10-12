@@ -16,7 +16,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from guard_harness.cli import GuardCLI
+from guard_harness.cli import PAIR_SCHEMA, GuardCLI, Pair, decode_json
 from guard_harness.paper_bot import LocalGuard, PaperError
 from guard_harness.paper_roundtrip import round_trip
 from guard_harness.runner import run
@@ -94,8 +94,24 @@ class Inputs:
     output: Path
     marker: str
     account_network: str = "mainnet"
+    scenario: str = "upgrade"
+    release_commit: str = ""
+    manifest_sha256: str = ""
+    binary_sha256: str = ""
+    loader_channel: str = "staging"
+    archive: Path | None = None
+    archive_sha256: str = ""
+
+    @property
+    def initial(self) -> tuple[Path, str, str]:
+        return (
+            (self.installer, self.installer_sha256, self.version)
+            if self.scenario == "fresh"
+            else (self.previous_installer, self.previous_installer_sha256, self.previous_version)
+        )
 
     def validate(self) -> None:
+        require(self.scenario in {"fresh", "upgrade"}, "explicit lifecycle scenario required")
         require(os.geteuid() == 0 and Path("/run/systemd/system").is_dir(), "root systemd required")
         require(
             MARKER.is_file() and MARKER.read_text().strip() == self.marker,
@@ -140,6 +156,11 @@ class NativeLifecycle:
         return self.command(name, ["systemctl", *args, UNIT])
 
     def install(self, name: str, installer: Path, *, files_only: bool = False) -> None:
+        if self.inputs.scenario == "fresh" and not files_only:
+            from guard_harness.linux_channels import curl_install
+
+            curl_install(self.inputs)
+            return
         args = ["sh", str(installer), "--non-interactive"]
         if files_only:
             args.append("--install-only")
@@ -162,6 +183,8 @@ class NativeLifecycle:
     def version(self, expected: str) -> None:
         got = self.command("version-" + expected, [str(BINARY), "--version"])
         require(got == "zunder-guard " + expected.removeprefix("v"), "installed version differs")
+        if expected == self.inputs.version and self.inputs.binary_sha256:
+            authenticated_file(BINARY, self.inputs.binary_sha256)
 
     def healthy(self) -> None:
         wait_healthy(self.guard)
@@ -172,16 +195,38 @@ class NativeLifecycle:
         )
         require(status["account"].lower() == self.inputs.account.lower(), "service account differs")
 
+    def private_pair(self) -> Path:
+        return Path("/root") / (".guard-paper-pair-" + self.inputs.marker + ".json")
+
+    def keep_pair(self, pair: Pair) -> None:
+        with self.private_pair().open("x") as stream:
+            self.private_pair().chmod(0o600)
+            json.dump(dict(client_address=pair.address, client_key=pair.key), stream)
+
+    def restored_pair(self) -> Pair:
+        path = self.private_pair()
+        require(
+            path.is_file()
+            and not path.is_symlink()
+            and path.stat().st_uid == 0
+            and path.stat().st_mode & 0o077 == 0,
+            "private paper pairing is not owned",
+        )
+        value = decode_json(path.read_text(), PAIR_SCHEMA)
+        return Pair(value["client_address"], value["client_key"])
+
     def before_reboot(self) -> None:
         require(
             not HOME.exists() and not BINARY.exists(),
             "lifecycle requires a fresh disposable machine",
         )
-        self.install("previous-install", self.inputs.previous_installer)
-        self.version(self.inputs.previous_version)
+        installer, _, version = self.inputs.initial
+        self.install(self.inputs.scenario + "-install", installer)
+        self.version(version)
         self.healthy()
         self.systemctl("stop-pair", "stop")
         pair = self.cli.pair()
+        self.keep_pair(pair)
         self.command("pair-owner", ["chown", "-R", "zunder-guard:zunder-guard", str(HOME)])
         self.systemctl("start-pair", "start")
         self.healthy()
@@ -204,6 +249,11 @@ class NativeLifecycle:
         self.recover(seqs)
         self.systemctl("enabled", "is-enabled")
         record = {
+            "scenario": self.inputs.scenario,
+            "initial_release": {
+                "version": self.inputs.initial[2],
+                "installer_sha256": self.inputs.initial[1],
+            },
             "stage": "awaiting-reboot",
             "boot_id": Path("/proc/sys/kernel/random/boot_id").read_text().strip(),
             "decision_seqs": seqs,
@@ -226,7 +276,10 @@ class NativeLifecycle:
 
     def after_reboot(self, *, require_reboot: bool = True) -> None:
         record = json.loads((self.inputs.output / "linux-lifecycle.json").read_text())
-        require(record["stage"] == "awaiting-reboot", "reboot phase receipt missing")
+        require(
+            record["stage"] == "awaiting-reboot" and record.get("scenario") == self.inputs.scenario,
+            "reboot scenario receipt missing",
+        )
         require(
             record["installer_sha256"] == self.inputs.installer_sha256
             and record["previous_installer_sha256"] == self.inputs.previous_installer_sha256,
@@ -235,16 +288,23 @@ class NativeLifecycle:
         boot = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
         if require_reboot:
             require(boot != record["boot_id"], "kernel reboot not observed")
+        self.version(self.inputs.initial[2])
         self.healthy()
         self.recover(record["decision_seqs"])
         self.systemctl("stop-upgrade", "stop")
         before = snapshot(HOME)
-        for step in ("upgrade", "reinstall"):
+        pair = self.restored_pair()
+        for step in (
+            ("upgrade", "reinstall") if self.inputs.scenario == "upgrade" else ("reinstall",)
+        ):
             self.install(step, self.inputs.installer, files_only=True)
             self.version(self.inputs.version)
             preserved(before, snapshot(HOME))
             self.systemctl(step + "-start", "start")
             self.healthy()
+            self.recover(record["decision_seqs"])
+            new_seqs = [decision.seq for decision in round_trip(self.guard, pair)]
+            record["decision_seqs"].extend(new_seqs)
             self.recover(record["decision_seqs"])
             self.systemctl(step + "-stop", "stop")
             before = snapshot(HOME)
@@ -266,6 +326,12 @@ class NativeLifecycle:
                 not (Path("/usr/local/share/licenses/zunder-guard") / notice).exists(),
                 "uninstall left notice",
             )
+        self.private_pair().unlink()
+        if self.inputs.scenario == "fresh":
+            from guard_harness.linux_channels import curl_receipt, manual, website_install
+
+            curl_receipt(self.inputs, website_install(self))
+            manual(self.inputs)
         record.update(
             stage="passed",
             schema=1,
@@ -286,17 +352,22 @@ class NativeLifecycle:
                 "restart",
                 "crash-recovery",
                 "journal-history",
-                "upgrade",
                 "reinstall",
                 "state-retained",
                 "pairing-retained",
                 "uninstall",
                 "cleanup",
             ]
+            + (
+                ["upgrade", "paper-post-upgrade-allow-resize-veto"]
+                if self.inputs.scenario == "upgrade"
+                else ["fresh-candidate-paper"]
+            )
             + (["kernel-reboot"] if require_reboot else []),
             reboot_boot_id=boot,
             preserved_state=before,
             version=self.inputs.version,
+            binary_sha256=self.inputs.binary_sha256,
             previous_version=self.inputs.previous_version,
         )
         self.write(record)
@@ -322,6 +393,11 @@ def main() -> None:
     parser.add_argument("--mode", choices=("native", "container"), default="native")
     parser.add_argument("--account-network", choices=("mainnet", "testnet"), default="mainnet")
     parser.add_argument("--source-container-diagnostic", action="store_true")
+    parser.add_argument("--scenario", choices=("fresh", "upgrade"), default="upgrade")
+    for name in ("release-commit", "manifest-sha256", "binary-sha256", "archive-sha256"):
+        parser.add_argument("--" + name, default="")
+    parser.add_argument("--loader-channel", choices=("staging", "canonical"), default="staging")
+    parser.add_argument("--archive", type=Path)
     args = vars(parser.parse_args())
     phase = args.pop("phase")
     mode = args.pop("mode")

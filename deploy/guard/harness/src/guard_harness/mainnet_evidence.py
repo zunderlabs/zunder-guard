@@ -40,6 +40,8 @@ M2_ROUTES = {
     "windows-per-user": "windows-per-user",
 }
 M2_LITERALS = {
+    "key-file-option": "cannot be used with",
+    "environment-key": "cannot be used with",
     "missing-consent": "mainnet needs --confirm-mainnet",
     "wrong-account-consent": "the confirmation does not name the account",
     "missing-credential-store": (
@@ -51,8 +53,6 @@ M2_LITERALS = {
         case: "a mainnet key comes only on standard input (--key-stdin)"
         for case in (
             "plain-key-file",
-            "key-file-option",
-            "environment-key",
             "plain-docker",
             "compose",
         )

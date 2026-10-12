@@ -17,11 +17,14 @@ for (const scenario of ['under', 'over', 'late', 'blocked']) {
     const domain = process.env['GUARD_EMAIL_DOMAIN'] ?? '';
     const root = process.env['GUARD_PURCHASE_WORK'] ?? '';
     expect(Boolean(origin && domain && root), 'complete P5 inputs').toBe(true);
+    const pinnedPayTo = process.env['GUARD_PAY_TO_HYPERLIQUID'] ?? '';
+    expect(/^0x[0-9a-fA-F]{40}$/.test(pinnedPayTo), 'independently pinned staging merchant').toBe(true);
     const statusResponse = await get(request, '/api/licence/status', {}, 'edge staging admission');
     const status = await safe(() => statusResponse.json(), 'edge staging JSON');
     expect(statusResponse.status() === 200 && status.ok === true && status.open === true
       && status.chain === 'testnet' && status.profile === 'staging' && status.priceDivisor === 1000
-      && status.emailDomain === domain, 'C4 admission before quote').toBe(true);
+      && status.emailDomain === domain && typeof status.payTo?.hyperliquid === 'string'
+      && status.payTo.hyperliquid.toLowerCase() === pinnedPayTo.toLowerCase(), 'C4 admission before quote').toBe(true);
     const since = Date.now();
     const email = `edge-${randomUUID()}@${domain}`;
     const quote = await post(request, '/api/licence/quote', { headers: { Origin: origin }, data: {
@@ -47,7 +50,7 @@ for (const scenario of ['under', 'over', 'late', 'blocked']) {
     await mkdir(work, { mode: 0o700 });
     await command('guard_harness.purchase_payment', ['--order', order.number, '--amount', edgeAmount(order.usdc, scenario),
       '--scenario', scenario, '--work', work], { PATH: process.env['PATH'], HOME: root,
-      GUARD_STAGING_URL: origin, GUARD_ORDER_TOKEN: process.env['GUARD_ORDER_TOKEN'],
+      GUARD_STAGING_URL: origin, GUARD_PAY_TO_HYPERLIQUID: pinnedPayTo, GUARD_ORDER_TOKEN: process.env['GUARD_ORDER_TOKEN'],
       GUARD_ACCESS_CLIENT_ID: process.env['GUARD_ACCESS_CLIENT_ID'], GUARD_ACCESS_CLIENT_SECRET: process.env['GUARD_ACCESS_CLIENT_SECRET'],
       ...(scenario === 'blocked' ? { E2E_PAYER_BLOCKED_KEY: process.env['E2E_PAYER_BLOCKED_KEY'] }
         : { E2E_PAYER_HYPERLIQUID_TESTNET_KEY: process.env['E2E_PAYER_HYPERLIQUID_TESTNET_KEY'] }),

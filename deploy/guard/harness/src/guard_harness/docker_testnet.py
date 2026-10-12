@@ -26,7 +26,7 @@ from guard_harness.paper_bot import LocalGuard, PaperError
 from guard_harness.runner import RunResult, run
 from guard_harness.staged_subjects import _private
 from guard_harness.testnet_run import ROOT
-from guard_harness.testnet_scan import Read, TestnetReads, flat_scan
+from guard_harness.testnet_scan import SCAN_TIMEOUT, Read, TestnetReads, flat_scan
 
 IMAGE = r"ghcr\.io/zunderlabs/zunder-guard@sha256:[0-9a-f]{64}"
 MAX_ARCHIVE = 32 * 1024 * 1024
@@ -151,6 +151,7 @@ def archive_state(
                 not member.name.startswith("/") and ".." not in parts,
                 "Testnet state archive path differs",
             )
+            require("emergency" not in parts, "Testnet emergency evidence needs human review")
             if member.isdir():
                 continue
             if len(parts) == 2 and parts[0] == "data":
@@ -195,6 +196,11 @@ def archive_state(
         files[name] = files[name].rstrip(b"\x00")
     # Check the complete persisted journal, not the endpoint's bounded recent window.
     previous_check = ""
+    sequence = startups = 0
+    require(
+        (initial and not files["decisions.jsonl"]) or files["decisions.jsonl"].endswith(b"\n"),
+        "Testnet decision journal incomplete",
+    )
     for line in files["decisions.jsonl"].splitlines():
         text = line.decode()
         record = json.loads(text)
@@ -213,9 +219,25 @@ def archive_state(
             "Testnet decision journal event differs",
         )
         require(
-            event["kind"] not in {"decision", "intent", "sent", "recovered", "protect", "flatten"},
-            "unexpected Testnet exchange intent/event",
+            event["kind"] in {"started", "risk", "stopped"},
+            "action-bearing or unknown Testnet journal event",
         )
+        require(
+            type(event.get("seq")) is int and event["seq"] == sequence + 1,
+            "Testnet journal sequence incomplete",
+        )
+        sequence = event["seq"]
+        if event["kind"] == "started":
+            require(event.get("mode") == "testnet", "Testnet startup mode differs")
+            startups += 1
+        elif event["kind"] == "risk":
+            require(
+                event.get("open_positions") == 0
+                and event.get("discrepancies") == 0
+                and event.get("journal_error") is None,
+                "Testnet risk state unhealthy",
+            )
+    require(initial or startups > 0, "Testnet startup positive control missing")
     return files
 
 
@@ -262,7 +284,12 @@ def lifecycle(
     compose: Path | None = None,
     previous_compose: Path | None = None,
     read: Read | None = None,
+    scenario: str = "upgrade",
 ) -> None:
+    require(scenario in {"fresh", "upgrade"}, "explicit Docker scenario required")
+    initial_image = image if scenario == "fresh" else previous_image
+    initial_version = version if scenario == "fresh" else previous_version
+    initial_compose = compose if scenario == "fresh" else previous_compose
     require(os.environ.get("GUARD_C6_SERIALIZED") == "1", "shared C6 serialization required")
     require(
         bool(re.fullmatch(IMAGE, image))
@@ -287,9 +314,15 @@ def lifecycle(
     require(not work.exists() and not work.is_symlink(), "fresh Testnet workspace required")
     work.mkdir(mode=0o700)
     reads = read or TestnetReads()
+
+    def scan() -> dict[str, object]:
+        if isinstance(reads, TestnetReads):
+            reads.start_phase(timeout=SCAN_TIMEOUT)
+        return flat_scan(reads, account)
+
     started_ms = int(time.time() * 1000)
     # No volume, credential, container or signing process before this complete scan.
-    preflight = flat_scan(reads, account)
+    preflight = scan()
     name = "guard-testnet-" + uuid.uuid4().hex
     volume = name + "-data"
     with socket.socket() as reservation:
@@ -322,12 +355,12 @@ def lifecycle(
                 and stat.S_IMODE(info.st_mode) == 0o600,
                 "documented Compose secret ownership/mode differs",
             )
-        if previous_compose is not None:
+        if initial_compose is not None:
             assert credential is not None
             docker = TestnetCompose(
                 work,
-                previous_compose,
-                previous_image,
+                initial_compose,
+                initial_image,
                 name,
                 volume,
                 port,
@@ -367,15 +400,15 @@ def lifecycle(
         ]
         if compose is not None:
             init.extend(["--no-key", "--service-key-check"])
-        docker.command("run", "--rm", "-i", *mounted, previous_image, *init, stdin=key)
+        docker.command("run", "--rm", "-i", *mounted, initial_image, *init, stdin=key)
         pair = decode_json(
-            docker.command("run", "--rm", *mounted, previous_image, "pair", "--json").output,
+            docker.command("run", "--rm", *mounted, initial_image, "pair", "--json").output,
             PAIR_SCHEMA,
         )
         scope["client"] = pair["client_address"]
         docker.secrets += (pair["client_key"],)
         docker.command(
-            "create", "--name", name, *mounted, previous_image, "run", "--network", "testnet"
+            "create", "--name", name, *mounted, initial_image, "run", "--network", "testnet"
         )
         previous: dict[str, bytes] = snapshot(docker, name, initial=True, **scope)
         docker.command("rm", name)
@@ -385,12 +418,13 @@ def lifecycle(
             )
         guard = LocalGuard(f"http://127.0.0.1:{port}")
         last_start = 0
-        for stage, released_image, released_version, subject in (
-            ("previous", previous_image, previous_version, previous_compose),
-            ("upgrade", image, version, compose),
-            ("reinstall", image, version, compose),
-        ):
-            if stage != "previous":
+        initial_stage = "fresh" if scenario == "fresh" else "previous"
+        stages = [(initial_stage, initial_image, initial_version, initial_compose)]
+        if scenario == "upgrade":
+            stages.append(("upgrade", image, version, compose))
+        stages.append(("reinstall", image, version, compose))
+        for stage, released_image, released_version, subject in stages:
+            if stage != initial_stage:
                 docker.remove(name)
                 directory = work / stage
                 directory.mkdir(mode=0o700)
@@ -408,9 +442,7 @@ def lifecycle(
                         credential,
                     )
                 docker.secrets = (key.decode().strip(), pair["client_key"])
-            if isinstance(reads, TestnetReads):
-                reads.start_phase(timeout=720)
-            flat_scan(reads, account)
+            scan()
             active = True  # A failed request can still have started the signing process.
             docker.command(
                 "run",
@@ -447,8 +479,9 @@ def lifecycle(
                 "Testnet container image differs",
             )
             last_start = ready(guard, account=account, version=released_version, after=last_start)
-            if stage == "previous":
-                flat_scan(reads, account)
+            if stage == initial_stage:
+                # Same admitted RUN; complete durable audit is not venue-flat credit.
+                snapshot(docker, name, **scope)
                 docker.command("restart", name)
                 last_start = ready(
                     guard, account=account, version=released_version, after=last_start
@@ -494,7 +527,7 @@ def lifecycle(
                     > before,
                     "Testnet crash restart unconfirmed",
                 )
-            flat_scan(reads, account)
+            scan()
             no_exchange(reads, account, started_ms)
             docker.command("stop", name)
             active = False
@@ -505,11 +538,9 @@ def lifecycle(
     except BaseException as error:
         failures.append(error)
     finally:
-        if isinstance(reads, TestnetReads):
-            reads.start_phase(timeout=720)
         if active:
             try:
-                flat_scan(reads, account)
+                scan()
                 docker.command("stop", name)
                 active = False
             except BaseException as error:
@@ -557,7 +588,7 @@ def lifecycle(
                         ).output.strip(),
                         "owned Testnet Compose network remains",
                     )
-                postflight = flat_scan(reads, account)
+                postflight = scan()
                 no_exchange(reads, account, started_ms)
             except BaseException as error:
                 failures.append(error)
@@ -576,9 +607,12 @@ def lifecycle(
                 schema=1,
                 result="passed",
                 mode="testnet",
+                scenario=scenario,
+                initial_image=initial_image,
+                initial_version=initial_version,
                 channel="docker" if compose is None else "compose",
                 image=image,
-                previous_image=previous_image,
+                previous_image=previous_image if scenario == "upgrade" else None,
                 custody="documented-volume" if compose is None else "compose-secret",
                 cleanup_complete=True,
                 state_preserved=True,
@@ -597,7 +631,7 @@ def lifecycle(
                     "restart",
                     "crash-recovery",
                     "journal-history",
-                    "upgrade",
+                    *(["upgrade"] if scenario == "upgrade" else ["fresh-candidate-testnet"]),
                     "reinstall",
                     "pairing-retained",
                     "uninstall",

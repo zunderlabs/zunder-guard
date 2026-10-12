@@ -33,12 +33,13 @@ function requireHttps(value: string, label: string): void {
 }
 export default defineConfig({
   testDir: './purchase',
+  forbidOnly: true,
   timeout: 30_000,
   retries: 0,
   workers: 1,
   // HTML/JSON reporters serialize failed API step errors even after callers catch them.
   // Keep only sanitized terminal output, which CI retains on failure.
-  reporter: [['list']],
+  reporter: [['list'], ['./proof-reporter.ts']],
   use: { baseURL: remote ?? 'http://127.0.0.1:4173', extraHTTPHeaders: headers,
     // API traces persist bearer and Access headers. Keep credential-bearing traces off.
     trace: 'off', serviceWorkers: 'block', launchOptions: { env: { PATH: process.env['PATH'] ?? '', HOME: process.env['HOME'] ?? '' } } },

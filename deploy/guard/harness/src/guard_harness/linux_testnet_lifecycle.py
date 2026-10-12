@@ -12,17 +12,25 @@ import os
 import platform
 import pwd
 import re
+import subprocess
 import sys
 import time
-from pathlib import Path
+import tomllib
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 from guard_harness.cli import PAIR_SCHEMA, decode_json
-from guard_harness.linux_lifecycle import ROOT_PATH, Inputs, authenticated_file, require
+from guard_harness.linux_lifecycle import (
+    ROOT_PATH,
+    Inputs,
+    LifecycleError,
+    authenticated_file,
+    require,
+)
 from guard_harness.linux_testnet_service import TestnetService
 from guard_harness.paper_bot import LocalGuard, PaperError
 from guard_harness.runner import run
-from guard_harness.testnet_scan import TestnetReads, flat_scan
+from guard_harness.testnet_scan import SCAN_TIMEOUT, TestnetReads, flat_scan
 
 JOURNALS = ("guard.toml", "risk.jsonl", "decisions.jsonl")
 PRIVATE = Path("/root/.guard-testnet-lifecycle")
@@ -160,12 +168,208 @@ class TestnetLifecycle:
         ).output.strip()
 
     def flat(self) -> None:
-        self.read.start_phase(timeout=720)
+        self.read.start_phase(timeout=SCAN_TIMEOUT)
         flat_scan(self.read, self.inputs.account)
 
     def control(self, name: str, action: str) -> None:
-        self.flat()
+        self.audit()
         self.command(name, ["systemctl", action, self.unit])
+
+    def audit(self) -> None:
+        """Same-scenario controls use durable no-exchange evidence, never venue-flat credit."""
+        no_exchange(self.home)
+        config = tomllib.loads((self.home / "guard.toml").read_text())
+        require(
+            config.get("mode") == config.get("network") == "testnet"
+            and config.get("account", "").lower() == self.inputs.account.lower()
+            and config.get("allow_mainnet", False) is False,
+            "owned Testnet runtime config differs",
+        )
+        expected = getattr(self, "admitted_release", None)
+        require(expected is not None, "runtime identity has not been admitted")
+        assert expected is not None
+        version, digest, image = expected
+        if self.route == "native":
+            authenticated_file(self.binary, digest)
+        else:
+            installed = json.loads(Path("/etc/zunder-guard-container/config.json").read_bytes())
+            require(installed.get("image") == image, "owned Testnet image differs")
+        require(
+            self.command(
+                "audit-version",
+                self.docker(["--version"])
+                if self.route == "container"
+                else [str(self.binary), "--version"],
+            )
+            == "zunder-guard " + version.removeprefix("v"),
+            "owned Testnet executable version differs",
+        )
+
+    def container_software(self) -> dict[str, str]:
+        """Capture the actual managed receipt and complete owned software trees before removal."""
+        receipt = json.loads(Path("/etc/zunder-guard-container/managed-install.json").read_bytes())
+        allowed = receipt.get("allowed_files")
+        require(isinstance(allowed, dict) and len(allowed) == 5, "managed software receipt differs")
+        assert isinstance(allowed, dict)
+        inventory: dict[str, str] = {}
+        units = {self.unit, "zunder-guard-setup-guardian.service"}
+        for filename in allowed:
+            require(isinstance(filename, str), "managed software path malformed")
+            path = Path(filename)
+            declared = PurePosixPath(filename)
+            require(
+                str(declared.parent) == "/usr/local/libexec/zunder-guard-container"
+                or (str(declared.parent) == "/etc/systemd/system" and declared.name in units),
+                "managed software scope differs",
+            )
+            require(path.is_file() and not path.is_symlink(), "managed software missing or linked")
+            inventory[filename] = hashlib.sha256(path.read_bytes()).hexdigest()
+        for unit in units:
+            fragment = self.command(
+                "owned-fragment", ["systemctl", "show", "--property=FragmentPath", "--value", unit]
+            )
+            require(fragment in inventory, "loaded service fragment is not owned")
+        for root in (
+            Path("/usr/local/libexec/zunder-guard-container"),
+            *(Path("/etc/systemd/system") / (unit + ".d") for unit in units),
+        ):
+            if not root.exists():
+                continue
+            require(root.is_dir() and not root.is_symlink(), "owned software tree differs")
+            inventory[str(root)] = "directory"
+            for path in root.rglob("*"):
+                require(
+                    not path.is_symlink() and (path.is_file() or path.is_dir()),
+                    "owned software tree contains unsafe entry",
+                )
+                inventory[str(path)] = (
+                    "directory" if path.is_dir() else hashlib.sha256(path.read_bytes()).hexdigest()
+                )
+        return inventory
+
+    def refuse_pending_uninstall(self, words: list[str]) -> None:
+        try:
+            result = subprocess.run(
+                words,
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                timeout=120,
+                check=False,
+                env={"PATH": ROOT_PATH, "HOME": "/root"},
+            )
+        except (OSError, subprocess.SubprocessError):
+            raise LifecycleError(
+                "pending transaction uninstall outcome unknown; diagnostics withheld"
+            ) from None
+        output = result.stdout + result.stderr
+        (self.inputs.output / "uninstall-refusal.log").write_text(
+            "Sensitive uninstall diagnostics withheld.\n"
+        )
+        require(
+            result.returncode > 0
+            and len(output) <= 65536
+            and b"Resolve installer transaction before uninstall." in output,
+            "released uninstall did not prove the expected transaction refusal",
+        )
+
+    def live_container_uninstall(self, words: list[str]) -> dict[str, str]:
+        self.audit()
+        inventory = self.container_software()
+        pid = self.command(
+            "live-uninstall-pid", ["systemctl", "show", "--property=MainPID", "--value", self.unit]
+        )
+        require(pid.isdigit() and int(pid) > 1, "live supervisor PID missing before uninstall")
+        for unit in (self.unit, "zunder-guard-setup-guardian.service"):
+            require(
+                self.command(
+                    "live-uninstall-state",
+                    ["systemctl", "show", "--property=ActiveState", "--value", unit],
+                )
+                == "active",
+                "owned runtime/guardian not active before uninstall",
+            )
+        identity = self.command(
+            "live-container-id",
+            ["docker", "inspect", "--format", "{{.Id}}", "zunder-guard-container"],
+        )
+        require(
+            re.fullmatch("[0-9a-f]{64}", identity) is not None,
+            "live owned container identity missing",
+        )
+        retained_state = retained(self.home)
+        recovery = {
+            name: Path("/etc/zunder-guard-container", name).read_bytes()
+            for name in ("config.json", "credential.cred", "managed-install.json")
+        }
+        gate = Path("/etc/zunder-guard-container/install-transaction.json")
+        require(
+            not gate.exists() and not gate.is_symlink(),
+            "real installer transaction needs resolution",
+        )
+        marker = b'{"harness_uninstall_refusal":1}\n'
+        with gate.open("xb") as stream:
+            gate.chmod(0o600)
+            stream.write(marker)
+        self.refuse_pending_uninstall(words)
+        require(
+            gate.read_bytes() == marker and not gate.is_symlink(),
+            "refusal transaction marker changed",
+        )
+        require(
+            self.command(
+                "refused-uninstall-pid",
+                ["systemctl", "show", "--property=MainPID", "--value", self.unit],
+            )
+            == pid,
+            "refused uninstall replaced/stopped runtime",
+        )
+        for unit in (self.unit, "zunder-guard-setup-guardian.service"):
+            require(
+                self.command(
+                    "refused-uninstall-state",
+                    ["systemctl", "show", "--property=ActiveState", "--value", unit],
+                )
+                == "active",
+                "refused uninstall changed runtime/guardian protection",
+            )
+        require(
+            self.command(
+                "refused-container-id",
+                ["docker", "inspect", "--format", "{{.Id}}", "zunder-guard-container"],
+            )
+            == identity,
+            "refused uninstall replaced the owned container",
+        )
+        require(self.container_software() == inventory, "refused uninstall changed owned software")
+        preserved(self.home, retained_state)
+        for name, before in recovery.items():
+            require(
+                Path("/etc/zunder-guard-container", name).read_bytes() == before,
+                "refused uninstall changed private recovery state",
+            )
+        self.audit()
+        gate.unlink()  # Only the unchanged marker created above, never an adopted transaction.
+        self.command("uninstall", words)  # Still-running Guard is stopped by the released product.
+        for filename in inventory:
+            path = Path(filename)
+            require(
+                not path.exists() and not path.is_symlink(),
+                "owned software inventory survived uninstall",
+            )
+        for unit in (self.unit, "zunder-guard-setup-guardian.service"):
+            require(
+                self.command(
+                    "removed-unit-state",
+                    ["systemctl", "show", "--property=LoadState", "--value", unit],
+                )
+                == "not-found"
+                and self.command(
+                    "removed-unit-pid", ["systemctl", "show", "--property=MainPID", "--value", unit]
+                )
+                == "0",
+                "owned service/process survived uninstall",
+            )
+        return inventory
 
     def docker(self, words: list[str], *, writing: bool = False) -> list[str]:
         config = json.loads(Path("/etc/zunder-guard-container/config.json").read_bytes())
@@ -248,6 +452,7 @@ class TestnetLifecycle:
             "plaintext credential route refused",
         )
         no_exchange(self.home)
+        self.admitted_release = (version, digest, image)
 
     def install(self, installer: Path, digest: str, key: bytes, *, initial: bool) -> None:
         self.flat()
@@ -265,6 +470,7 @@ class TestnetLifecycle:
                     str(self.binary.parent),
                 ],
             )
+            self.admitted_release = (self.inputs.version, self.binary_sha256, self.image)
             return
         value = TestnetService(
             installer,
@@ -277,6 +483,8 @@ class TestnetLifecycle:
             container=self.route == "container",
         ).setup(key)
         self.home = Path(value["home"])
+        if not initial:
+            self.admitted_release = (self.inputs.version, self.binary_sha256, self.image)
 
     def write(self, value: dict[str, Any]) -> None:
         self.record_path.write_text(json.dumps(value) + "\n")
@@ -308,12 +516,15 @@ class TestnetLifecycle:
                 "container volume already exists; no adoption",
             )
         self.private.mkdir(mode=0o700, parents=True)
-        self.install(
-            self.inputs.previous_installer, self.inputs.previous_installer_sha256, key, initial=True
+        installer, digest, version = self.inputs.initial
+        self.install(installer, digest, key, initial=True)
+        self.healthy(
+            self.inputs.initial[2],
+            self.binary_sha256 if self.inputs.scenario == "fresh" else self.previous_binary_sha256,
+            self.image if self.inputs.scenario == "fresh" else self.previous_image,
         )
-        self.healthy(self.inputs.previous_version, self.previous_binary_sha256, self.previous_image)
         self.control("pair-stop", "stop")
-        self.flat()
+        self.audit()
         words = (
             self.docker(["pair", "--json"], writing=True)
             if self.route == "container"
@@ -334,17 +545,25 @@ class TestnetLifecycle:
         (self.private / "snapshot.json").write_text(json.dumps(snapshot))
         (self.private / "snapshot.json").chmod(0o600)
         self.control("pair-start", "start")
-        self.healthy(self.inputs.previous_version, self.previous_binary_sha256, self.previous_image)
+        self.healthy(
+            self.inputs.initial[2],
+            self.binary_sha256 if self.inputs.scenario == "fresh" else self.previous_binary_sha256,
+            self.image if self.inputs.scenario == "fresh" else self.previous_image,
+        )
         self.control("restart", "restart")
-        self.healthy(self.inputs.previous_version, self.previous_binary_sha256, self.previous_image)
-        self.flat()
+        self.healthy(
+            self.inputs.initial[2],
+            self.binary_sha256 if self.inputs.scenario == "fresh" else self.previous_binary_sha256,
+            self.image if self.inputs.scenario == "fresh" else self.previous_image,
+        )
+        self.audit()
         self.command("daemon-reload", ["systemctl", "daemon-reload"])
         self.control("reload-restart", "restart")
         pid = self.command(
             "old-pid", ["systemctl", "show", "--property=MainPID", "--value", self.unit]
         )
         require(pid.isdigit() and int(pid) > 1, "service PID missing")
-        self.flat()
+        self.audit()
         self.command(
             "crash", ["systemctl", "kill", "--kill-whom=main", "--signal=SIGKILL", self.unit]
         )
@@ -354,12 +573,21 @@ class TestnetLifecycle:
         ) in (pid, "0"):
             require(time.monotonic() < deadline, "service crash recovery deadline")
             time.sleep(1)
-        self.healthy(self.inputs.previous_version, self.previous_binary_sha256, self.previous_image)
+        self.healthy(
+            self.inputs.initial[2],
+            self.binary_sha256 if self.inputs.scenario == "fresh" else self.previous_binary_sha256,
+            self.image if self.inputs.scenario == "fresh" else self.previous_image,
+        )
         preserved(self.home, snapshot)
         self.command("enabled", ["systemctl", "is-enabled", self.unit])
         self.flat()
         self.write(
             {
+                "scenario": self.inputs.scenario,
+                "initial_release": {
+                    "version": self.inputs.initial[2],
+                    "installer_sha256": self.inputs.initial[1],
+                },
                 "stage": "awaiting-reboot",
                 "boot_id": Path("/proc/sys/kernel/random/boot_id").read_text().strip(),
                 "installer_sha256": self.inputs.installer_sha256,
@@ -371,6 +599,7 @@ class TestnetLifecycle:
         record = json.loads(self.record_path.read_bytes())
         require(
             record.get("stage") == "awaiting-reboot"
+            and record.get("scenario") == self.inputs.scenario
             and record.get("installer_sha256") == self.inputs.installer_sha256
             and record.get("previous_installer_sha256") == self.inputs.previous_installer_sha256,
             "lifecycle inputs changed across boot",
@@ -397,7 +626,11 @@ class TestnetLifecycle:
                 "volume ownership path differs",
             )
             self.home = Path(mount)
-        self.healthy(self.inputs.previous_version, self.previous_binary_sha256, self.previous_image)
+        self.healthy(
+            self.inputs.initial[2],
+            self.binary_sha256 if self.inputs.scenario == "fresh" else self.previous_binary_sha256,
+            self.image if self.inputs.scenario == "fresh" else self.previous_image,
+        )
         private_state = self.private / "snapshot.json"
         require(
             not self.private.is_symlink()
@@ -409,7 +642,9 @@ class TestnetLifecycle:
         )
         snapshot = json.loads(private_state.read_bytes())
         preserved(self.home, snapshot)
-        for step in ("upgrade", "reinstall"):
+        for step in (
+            ("upgrade", "reinstall") if self.inputs.scenario == "upgrade" else ("reinstall",)
+        ):
             self.control(step + "-stop", "stop")
             snapshot = retained(self.home)
             self.install(self.inputs.installer, self.inputs.installer_sha256, key, initial=False)
@@ -417,10 +652,12 @@ class TestnetLifecycle:
             self.control(step + "-start", "start")
             self.healthy(self.inputs.version, self.binary_sha256, self.image)
             preserved(self.home, snapshot)
-        self.control("cleanup-stop", "stop")
+        if self.route == "native":
+            self.control("cleanup-stop", "stop")
         no_exchange(self.home)
         self.flat()
-        self.command("cleanup-disable", ["systemctl", "disable", self.unit])
+        if self.route == "native":
+            self.command("cleanup-disable", ["systemctl", "disable", self.unit])
         if self.route == "native":
             self.command(
                 "uninstall",
@@ -440,8 +677,7 @@ class TestnetLifecycle:
                 for name in ("config.json", "credential.cred")
             }
             self.flat()
-            self.command(
-                "uninstall",
+            owned_inventory = self.live_container_uninstall(
                 [
                     "sh",
                     str(self.inputs.installer),
@@ -500,14 +736,7 @@ class TestnetLifecycle:
             credential.unlink()
             require(not (Path("/etc/systemd/system") / self.unit).exists(), "unit survived cleanup")
         else:
-            for owned in (
-                "/etc/systemd/system/zunder-guard-container.service",
-                "/etc/systemd/system/zunder-guard-setup-guardian.service",
-                "/usr/local/libexec/zunder-guard-container/supervisor.py",
-                "/usr/local/libexec/zunder-guard-container/operations.py",
-                "/usr/local/libexec/zunder-guard-container/zunder-guard-container.service",
-                "/etc/systemd/system/zunder-guard-container.service.d/10-install-transaction.conf",
-            ):
+            for owned in owned_inventory:
                 path = Path(owned)
                 require(
                     not path.exists() and not path.is_symlink(),
@@ -527,9 +756,24 @@ class TestnetLifecycle:
             result="passed",
             mode="testnet",
             route=self.route,
+            channel_coverage=[],
+            installer_route=(
+                "sh <authenticated-loader> --container --network testnet"
+                if self.route == "container"
+                else "native-protected-service"
+            ),
             architecture="arm64" if platform.machine() in {"arm64", "aarch64"} else "amd64",
             version=self.inputs.version,
             previous_version=self.inputs.previous_version,
+            binary_sha256=self.binary_sha256,
+            previous_binary_sha256=self.previous_binary_sha256,
+            image=self.image,
+            previous_image=self.previous_image,
+            runtime_identity_evidence=(
+                "native-file-sha256"
+                if self.route == "native"
+                else "signed-immutable-prebuilt-image"
+            ),
             reboot_boot_id=boot,
             reboot_required=reboot_required,
             cleanup_complete=True,
@@ -547,7 +791,6 @@ class TestnetLifecycle:
                 "restart",
                 "daemon-reload",
                 "crash-recovery",
-                "upgrade",
                 "reinstall",
                 "pairing-retained",
                 "journal-history",
@@ -557,8 +800,17 @@ class TestnetLifecycle:
                 "cleanup",
                 "uninstall",
             ]
+            + (["upgrade"] if self.inputs.scenario == "upgrade" else ["fresh-candidate-testnet"])
             + (["kernel-reboot"] if reboot_required else []),
         )
+        if self.route == "container":
+            record["owned_software_inventory"] = owned_inventory
+            record["coverage"].extend(
+                ["uninstall-live-stop", "uninstall-transaction-refusal", "owned-software-inventory"]
+            )
+        if self.inputs.scenario == "fresh":
+            record.pop("previous_binary_sha256", None)
+            record.pop("previous_image", None)
         self.write(record)
 
 
@@ -579,6 +831,7 @@ def main() -> None:
     ):
         parser.add_argument("--" + name, required=True)
     parser.add_argument("--route", choices=("native", "container"), required=True)
+    parser.add_argument("--scenario", choices=("fresh", "upgrade"), default="upgrade")
     parser.add_argument("--image", default="")
     parser.add_argument("--previous-image", default="")
     parser.add_argument(

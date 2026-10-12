@@ -181,7 +181,7 @@ def test_m3_requires_authenticated_vectors_and_both_live_journeys(
                 manifest_sha256=digest,
                 result="passed",
                 tier="e2e",
-                coverage=["live-orders"],
+                coverage=["signed-release", "protected-entry", "owned-cleanup", "all-dex-flat"],
             )
         return VerifiedPredicate(value, kwargs["workflow"], release.commit)
 

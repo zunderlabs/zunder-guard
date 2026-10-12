@@ -1,12 +1,13 @@
 """Cleanup scan failures never return flat evidence or trigger repairs."""
 
+import json
 from decimal import Decimal
 from typing import Any
 from unittest.mock import MagicMock, Mock
 
 import pytest
 
-from guard_harness.testnet_scan import ScanError, flat_scan, inventory
+from guard_harness.testnet_scan import SCAN_TIMEOUT, ScanError, flat_scan, inventory
 from guard_harness.testnet_scan import TestnetReads as VenueReads
 
 ACCOUNT = "0x" + "12" * 20
@@ -198,8 +199,54 @@ def test_new_phase_preserves_request_pacing_after_preflight_expires() -> None:
     reads = VenueReads(clock=lambda: now[0], sleep=lambda _: None, timeout=15)
     reads.next_read = 118
     now[0] = 116
-    reads.start_phase(timeout=720)
-    assert reads.deadline == 836 and reads.next_read == 118
+    reads.start_phase(timeout=SCAN_TIMEOUT)
+    assert reads.deadline == 116 + SCAN_TIMEOUT and reads.next_read == 118
     with pytest.raises(ScanError):
-        reads.start_phase(timeout=721)
-    assert reads.deadline == 836 and reads.next_read == 118
+        reads.start_phase(timeout=SCAN_TIMEOUT + 1)
+    assert reads.deadline == 116 + SCAN_TIMEOUT and reads.next_read == 118
+
+
+@pytest.mark.parametrize("timeout,passes", [(720, False), (SCAN_TIMEOUT, True)])
+def test_complete_270_dex_inventory_keeps_every_paced_read(timeout: int, passes: bool) -> None:
+    now = [0.0]
+    pauses: list[float] = []
+    calls: list[dict[str, Any]] = []
+    dexes: list[object] = [None, *({"name": f"fixture{index}"} for index in range(269))]
+
+    def sleep(seconds: float) -> None:
+        pauses.append(seconds)
+        now[0] += seconds
+
+    def opened(request: Any, *, timeout: float) -> MagicMock:
+        assert timeout == 10
+        payload = json.loads(request.data)
+        calls.append(payload)
+        kind = payload["type"]
+        value: object = (
+            dexes
+            if kind == "perpDexs"
+            else "disabled"
+            if kind == "userAbstraction"
+            else []
+            if kind == "frontendOpenOrders"
+            else {"assetPositions": [], "marginSummary": {"accountValue": "200"}}
+        )
+        response = MagicMock()
+        response.__enter__.return_value.read.return_value = json.dumps(value).encode()
+        return response
+
+    reads = VenueReads(clock=lambda: now[0], sleep=sleep, timeout=timeout)
+    reads.opener = MagicMock()
+    reads.opener.open.side_effect = opened
+    if not passes:
+        with pytest.raises(ScanError, match="deadline"):
+            flat_scan(reads, ACCOUNT)
+        assert len(calls) < 543
+    else:
+        report = flat_scan(reads, ACCOUNT)
+        observations = report["observations"]
+        assert isinstance(observations, list) and len(observations) == 270
+        assert len(calls) == 543 and now[0] == 1086
+        assert len([p for p in calls if p["type"] == "frontendOpenOrders"]) == 270
+        assert calls[-1] == {"type": "perpDexs"}
+    assert pauses and all(seconds == 2 for seconds in pauses)

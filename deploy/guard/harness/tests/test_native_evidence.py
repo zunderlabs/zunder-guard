@@ -1,44 +1,157 @@
+import hashlib
 import json
 import platform
 from pathlib import Path
 
 import pytest
+from test_install_evidence import release, write
 from test_testnet_run import COMMIT
 
+from guard_harness.channel_evidence import commands, required
+from guard_harness.lifecycle_coverage import LIFECYCLE_COVERAGE
 from guard_harness.native_evidence import PAPER, PERUSER, TESTNET, VARIANTS, predicate
 from guard_harness.native_paper import LifecycleError
 from guard_harness.native_refusals import refuse
+from guard_harness.testnet_process import ProcessError
 from guard_harness.testnet_run import ROOT
 
 
 def fixture(root: Path, row: str) -> Path:
-    manifest = root / "release-manifest.json"
-    manifest.write_bytes((ROOT / "release/examples/build-v2.json").read_bytes())
+    subjects = root / "subjects"
+    current = release(subjects / "candidate/assets")
+    previous = release(subjects / "previous/assets", old=True)
+    manifest = current.assets / "release-manifest.json"
+    sha = hashlib.sha256(manifest.read_bytes()).hexdigest()
+    write(
+        subjects / "input.json",
+        dict(
+            tag=current.tag,
+            commit=COMMIT,
+            previous_tag=previous.tag,
+            previous_commit=previous.commit,
+            harness_commit=COMMIT,
+            diagnostic=False,
+            loader_channel="staging",
+        ),
+    )
     for variant in VARIANTS[row]:
-        directory = root / variant
-        directory.mkdir()
-        (directory / "identities.json").write_text(
-            json.dumps({"diagnostic": False, "release_commit": COMMIT, "harness_commit": COMMIT})
-        )
-        for name, coverage, mode in (
-            ("paper/paper.receipt.json", PAPER, "paper"),
-            ("testnet/testnet.receipt.json", TESTNET, "testnet"),
-            ("testnet/per-user/receipt.json", PERUSER, "testnet"),
-        ):
-            path = directory / name
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(
-                json.dumps({"result": "passed", "coverage": sorted(coverage), "mode": mode})
+        target = "darwin-arm64" if row == "I3" else "windows-amd64"
+        for scenario in ("fresh", "upgrade"):
+            directory = root / variant / scenario
+            write(
+                directory / "identities.json",
+                dict(
+                    diagnostic=False,
+                    release_commit=COMMIT,
+                    harness_commit=COMMIT,
+                    tag=current.tag,
+                    manifest_sha256=sha,
+                    scenario=scenario,
+                    **(
+                        dict(previous_tag=previous.tag, previous_commit=previous.commit)
+                        if scenario == "upgrade"
+                        else {}
+                    ),
+                ),
             )
+            identities = {
+                item.tag: dict(
+                    commit=item.commit,
+                    version="zunder-guard " + item.tag.removeprefix("v"),
+                    binary_sha256=hashlib.sha256(item.binary(target)).hexdigest(),
+                )
+                for item in ((current,) if scenario == "fresh" else (previous, current))
+            }
+            for name, coverage, mode in (
+                ("paper/paper.receipt.json", PAPER, "paper"),
+                ("testnet/testnet.receipt.json", TESTNET, "testnet"),
+                ("testnet/per-user/receipt.json", PERUSER, "testnet"),
+            ):
+                checks = coverage - {"upgrade"}
+                checks |= {"fresh-candidate" if scenario == "fresh" else "upgrade"}
+                if row == "I4" and mode == "paper":
+                    checks = checks - {"crash-recovery"} | {"manual-crash-restart"}
+                if name.startswith("testnet/per-user"):
+                    checks = checks - {"candidate-loader-stdin"} | {
+                        "candidate-loader-stdin" if scenario == "fresh" else "previous-release-init"
+                    }
+                write(
+                    directory / name,
+                    dict(
+                        schema=1,
+                        result="passed",
+                        coverage=sorted(checks),
+                        mode=mode,
+                        scenario=scenario,
+                        tag=current.tag,
+                        commit=COMMIT,
+                        manifest_sha256=sha,
+                        observed_releases=identities,
+                        decision_journal_sha256="e" * 64,
+                        no_exchange=True,
+                        channel_coverage=["D3:homebrew"]
+                        if row == "I3" and scenario == "fresh"
+                        else [],
+                    ),
+                )
+            if scenario == "fresh":
+                channel = "D1" if row == "I3" else "D2"
+                url = "https://zunderlabs.com/i-staging" + (".ps1" if row == "I4" else "")
+                write(
+                    directory / f"channels/{channel}.json",
+                    dict(
+                        schema=1,
+                        result="passed",
+                        channel=channel,
+                        scenario=scenario,
+                        mode="paper",
+                        tag=current.tag,
+                        commit=COMMIT,
+                        manifest_sha256=sha,
+                        installed_binary_sha256=hashlib.sha256(current.binary(target)).hexdigest(),
+                        version=current.tag.removeprefix("v"),
+                        cleanup_complete=True,
+                        coverage=sorted(required(channel, target)),
+                        command=("irm " + url + " | iex")
+                        if row == "I4"
+                        else ("curl -fsSL " + url + " | sh"),
+                        loader_sha256=hashlib.sha256(
+                            current.asset("i.ps1" if row == "I4" else "i")
+                        ).hexdigest(),
+                        executions=[
+                            dict(
+                                form=form,
+                                command=command,
+                                result="passed",
+                                installed_binary_sha256=hashlib.sha256(
+                                    current.binary(target)
+                                ).hexdigest(),
+                                version=current.tag.removeprefix("v"),
+                                mode="paper",
+                                account_network="testnet",
+                                health=True,
+                                paper_roundtrip=True,
+                                owned_process_stopped=True,
+                                cleanup_complete=True,
+                                setup_identity="runner-user",
+                                configuration_home="user-default",
+                                cleanup_method="owned-manual-cleanup"
+                                if row == "I3"
+                                else "released-per-user-uninstall",
+                            )
+                            for form, command in commands(channel).items()
+                        ],
+                    ),
+                )
     return manifest
 
 
 @pytest.mark.parametrize("row", ["I3", "I4"])
 def test_complete_exact_source_row(row: str, tmp_path: Path) -> None:
     manifest = fixture(tmp_path, row)
-    value = predicate(row, tmp_path, manifest, COMMIT)
+    value = predicate(row, tmp_path, manifest, COMMIT, tmp_path / "subjects")
     assert value["journey"] == row and value["result"] == "passed"
-    assert VARIANTS[row] <= set(value["coverage"])
+    assert value["coverage"] == sorted(LIFECYCLE_COVERAGE[row])
 
 
 @pytest.mark.parametrize(
@@ -46,7 +159,7 @@ def test_complete_exact_source_row(row: str, tmp_path: Path) -> None:
 )
 def test_no_credit_for_partial_or_diagnostic_receipts(mutation: str, tmp_path: Path) -> None:
     manifest = fixture(tmp_path, "I4")
-    variant = tmp_path / "windows2022-ps51"
+    variant = tmp_path / "windows2022-ps51/upgrade"
     identity = variant / "identities.json"
     if mutation == "diagnostic":
         value = json.loads(identity.read_bytes())
@@ -66,8 +179,8 @@ def test_no_credit_for_partial_or_diagnostic_receipts(mutation: str, tmp_path: P
         else:
             value["coverage"].remove("native-custody-readback")
         path.write_text(json.dumps(value))
-    with pytest.raises((LifecycleError, FileNotFoundError)):
-        predicate("I4", tmp_path, manifest, COMMIT)
+    with pytest.raises((LifecycleError, FileNotFoundError, ValueError)):
+        predicate("I4", tmp_path, manifest, COMMIT, tmp_path / "subjects")
 
 
 def test_exit_failure_alone_is_not_a_refusal(tmp_path: Path) -> None:
@@ -82,6 +195,116 @@ def test_exit_failure_alone_is_not_a_refusal(tmp_path: Path) -> None:
             expected="mainnet refusal",
             log=tmp_path / "refusal.log",
         )
+
+
+@pytest.mark.parametrize("scenario", ["fresh", "upgrade"])
+def test_paper_driver_emits_exact_admitted_history_and_applicable_crash_checks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, scenario: str
+) -> None:
+    from guard_harness import native_paper
+    from guard_harness.cli import GuardCLI, Pair
+
+    current = release(tmp_path / "current/assets")
+    previous = release(tmp_path / "previous/assets", old=True)
+    monkeypatch.setattr(platform, "system", lambda: "Windows")
+    driver = native_paper.Paper(
+        release=current,
+        previous=previous,
+        work=tmp_path / "paper",
+        shell="fixture-shell",
+        scenario=scenario,
+    )
+
+    def install(item: object, **kwargs: object) -> None:
+        driver.binary.parent.mkdir(parents=True, exist_ok=True)
+        driver.binary.write_bytes(b"inert fixture executable never invoked")
+
+    def command(argv: list[str], *, sensitive: bool = False) -> str:
+        if "init" in argv:
+            for name in ("guard.toml", "risk-paper.jsonl", "decisions-paper.jsonl"):
+                (driver.home / name).write_bytes(b"inert retained fixture bytes")
+        if "-Uninstall" in argv:
+            driver.binary.unlink()
+        return ""
+
+    monkeypatch.setattr(driver, "install", install)
+    monkeypatch.setattr(driver, "command", command)
+    for action in ("start", "stop", "crash"):
+        monkeypatch.setattr(driver, action, lambda: None)
+    monkeypatch.setattr(
+        GuardCLI, "pair", lambda self: Pair("fixture-address", "fixture-client-key")
+    )
+    monkeypatch.setattr(native_paper, "healthy", lambda *args, **kwargs: {})
+    monkeypatch.setattr(native_paper, "round_trip", lambda *args: None)
+    monkeypatch.setattr("guard_harness.native_refusals.setup_refusals", lambda *args, **kwargs: [])
+    value = driver.execute("fixture-account")
+    expected = PAPER - {"crash-recovery", "upgrade"} | {
+        "manual-crash-restart",
+        "fresh-candidate" if scenario == "fresh" else "upgrade",
+    }
+    checks = value["coverage"]
+    assert isinstance(checks, list)
+    assert set(checks) == expected
+    assert value["scenario"] == scenario and not driver.binary.exists()
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "binary",
+        "version",
+        "scenario",
+        "tag",
+        "journal",
+        "exchange",
+        "fresh-missing",
+        "fresh-predecessor-echo",
+        "unrecognized-coverage",
+        "channel-command",
+        "channel-binary",
+        "channel-cleanup",
+    ],
+)
+def test_measured_native_identity_and_fresh_channel_cannot_be_relabelled(
+    tmp_path: Path, mutation: str
+) -> None:
+    manifest = fixture(tmp_path, "I3")
+    root = tmp_path / "macos/fresh"
+    path = root / "testnet/testnet.receipt.json"
+    if mutation == "fresh-missing":
+        (root / "identities.json").unlink()
+    else:
+        if mutation.startswith("channel-"):
+            path = root / "channels/D1.json"
+        elif mutation == "fresh-predecessor-echo":
+            path = root / "identities.json"
+        value = json.loads(path.read_bytes())
+        if mutation == "binary":
+            value["observed_releases"]["v1.0.0"]["binary_sha256"] = "f" * 64
+        elif mutation == "version":
+            value["observed_releases"]["v1.0.0"]["version"] = "zunder-guard 0.9.0"
+        else:
+            value.update(
+                {
+                    "scenario": {"scenario": "upgrade"},
+                    "tag": {"tag": "v0.9.0"},
+                    "journal": {"decision_journal_sha256": ""},
+                    "exchange": {"no_exchange": False},
+                    "unrecognized-coverage": {
+                        "coverage": value.get("coverage", []) + ["unmeasured-check"]
+                    },
+                    "fresh-predecessor-echo": {
+                        "previous_tag": "v0.9.0",
+                        "previous_commit": "c" * 40,
+                    },
+                    "channel-command": {"command": "download then execute local file"},
+                    "channel-binary": {"installed_binary_sha256": "f" * 64},
+                    "channel-cleanup": {"cleanup_complete": False},
+                }[mutation]
+            )
+        path.write_text(json.dumps(value))
+    with pytest.raises((LifecycleError, ProcessError, ValueError)):
+        predicate("I3", tmp_path, manifest, COMMIT, tmp_path / "subjects")
 
 
 def test_candidate_uses_real_loader_stdin_contract(
@@ -216,6 +439,8 @@ def test_per_user_predecessor_init_has_only_supported_command_arguments(
     import guard_harness.native_testnet as module
     from guard_harness.native_paper import Paper
     from guard_harness.native_release import Release
+
+    monkeypatch.setattr(module, "flat_scan", lambda *args: None)
 
     monkeypatch.setattr(platform, "system", lambda: "Windows")
     monkeypatch.setenv("ProgramData", str(tmp_path / "windows-program-data"))

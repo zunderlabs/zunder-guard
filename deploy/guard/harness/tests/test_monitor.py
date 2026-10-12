@@ -115,3 +115,46 @@ def test_alert_has_one_fixed_endpoint_and_no_retry(monkeypatch: pytest.MonkeyPat
 def test_alert_invalid_frame_refused_before_http(token: str, check: str, url: str) -> None:
     with pytest.raises(AttestationError, match="frame refused"):
         monitor.alert(token=token, check=check, run_url=url)
+
+
+def test_scheduled_empty_canonical_skips_without_admission(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("guard_harness.channel_head.read", lambda channel: (None, None))
+    monkeypatch.setattr("guard_harness.channel_head.published_stable", lambda: None)
+    monkeypatch.setattr(
+        monitor, "admitted", lambda *args, **kwargs: pytest.fail("absent head admitted")
+    )
+    assert monitor.scheduled(tmp_path / "fresh") == {
+        "promoted": False,
+        "reason": "canonical-head-and-public-stable-absent",
+    }
+
+
+def test_scheduled_unknown_network_state_never_skips(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def unreadable(channel: str) -> None:
+        raise AttestationError("network unavailable")
+
+    monkeypatch.setattr("guard_harness.channel_head.read", unreadable)
+    with pytest.raises(AttestationError, match="network unavailable"):
+        monitor.scheduled(tmp_path / "fresh")
+    assert not (tmp_path / "fresh").exists()
+
+
+@pytest.mark.parametrize("stable", ["present", "unknown"])
+def test_canonical_404_after_launch_or_unknown_signal_fails_and_never_writes_skip(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stable: str
+) -> None:
+    monkeypatch.setattr("guard_harness.channel_head.read", lambda channel: (None, None))
+
+    def signal() -> str:
+        if stable == "unknown":
+            raise AttestationError("public metadata unavailable")
+        return "v1.0.0"
+
+    monkeypatch.setattr("guard_harness.channel_head.published_stable", signal)
+    with pytest.raises(AttestationError):
+        monitor.scheduled(tmp_path / "fresh")
+    assert not (tmp_path / "fresh").exists()

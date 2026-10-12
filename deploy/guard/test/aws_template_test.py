@@ -85,12 +85,22 @@ class AwsTemplate(unittest.TestCase):
         signal = next(s for s in statements if s['Action'] == 'cloudformation:SignalResource')
         self.assertEqual(signal['Resource'], {'Ref': 'AWS::StackId'})
 
+    def test_installer_channel_defaults_to_canonical_and_selects_signed_staging(self):
+        self.assertEqual(DOC['Parameters']['InstallerChannel']['Default'], 'canonical')
+        self.assertEqual(DOC['Parameters']['InstallerChannel']['AllowedValues'], ['canonical', 'staging'])
+        sub = DOC['Resources']['Instance']['Properties']['UserData']['Fn::Base64']['Sub']
+        self.assertEqual(sub[1]['InstallerPath'], {'If': ['StagingInstaller', 'i-staging', 'i']})
+        self.assertIn('https://zunderlabs.com/${InstallerPath}', sub[0])
+
     def test_bootstrap_signals_success_only_after_healthy_paper_install(self):
         script = DOC['Resources']['Instance']['Properties']['UserData']['Fn::Base64']['Sub'][0]
         for name, value in {'AWS::Region': 'ap-northeast-1', 'AWS::StackId': 'test-stack',
-                            'Rules': RULES, 'Account': ACCOUNT, 'ListenArg': ''}.items():
+                            'Rules': RULES, 'Account': ACCOUNT, 'ListenArg': '', 'InstallerPath': 'i-staging'}.items():
             script = script.replace('${' + name + '}', value)
-        for failure in ['', 'download', 'sh', 'systemctl', 'health', 'aws', 'apt-get']:
+        self.assertIn('snap install aws-cli --classic', script)
+        self.assertIn('/snap/bin/aws cloudformation signal-resource', script)
+        self.assertNotIn('ca-certificates awscli', script)
+        for failure in ['', 'download', 'sh', 'systemctl', 'health', 'aws', 'apt-get', 'snap', 'apt-get-no-cli']:
             with self.subTest(failure=failure), tempfile.TemporaryDirectory() as directory:
                 tmp = Path(directory)
                 wrapper = tmp / 'fake'
@@ -110,12 +120,13 @@ if operation == 'download':
     pathlib.Path(args[args.index('-o') + 1]).write_text('# fake installer')
 ''')
                 wrapper.chmod(0o755)
-                for command in ['apt-get', 'curl', 'sh', 'systemctl', 'aws']:
-                    (tmp / command).symlink_to(wrapper)
+                for command in ['apt-get', 'snap', 'curl', 'sh', 'systemctl', 'aws']:
+                    if not (command == 'aws' and failure == 'apt-get-no-cli'):
+                        (tmp / command).symlink_to(wrapper)
                 log = tmp / 'calls.jsonl'
                 env = dict(os.environ, PATH=str(tmp) + os.pathsep + os.environ['PATH'],
-                           AWS_TEST_LOG=str(log), AWS_TEST_FAIL=failure)
-                result = subprocess.run(['bash', '-c', script], env=env, capture_output=True, text=True, timeout=10)
+                           AWS_TEST_LOG=str(log), AWS_TEST_FAIL=('apt-get' if failure == 'apt-get-no-cli' else failure))
+                result = subprocess.run(['bash', '-c', script.replace('/snap/bin/aws', str(tmp / 'aws'))], env=env, capture_output=True, text=True, timeout=10)
                 self.assertNotIn('FIXTURE-PAIRING-CREDENTIAL', result.stdout + result.stderr)
                 diagnostic = re.search(r'root-only file (\S+);', result.stdout)
                 if diagnostic:
@@ -124,14 +135,24 @@ if operation == 'download':
                     private_log.unlink()
                 calls = [json.loads(line) for line in log.read_text().splitlines()]
                 signals = [call for call in calls if call[0] == 'aws']
-                if failure == 'apt-get':
+                if failure == 'apt-get-no-cli':
                     self.assertNotEqual(result.returncode, 0)
-                    self.assertEqual(signals, [])  # CloudFormation times out if dependencies cannot install.
+                    self.assertEqual(signals, [])
+                    self.assertFalse(any(call[0] in ('curl', 'sh', 'systemctl') for call in calls))
+                    self.assertEqual(DOC['Resources']['Instance']['CreationPolicy']['ResourceSignal'],
+                                     {'Count': 1, 'Timeout': 'PT20M'})
                     continue
+                # The fixture's AWS CLI exists before dependencies run, so the early
+                # EXIT trap must attempt FAILURE even when apt/snap installation fails.
+                # A real image without a usable CLI still fails through CreationPolicy timeout.
+                if failure in ('apt-get', 'snap'):
+                    self.assertFalse(any(call[0] in ('curl', 'sh', 'systemctl') for call in calls))
                 self.assertEqual(len(signals), 1)
                 self.assertEqual(signals[0][-1], 'FAILURE' if failure and failure != 'aws' else 'SUCCESS')
                 self.assertEqual(result.returncode == 0, not failure, result.stderr)
                 if not failure:
+                    download = next(call for call in calls if call[0] == 'curl' and '-o' in call)
+                    self.assertEqual(download[-1], 'https://zunderlabs.com/i-staging')
                     install = next(call for call in calls if call[0] == 'sh')
                     self.assertEqual(install[2:], ['--non-interactive', '--network', 'paper', '--rules', RULES, '--account', ACCOUNT])
                     self.assertLess(next(i for i,c in enumerate(calls) if c[0] == 'systemctl'), len(calls)-1)

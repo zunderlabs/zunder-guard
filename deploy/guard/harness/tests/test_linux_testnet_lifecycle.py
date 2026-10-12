@@ -22,7 +22,7 @@ from guard_harness.linux_testnet_lifecycle import (
     retained,
 )
 from guard_harness.runner import RunResult
-from guard_harness.testnet_scan import ScanError
+from guard_harness.testnet_scan import SCAN_TIMEOUT, ScanError
 
 
 def journal(home: Path, events: list[dict[str, Any]]) -> None:
@@ -107,7 +107,7 @@ def test_retention_keeps_pairing_and_populated_testnet_journal_prefix(tmp_path: 
 
 
 @pytest.mark.parametrize("action", ["start", "stop", "restart"])
-def test_uncertain_flat_scan_never_mutates_or_removes_service(
+def test_uncertain_runtime_audit_never_mutates_or_removes_service(
     monkeypatch: pytest.MonkeyPatch, action: str
 ) -> None:
     lifecycle = object.__new__(ProtectedLifecycle)
@@ -116,10 +116,63 @@ def test_uncertain_flat_scan_never_mutates_or_removes_service(
     def unknown() -> None:
         raise ScanError("testnet HTTP/JSON read failed")
 
-    monkeypatch.setattr(lifecycle, "flat", unknown)
+    monkeypatch.setattr(lifecycle, "audit", unknown)
     monkeypatch.setattr(lifecycle, "command", lambda *args: pytest.fail("no mutation authorized"))
     with pytest.raises(ScanError):
         lifecycle.control("fixture", action)
+
+
+@pytest.mark.parametrize("mutation", ["none", "account", "binary", "action"])
+def test_same_scenario_controls_require_real_identity_and_complete_journal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mutation: str
+) -> None:
+    lifecycle = object.__new__(ProtectedLifecycle)
+    lifecycle.home = tmp_path
+    lifecycle.route = "native"
+    lifecycle.unit = "synthetic-testnet.service"
+    account = "0x" + "1" * 40
+    lifecycle.inputs = cast(Any, SimpleNamespace(account=account))
+    lifecycle.binary = tmp_path / "guard-fixture"
+    lifecycle.binary.write_bytes(b"candidate bytes")
+    digest = hashlib.sha256(lifecycle.binary.read_bytes()).hexdigest()
+    lifecycle.admitted_release = ("v1.2.3", digest, "")
+    (tmp_path / "guard.toml").write_text(
+        'mode="testnet"\nnetwork="testnet"\naccount="' + account + '"\n'
+    )
+    events: list[dict[str, Any]] = [{"kind": "started", "mode": "testnet"}]
+    if mutation == "account":
+        (tmp_path / "guard.toml").write_text('mode="testnet"\nnetwork="testnet"\naccount="x"')
+    elif mutation == "binary":
+        lifecycle.binary.write_bytes(b"altered executable")
+    elif mutation == "action":
+        events.append({"kind": "intent"})
+    journal(tmp_path, events)
+    calls: list[list[str]] = []
+
+    def command(label: str, argv: list[str]) -> str:
+        calls.append(argv)
+        return "zunder-guard 1.2.3" if label == "audit-version" else ""
+
+    monkeypatch.setattr(lifecycle, "command", command)
+    monkeypatch.setattr(lifecycle, "flat", lambda: pytest.fail("audit is not venue-flat proof"))
+    if mutation != "none":
+        with pytest.raises(LifecycleError):
+            lifecycle.control("restart", "restart")
+        assert not any(argv[0] == "systemctl" for argv in calls)
+    else:
+        lifecycle.control("restart", "restart")
+        assert calls[-1] == ["systemctl", "restart", lifecycle.unit]
+
+
+def test_failed_preflight_prevents_initial_custody_and_upgrade(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    lifecycle = object.__new__(ProtectedLifecycle)
+    monkeypatch.setattr(lifecycle, "flat", lambda: (_ for _ in ()).throw(ScanError("unknown")))
+    monkeypatch.setattr(lifecycle, "command", lambda *a: pytest.fail("no install after unknown"))
+    for initial in (True, False):
+        with pytest.raises(ScanError):
+            lifecycle.install(tmp_path / "installer", "a" * 64, b"b" * 64 + b"\n", initial=initial)
 
 
 def test_guest_key_transport_is_only_encrypted_ssh_stdin(
@@ -171,7 +224,7 @@ def test_unknown_cleanup_preserves_live_guest_and_private_disk(
             pytest.fail("uncertain cleanup must not kill protection")
 
     def observation(command: str, *, timeout: float) -> str:
-        assert timeout == 900
+        assert timeout == SCAN_TIMEOUT + 120
         if outcome in {"unknown", "timeout"}:
             raise RuntimeError("bounded SSH read failed or timed out")
         return "malformed" if outcome == "malformed" else '{"flat":false}'
@@ -264,7 +317,17 @@ def test_container_installer_stdin_consumption_matches_released_setup(
 
 @pytest.mark.parametrize(
     "failure",
-    ["none", "credential-changed", "config-changed", "broken-unit", "journal-lost", "volume-lost"],
+    [
+        "none",
+        "credential-changed",
+        "config-changed",
+        "broken-unit",
+        "journal-lost",
+        "volume-lost",
+        "refusal-stopped",
+        "refusal-gate-changed",
+        "unknown-helper",
+    ],
 )
 def test_container_uninstall_credit_requires_recovery_preservation_and_absent_software(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str
@@ -272,7 +335,8 @@ def test_container_uninstall_credit_requires_recovery_preservation_and_absent_so
     root = tmp_path / "root"
 
     def mapped(*parts: str) -> Path:
-        return root / Path(*parts).as_posix().lstrip("/")
+        path = Path(*parts)
+        return path if path.is_relative_to(root) else root / path.as_posix().lstrip("/")
 
     home = mapped("/var/lib/docker/volumes/fixture/_data")
     home.mkdir(parents=True)
@@ -296,6 +360,13 @@ def test_container_uninstall_credit_requires_recovery_preservation_and_absent_so
         file = mapped(path)
         file.parent.mkdir(parents=True, exist_ok=True)
         file.write_bytes(b"synthetic owned software")
+    (recovery / "managed-install.json").write_text(
+        json.dumps({"allowed_files": {file: ["a" * 64] for file in owned[:5]}})
+    )
+    if failure == "unknown-helper":
+        mapped("/usr/local/libexec/zunder-guard-container/unknown-helper.py").write_bytes(
+            b"unexpected helper"
+        )
     boot = mapped("/proc/sys/kernel/random/boot_id")
     boot.parent.mkdir(parents=True)
     boot.write_text("synthetic boot")
@@ -310,11 +381,14 @@ def test_container_uninstall_credit_requires_recovery_preservation_and_absent_so
     lifecycle.inputs = cast(
         Any,
         SimpleNamespace(
+            output=tmp_path,
             installer=tmp_path / "released-install.sh",
             installer_sha256="a" * 64,
             previous_installer_sha256="b" * 64,
             version="v1.2.3",
             previous_version="v1.2.2",
+            scenario="upgrade",
+            initial=(tmp_path / "previous.sh", "b" * 64, "v1.2.2"),
         ),
     )
     lifecycle.binary_sha256 = lifecycle.previous_binary_sha256 = "c" * 64
@@ -324,12 +398,20 @@ def test_container_uninstall_credit_requires_recovery_preservation_and_absent_so
         json.dumps(
             {
                 "stage": "awaiting-reboot",
+                "scenario": "upgrade",
                 "boot_id": "synthetic boot",
                 "installer_sha256": "a" * 64,
                 "previous_installer_sha256": "b" * 64,
             }
         )
     )
+    monkeypatch.setattr(lifecycle, "audit", lambda: None)
+
+    def refusal(words: list[str]) -> None:
+        if failure == "refusal-gate-changed":
+            mapped("/etc/zunder-guard-container/install-transaction.json").write_bytes(b"changed")
+
+    monkeypatch.setattr(lifecycle, "refuse_pending_uninstall", refusal)
     monkeypatch.setattr(lifecycle, "healthy", lambda *args: None)
     monkeypatch.setattr(lifecycle, "control", lambda *args: None)
     monkeypatch.setattr(lifecycle, "flat", lambda: None)
@@ -346,6 +428,18 @@ def test_container_uninstall_credit_requires_recovery_preservation_and_absent_so
 
     def command(name: str, argv: list[str]) -> str:
         calls.append(name)
+        if name == "owned-fragment":
+            return "/etc/systemd/system/" + argv[-1]
+        if name in {"live-uninstall-pid", "refused-uninstall-pid"}:
+            return "0" if failure == "refusal-stopped" and name == "refused-uninstall-pid" else "42"
+        if name in {"live-uninstall-state", "refused-uninstall-state"}:
+            return "active"
+        if name in {"live-container-id", "refused-container-id"}:
+            return "e" * 64
+        if name == "removed-unit-state":
+            return "not-found"
+        if name == "removed-unit-pid":
+            return "0"
         if name == "owned-volume":
             return "/var/lib/docker/volumes/fixture/_data"
         if name == "retained-volume":
@@ -362,6 +456,9 @@ def test_container_uninstall_credit_requires_recovery_preservation_and_absent_so
             ]
             for file in owned:
                 mapped(file).unlink()
+            if failure != "unknown-helper":
+                mapped("/usr/local/libexec/zunder-guard-container").rmdir()
+            mapped("/etc/systemd/system/zunder-guard-container.service.d").rmdir()
             if failure == "broken-unit":
                 mapped(owned[0]).symlink_to("synthetic-missing-target")
             elif failure in {"credential-changed", "config-changed"}:
@@ -381,7 +478,49 @@ def test_container_uninstall_credit_requires_recovery_preservation_and_absent_so
         lifecycle.after(b"d" * 64 + b"\n", reboot_required=False)
         result = json.loads(lifecycle.record_path.read_bytes())
         assert result["stage"] == "passed" and result["cleanup_complete"] is True
+        assert result["binary_sha256"] == lifecycle.binary_sha256
+        assert result["previous_binary_sha256"] == lifecycle.previous_binary_sha256
+        assert (
+            result["image"] == lifecycle.image
+            and result["previous_image"] == lifecycle.previous_image
+        )
+        assert result["runtime_identity_evidence"] == "signed-immutable-prebuilt-image"
+        from guard_harness.install_evidence import TESTNET, completed
+
+        required = TESTNET | {
+            "uninstall-live-stop",
+            "uninstall-transaction-refusal",
+            "owned-software-inventory",
+        }
+        assert completed(result, required, mode="testnet") == required
         assert "uninstall" in result["coverage"] and "supervisor-retired" not in result["coverage"]
         assert not snapshot.exists()
         assert (recovery / "credential.cred").read_bytes() == b"synthetic retained credential.cred"
-    assert "uninstall" in calls
+    assert ("uninstall" in calls) is (failure not in {"refusal-stopped", "refusal-gate-changed"})
+
+
+@pytest.mark.parametrize(
+    "code,body",
+    [
+        (0, b"Resolve installer transaction before uninstall."),
+        (1, b"wrong refusal"),
+        (1, b"Resolve installer transaction before uninstall."),
+    ],
+)
+def test_actual_refusal_status_and_diagnostics_are_admitted_without_replay(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, code: int, body: bytes
+) -> None:
+    lifecycle = object.__new__(ProtectedLifecycle)
+    lifecycle.inputs = cast(Any, SimpleNamespace(output=tmp_path))
+
+    def invoke(words: list[str], **kwargs: Any) -> subprocess.CompletedProcess[bytes]:
+        assert kwargs["stdin"] == subprocess.DEVNULL and kwargs["timeout"] == 120
+        return subprocess.CompletedProcess(words, code, b"private needle", body)
+
+    monkeypatch.setattr(subprocess, "run", invoke)
+    if code == 1 and body.startswith(b"Resolve"):
+        lifecycle.refuse_pending_uninstall(["released-uninstall"])
+    else:
+        with pytest.raises(LifecycleError):
+            lifecycle.refuse_pending_uninstall(["released-uninstall"])
+    assert b"private needle" not in (tmp_path / "uninstall-refusal.log").read_bytes()

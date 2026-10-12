@@ -5,11 +5,15 @@ A single SQLite-backed Durable Object commits each channel's predicate, Sigstore
 bundle and Unix/Windows loader bytes together. The same transaction records each
 build's lifecycle head. Stale channel heads, skipped revisions, wrong predecessors,
 superseded staging builds and transitions after withdrawal return HTTP 409 without
-changing published bytes. A withdrawn channel returns HTTP 410 for its loaders and
+changing published bytes. Promoted state requires a stable version/tag; RCs cannot
+be promoted. Withdrawing canonical also disables staging loaders if they still
+serve that failed build, while preserving a newer staging candidate. A withdrawn channel returns HTTP 410 for its loaders and
 continues to expose the withdrawal predicate and bundle.
 
 The trusted publisher POSTs `/guard/publish` with a bearer token from the Worker
-secret `INSTALLER_PUBLISH_TOKEN`. Its JSON has exactly these fields:
+secret `STAGING_INSTALLER_PUBLISH_TOKEN` for staging, or
+`INSTALLER_PUBLISH_TOKEN` for canonical publication and rollback. Tokens cannot write
+the other channel. Its JSON has exactly these fields:
 
 - `channel`: `staging` or `canonical`.
 - `expected`: the current channel's predicate digest, or null for an empty channel.

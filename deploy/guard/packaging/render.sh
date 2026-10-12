@@ -67,6 +67,7 @@ render() { # template output
 render "$HERE/../install.sh" "$DIST/install.sh"
 # Internal macOS helper is independently covered by the signed release manifest.
 render "$HERE/../macos/install-service.sh" "$DIST/install-macos-service.sh"
+cp "$HERE/../macos/uninstall.py" "$DIST/uninstall-macos-testnet.py"
 render "$HERE/../loader/i.sh" "$DIST/i"
 render "$HERE/../loader/i.ps1" "$DIST/i.ps1"
 render "$HERE/../windows/service.ps1" "$DIST/install-windows-service.ps1"
@@ -91,7 +92,6 @@ LOADER_SHA=$(sha256sum "$DIST/i" | cut -d' ' -f1)
 python3 - "$DIST" "$VERSION" "$LOADER_SHA" <<'PY'
 import pathlib, sys
 dist, version, sha = pathlib.Path(sys.argv[1]), sys.argv[2], sys.argv[3]
-url = f"https://github.com/zunderlabs/zunder-guard/releases/download/{version}/i"
 def replace_once(text, old, new, name):
     if text.count(old) != 1:
         sys.exit(f"{name}: expected cloud bootstrap block absent or duplicated")
@@ -99,9 +99,9 @@ def replace_once(text, old, new, name):
 
 path = dist / "cloudformation.yaml"
 text = path.read_text()
-text = replace_once(text,
-    'curl -fsSL --proto \'=https\' --retry 3 -o "$loader" https://zunderlabs.com/i',
-    f'curl -fsSL --proto \'=https\' --retry 3 -o "$loader" \'{url}\'\n'
+download = 'curl -fsSL --proto \'=https\' --retry 3 -o "$loader" https://zunderlabs.com/${InstallerPath}'
+text = replace_once(text, download,
+    download + f'\n            # Admit only this signed release ({version}), whichever channel was selected.\n'
     f'            printf \'%s  %s\\n\' \'{sha}\' "$loader" | sha256sum -c -', path.name)
 text = replace_once(text,
     "Follow deploy/guard/systemd/ACTIVATION.md at the source commit named in this release.",

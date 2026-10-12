@@ -16,6 +16,7 @@ from guard_harness.cli import Pair
 from guard_harness.paper_bot import LocalGuard
 from guard_harness.testnet_journey import Journey
 from guard_harness.testnet_protection import Entry
+from guard_harness.testnet_scan import SCAN_TIMEOUT
 from guard_harness.testnet_scan import TestnetReads as VenueReads
 
 ACCOUNT = "0x" + "a" * 40
@@ -148,7 +149,9 @@ def test_replacement_or_dead_child_refuses_local_reads(
             owner.child.wait(timeout=5)
 
 
-@pytest.mark.parametrize("deadline", [1300.0, 1299.999])
+@pytest.mark.parametrize(
+    "deadline", [process.ENTRY_REMAINING + 100.0, process.ENTRY_REMAINING + 99.999]
+)
 def test_journey_connects_owned_process_and_keeps_guard_on_cleanup_failure(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -185,13 +188,13 @@ def test_journey_connects_owned_process_and_keeps_guard_on_cleanup_failure(
         kwargs["admit_entry"]()
         assert read.deadline == 280
         kwargs["begin_cleanup"]()
-        assert read.deadline == 820 and read.next_read == 102
+        assert read.deadline == 100 + SCAN_TIMEOUT and read.next_read == 102
         return Journey(None, None, "cleanup_incomplete_keep_guard_running", False)
 
     monkeypatch.setattr(process, "MCP", FakeMCP)
     monkeypatch.setattr(process, "execute", execute)
     monkeypatch.setattr(time, "monotonic", lambda: 100.0)
-    if deadline < 1300:
+    if deadline < 100 + process.ENTRY_REMAINING:
         with pytest.raises(process.ProcessError):
             owner.journey(
                 VenueReads(clock=lambda: 100.0),

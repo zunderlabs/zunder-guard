@@ -7,7 +7,9 @@ import re
 from pathlib import Path
 from typing import Any
 
+from guard_harness.channel_evidence import admit
 from guard_harness.docker_run import _version
+from guard_harness.lifecycle_coverage import LIFECYCLE_COVERAGE
 from guard_harness.native_release import Release
 from guard_harness.release_state import validate_build
 from guard_harness.testnet_run import ROOT
@@ -27,6 +29,7 @@ PAPER = {
     "pairing-retained",
     "uninstall",
     "cleanup",
+    "paper-post-upgrade-allow-resize-veto",
 }
 TESTNET = {
     "install",
@@ -42,6 +45,8 @@ TESTNET = {
     "uninstall",
     "cleanup",
     "no-exchange",
+    "daemon-reload",
+    "all-dex-flat",
 }
 DOCKER_PAPER = {
     "init",
@@ -100,7 +105,7 @@ def completed(value: dict[str, Any], required: set[str], *, mode: str) -> set[st
         or not isinstance(checks, list)
         or any(not isinstance(item, str) for item in checks)
         or len(set(checks)) != len(checks)
-        or not required <= set(checks)
+        or required != set(checks)
         or any(
             value.get(name) is not True
             for name in (
@@ -146,7 +151,6 @@ def predicate(
     observed: set[str] = set()
     tier = "guest" if row in {"I1", "I6"} else "e2e"
     if row == "I5":
-        root = read(evidence / "receipt.json")
         image = (
             build["distribution"]["docker"]["image"]
             + "@"
@@ -164,78 +168,233 @@ def predicate(
             "manifest_sha256": hashlib.sha256(previous.asset("release-manifest.json")).hexdigest(),
             "image": old_image,
         }
-        if (
-            root.get("commit") != commit
-            or root.get("tag") != current.tag
-            or root.get("manifest_sha256") != hashlib.sha256(build_bytes).hexdigest()
-            or root.get("harness_commit") != commit
-            or root.get("diagnostic") is not False
-            or root.get("image") != image
-            or image == old_image
-            or root.get("compose_sha256")
-            != hashlib.sha256(current.asset("compose.yaml")).hexdigest()
-            or root.get("previous_release") != expected_previous
-        ):
-            raise EvidenceError("Docker runtime subjects/source differ from C2")
         for channel in ("docker", "compose"):
-            for mode, required in (("paper", DOCKER_PAPER), ("testnet", DOCKER_TESTNET)):
-                value = read(evidence / f"{channel}-{mode}/receipt.json")
-                observed.update(completed(value, required, mode=mode))
+            for scenario in ("fresh", "upgrade"):
+                root = read(evidence / scenario / channel / "receipt.json")
                 if (
-                    value.get("channel") != channel
-                    or value.get("image") != image
-                    or value.get("previous_image") != old_image
+                    root.get("scenario") != scenario
+                    or root.get("channel") != channel
+                    or root.get("commit") != commit
+                    or root.get("tag") != current.tag
+                    or root.get("manifest_sha256") != hashlib.sha256(build_bytes).hexdigest()
+                    or root.get("harness_commit") != commit
+                    or root.get("diagnostic") is not False
+                    or root.get("image") != image
+                    or image == old_image
+                    or root.get("compose_sha256")
+                    != hashlib.sha256(current.asset("compose.yaml")).hexdigest()
+                    or root.get("previous_release") != expected_previous
                 ):
-                    raise EvidenceError("Docker lifecycle channel/image differs")
-                if mode == "testnet" and value.get("custody") != (
-                    "documented-volume" if channel == "docker" else "compose-secret"
-                ):
-                    raise EvidenceError("documented Testnet container custody required")
-                observed.add(f"{channel}-{mode}")
+                    raise EvidenceError("Docker runtime subjects/source/scenario differ from C2")
+                for mode, base in (("paper", DOCKER_PAPER), ("testnet", DOCKER_TESTNET)):
+                    required = (
+                        base
+                        if scenario == "upgrade"
+                        else base - {"upgrade", "upgrade-journal", "upgrade-pairing"}
+                        | {"fresh-candidate-" + mode}
+                    )
+                    value = read(evidence / mode / scenario / channel / "receipt.json")
+                    observed.update(completed(value, required, mode=mode))
+                    if (
+                        value.get("scenario") != scenario
+                        or value.get("channel") != channel
+                        or value.get("image") != image
+                        or value.get("initial_image")
+                        != (image if scenario == "fresh" else old_image)
+                        or value.get("initial_version")
+                        != (current.tag if scenario == "fresh" else previous.tag).removeprefix("v")
+                        or value.get("previous_image")
+                        != (None if scenario == "fresh" else old_image)
+                    ):
+                        raise EvidenceError("Docker lifecycle fresh/upgrade channel/image differs")
+                    if mode == "testnet" and (
+                        value.get("custody")
+                        != ("documented-volume" if channel == "docker" else "compose-secret")
+                        or not isinstance(value.get("decision_journal_sha256"), str)
+                        or re.fullmatch(r"[0-9a-f]{64}", value["decision_journal_sha256"]) is None
+                    ):
+                        raise EvidenceError("documented Testnet container custody/journal required")
+                    observed.add(
+                        mode
+                        + (
+                            ":fresh-candidate"
+                            if scenario == "fresh"
+                            else ":previous-release-upgrade"
+                        )
+                    )
+            observed.add("D4:" + channel)
+        # Actual container deletion/volume cleanup and old-pair journal checks are
+        # required above; normalize their row tokens only after all four executions.
+        observed.update({"uninstall", "journal-history", "pairing-retained"})
     else:
         loader = subjects / "i-staging"
         if loader.is_symlink() or loader.read_bytes() != current.asset("i"):
             raise EvidenceError("runtime loader differs from authenticated staged bytes")
         route, architecture = ROWS[row]
-        for mode, filename, required in (
+        for mode, filename, base in (
             ("paper", "linux-lifecycle.json", PAPER),
             ("testnet", "testnet-lifecycle.json", TESTNET),
         ):
-            value = read(evidence / mode / filename)
-            mode_coverage = completed(value, required, mode=mode)
-            observed.update(mode_coverage)
-            if (
-                value.get("route") != route
-                or value.get("architecture") != architecture
-                or value.get("version") != current.tag
-                or value.get("previous_version") != previous.tag
-                or value.get("installer_sha256") != hashlib.sha256(loader.read_bytes()).hexdigest()
-                or value.get("previous_installer_sha256")
-                != hashlib.sha256(previous.asset("install.sh")).hexdigest()
-                or value.get("stage") != "passed"
-            ):
-                raise EvidenceError("Linux runtime version/route/bytes differ")
-            if mode == "testnet" and value.get("custody") != "systemd-creds":
-                raise EvidenceError("encrypted systemd Testnet custody required")
-            if row in {"I1", "I6"}:
-                if (
-                    value.get("guest_acceleration") != "kvm"
-                    or value.get("gate_eligible") is not True
-                    or value.get("reboot_required") is not True
-                    or "kernel-reboot" not in mode_coverage
-                    or value.get("boot_id") == value.get("reboot_boot_id")
-                    or any(
-                        not isinstance(value.get(key), str)
-                        or not re.fullmatch(
-                            r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", value[key]
-                        )
-                        for key in ("boot_id", "reboot_boot_id")
-                    )
+            for scenario in ("fresh", "upgrade"):
+                required = (
+                    base
+                    if scenario == "upgrade"
+                    else base - {"upgrade", "paper-post-upgrade-allow-resize-veto"}
+                    | {"fresh-candidate-" + mode}
+                )
+                if row == "I6" and mode == "testnet":
+                    required |= {
+                        "uninstall-live-stop",
+                        "uninstall-transaction-refusal",
+                        "owned-software-inventory",
+                    }
+                value = read(evidence / mode / scenario / filename)
+                if row in {"I1", "I6"}:
+                    required = required | {"kernel-reboot"}
+                mode_coverage = completed(value, required, mode=mode)
+                if scenario == "fresh" and any(
+                    value.get(key) is not None
+                    for key in ("previous_binary_sha256", "previous_image")
                 ):
-                    raise EvidenceError("real KVM kernel reboot required for each mode")
-            elif value.get("reboot_required") is not False:
-                raise EvidenceError("arm64 native restart receipt required")
-            observed.add(mode)
+                    raise EvidenceError(
+                        "fresh lifecycle cannot claim unmeasured predecessor runtime"
+                    )
+                if row == "I6" and mode == "testnet":
+                    inventory = value.get("owned_software_inventory")
+                    if (
+                        not isinstance(inventory, dict)
+                        or len(inventory) < 6
+                        or any(
+                            not isinstance(name, str)
+                            or not name.startswith(
+                                (
+                                    "/usr/local/libexec/zunder-guard-container/",
+                                    "/etc/systemd/system/zunder-guard-",
+                                )
+                            )
+                            or not isinstance(digest, str)
+                            or not (digest == "directory" or re.fullmatch(r"[0-9a-f]{64}", digest))
+                            for name, digest in inventory.items()
+                            if name != "/usr/local/libexec/zunder-guard-container"
+                        )
+                    ):
+                        raise EvidenceError(
+                            "complete measured owned container software inventory required"
+                        )
+                observed.update(mode_coverage)
+                initial = current if scenario == "fresh" else previous
+                initial_hash = hashlib.sha256(
+                    loader.read_bytes() if scenario == "fresh" else previous.asset("install.sh")
+                ).hexdigest()
+                if (
+                    value.get("route") != route
+                    or value.get("architecture") != architecture
+                    or value.get("version") != current.tag
+                    or value.get("previous_version") != previous.tag
+                    or value.get("scenario") != scenario
+                    or value.get("initial_release")
+                    != dict(version=initial.tag, installer_sha256=initial_hash)
+                    or value.get("installer_sha256")
+                    != hashlib.sha256(loader.read_bytes()).hexdigest()
+                    or value.get("previous_installer_sha256")
+                    != hashlib.sha256(previous.asset("install.sh")).hexdigest()
+                    or value.get("stage") != "passed"
+                ):
+                    raise EvidenceError("Linux fresh/upgrade runtime version/route/bytes differ")
+                if mode == "testnet" and (
+                    value.get("custody") != "systemd-creds"
+                    or value.get("exchange_requests") != 0
+                    or value.get("exchange_evidence") != "complete-durable-decision-journal"
+                ):
+                    raise EvidenceError(
+                        "encrypted systemd Testnet custody and no-exchange journal required"
+                    )
+                if route == "native":
+                    target = "linux-" + architecture
+                    if (
+                        value.get("binary_sha256")
+                        != hashlib.sha256(current.binary(target)).hexdigest()
+                    ):
+                        raise EvidenceError("actual installed native binary differs from C2")
+                    if mode == "testnet" and (
+                        value.get("previous_binary_sha256")
+                        != (
+                            None
+                            if scenario == "fresh"
+                            else hashlib.sha256(previous.binary(target)).hexdigest()
+                        )
+                        or value.get("runtime_identity_evidence") != "native-file-sha256"
+                    ):
+                        raise EvidenceError("native Testnet predecessor identity differs")
+                else:
+                    old_build = json.loads(previous.asset("release-manifest.json"))
+                    image = (
+                        build["distribution"]["docker"]["image"]
+                        + "@"
+                        + build["distribution"]["docker"]["digest"]
+                    )
+                    old_image = (
+                        old_build["distribution"]["docker"]["image"]
+                        + "@"
+                        + old_build["distribution"]["docker"]["digest"]
+                    )
+                    if value.get("image") != image or value.get("installer_route") != (
+                        (
+                            "curl -fsSL https://zunderlabs.com/i-staging | sh -s -- "
+                            "--container --network paper"
+                        )
+                        if scenario == "fresh" and mode == "paper"
+                        else "sh <authenticated-loader> --container --network " + mode
+                    ):
+                        raise EvidenceError("actual managed container image/entry route differs")
+                    if mode == "paper" and value.get("initial_image") != (
+                        image if scenario == "fresh" else old_image
+                    ):
+                        raise EvidenceError("managed paper initial image differs")
+                    if mode == "testnet" and (
+                        value.get("previous_image") != (None if scenario == "fresh" else old_image)
+                        or value.get("runtime_identity_evidence")
+                        != "signed-immutable-prebuilt-image"
+                    ):
+                        raise EvidenceError("managed Testnet image evidence differs")
+                if row in {"I1", "I6"}:
+                    if (
+                        value.get("guest_acceleration") != "kvm"
+                        or value.get("gate_eligible") is not True
+                        or value.get("reboot_required") is not True
+                        or "kernel-reboot" not in mode_coverage
+                        or value.get("boot_id") == value.get("reboot_boot_id")
+                        or any(
+                            not isinstance(value.get(key), str)
+                            or not re.fullmatch(
+                                r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", value[key]
+                            )
+                            for key in ("boot_id", "reboot_boot_id")
+                        )
+                    ):
+                        raise EvidenceError(
+                            "real KVM kernel reboot required for every scenario/mode"
+                        )
+                    observed.add(mode + ":kernel-reboot")
+                elif value.get("reboot_required") is not False:
+                    raise EvidenceError("arm64 native restart receipt required")
+                observed.add(
+                    mode
+                    + (":fresh-candidate" if scenario == "fresh" else ":previous-release-upgrade")
+                )
+        if row in {"I1", "I2"}:
+            target = "linux-" + architecture
+            observed.add(admit(evidence / "channels/D1.json", "D1", current, target))
+            if row == "I1":
+                observed.add(admit(evidence / "channels/D5.json", "D5", current, target))
+        else:
+            if read(evidence / "paper/fresh/linux-lifecycle.json").get("channel_coverage") != [
+                "D7:container-native"
+            ]:
+                raise EvidenceError("measured literal managed container entry route required")
+            observed.add("D7:container-native")
+    if not LIFECYCLE_COVERAGE[row] <= observed:
+        raise EvidenceError("install row lacks pinned measured coverage")
     return dict(
         schema=1,
         journey=row,
@@ -243,7 +402,7 @@ def predicate(
         manifest_sha256=hashlib.sha256(build_bytes).hexdigest(),
         result="passed",
         tier=tier,
-        coverage=sorted(observed),
+        coverage=sorted(LIFECYCLE_COVERAGE[row]),
     )
 
 

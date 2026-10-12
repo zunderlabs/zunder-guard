@@ -119,11 +119,11 @@ def execute(
     dummy.chmod(0o600)
     for case, args, extra in (
         ("plain-key-file", [], {}),
-        ("key-file-option", ["--key-file", str(dummy)], {}),
+        ("key-file-option", ["--key-stdin", "--key-file", str(dummy)], {}),
         (
             "environment-key",
-            [],
-            {"ZUNDER_GUARD_KEY_FILE": str(dummy), "ZUNDER_API_WALLET_KEY": "not-a-private-key"},
+            ["--key-stdin"],
+            {"ZUNDER_GUARD_KEY_FILE": str(dummy)},
         ),
     ):
         result = subprocess.run(
@@ -134,6 +134,7 @@ def execute(
             timeout=30,
             check=False,
         )
+        literal = LITERAL if case == "plain-key-file" else "cannot be used with"
         output = (result.stdout + result.stderr).replace(account.encode(), b"[ACCOUNT]")
         record(
             release,
@@ -143,8 +144,8 @@ def execute(
             work=work / "M2",
             output=output,
             exit_code=result.returncode,
-            literal=LITERAL,
-            passed=result.returncode != 0 and LITERAL.encode() in output,
+            literal=literal,
+            passed=result.returncode != 0 and literal.encode() in output,
         )
     # Hide only the credential utility in an isolated PATH. The real signed installer
     # must refuse before binary installation, key parsing, units or credential writes.
@@ -307,6 +308,7 @@ def containers(release: Release, *, image: str, home: Path, work: Path, account:
             timeout=90,
             check=False,
         )
+        literal = LITERAL
         output = (result.stdout + result.stderr).replace(account.encode(), b"[ACCOUNT]")
         record(
             release,
@@ -316,6 +318,6 @@ def containers(release: Release, *, image: str, home: Path, work: Path, account:
             work=work / "M2",
             output=output,
             exit_code=result.returncode,
-            literal=LITERAL,
-            passed=result.returncode != 0 and LITERAL.encode() in output,
+            literal=literal,
+            passed=result.returncode != 0 and literal.encode() in output,
         )

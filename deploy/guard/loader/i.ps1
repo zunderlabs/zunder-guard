@@ -29,6 +29,8 @@ param(
   [switch]$KeyStdin,
   # Download, verify and install; no setup.
   [switch]$InstallOnly,
+  # Local per-user removal; retains config, journals and Credential Manager custody.
+  [switch]$Uninstall,
   # Replace an existing configuration (the journals are kept).
   [switch]$Force,
   [string]$InstallDir = '',
@@ -87,7 +89,11 @@ function Assert-ZgPath([string]$Path,[switch]$Machine,[string]$ReadSid) {
       if ($rule.AccessControlType -ne 'Allow' -or $rule.IdentityReference.Value -in @('S-1-5-18','S-1-5-32-544','S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464')) { continue }
       $allowed = 0x1200a9 # read/execute/synchronize; no delete, ACL or owner writes
       if ($current -in $known) { $allowed = $allowed -bor 6 } # standard root create-child only; each created anchor rechecked
-      if (([int]$rule.FileSystemRights -band (-bnot $allowed)) -ne 0) { throw 'Unprivileged machine path mutation rights refused.' }
+      if (([int]$rule.FileSystemRights -band (-bnot $allowed)) -ne 0) {
+        $kind = if ($current -eq [IO.Path]::GetPathRoot($full)) { 'drive-root' } elseif ($current -eq $known[0]) { 'program-data-root' } elseif ($current -eq $known[1]) { 'program-files-root' } else { 'protected-path' }
+        $rights = '{0:x8}' -f [int]$rule.FileSystemRights
+        throw "Unprivileged machine path mutation rights refused ($kind, rights=$rights)."
+      }
     }
     if ($current -eq [IO.Path]::GetPathRoot($current)) { break }
     $current = [IO.Path]::GetDirectoryName($current)
@@ -282,6 +288,7 @@ function Install-ZunderGuard {
   $CosignVersion = 'v3.1.3'
   $CosignSha256 = '9fe59be0eca1271873ce019061335eb1ac419b7059202e797828467ddabe33be'
 
+  if ($Uninstall -and ($Rules -or $Account -or $Licence -or $Network -or $ManagedService -or $KeyStdin -or $InstallOnly -or $Force -or $ConfirmAccount -or $EquityCap)) { throw 'Per-user uninstall accepts only InstallDir and NonInteractive.' }
   if ($KeyStdin -and ($Network -ne 'testnet' -or -not $NonInteractive -or $InstallOnly -or $Force -or -not [Console]::IsInputRedirected)) { throw 'Private KeyStdin requires explicit noninteractive Testnet setup through redirected stdin.' }
   if ($ManagedService -and $Network -notin @('mainnet','testnet')) { throw 'Managed service requires a sending network.' }
   if ($Network -eq 'mainnet' -or ($Network -eq 'testnet' -and $ManagedService)) {
@@ -293,6 +300,44 @@ function Install-ZunderGuard {
     throw 'i.ps1 is for Windows; on Linux and macOS: curl -fsSL https://zunderlabs.com/i | sh'
   }
   if (-not [Environment]::Is64BitOperatingSystem) { throw 'zunder-guard needs 64-bit Windows' }
+  if ($Uninstall) {
+    if ($Rules -or $Account -or $Licence -or $Network -or $ManagedService -or $KeyStdin -or $InstallOnly -or $Force -or $ConfirmAccount -or $EquityCap) { throw 'Per-user uninstall accepts only InstallDir and NonInteractive.' }
+    if (-not $InstallDir) { $InstallDir = Join-Path $env:LOCALAPPDATA 'Programs\zunder-guard' }
+    $full = [IO.Path]::GetFullPath($InstallDir)
+    if ($full -cne $InstallDir -or $full.StartsWith('\\') -or $full.Substring(2).Contains(':')) { throw 'Noncanonical per-user uninstall directory.' }
+    $cursor = $full
+    while ($cursor) {
+      $item = Get-Item -LiteralPath $cursor -Force -ErrorAction Stop
+      if (-not $item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw 'Per-user uninstall ancestor is not a plain directory.' }
+      $parent = [IO.Path]::GetDirectoryName($cursor)
+      if (-not $parent -or $parent -eq $cursor) { break }
+      $cursor = $parent
+    }
+    $owned = @('zunder-guard.exe', 'LICENSE', 'NOTICE', 'THIRD_PARTY_LICENSES.md', 'README.md', '.zunder-guard-install.json')
+    $files = @(Get-ChildItem -LiteralPath $full -Force)
+    if (-not ($files.Name -contains 'zunder-guard.exe')) { throw 'Owned per-user executable missing; removal refused.' }
+    foreach ($item in $files) {
+      if ($item.Name -notin $owned -or $item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw 'Unknown or aliased per-user install entry; removal refused.' }
+    }
+    $marker = Join-Path $full '.zunder-guard-install.json'
+    $inventory = Get-Content -LiteralPath $marker -Raw -ErrorAction Stop | ConvertFrom-Json
+    if ($inventory.schema -ne 1 -or $inventory.tag -notmatch '^v[0-9]+\.[0-9]+\.[0-9]+(?:-rc\.[0-9]+)?$' -or @($inventory.PSObject.Properties).Count -ne 3) { throw 'Per-user installation ownership record refused.' }
+    $payloads = @($files | Where-Object { $_.Name -ne '.zunder-guard-install.json' })
+    if (@($inventory.files.PSObject.Properties).Count -ne $payloads.Count) { throw 'Per-user release inventory differs.' }
+    foreach ($item in $payloads) {
+      $expected = $inventory.files.($item.Name)
+      if ($expected -notmatch '^[0-9a-f]{64}$' -or (Get-FileHash -LiteralPath $item.FullName -Algorithm SHA256).Hash.ToLowerInvariant() -ne $expected) { throw 'Installed release files changed; uninstall refused.' }
+    }
+    # Delete the executable first: a running Windows executable cannot be removed.
+    Remove-Item -LiteralPath (Join-Path $full 'zunder-guard.exe') -Force -ErrorAction Stop
+    foreach ($item in $files) { if ($item.Name -ne 'zunder-guard.exe') { Remove-Item -LiteralPath $item.FullName -Force -ErrorAction Stop } }
+    [IO.Directory]::Delete($full, $false)
+    $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+    $kept = @($userPath -split ';' | Where-Object { $_ -ne $full }) -join ';'
+    if ($kept -ne $userPath) { [Environment]::SetEnvironmentVariable('Path', $kept, 'User') }
+    Write-Host 'Removed per-user release files. Configuration, journals, pairings and Credential Manager custody are retained.'
+    return
+  }
   # x64 build; Windows 11 on ARM runs it through its x64 emulation.
   $Archive = "zunder-guard-$V-windows-amd64.zip"
   if (-not $Network) { $Network = '' }
@@ -378,6 +423,12 @@ function Install-ZunderGuard {
       $From = Join-Path $Unpacked $Notice
       if (Test-Path -LiteralPath $From) { Copy-Item -LiteralPath $From -Destination (Join-Path $InstallDir $Notice) -Force }
     }
+    $inventory = @{}
+    foreach ($name in 'zunder-guard.exe', 'LICENSE', 'NOTICE', 'THIRD_PARTY_LICENSES.md', 'README.md') {
+      $file = Join-Path $InstallDir $name
+      if (Test-Path -LiteralPath $file -PathType Leaf) { $inventory[$name] = (Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash.ToLowerInvariant() }
+    }
+    @{schema=1; tag=$V; files=$inventory} | ConvertTo-Json -Depth 3 | Set-Content -LiteralPath (Join-Path $InstallDir '.zunder-guard-install.json') -Encoding UTF8
     $Version = (& $Exe --version) -join ''
     if ($Version -ne "zunder-guard $($V.TrimStart('v'))") { throw "installed binary reports '$Version', expected $V" }
     Write-Host "Installed $Version to $Exe"

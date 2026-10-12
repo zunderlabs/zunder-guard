@@ -4,7 +4,7 @@ import { spawn } from 'node:child_process';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { test, expect } from '@playwright/test';
-import { restrictAccessHeaders } from './browser-access.js';
+import { admitStagingDocument, restrictAccessHeaders } from './browser-access.js';
 import { get, safe } from './safe.js';
 import { STAGING_ORIGIN, TESTNET_ORIGIN, WALLET_CHAIN,
   admittedDescriptor, approvalBody, canonical, validateApproval } from './approval-policy.js';
@@ -142,7 +142,7 @@ test('P8 staging approve page signs one pinned testnet builder approval', async 
     }
   });
   try {
-    await safe(() => page.goto(`/approve?builder=${builder}`), 'P8 isolated approval page');
+    await admitStagingDocument(page, `/approve?builder=${builder}`, STAGING_ORIGIN);
     await safe(() => page.getByTestId('approve-network-testnet').click(), 'P8 testnet selection');
     expect((await safe(() => page.getByTestId('approve-builder-address').textContent(), 'P8 builder display'))?.trim()
       .toLowerCase() === builder, 'displayed pinned builder').toBe(true);

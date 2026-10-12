@@ -86,6 +86,23 @@ class OwnedContainers(Stage):
                 'HostConfig': {'RestartPolicy': {'Name': 'no'}, 'LogConfig': {'Type': 'none'}},
                 'Mounts': [{'Type': 'volume', 'Name': record['volume'], 'Destination': '/data'}]}
 
+    def test_cache_cleanup_refusal_uses_sanitized_installer_boundary_before_writes(self):
+        class CacheOwner:
+            Refused = RuntimeError
+
+            def remove_owned_bytecode_cache(self, receipt):
+                raise self.Refused('Compiled helper cache ownership unknown; preserve for review.')
+
+        cache = CacheOwner()
+        with patch.object(self.wrapper, 'admit_services'), \
+                patch.object(self.wrapper, 'load_module', return_value=cache), \
+                patch.object(self.wrapper, 'ownership_receipt', return_value={'version': 1}), \
+                patch.object(self.wrapper, 'mkdir') as mkdir:
+            with self.assertRaises(self.ops.Refused):
+                self.wrapper.install_files(self.config)
+            mkdir.assert_not_called()
+            self.assertIs(cache.Refused, self.ops.Refused)
+
     def test_reused_name_never_removes_foreign_id(self):
         record, directory = self.operation()
         self.ops.atomic(directory / 'id.json', 'e' * 64)

@@ -585,6 +585,7 @@ jobs:
           retention-days: 7
       - name: actionlint
         run: |
+          python3 deploy/guard/test/workflow-concurrency-test.py
           python3 deploy/guard/test/workflow-concurrency.py .github/workflows/*.yml
           # Validate queue semantics above; actionlint predates GitHub queue:max.
           docker run --rm -v "$PWD:/repo:ro" -w /repo rhysd/actionlint:1.7.12 \
@@ -654,7 +655,11 @@ jobs:
           node-version: '24'
       - name: Install the locked fixture test dependencies
         run: npm ci
+      - name: Install pinned Chromium for browser boundary regressions
+        run: npx playwright install --with-deps chromium
       - name: Typecheck and test the loopback C4 fixture
+        env:
+          GUARD_BROWSER_BOUNDARY_TEST: '1'
         run: |
           set -euo pipefail
           {

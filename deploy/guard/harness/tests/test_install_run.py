@@ -51,6 +51,8 @@ def prepared(
             "install_run",
             "--row",
             row,
+            "--scenario",
+            "upgrade",
             "--subjects",
             str(subjects),
             "--output",
@@ -73,6 +75,9 @@ def prepared(
             if name == "install.sh":
                 assert self.tag == "v0.9.0" and self.commit == "c" * 40
                 return b"signed previous installer"
+            if name.endswith(".tar.gz"):
+                assert self.tag == "v1.0.0"
+                return b"authenticated archive fixture"
             assert name == "release-manifest.json"
             digest = "d" * 64 if self.tag == "v1.0.0" else "e" * 64
             return json.dumps(
@@ -106,10 +111,12 @@ def prepared(
 
 
 @pytest.mark.parametrize("row", ["I1", "I2", "I6"])
+@pytest.mark.parametrize("prefix", ["", "0x"])
 def test_both_modes_use_exact_subjects_and_only_private_testnet_stdin(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, row: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, row: str, prefix: str
 ) -> None:
     subjects, calls = prepared(tmp_path, monkeypatch, row)
+    monkeypatch.setenv("WALLET_FRAME", prefix + KEY)
     install_run.main()
     lifecycle = [(argv, kwargs) for argv, kwargs in calls if "-m" in argv]
     assert len(lifecycle) == 2
@@ -232,3 +239,51 @@ def test_unknown_profile_cannot_relax_source_admission(
     with pytest.raises(ProcessError):
         install_run.main()
     assert calls == []
+
+
+@pytest.mark.parametrize("row", ["I1", "I6"])
+@pytest.mark.parametrize("scenario", ["fresh", "upgrade", "both"])
+def test_guest_scenario_outputs_match_independent_and_combined_artifact_layouts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, row: str, scenario: str
+) -> None:
+    _, calls = prepared(tmp_path, monkeypatch, row)
+    args = list(sys.argv)
+    args[args.index("--scenario") + 1] = scenario
+    monkeypatch.setattr(sys, "argv", args)
+    previous_runner = subprocess.run
+
+    def run(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess[bytes]:
+        result: subprocess.CompletedProcess[bytes] = previous_runner(argv, **kwargs)
+        if row == "I1" and scenario in {"fresh", "both"} and "--testnet-lifecycle" not in argv:
+            output = Path(argv[argv.index("--output") + 1])
+            folder = output / "channels" if scenario == "fresh" else output / "fresh/channels"
+            folder.mkdir(parents=True)
+            for channel in ("D1", "D5"):
+                (folder / (channel + ".json")).write_text(
+                    json.dumps(
+                        dict(
+                            channel=channel,
+                            tag="v1.0.0",
+                            commit=COMMIT,
+                            result="passed",
+                        )
+                    )
+                )
+        return result
+
+    monkeypatch.setattr("guard_harness.install_run.subprocess.run", run)
+    install_run.main()
+    assert len(calls) == 2
+    for mode, (argv, kwargs) in zip(("paper", "testnet"), calls, strict=True):
+        expected = tmp_path / "evidence" / mode
+        if scenario != "both":
+            expected /= scenario
+        assert argv[argv.index("--output") + 1] == str(expected)
+        assert argv[argv.index("--scenario") + 1] == scenario
+        assert kwargs.get("input", b"") == (KEY.encode() + b"\n" if mode == "testnet" else b"")
+    if row == "I1" and scenario in {"fresh", "both"}:
+        for channel in ("D1", "D5"):
+            receipt = json.loads(
+                (tmp_path / "evidence/channels" / (channel + ".json")).read_bytes()
+            )
+            assert receipt["channel"] == channel and receipt["commit"] == COMMIT

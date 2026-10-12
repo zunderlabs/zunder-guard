@@ -16,17 +16,29 @@ from guard_harness.native_release import Release, staged_loader
 from guard_harness.paper_bot import LocalGuard, PaperError
 from guard_harness.runner import run
 from guard_harness.testnet_run import ROOT
+from guard_harness.testnet_scan import TestnetReads, flat_scan
 
 
 class NativeTestnet:
     def __init__(
-        self, current: Release, previous: Release, work: Path, account: str, shell: str
+        self,
+        current: Release,
+        previous: Release,
+        work: Path,
+        account: str,
+        shell: str,
+        scenario: str = "upgrade",
     ) -> None:
         self.current, self.previous, self.work, self.account = current, previous, work, account
         self.shell = shell
+        if scenario not in {"fresh", "upgrade"}:
+            raise LifecycleError("native lifecycle scenario refused")
+        self.scenario = scenario
         self.mac = platform.system() == "Darwin"
         self.sequence = 0
         self.key: bytes = b""
+        self.observed: dict[str, dict[str, str]] = {}
+        self.journal_digest = ""
         self.env = {
             name: value for name, value in os.environ.items() if not name.startswith("ZUNDER_")
         }
@@ -65,14 +77,65 @@ class NativeTestnet:
             return Path(value["executable"])
         return Path(os.environ["ProgramFiles"]) / "ZunderGuard" / self.id / "zunder-guard.exe"
 
+    def identity(self, release: Release) -> None:
+        binary = self.installed()
+        if self.mac:
+            value = self.command(["sudo", "shasum", "-a", "256", str(binary)], sensitive=True)
+            digest = value.split()[0] if value.split() else ""
+        else:
+            if binary.is_symlink():
+                raise LifecycleError("installed Testnet executable is a symlink")
+            digest = hashlib.sha256(binary.read_bytes()).hexdigest()
+        target = "darwin-arm64" if self.mac else "windows-amd64"
+        version = self.command((["sudo"] if self.mac else []) + [str(binary), "--version"])
+        if digest != hashlib.sha256(
+            release.binary(target)
+        ).hexdigest() or version != "zunder-guard " + release.tag.removeprefix("v"):
+            raise LifecycleError("native Testnet version or installed bytes differ")
+        self.observed[release.tag] = dict(
+            commit=release.commit, binary_sha256=digest, version=version
+        )
+
+    def audit(self) -> None:
+        from guard_harness.native_journal import audit
+
+        journal = self.home / "decisions.jsonl"
+        if self.mac:
+            text = self.command(["sudo", "head", "-c", "8388609", str(journal)], sensitive=True)
+            if len(text.encode()) > 8 * 1024 * 1024:
+                raise LifecycleError("native decision journal exceeds audit bound")
+            body = text.rstrip("\x00").rstrip("\n").encode() + b"\n"
+            emergency = bool(
+                self.command(
+                    [
+                        "sudo",
+                        "/bin/sh",
+                        "-c",
+                        'test ! -L "$1" && { test ! -e "$1" || '
+                        'find "$1" -mindepth 1 -print -quit; }',
+                        "guard-emergency-probe",
+                        str(self.home / "emergency"),
+                    ],
+                    sensitive=True,
+                )
+            )
+        else:
+            if journal.is_symlink():
+                raise LifecycleError("native decision journal is a symlink")
+            body = journal.read_bytes()
+            emergency = any((self.home / "emergency").rglob("*"))
+        self.journal_digest = audit(body, emergency_present=emergency)
+
     def snapshot(self) -> dict[str, bytes]:
         result: dict[str, bytes] = {}
-        for name in ("guard.toml", "risk.jsonl"):
+        for name in ("guard.toml", "risk.jsonl", "decisions.jsonl"):
             path = self.home / name
             if self.mac:
                 body = self.command(["sudo", "cat", str(path)], sensitive=True).encode()
             else:
                 body = path.read_bytes()
+            if name.endswith(".jsonl"):
+                body = body.rstrip(b"\x00")
             if not body:
                 raise LifecycleError("native configuration/journal missing")
             result[name] = body
@@ -80,8 +143,8 @@ class NativeTestnet:
 
     def retained(self, old: dict[str, bytes]) -> None:
         new = self.snapshot()
-        if new["guard.toml"] != old["guard.toml"] or not new["risk.jsonl"].startswith(
-            old["risk.jsonl"]
+        if new["guard.toml"] != old["guard.toml"] or any(
+            not new[name].startswith(old[name]) for name in ("risk.jsonl", "decisions.jsonl")
         ):
             raise LifecycleError("native upgrade lost configuration/pairings/journal prefix")
 
@@ -126,7 +189,16 @@ class NativeTestnet:
             loader.write_bytes(release.asset("i" if self.mac else "i.ps1"))
         rules = json.loads((ROOT / "rules/vectors.json").read_bytes())["valid"][0]["canonical"]
         if self.mac:
-            words = ["sh", str(loader), "--network", "testnet", "--non-interactive", "--key-stdin"]
+            words = [
+                "sudo",
+                "-n",
+                "sh",
+                str(loader),
+                "--network",
+                "testnet",
+                "--non-interactive",
+                "--key-stdin",
+            ]
             if fresh:
                 words += [
                     "--rules",
@@ -200,13 +272,8 @@ class NativeTestnet:
                         ]
                     )
                 )
-        target = "darwin-arm64" if self.mac else "windows-amd64"
+        self.identity(release)
         binary = self.installed()
-        if (
-            hashlib.sha256(binary.read_bytes()).digest()
-            != hashlib.sha256(release.binary(target)).digest()
-        ):
-            raise LifecycleError("native service image differs from exact released binary")
         check = [str(binary), "service", "check", "--binding", str(self.binding), "--json"]
         value = json.loads(self.command((["sudo"] if self.mac else []) + check))
         if (
@@ -229,6 +296,7 @@ class NativeTestnet:
             self.action("Stop")
 
     def healthy(self, release: Release) -> None:
+        self.identity(release)
         guard = LocalGuard(self.url if self.mac else "http://127.0.0.1:8547")
         deadline = time.monotonic() + 120
         while time.monotonic() < deadline:
@@ -303,22 +371,35 @@ class NativeTestnet:
         self.work.mkdir(mode=0o700)
         active = False
         try:
-            self.install(self.previous, fresh=True)
+            initial = self.current if self.scenario == "fresh" else self.previous
+            self.install(initial, fresh=True)
             if self.mac:
                 self.ensure_macos_journal()
             self.start()
             active = True
-            self.healthy(self.previous)
+            self.healthy(initial)
             old = self.snapshot()
             self.crash()
-            self.healthy(self.previous)
+            self.healthy(initial)
             self.stop()
+            self.audit()
             active = False
             self.retained(old)
             self.start()
             active = True
-            self.healthy(self.previous)
+            self.healthy(initial)
             self.stop()
+            self.audit()
+            active = False
+            if self.scenario == "upgrade":
+                flat_scan(TestnetReads(), self.account)
+            self.install(self.current)
+            self.retained(old)
+            self.start()
+            active = True
+            self.healthy(self.current)
+            self.stop()
+            self.audit()
             active = False
             self.install(self.current)
             self.retained(old)
@@ -326,26 +407,23 @@ class NativeTestnet:
             active = True
             self.healthy(self.current)
             self.stop()
-            active = False
-            self.install(self.current)
-            self.retained(old)
-            self.start()
-            active = True
-            self.healthy(self.current)
-            self.stop()
+            self.audit()
             active = False
             if self.mac:
+                uninstaller = self.work / "uninstall-current.sh"
+                uninstaller.write_bytes(self.current.asset("install.sh"))
                 self.command(
                     [
                         "sudo",
-                        str(self.installed()),
-                        "service",
-                        "remove-credential",
-                        "--binding",
-                        str(self.binding),
-                    ]
+                        "sh",
+                        str(uninstaller),
+                        "--uninstall",
+                        "--service-instance",
+                        "testnet",
+                        "--non-interactive",
+                    ],
+                    sensitive=True,
                 )
-                self.command(["sudo", "rm", str(self.plist)])
                 if self.plist.exists():
                     raise LifecycleError("launchd registration survived removal")
             else:
@@ -363,8 +441,18 @@ class NativeTestnet:
                 )
             self.retained(old)
             return {
+                "schema": 1,
                 "result": "passed",
                 "mode": "testnet",
+                "scenario": self.scenario,
+                "tag": self.current.tag,
+                "commit": self.current.commit,
+                "manifest_sha256": hashlib.sha256(
+                    self.current.asset("release-manifest.json")
+                ).hexdigest(),
+                "observed_releases": self.observed,
+                "decision_journal_sha256": self.journal_digest,
+                "no_exchange": True,
                 "coverage": [
                     "signed-release",
                     "native-custody-readback",
@@ -372,7 +460,7 @@ class NativeTestnet:
                     "restart",
                     "crash-recovery",
                     "supervisor-reload",
-                    "upgrade",
+                    "fresh-candidate" if self.scenario == "fresh" else "upgrade",
                     "reinstall",
                     "pairing-config-retained",
                     "journal-prefix",
@@ -424,7 +512,13 @@ def candidate_user_setup(native: NativeTestnet, paper: Paper, work: Path, rules:
 def per_user(native: NativeTestnet, work: Path, key: bytes) -> None:
     """Ordinary Windows Credential Manager setup and stored-key startup, no orders."""
     work.mkdir(mode=0o700)
-    paper = Paper(release=native.current, previous=native.previous, work=work, shell=native.shell)
+    paper = Paper(
+        release=native.current,
+        previous=native.previous,
+        work=work,
+        shell=native.shell,
+        scenario=native.scenario,
+    )
     paper.home.mkdir(mode=0o700)
     native.env["ZUNDER_GUARD_HOME"] = str(paper.home)
     rules = json.loads((ROOT / "rules/vectors.json").read_bytes())["valid"][0]["canonical"]
@@ -432,37 +526,44 @@ def per_user(native: NativeTestnet, work: Path, key: bytes) -> None:
     loader.write_bytes(native.previous.asset("i.ps1"))
     native.key = key
     try:
-        paper.install(native.previous)
-        native.command(
-            [
-                str(paper.binary),
-                "--home",
-                str(paper.home),
-                "init",
-                "--non-interactive",
-                "--network",
-                "testnet",
-                "--key-stdin",
-                "--key-store",
-                "credential-manager",
-                "--rules",
-                rules,
-                "--account",
-                native.account,
-            ],
-            key=True,
-            sensitive=True,
-        )
-        for index, release in enumerate((native.previous, native.current, native.current)):
-            if release == native.current:
+        # Per-user custody is a separate admission from the machine-service route.
+        flat_scan(TestnetReads(), native.account)
+        initial = native.current if native.scenario == "fresh" else native.previous
+        paper.install(initial)
+        if native.scenario == "fresh":
+            candidate_user_setup(native, paper, work, rules)
+        else:
+            native.command(
+                [
+                    str(paper.binary),
+                    "--home",
+                    str(paper.home),
+                    "init",
+                    "--non-interactive",
+                    "--network",
+                    "testnet",
+                    "--key-stdin",
+                    "--key-store",
+                    "credential-manager",
+                    "--rules",
+                    rules,
+                    "--account",
+                    native.account,
+                ],
+                key=True,
+                sensitive=True,
+            )
+        journal_digest = ""
+        for index, release in enumerate((initial, native.current, native.current)):
+            if index > 0:
+                if index == 1 and native.scenario == "upgrade":
+                    flat_scan(TestnetReads(), native.account)
                 paper.install(release, upgrade=True)
             if (
                 hashlib.sha256(paper.binary.read_bytes()).digest()
                 != hashlib.sha256(release.binary("windows-amd64")).digest()
             ):
                 raise LifecycleError("per-user sending binary differs from authenticated release")
-            if index == 2:
-                candidate_user_setup(native, paper, work, rules)
             # No key flag: real Guard must retrieve its stored Credential Manager key.
             with (work / "runtime.log").open("ab") as output:
                 process = subprocess.Popen(
@@ -511,19 +612,50 @@ def per_user(native: NativeTestnet, work: Path, key: bytes) -> None:
                     except subprocess.TimeoutExpired:
                         process.kill()
                         process.wait(timeout=10)
-        paper.binary.unlink()
+            from guard_harness.native_journal import audit
+
+            journal_digest = audit(
+                (paper.home / "decisions.jsonl").read_bytes(),
+                emergency_present=any((paper.home / "emergency").rglob("*")),
+            )
+        native.command(
+            native.ps(
+                [
+                    "-File",
+                    str(work / f"loader-{native.current.tag}.ps1"),
+                    "-Uninstall",
+                    "-NonInteractive",
+                    "-InstallDir",
+                    str(paper.binary.parent),
+                ]
+            )
+        )
+        if paper.binary.exists():
+            raise LifecycleError("released per-user uninstall retained executable")
         (work / "receipt.json").write_text(
             json.dumps(
                 {
                     "result": "passed",
+                    "schema": 1,
                     "mode": "testnet",
+                    "scenario": native.scenario,
+                    "tag": native.current.tag,
+                    "commit": native.current.commit,
+                    "manifest_sha256": hashlib.sha256(
+                        native.current.asset("release-manifest.json")
+                    ).hexdigest(),
+                    "observed_releases": paper.observed,
+                    "decision_journal_sha256": journal_digest,
+                    "no_exchange": True,
                     "coverage": [
                         "credential-manager",
-                        "candidate-loader-stdin",
+                        "candidate-loader-stdin"
+                        if native.scenario == "fresh"
+                        else "previous-release-init",
                         "stored-key-runtime",
                         "read-only-health",
                         "restart",
-                        "upgrade",
+                        "fresh-candidate" if native.scenario == "fresh" else "upgrade",
                         "reinstall",
                         "uninstall",
                         "no-exchange",
@@ -557,6 +689,7 @@ def main() -> None:
     parser.add_argument("--assets", type=Path, required=True)
     parser.add_argument("--work", type=Path, required=True)
     parser.add_argument("--shell", default="powershell.exe")
+    parser.add_argument("--scenario", choices=("fresh", "upgrade"), default="upgrade")
     parser.add_argument("--mode", choices=("testnet", "mainnet-refusal"), default="testnet")
     args = parser.parse_args()
     if (
@@ -583,6 +716,7 @@ def main() -> None:
         args.work,
         args.account,
         args.shell,
+        args.scenario,
     )
     try:
         receipt = native.execute(key)
