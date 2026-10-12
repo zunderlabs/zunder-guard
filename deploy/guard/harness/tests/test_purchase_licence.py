@@ -7,6 +7,12 @@ import pytest
 
 from guard_harness import purchase_licence as licence
 
+SIGNATURE = "A" * 86
+SYNTHETIC = "zgl1_synthetic." + SIGNATURE
+OLD = "zgl1_old." + SIGNATURE
+NEW = "zgl1_new." + SIGNATURE
+RENEWED = "zgl1_renewed." + SIGNATURE
+
 
 @pytest.fixture
 def setup(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Any:
@@ -37,7 +43,7 @@ def setup(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Any:
             pass
 
         def set_licence(self, key: str) -> None:
-            assert key == "zgl1_synthetic"
+            assert key == SYNTHETIC
             calls.append("licence")
 
         def status(self, **kwargs: Any) -> dict[str, Any]:
@@ -74,7 +80,7 @@ def test_licence_install_receipt_only_after_owned_service_stops(setup: Any) -> N
         tag="v1.0.0-rc.2",
         commit="a" * 40,
         account=status["account"],
-        key="zgl1_synthetic",
+        key=SYNTHETIC,
     )
     assert calls == ["authenticated", "init", "licence", "started", "stopped"]
     receipt = (work / "licence-receipt.json").read_text()
@@ -103,7 +109,7 @@ def test_bad_licensed_status_always_stops_and_cannot_receipt(setup: Any, failure
             tag="v1.0.0-rc.2",
             commit="a" * 40,
             account=account,
-            key="zgl1_synthetic",
+            key=SYNTHETIC,
         )
     assert calls[-1] == "stopped"
     assert not (work / "licence-receipt.json").exists()
@@ -118,7 +124,7 @@ def test_paid_receipt_binds_selected_journey(setup: Any, journey: str) -> None:
         tag="v1.0.0-rc.2",
         commit="a" * 40,
         account=status["account"],
-        key="zgl1_synthetic",
+        key=SYNTHETIC,
         journey=journey,
     )
     receipt = json.loads((work / "licence-receipt.json").read_bytes())
@@ -136,7 +142,7 @@ def test_unknown_journey_refuses_before_binary_or_licence_custody(setup: Any) ->
             tag="v1.0.0-rc.2",
             commit="a" * 40,
             account=status["account"],
-            key="zgl1_synthetic",
+            key=SYNTHETIC,
             journey="P5",
         )
     assert calls == []
@@ -147,12 +153,12 @@ def test_renewal_opt_in_preserves_policy_and_is_private(tmp_path: Path) -> None:
     import tomllib
 
     path = tmp_path / "guard.toml"
-    path.write_text('licence = "zgl1_old"\n[policy]\nrisk_per_trade = "0.01"\n')
+    path.write_text(f'licence = "{OLD}"\n[policy]\nrisk_per_trade = "0.01"\n')
     token = "a" * 43
     licence.enable_renewal(path, token)
     parsed = tomllib.loads(path.read_text())
     assert parsed["licence_auto_update"] is True and parsed["licence_renewal_token"] == token
-    assert parsed["licence"] == "zgl1_old"
+    assert parsed["licence"] == OLD
     assert parsed["policy"] == {"risk_per_trade": "0.01"}
     assert path.stat().st_mode & 0o777 == 0o600
     with pytest.raises(ValueError, match="fresh opt-in"):
@@ -161,11 +167,23 @@ def test_renewal_opt_in_preserves_policy_and_is_private(tmp_path: Path) -> None:
 
 @pytest.mark.parametrize(
     "renewal",
-    [{"key": "zgl1_old", "token": "a" * 43}, {"key": "zgl1_new", "token": "short"}],
+    [
+        {
+            "key": OLD,
+            "token": "a" * 43,
+        },
+        {
+            "key": NEW,
+            "token": "short",
+        },
+    ],
 )
 def test_renewal_refuses_repeated_key_or_malformed_token(renewal: dict[str, str]) -> None:
     with pytest.raises(ValueError, match="distinct emailed"):
-        licence.validate_renewal(renewal, "zgl1_old")
+        licence.validate_renewal(
+            renewal,
+            OLD,
+        )
 
 
 @pytest.mark.parametrize("applied", [True, False])
@@ -177,7 +195,7 @@ def test_auto_update_requires_persistence_and_applied_newer_expiry(
     logs = tmp_path / "logs"
     logs.mkdir()
     config = home / "guard.toml"
-    config.write_text('licence = "zgl1_old"\n')
+    config.write_text(f'licence = "{OLD}"\n')
     stopped: list[bool] = []
     ticks = iter([0.0, 1.0, 2.0, 3.0, 200.0])
     monkeypatch.setattr("guard_harness.purchase_licence.time.monotonic", lambda: next(ticks))
@@ -189,7 +207,7 @@ def test_auto_update_requires_persistence_and_applied_newer_expiry(
         def status(self, **kwargs: Any) -> dict[str, Any]:
             self.reads += 1
             if self.reads == 2:
-                config.write_text('licence = "zgl1_new"\n')
+                config.write_text(f'licence = "{NEW}"\n')
             return {
                 "mode": "paper",
                 "account": "0x" + "1" * 40,
@@ -229,8 +247,8 @@ def test_auto_update_requires_persistence_and_applied_newer_expiry(
             cast(GuardCLI, CLI()),
             {"PATH": "/bin", "HOME": str(home)},
             "0x" + "1" * 40,
-            "zgl1_old",
-            "zgl1_new",
+            OLD,
+            NEW,
         )
 
     if applied:
@@ -266,9 +284,33 @@ def test_p6_refuses_origin_before_token_opt_in_or_runtime(
             tag="v1.0.0-rc.2",
             commit="a" * 40,
             account=status["account"],
-            key="zgl1_synthetic",
+            key=SYNTHETIC,
             journey="P6",
-            renewal={"key": "zgl1_renewed", "token": "a" * 43},
+            renewal={
+                "key": RENEWED,
+                "token": "a" * 43,
+            },
         )
     assert calls == ["authenticated", "init", "licence"]
     assert not (work / "licence-receipt.json").exists()
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        "zgl1_payload",
+        "zgl1_payload." + "A" * 85,
+        "zgl1_payload." + "A" * 87,
+        "zgl1_payload." + "A" * 86 + ".extra",
+        "zgl1_" + "A" * 4005 + "." + "A" * 86,
+        "zgl1_payload." + "A" * 86 + "\n",
+    ],
+)
+def test_complete_key_refuses_truncated_extended_or_oversized_wire_token(key: str) -> None:
+    assert not licence.valid_licence_key(key)
+
+
+def test_complete_key_preserves_signature_and_maximum_wire_size() -> None:
+    key = "zgl1_" + "A" * 4004 + "." + "A" * 86
+    assert len(key) == 4096
+    assert licence.valid_licence_key(key)

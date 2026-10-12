@@ -17,6 +17,7 @@ from typing import Any, BinaryIO
 from guard_harness.release_state import validate_build
 from guard_harness.runner import run
 from guard_harness.staged_subjects import _private
+from guard_harness.testnet_journey import JOURNEY_PHASES
 from guard_harness.testnet_process import ENTRY_REMAINING, Foreground, ProcessError
 from guard_harness.testnet_scan import SCAN_TIMEOUT, TestnetReads
 
@@ -213,6 +214,14 @@ def execute_release(
         reads = TestnetReads()
         captured: dict[str, Any] = {}
 
+        def observe_phase(phase: str) -> None:
+            # Only fixed code-owned labels survive exceptions. Never copy a
+            # response, exception, price, account or arbitrary callback string.
+            receipt["journey_phase"] = (
+                phase if type(phase) is str and phase in JOURNEY_PHASES else "unknown"
+            )
+            _receipt(work, receipt)
+
         def capture_entry(observed: object, begun: int, ended: int) -> None:
             if builder_approval is None:
                 return
@@ -230,10 +239,16 @@ def execute_release(
 
         # Raw account events/fills stay in memory and never enter artifact uploads.
         if builder_approval is None:
-            result = owner.journey(reads, version=tag[1:], deadline=deadline)
+            result = owner.journey(
+                reads, version=tag[1:], deadline=deadline, observe_phase=observe_phase
+            )
         else:
             result = owner.journey(
-                reads, version=tag[1:], deadline=deadline, capture_entry=capture_entry
+                reads,
+                version=tag[1:],
+                deadline=deadline,
+                capture_entry=capture_entry,
+                observe_phase=observe_phase,
             )
         receipt.update(
             result="passed" if result.passed else "failed",

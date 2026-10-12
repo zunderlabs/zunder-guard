@@ -14,6 +14,29 @@ from guard_harness.linux_lifecycle import MARKER, ROOT_PATH, authenticated_file,
 from guard_harness.runner import run
 
 
+def container_install_failure_category(output: str) -> str:
+    """Recognize complete public installer refusals; retain no private output fragment."""
+    if type(output) is not str:
+        return "unknown"
+    refusals = {
+        "Verified image signature admission failed before wallet input.": (
+            "container-image-signature"
+        ),
+        "Verified image pull failed before wallet input.": "container-image-pull",
+        "Guard setup command failed; activation remains inhibited.": "container-guard-setup",
+        "Encrypted supervisor installation failed; activation remains inhibited.": (
+            "container-supervisor"
+        ),
+        "Guard did not reach the expected healthy account/risk/licence state.": (
+            "container-readiness"
+        ),
+    }
+    for message, category in refusals.items():
+        if output == "Container installation refused: " + message + "\n":
+            return category
+    return "unknown"
+
+
 @dataclass(frozen=True)
 class TestnetService:
     installer: Path
@@ -86,6 +109,7 @@ class TestnetService:
             stdin=frames,
             secrets=[key.decode().strip()],
             sensitive_output=True,
+            failure_classifier=container_install_failure_category if self.container else None,
             env={"PATH": ROOT_PATH, "HOME": "/root"},
         )
         if self.container:

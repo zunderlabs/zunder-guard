@@ -8,7 +8,8 @@ import test_testnet_ownership as reference
 
 from guard_harness.mcp_client import MCP, Tool
 from guard_harness.paper_bot import LocalGuard
-from guard_harness.testnet_journey import execute
+from guard_harness.testnet_journey import admit_preview, execute
+from guard_harness.testnet_protection import Entry, entry_plan
 
 
 class Scenario:
@@ -131,7 +132,7 @@ class Scenario:
             self.read,
             account=collector.ACCOUNT,
             client=self.opening[1],
-            entry=self.opening[2],
+            entry=kwargs.pop("entry", self.opening[2]),
             version="1.0.0-rc.1",
             process_started_ms=1000,
             stop_guard=self.stop,
@@ -354,3 +355,110 @@ def test_preview_error_never_reaches_entry_or_cleanup_budget_admission() -> None
     with pytest.raises(RuntimeError):
         scenario.execute(admit_entry=lambda: pytest.fail("no budget admission after preview error"))
     assert scenario.calls == ["preview_order"] and not scenario.stopped
+
+
+@pytest.mark.parametrize(
+    "field,value,phase",
+    [
+        ("ok", False, "preview-identity"),
+        ("source", "private-body-fixture", "preview-verdict"),
+        ("verdict", "veto", "preview-verdict"),
+        ("allowed_size", "0", "preview-sizing"),
+        ("view_age_ms", 60001, "preview-age"),
+        ("changes_quoted", ["private-body-fixture"], "preview-stop-quote"),
+        ("stop_price", "0", "preview-stop-price"),
+    ],
+)
+def test_preview_failure_reports_only_its_fixed_admission_phase(
+    field: str, value: Any, phase: str
+) -> None:
+    scenario = Scenario()
+    (scenario.preview if field == "ok" else scenario.preview["preview"])[field] = value
+    phases: list[str] = []
+    with pytest.raises(RuntimeError):
+        scenario.execute(observe_phase=phases.append)
+    assert phases[-1] == phase
+    assert "private-body-fixture" not in repr(phases)
+    assert scenario.calls == ["preview_order"] and not scenario.stopped
+
+
+def test_long_flat_scan_precedes_fresh_planning_and_stale_plan_remains_refused(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scenario = Scenario()
+    clock = [1000]
+    timeline: list[str] = []
+    markets = [{"name": "BTC", "szDecimals": 5, "isDelisted": False}]
+    old_entry = entry_plan(markets, {"BTC": "60000"})
+    fresh = entry_plan(markets, {"BTC": "60200"})
+    assert fresh.limit > old_entry.limit and fresh.size == old_entry.size
+
+    def scan(read: Any, account: str) -> dict[str, Any]:
+        assert timeline == [] and account == collector.ACCOUNT
+        timeline.append("flat-scan")
+        clock[0] += 12 * 60 * 1000
+        return {"flat": True}
+
+    def plan() -> Entry:
+        assert timeline == ["flat-scan"] and clock[0] == 721000
+        timeline.append("fresh-plan")
+        return entry_plan(markets, {"BTC": "60200"})
+
+    measured = copy.deepcopy(scenario.preview)
+    measured["preview"].update(
+        requested_size=str(fresh.size),
+        allowed_size=str(fresh.size),
+        order_price=str(old_entry.limit),
+        worst_price=str(old_entry.limit),
+        stop_price="58996",
+        changes_quoted=["a reduce-only stop at 58996 (2% from 60200) is attached"],
+    )
+    phases: list[str] = []
+    with pytest.raises(RuntimeError):
+        admit_preview(measured, old_entry, observe_phase=phases.append)
+    assert phases[-1] == "preview-price-bound"  # Preserve the original strict price predicate.
+    measured["preview"].update(order_price=str(fresh.limit), worst_price=str(fresh.limit))
+
+    def preview(name: Tool, arguments: dict[str, Any] | None = None) -> tuple[dict[str, Any], bool]:
+        assert timeline == ["flat-scan", "fresh-plan"]
+        assert name == "preview_order"
+        assert arguments is not None
+        assert arguments["limit_price"] == str(fresh.limit)
+        assert arguments["size"] == str(fresh.size) and arguments["time_in_force"] == "ioc"
+        scenario.calls.append(name)
+        timeline.append("preview")
+        return measured, False
+
+    def stop_before_entry() -> None:
+        raise RuntimeError("offline stop at the unchanged entry budget boundary")
+
+    monkeypatch.setattr("guard_harness.testnet_journey.flat_scan", scan)
+    scenario.tool = preview  # type: ignore[method-assign]
+    with pytest.raises(RuntimeError, match="unchanged entry budget boundary"):
+        execute(
+            cast(LocalGuard, scenario),
+            cast(MCP, scenario),
+            scenario.read,
+            account=collector.ACCOUNT,
+            client=scenario.opening[1],
+            entry=plan,
+            version="1.0.0-rc.1",
+            process_started_ms=1000,
+            stop_guard=scenario.stop,
+            now_ms=lambda: clock[0],
+            admit_entry=stop_before_entry,
+        )
+    assert timeline == ["flat-scan", "fresh-plan", "preview"]
+    assert scenario.calls == ["preview_order"] and not scenario.stopped
+
+
+def test_failed_flat_scan_never_invokes_planner_or_preview(monkeypatch: pytest.MonkeyPatch) -> None:
+    scenario = Scenario()
+
+    def refuse(*args: Any) -> dict[str, Any]:
+        raise RuntimeError("offline scan refusal")
+
+    monkeypatch.setattr("guard_harness.testnet_journey.flat_scan", refuse)
+    with pytest.raises(RuntimeError, match="offline scan refusal"):
+        scenario.execute(entry=lambda: pytest.fail("no market planning after unknown flat scan"))
+    assert scenario.calls == [] and not scenario.stopped

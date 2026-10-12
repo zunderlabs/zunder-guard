@@ -51,11 +51,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     environment: e2e
-    # T2 and nightly must use this same account group; never interrupt protection.
-    concurrency:
-      group: guard-e2e-testnet
-      cancel-in-progress: false
-      queue: max
+    # The admitted caller owns C6 for the whole run; T2 follows successful T1.
     permissions:
       contents: read
       actions: read
@@ -93,6 +89,16 @@ jobs:
         with:
           node-version: '24'
       - run: npm ci --prefix deploy/guard/journeys
+      - name: Admit exact caller whole-run C6 ownership before custody
+        env:
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+          WORKFLOW_SHA: ${{ github.workflow_sha }}
+          CALLER_SHA: ${{ github.sha }}
+          CALLER_REF: ${{ github.ref }}
+          CALLER_REPOSITORY: ${{ github.repository }}
+          CALLER_EVENT: ${{ github.event_name }}
+        shell: bash
+        run: python -m guard_harness.c6_owner --callee journey.yml --profile all
       - name: Authenticate builder from the released keyless paper Guard
         env:
           GH_TOKEN: ${{ github.token }}
@@ -228,11 +234,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     environment: e2e
-    # T2 and nightly must use this same account group; never interrupt protection.
-    concurrency:
-      group: guard-e2e-testnet
-      cancel-in-progress: false
-      queue: max
+    # The admitted caller owns C6 for the whole run; T2 follows successful T1.
     permissions:
       contents: read
       actions: read
@@ -266,6 +268,16 @@ jobs:
         run: |
           python -m pip install --require-hashes --only-binary=:all: -r deploy/guard/harness/requirements-runtime.lock
           python -m pip install --no-deps --no-build-isolation -e ./deploy/guard/harness
+      - name: Admit exact caller whole-run C6 ownership before custody
+        env:
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+          WORKFLOW_SHA: ${{ github.workflow_sha }}
+          CALLER_SHA: ${{ github.sha }}
+          CALLER_REF: ${{ github.ref }}
+          CALLER_REPOSITORY: ${{ github.repository }}
+          CALLER_EVENT: ${{ github.event_name }}
+        shell: bash
+        run: python -m guard_harness.c6_owner --callee journey.yml --profile all
       - name: Reserve cleanup against the recorded job start
         env:
           GH_TOKEN: ${{ github.token }}
@@ -522,6 +534,8 @@ jobs:
             ${{ runner.temp }}/quote-evidence/predicate.json
             ${{ runner.temp }}/quote-evidence/P*/payment/payment-attempt.json
             ${{ runner.temp }}/quote-evidence/P*/payment/payment-receipt.json
+            ${{ runner.temp }}/quote-evidence/P*/renewal-payment/payment-attempt.json
+            ${{ runner.temp }}/quote-evidence/P*/renewal-payment/payment-receipt.json
             ${{ runner.temp }}/quote-evidence/P*/licensed/licence-receipt.json
             ${{ steps.evidence.outputs.bundle-path }}
           if-no-files-found: warn

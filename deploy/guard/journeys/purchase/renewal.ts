@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { expect, type Page, type APIRequestContext } from '@playwright/test';
 import { get, post, safe, validInboxMessage } from './safe.js';
 import { command } from './subprocess.js';
+import { emailedLicence } from './licence-key.js';
 import { admitStagingDocument } from './browser-access.js';
 
 export async function renewPurchase(page: Page, request: APIRequestContext, input: {
@@ -54,7 +55,7 @@ export async function renewPurchase(page: Page, request: APIRequestContext, inpu
     expect(inboxResponse.status() === 200 && Array.isArray(inbox), 'renewal inbox list').toBe(true);
     for (const message of inbox) {
       expect(validInboxMessage(message, input.email, input.since), 'renewal email metadata').toBe(true);
-      const key: string | undefined = message.text.match(/\bzgl1_[A-Za-z0-9_-]+/)?.[0];
+      const key = emailedLicence(message.text);
       if (key && key !== input.oldKey && state.state === 'delivered' && state.key_issued === true) {
         return JSON.stringify({ old_key: input.oldKey, new_key: key, token: input.token });
       }

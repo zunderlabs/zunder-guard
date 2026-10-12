@@ -1,21 +1,36 @@
 #!/usr/bin/env python3
 """Validate GitHub's queue extension while actionlint predates that valid key."""
 
+import importlib.util
 import sys
 from pathlib import Path
 
 import yaml
 
 
+spec = importlib.util.spec_from_file_location(
+    "guard_c6_queue_contract",
+    Path(__file__).resolve().parents[1] / "harness/src/guard_harness/c6_owner.py",
+)
+assert spec and spec.loader
+contract = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(contract)
+
+
 def validate(paths):
     shared = []
     required = set()
+    sources = {}
     for path in paths:
-        document = yaml.safe_load(Path(path).read_text())
+        name = Path(path).name
+        if name in sources:
+            raise ValueError("duplicate workflow source")
+        sources[name] = Path(path).read_text()
+        document = contract.document(sources[name])
         jobs = document.get("jobs", {})
         for name, job in jobs.items():
-            # Leaf jobs taking C6 custody must hold the same durable queue. Reusable
-            # callers merely forward secrets and do not execute with custody.
+            # Identify exact custody leaves. The canonical graph binds them to
+            # its whole-run owner; isolated fixtures require an explicit leaf lock.
             if "uses" in job:
                 continue
             environments = [document.get("env", {}), job.get("env", {})]
@@ -47,7 +62,17 @@ def validate(paths):
             if concurrency.get("group") == "guard-release-channel-mutation":
                 if concurrency.get("queue") != "max" or concurrency.get("cancel-in-progress") is not False:
                     raise ValueError(f"{path}:{name}: channel mutation requires durable serial queue")
-    if set(shared) != required:
+    canonical = {"verify.yml", "nightly.yml", "install-matrix.yml", "journey.yml"}
+    if canonical.intersection(sources):
+        if not canonical.issubset(sources):
+            raise ValueError("complete run-wide C6 workflow graph required")
+        for caller in ("verify.yml", "nightly.yml"):
+            contract.validate(caller, sources[caller], sources["install-matrix.yml"], sources["journey.yml"])
+        covered = {("install-matrix.yml", job) for job in contract.READERS}
+        covered.update(("journey.yml", job) for job in ("testnet-foreground", "testnet-systemd"))
+        if required != covered or set(shared) != {("verify.yml", "workflow"), ("nightly.yml", "workflow")}:
+            raise ValueError("complete run-wide C6 custody ownership required")
+    elif set(shared) != required:
         raise ValueError("complete shared-account lifecycle and trading locks required")
 
 

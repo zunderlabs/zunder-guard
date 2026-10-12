@@ -18,6 +18,11 @@ from guard_harness.staged_subjects import _private
 from guard_harness.testnet_run import ROOT, signed_binary
 
 
+def valid_licence_key(key: str) -> bool:
+    # Complete bounded wire token, including signature. Rust verifies its contents.
+    return re.fullmatch(r"zgl1_[A-Za-z0-9_-]{1,4004}\.[A-Za-z0-9_-]{86}", key) is not None
+
+
 def licensed_status(status: dict[str, Any], account: str, *, source: str = "file") -> None:
     if (
         status["mode"] != "paper"
@@ -34,7 +39,7 @@ def validate_renewal(renewal: dict[str, str], old_key: str) -> None:
     if (
         set(renewal) != {"key", "token"}
         or not re.fullmatch(r"[A-Za-z0-9_-]{43}", renewal["token"])
-        or not re.fullmatch(r"zgl1_[A-Za-z0-9_-]{1,16000}", renewal["key"])
+        or not valid_licence_key(renewal["key"])
         or renewal["key"] == old_key
     ):
         raise ValueError("distinct emailed renewal key and token required")
@@ -138,7 +143,7 @@ def install(
     _private(work, directory=True)
     if not re.fullmatch(r"0x[0-9a-fA-F]{40}", account):
         raise ValueError("licence account shape required")
-    if not re.fullmatch(r"zgl1_[A-Za-z0-9_-]{1,16000}", key):
+    if not valid_licence_key(key):
         raise ValueError("single emailed licence required")
     binary = work / "zunder-guard"
     _, manifest_digest = signed_binary(assets, binary, tag=tag, commit=commit)

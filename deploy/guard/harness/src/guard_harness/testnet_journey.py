@@ -42,10 +42,38 @@ class Journey:
         )
 
 
-def admit_preview(result: dict[str, Any], entry: Entry) -> None:
+JOURNEY_PHASES = frozenset(
+    {
+        "guard-readiness",
+        "mcp-initialize",
+        "guard-status",
+        "flat-scan",
+        "entry-plan",
+        "preview-response",
+        "preview-identity",
+        "preview-verdict",
+        "preview-sizing",
+        "preview-age",
+        "preview-stop-quote",
+        "preview-stop-price",
+        "preview-price-bound",
+        "entry-budget",
+        "entry-attempt",
+    }
+)
+
+
+def admit_preview(
+    result: dict[str, Any],
+    entry: Entry,
+    *,
+    observe_phase: Callable[[str], None] = lambda _: None,
+) -> None:
     """Admit the unchanged planned entry with Guard's measured default stop."""
+    observe_phase("preview-identity")
     _need(result.get("ok") is True and result.get("coin") == "BTC" and result.get("side") == "buy")
     preview = _object(result.get("preview"))
+    observe_phase("preview-verdict")
     _need(
         preview.get("source") == "guard"
         and (preview.get("verdict"), preview.get("code"))
@@ -54,14 +82,17 @@ def admit_preview(result: dict[str, Any], entry: Entry) -> None:
         and preview.get("stop_source") == "guard_policy"
         and preview.get("time_in_force") == "ioc"
     )
+    observe_phase("preview-sizing")
     _need(
         _positive(preview.get("requested_size")) == entry.size
         and _positive(preview.get("allowed_size")) == entry.size
         and _positive(preview.get("order_price")) == entry.limit
         and _positive(preview.get("worst_price")) == entry.limit
     )
+    observe_phase("preview-age")
     age = preview.get("view_age_ms")
     _need(type(age) is int and 0 <= age <= 60000)
+    observe_phase("preview-stop-quote")
     changes = preview.get("changes_quoted")
     if not isinstance(changes, list) or not all(isinstance(change, str) for change in changes):
         raise ProtectionError("preview protection changes required")
@@ -78,8 +109,10 @@ def admit_preview(result: dict[str, Any], entry: Entry) -> None:
     ]
     _need(len(references) == 1)
     quoted_stop, reference = (_positive(value) for value in references[0].groups())
+    observe_phase("preview-stop-price")
     stop = _positive(preview.get("stop_price"))
     _need(stop == quoted_stop == price_grid(reference * Decimal("0.98"), entry.precision, up=True))
+    observe_phase("preview-price-bound")
     _need(
         stop < reference <= entry.limit
         and entry.limit <= price_grid(reference * Decimal("1.005"), entry.precision, up=False)
@@ -93,13 +126,14 @@ def execute(
     *,
     account: str,
     client: str,
-    entry: Entry,
+    entry: Entry | Callable[[], Entry],
     version: str,
     process_started_ms: int,
     stop_guard: Callable[[], None],
     admit_entry: Callable[[], None] = lambda: None,
     begin_cleanup: Callable[[], None] = lambda: None,
     capture_entry: Callable[[Ownership, int, int], None] = lambda *_: None,
+    observe_phase: Callable[[str], None] = lambda _: None,
     now_ms: Callable[[], int] = lambda: time.time_ns() // 1_000_000,
 ) -> Journey:
     """One entry attempt, actual protection readback, owned cleanup and independent scan.
@@ -110,7 +144,9 @@ def execute(
     is attempted, cleanup always runs; failed cleanup preserves the Guard and its protection.
     An exception message or response body never enters the returned diagnostic.
     """
-    entry.validate()
+    if isinstance(entry, Entry):
+        entry.validate()
+    observe_phase("guard-status")
     _need(mcp.writes_bound and mcp.close_size_bound and mcp.limit_price_ioc)
     _need(type(process_started_ms) is int and process_started_ms > 0)
     status = _object(guard.request("/guard/status"))
@@ -146,7 +182,16 @@ def execute(
     sequences = [_oid(event.get("seq")) for event in initial]
     _need(len(sequences) == len(set(sequences)))
     baseline = max(sequences, default=0)
+    observe_phase("flat-scan")
     flat_scan(read, account)  # C6 floor and every DEX, before any entry attempt.
+    observe_phase("entry-plan")
+    # Production planning reads fresh market data after the long mandatory scan.
+    # Fixed explicit Entry values remain available for independent offline fixtures.
+    if callable(entry):
+        entry = entry()
+    _need(isinstance(entry, Entry))
+    entry.validate()
+    observe_phase("preview-response")
     preview, error = mcp.tool(
         "preview_order",
         {
@@ -159,7 +204,8 @@ def execute(
         },
     )
     _need(not error)
-    admit_preview(preview, entry)
+    admit_preview(preview, entry, observe_phase=observe_phase)
+    observe_phase("entry-budget")
     admit_entry()  # Reserve cleanup time after the potentially long preflight.
     begun = now_ms()
     _need(type(begun) is int and begun > 0)
@@ -174,6 +220,7 @@ def execute(
     protected, cleaned, failure, stopped = None, None, None, False
     try:
         # Set the attempt boundary before transmission: timeout can mean the order arrived.
+        observe_phase("entry-attempt")
         result, error = mcp.tool(
             "place_order",
             {

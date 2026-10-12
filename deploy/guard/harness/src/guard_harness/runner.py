@@ -26,6 +26,11 @@ FAILURE_CATEGORIES = frozenset(
         "policy",
         "filesystem",
         "process-custody",
+        "container-image-signature",
+        "container-image-pull",
+        "container-guard-setup",
+        "container-supervisor",
+        "container-readiness",
         "unknown",
     }
 )

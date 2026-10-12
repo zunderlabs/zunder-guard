@@ -7,8 +7,9 @@ on:
 permissions:
   contents: read
 concurrency:
-  group: guard-nightly
+  group: guard-e2e-testnet
   cancel-in-progress: false
+  queue: max
 jobs:
   promoted:
     if: github.repository == 'zunderlabs/zunder-guard' && github.ref == 'refs/heads/main'

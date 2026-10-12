@@ -11,7 +11,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from guard_harness.native_release import Release
+from guard_harness.native_release import Release, diagnostic_mode
 from guard_harness.testnet_process import ProcessError
 from guard_harness.testnet_run import ROOT
 
@@ -162,34 +162,34 @@ def main() -> None:
     parser.add_argument("--paper-account", required=True)
     parser.add_argument("--scenario", choices=("fresh", "upgrade", "both"), default="both")
     args = parser.parse_args()
+    diagnostic = diagnostic_mode()
     profile = os.environ.get("INSTALL_MATRIX_PROFILE", "all")
-    if profile not in {"all", "nightly"}:
+    if profile not in {"all", "nightly"} or (diagnostic and profile != "all"):
         raise ProcessError("known install profile required")
     identity = json.loads((args.subjects / "input.json").read_bytes())
+    if not isinstance(identity, dict):
+        raise ProcessError("authenticated subject identity object required")
+    harness_commit = os.environ.get("GITHUB_SHA", "")
     if (
-        identity.get("diagnostic") is not False
-        or identity.get("harness_commit") != os.environ.get("GITHUB_SHA")
-        or (profile == "all" and identity.get("commit") != os.environ.get("GITHUB_SHA"))
+        identity.get("diagnostic") is not diagnostic
+        or re.fullmatch(r"[0-9a-f]{40}", harness_commit) is None
+        or identity.get("harness_commit") != harness_commit
+        or (profile == "all" and not diagnostic and identity.get("commit") != harness_commit)
     ):
-        raise ProcessError("non-diagnostic authenticated harness identity required")
+        raise ProcessError("explicit diagnostic mode and authenticated harness identity required")
+    if identity.get("loader_channel") != ("staging" if profile == "all" else "canonical"):
+        raise ProcessError("known loader channel required")
     if os.environ.get("GUARD_C6_SERIALIZED") != "1":
         raise ProcessError("serialized Testnet runtime required")
-    framed = os.environ.pop("WALLET_FRAME", "").strip()
-    key = framed.removeprefix("0x").encode() + b"\n"
     if args.row == "I2" and args.scenario == "both":
         raise ProcessError("I2 needs independently fresh runners for each explicit scenario")
-    if re.fullmatch(rb"[0-9a-fA-F]{64}\n", key) is None:
-        raise ProcessError("private framed Testnet key required")
     if not args.output.is_absolute() or args.output.exists():
         raise ProcessError("fresh absolute evidence directory required")
-    args.output.mkdir(mode=0o700)
     current = Release(identity["tag"], identity["commit"], args.subjects / "candidate/assets")
     previous = Release(
         identity["previous_tag"], identity["previous_commit"], args.subjects / "previous/assets"
     )
     loader = args.subjects / "i-staging"
-    if identity.get("loader_channel") != ("staging" if profile == "all" else "canonical"):
-        raise ProcessError("known loader channel required")
     if loader.read_bytes() != current.asset("i"):
         raise ProcessError("loader snapshot differs from signed release")
     old_installer = previous.assets / "install.sh"
@@ -209,6 +209,7 @@ def main() -> None:
     archive_name = f"zunder-guard-{current.tag}-{target}.tar.gz"
     archive_digest = hashlib.sha256(current.asset(archive_name)).hexdigest()
     candidate_binary_digest = hashlib.sha256(current.binary(target)).hexdigest()
+    previous_binary_digest = hashlib.sha256(previous.binary(target)).hexdigest()
     paper_identity = [
         "--release-commit",
         current.commit,
@@ -221,6 +222,26 @@ def main() -> None:
         "--archive-sha256",
         archive_digest,
     ]
+    framed = os.environ.pop("WALLET_FRAME", "").strip()
+    key = framed.removeprefix("0x").encode() + b"\n"
+    if re.fullmatch(rb"[0-9a-fA-F]{64}\n", key) is None:
+        raise ProcessError("private framed Testnet key required")
+    args.output.mkdir(mode=0o700)
+    if diagnostic:
+        (args.output / "diagnostic-only.json").write_text(
+            json.dumps(
+                {
+                    "schema": 1,
+                    "status": "diagnostic_only",
+                    "diagnostic": True,
+                    "row": args.row,
+                    "scenario": args.scenario,
+                    "commit": current.commit,
+                    "harness_commit": harness_commit,
+                }
+            )
+            + "\n"
+        )
     env = {
         name: os.environ[name]
         for name in ("PATH", "HOME", "GUARD_C6_SERIALIZED")
@@ -239,6 +260,8 @@ def main() -> None:
             str(old_installer),
             *common,
         ]
+        if diagnostic:
+            base.append("--diagnostic")
         mode = "container" if args.row == "I6" else "native"
         child(
             [
@@ -361,9 +384,9 @@ def main() -> None:
     testnet.extend(
         [
             "--binary-sha256",
-            hashlib.sha256(current.binary(target)).hexdigest(),
+            candidate_binary_digest,
             "--previous-binary-sha256",
-            hashlib.sha256(previous.binary(target)).hexdigest(),
+            previous_binary_digest,
         ]
     )
     if args.row == "I2":

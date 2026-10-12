@@ -4,6 +4,7 @@ import { randomUUID } from 'node:crypto';
 import { mkdir } from 'node:fs/promises';
 import { join } from 'node:path';
 import { renewPurchase } from './renewal.js';
+import { emailedLicence } from './licence-key.js';
 import { test, expect, type Page } from '@playwright/test';
 import { safe, get, post, validInboxMessage } from './safe.js';
 import { command } from './subprocess.js';
@@ -179,10 +180,10 @@ test(`${journey} pricing to paid email to installed released licence`, async ({ 
     for (const value of messages as unknown[]) {
       expect(validInboxMessage(value, email, since), 'paid inbox metadata').toBe(true);
       const text = (value as { text: string }).text;
-      const match = text.match(/\bzgl1_[A-Za-z0-9_-]+/);
+      const key = emailedLicence(text);
       const renew = text.match(/\/licence#renew=([A-Za-z0-9_-]{43})(?![A-Za-z0-9_-])/);
       if (renew) renewalToken = renew[1] ?? '';
-      if (match && state.state === 'delivered' && state.key_issued === true) licence = match[0];
+      if (key && state.state === 'delivered' && state.key_issued === true) licence = key;
     }
     if (licence) break;
     await new Promise(resolve => setTimeout(resolve, 5000));

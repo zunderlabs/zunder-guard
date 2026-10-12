@@ -193,13 +193,16 @@ class Foreground:
         version: str,
         deadline: float,
         capture_entry: Callable[[Ownership, int, int], None] = lambda *_: None,
+        observe_phase: Callable[[str], None] = lambda _: None,
     ) -> Journey:
         # Caller derives this monotonic deadline from the actual job's remaining lifetime.
         _need(math.isfinite(deadline) and deadline > time.monotonic())
+        observe_phase("guard-readiness")
         self.wait_ready()
-        if entry is None:
+
+        def fresh_entry() -> Entry:
             markets = _orders(_object(read({"type": "meta"})).get("universe"))
-            entry = entry_plan(markets, _object(read({"type": "allMids"})))
+            return entry_plan(markets, _object(read({"type": "allMids"})))
 
         def admit_entry() -> None:
             self.alive()
@@ -210,6 +213,7 @@ class Foreground:
         def begin_cleanup() -> None:
             read.start_phase(timeout=SCAN_TIMEOUT)
 
+        observe_phase("mcp-initialize")
         with MCP(
             self.binary,
             sha256=self.sha256,
@@ -224,13 +228,14 @@ class Foreground:
                 read,
                 account=self.account,
                 client=self.pair.address,
-                entry=entry,
+                entry=fresh_entry if entry is None else entry,
                 version=version,
                 process_started_ms=self.started_ms,
                 stop_guard=self.stop_after_flat,
                 admit_entry=admit_entry,
                 begin_cleanup=begin_cleanup,
                 capture_entry=capture_entry,
+                observe_phase=observe_phase,
             )
 
 

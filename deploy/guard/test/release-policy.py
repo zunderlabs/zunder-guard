@@ -40,8 +40,41 @@ class WorkflowQueue(unittest.TestCase):
                 paths = []
                 for source in WORKFLOWS.glob("*.yml"):
                     document = yaml.safe_load(source.read_text())
+                    if source.name == "verify.yml":
+                        document["concurrency"].update(patch_value)
+                    target = Path(directory) / source.name
+                    target.write_text(yaml.safe_dump(document))
+                    paths.append(target)
+                with self.assertRaises(ValueError):
+                    validate(paths)
+
+    def test_run_owner_covers_exact_custody_and_successful_trader_order(self):
+        validate = runpy.run_path(str(SCRIPT.parent.parent / "test/workflow-concurrency.py"))["validate"]
+        for mutation in ("owner", "inner-lock", "early-reader", "early-T2", "extra-trader", "missing-custody"):
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as directory:
+                paths = []
+                for source in WORKFLOWS.glob("*.yml"):
+                    document = yaml.safe_load(source.read_text())
+                    if source.name == "verify.yml":
+                        if mutation == "owner":
+                            del document["concurrency"]
+                        elif mutation == "early-reader":
+                            document["jobs"]["install-matrix"]["needs"] = "staging"
                     if source.name == "install-matrix.yml":
-                        document["jobs"]["native"]["concurrency"].update(patch_value)
+                        if mutation == "inner-lock":
+                            document["jobs"]["native"]["concurrency"] = {
+                                "group": "guard-e2e-testnet", "queue": "max", "cancel-in-progress": False,
+                            }
+                        elif mutation == "missing-custody":
+                            for step in document["jobs"]["native"]["steps"]:
+                                for key, value in list(step.get("env", {}).items()):
+                                    if "secrets.E2E_TESTNET_" in str(value):
+                                        step["env"][key] = "unit-no-custody"
+                    if source.name == "journey.yml":
+                        if mutation == "early-T2":
+                            document["jobs"]["testnet-systemd"]["needs"] = "purchase"
+                        elif mutation == "extra-trader":
+                            document["jobs"]["extra-trader"] = {"runs-on": "ubuntu-24.04", "steps": []}
                     target = Path(directory) / source.name
                     target.write_text(yaml.safe_dump(document))
                     paths.append(target)

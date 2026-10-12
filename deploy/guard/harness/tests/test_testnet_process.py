@@ -213,3 +213,49 @@ def test_journey_connects_owned_process_and_keeps_guard_on_cleanup_failure(
             deadline=deadline,
         )
         assert entered and not result.guard_stopped and not result.passed
+
+
+def test_production_driver_defers_market_reads_to_post_scan_planner(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    owner = process.Foreground.__new__(process.Foreground)
+    owner.binary, owner.home = tmp_path / "binary", tmp_path / "home"
+    owner.sha256, owner.url, owner.work = "a" * 64, "http://127.0.0.1:18547", tmp_path
+    owner.client_key, owner.account = tmp_path / "client", ACCOUNT
+    owner.pair = Pair(CLIENT, SYNTHETIC_CLIENT_KEY)
+    owner.started_ms = 1000
+    monkeypatch.setattr(owner, "wait_ready", lambda: None)
+    timeline: list[str] = []
+
+    class FakeMCP:
+        def __init__(self, binary: Path, **kwargs: Any) -> None:
+            assert timeline == []
+
+        def __enter__(self) -> "FakeMCP":
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            pass
+
+    def read(payload: dict[str, Any]) -> dict[str, Any]:
+        assert timeline and timeline[0] == "execute"
+        timeline.append(payload["type"])
+        return (
+            {"universe": [{"name": "BTC", "szDecimals": 5, "isDelisted": False}]}
+            if payload["type"] == "meta"
+            else {"BTC": "60200"}
+        )
+
+    def execute(*args: Any, **kwargs: Any) -> Journey:
+        assert timeline == [] and callable(kwargs["entry"])
+        timeline.append("execute")
+        planned = kwargs["entry"]()
+        planned.validate()
+        assert planned.limit == Decimal("60320")
+        assert planned.size * planned.limit <= Decimal("15")
+        return Journey(None, None, "offline", False)
+
+    monkeypatch.setattr(process, "MCP", FakeMCP)
+    monkeypatch.setattr(process, "execute", execute)
+    owner.journey(read, version="1.0.0-rc.1", deadline=time.monotonic() + 10000)  # type: ignore[arg-type]
+    assert timeline == ["execute", "meta", "allMids"]

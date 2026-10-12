@@ -144,7 +144,9 @@ function Write-ZgJson([string]$Path,$Value) {
   $file = [IO.FileStream]::new($next,[IO.FileMode]::CreateNew,[IO.FileAccess]::Write,[IO.FileShare]::None)
   try { $file.Write($bytes,0,$bytes.Length); $file.Flush($true) } finally { $file.Dispose() }
   Set-ZgAcl $next ''
-  if ([IO.File]::Exists($Path)) { [IO.File]::Replace($next,$Path,$null) } else { [IO.File]::Move($next,$Path) }
+  # A bare $null becomes an empty .NET string in Windows PowerShell 5.1.
+  # Preserve atomic replacement with a genuine null backup filename.
+  if ([IO.File]::Exists($Path)) { [IO.File]::Replace($next,$Path,[NullString]::Value) } else { [IO.File]::Move($next,$Path) }
 }
 function Get-ZgManifestHash([string]$Sums,[string]$Name) {
   $found = @()

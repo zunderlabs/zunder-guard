@@ -191,6 +191,41 @@ def test_verification_before_custody_and_sanitized_receipt(
         assert parsed["failure"] == "journey_incomplete_keep_protection"
 
 
+@pytest.mark.parametrize("phase", ["preview-price-bound", "private-response-body", None])
+def test_pre_entry_exception_retains_only_finite_phase_without_bodies_or_claims(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, phase: Any
+) -> None:
+    key = io.BytesIO(b"FIXTURE-PRIVATE-INPUT")
+
+    def verify(argv: list[str], **kwargs: Any) -> None:
+        assets(Path(argv[-1]))
+
+    class Owner:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            pass
+
+        def journey(self, *args: Any, **kwargs: Any) -> Journey:
+            kwargs["observe_phase"](phase)
+            raise RuntimeError("FIXTURE-PRIVATE-INPUT " + ACCOUNT + " private-response-body")
+
+    monkeypatch.setattr(command, "run", verify)
+    monkeypatch.setattr(command, "Foreground", Owner)
+    assert command.execute_release(**args(tmp_path, key)) == 1
+    text = (tmp_path / "run/receipt.json").read_text()
+    receipt = json.loads(text)
+    assert receipt["journey_phase"] == (
+        "preview-price-bound" if phase == "preview-price-bound" else "unknown"
+    )
+    assert receipt["failure"] == "journey_incomplete_keep_protection"
+    assert all(
+        name not in receipt for name in ["cleanup_complete", "guard_stopped", "protected_entry"]
+    )
+    assert all(
+        value not in text for value in ["FIXTURE-PRIVATE-INPUT", ACCOUNT, "private-response-body"]
+    )
+    assert key.tell() == 0
+
+
 def test_authentication_failure_never_launches_or_reads_key(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
