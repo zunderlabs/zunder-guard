@@ -3,6 +3,7 @@
 (deploy/guard/test/installer.sh runs it). Uses pexpect (ISC licence), a test tool only.
 
     installer_test.py install-only # offline release fixtures, no Rust binary or services
+    installer_test.py software-dirs # offline restrictive-umask filesystem controls
     installer_test.py container   # in a throwaway container: no systemd, non-root user
     installer_test.py bootstrap   # in a container without cosign: the pinned cosign download
     installer_test.py systemd     # on the Linux build host itself: unit, credentials, clean-up
@@ -611,6 +612,120 @@ def case_install_only_offline():
          else fail)("failed replacement keeps previous binary and cleans staging", result.stderr)
 
 
+def case_instance_software_directories_offline():
+    """Run the exact directory block on real temporary directories under umask077.
+
+    Fixed /opt paths are mapped to a temporary tree. On non-root hosts the stat
+    fixture reports a synthetic root owner and install drops only -o/-g; modes,
+    symlinks and writes are real. This is not a native service admission test.
+    """
+    source = Path(__file__).resolve().parents[1] / "install.sh"
+    block = source.read_text().split("# BEGIN managed instance software directories\n", 1)[1]
+    block = block.split("# END managed instance software directories", 1)[0]
+    real_install = shutil.which("install")
+    for case in ("fresh", "repair", "managed-fresh", "mainnet-prefix", "custom", "darwin",
+                 "foreign-root", "foreign-bin", "root-symlink", "bin-symlink", "opt-symlink",
+                 "root-writable", "bin-writable", "root-special", "opt-private"):
+        with tempfile.TemporaryDirectory(prefix="guard-software-dirs-") as temporary:
+            root = Path(temporary)
+            opt = root / "opt"
+            opt.mkdir(mode=0o755)
+            opt.chmod(0o755)
+            selected = "mainnet" if case == "mainnet-prefix" else "testnet"
+            software = opt / ("zunder-guard-" + selected)
+            prefix = software / "bin"
+            custody = root / "private-state"
+            custody.mkdir(mode=0o700)
+            private = custody / "inert-credential"
+            private.write_bytes(b"preserved inert private frame\n")
+            private.chmod(0o600)
+            custody_before = (custody.stat().st_mode, private.stat().st_mode, private.read_bytes())
+            fakebin = root / "fakebin"
+            fakebin.mkdir()
+            # Local non-root fixtures cannot chown. Project ownership explicitly;
+            # foreign-path controls override it. Actual Linux root execution below
+            # uses real owners and an unprivileged child when available.
+            stat_shim = fakebin / "stat"
+            stat_shim.write_text("#!" + sys.executable + "\n"
+                                 "import os, stat, sys\n"
+                                 "path = sys.argv[-1]\n"
+                                 "value = os.lstat(path)\n"
+                                 "if sys.argv[2] == '%u':\n"
+                                 " print(1 if path == os.environ.get('FOREIGN_PATH') else "
+                                 "(value.st_uid if os.geteuid() == 0 else 0))\n"
+                                 "else: print(format(stat.S_IMODE(value.st_mode), 'o'))\n")
+            stat_shim.chmod(0o755)
+            install_shim = fakebin / "install"
+            install_shim.write_text("#!" + sys.executable + "\n"
+                                    "import os, sys\n"
+                                    "args = iter(sys.argv[1:]); kept = []\n"
+                                    "for arg in args:\n"
+                                    " if arg in ('-o', '-g') and os.geteuid() != 0: next(args)\n"
+                                    " else: kept.append(arg)\n"
+                                    "os.execv(" + repr(real_install) + ", ['install', *kept])\n")
+            install_shim.chmod(0o755)
+            unsafe = case not in ("fresh", "repair", "managed-fresh", "mainnet-prefix", "custom", "darwin")
+            if case not in ("fresh", "managed-fresh", "mainnet-prefix"):
+                subprocess.run(["sh", "-eu", "-c", 'umask 077; mkdir -p "$1"', "fixture", str(prefix)],
+                               check=True, stdin=subprocess.DEVNULL, capture_output=True)
+                if software.stat().st_mode & 0o7777 != 0o700 or prefix.stat().st_mode & 0o7777 != 0o700:
+                    fail("legacy mkdir under077 reproduces private software directories")
+            foreign = ""
+            if case.startswith("foreign-"):
+                foreign = str(software if case == "foreign-root" else prefix)
+            if case in ("root-writable", "bin-writable", "root-special"):
+                target = prefix if case == "bin-writable" else software
+                target.chmod(0o2700 if case == "root-special" else 0o770)
+            if case in ("root-symlink", "bin-symlink", "opt-symlink"):
+                target = {"root-symlink": software, "bin-symlink": prefix, "opt-symlink": opt}[case]
+                moved = root / "outside"
+                target.rename(moved)
+                target.symlink_to(moved, target_is_directory=True)
+            if case == "opt-private":
+                opt.chmod(0o700)
+            observed_paths = [opt, software, prefix, custody, private]
+            before = {str(p): p.lstat().st_mode for p in observed_paths if p.exists() or p.is_symlink()}
+            env = {"PATH": str(fakebin) + os.pathsep + os.environ["PATH"],
+                   "OS": "darwin" if case == "darwin" else "linux", "SUDO_BIN": "",
+                   "SERVICE_INSTANCE": selected if case == "managed-fresh" else "",
+                   "INSTALL_ONLY": "0" if case == "managed-fresh" else "1",
+                   "PREFIX": str(root / "custom/bin") if case == "custom" else str(prefix),
+                   "FOREIGN_PATH": foreign}
+            script = 'set -eu\numask 077\ndie() { echo "$1" >&2; exit 1; }\n' + block.replace("/opt", str(opt))
+            result = subprocess.run(["sh", "-c", script + "\numask\n"], env=env,
+                                    stdin=subprocess.DEVNULL, capture_output=True, text=True)
+            after = {str(p): p.lstat().st_mode for p in observed_paths if p.exists() or p.is_symlink()}
+            unchanged_custody = custody_before == (custody.stat().st_mode, private.stat().st_mode, private.read_bytes())
+            if unsafe:
+                good = result.returncode != 0 and before == after and unchanged_custody
+            elif case in ("custom", "darwin"):
+                good = result.returncode == 0 and before == after and unchanged_custody
+            else:
+                good = (result.returncode == 0 and software.stat().st_mode & 0o7777 == 0o755
+                        and prefix.stat().st_mode & 0o7777 == 0o755
+                        and opt.stat().st_mode == before[str(opt)] and unchanged_custody
+                        and int(result.stdout.strip(), 8) == 0o077)
+                if good and os.geteuid() == 0 and sys.platform.startswith("linux"):
+                    # No key or Guard: prove a second uid can traverse the public
+                    # tree while the synthetic private sibling remains denied.
+                    root.chmod(0o755)
+                    executable = prefix / "inert-executable"
+                    executable.write_text("#!/bin/sh\nexit 0\n")
+                    executable.chmod(0o755)
+                    def unprivileged():
+                        os.setgroups([])
+                        os.setgid(65534)
+                        os.setuid(65534)
+                    child = subprocess.run(["/bin/sh", "-c", 'exec "$1"', "fixture", str(executable)],
+                                           preexec_fn=unprivileged, stdin=subprocess.DEVNULL,
+                                           capture_output=True)
+                    denied = subprocess.run(["cat", str(private)], preexec_fn=unprivileged,
+                                            stdin=subprocess.DEVNULL, capture_output=True)
+                    good = child.returncode == 0 and denied.returncode != 0
+            (ok if good else fail)("managed software directories under077: " + case,
+                                   result.stdout + result.stderr)
+
+
 def case_init_options_offline():
     """Execute the installer's actual init-argument block with an inert Guard.
 
@@ -689,14 +804,17 @@ def case_init_options_offline():
 
 def main():
     mode = sys.argv[1]
-    if mode not in ("install-only", "init-options"):
+    if mode not in ("install-only", "init-options", "software-dirs"):
         global pexpect
         import pexpect
     if mode == "init-options":
         case_init_options_offline()
+    elif mode == "software-dirs":
+        case_instance_software_directories_offline()
     elif mode == "install-only":
         case_init_options_offline()
         case_install_only_offline()
+        case_instance_software_directories_offline()
     elif mode == "container":
         case_paper_interactive_through_the_pipe()
         case_edit_with_bounds()

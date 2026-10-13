@@ -2,10 +2,15 @@
 
 Only a complete independent flat scan permits a lifecycle mutation. Private snapshots
 live outside the collected evidence tree; API wallet input is stdin-only in memory.
+
+The explicit lifecycle stays together because setup, crash, upgrade and uninstall
+share one exact service unit, route and private state binding. Passive failure
+observations use that same binding.
 """
 
 import argparse
 import base64
+import errno
 import hashlib
 import json
 import os
@@ -16,10 +21,12 @@ import subprocess
 import sys
 import time
 import tomllib
+import urllib.error
 from pathlib import Path, PurePosixPath
 from typing import Any
 
-from guard_harness.cli import PAIR_SCHEMA, decode_json
+from guard_harness.bounded_http_read import bounded_read
+from guard_harness.cli import PAIR_SCHEMA, STATUS_SCHEMA, decode_json
 from guard_harness.journal_diagnostics import error_category, valid_fee_approval
 from guard_harness.linux_lifecycle import (
     ROOT_PATH,
@@ -30,11 +37,128 @@ from guard_harness.linux_lifecycle import (
 )
 from guard_harness.linux_testnet_service import TestnetService
 from guard_harness.paper_bot import LocalGuard, PaperError
-from guard_harness.runner import run
-from guard_harness.testnet_scan import SCAN_TIMEOUT, TestnetReads, flat_scan
+from guard_harness.runner import RunError, run
+from guard_harness.source_installer import component_metadata, verify_file
+from guard_harness.testnet_scan import SCAN_TIMEOUT, ScanError, TestnetReads, flat_scan
 
 JOURNALS = ("guard.toml", "risk.jsonl", "decisions.jsonl")
 PRIVATE = Path("/root/.guard-testnet-lifecycle")
+
+
+LIFECYCLE_PHASES = frozenset({"before-reboot", "after-reboot", "all-no-reboot", "check-flat"})
+LIFECYCLE_OPERATIONS = frozenset(
+    {
+        "admission",
+        "after-reboot",
+        "audit",
+        "audit-version",
+        "before-reboot",
+        "cleanup-disable",
+        "cleanup-stop",
+        "container-binary-digest",
+        "crash",
+        "daemon-reload",
+        "enabled",
+        "flat-scan",
+        "fresh-volume-inventory",
+        "install",
+        "live-container-id",
+        "live-uninstall-pid",
+        "live-uninstall-state",
+        "old-pid",
+        "owned-fragment",
+        "owned-volume",
+        "pair-start",
+        "pair-stop",
+        "private-pair",
+        "readiness",
+        "recovered-pid",
+        "refused-container-id",
+        "refused-uninstall-pid",
+        "refused-uninstall-state",
+        "released-files-install",
+        "reload-restart",
+        "remaining-container",
+        "removed-unit-pid",
+        "removed-unit-state",
+        "restart",
+        "service-state",
+        "retained-volume",
+        "uninstall",
+    }
+)
+
+
+SERVICE_STATES = {
+    "ActiveState": frozenset(
+        "active reloading inactive failed activating deactivating maintenance".split()
+    ),
+    "SubState": frozenset(
+        (
+            "running dead failed auto-restart start-pre start start-post stop "
+            "stop-sigterm stop-sigkill stop-post exited final-sigterm final-sigkill"
+        ).split()
+    ),
+    "Result": frozenset(
+        (
+            "success resources protocol timeout exit-code signal core-dump watchdog "
+            "start-limit-hit oom-kill"
+        ).split()
+    ),
+}
+
+
+def bounded_status(value: str, maximum: int) -> int | None:
+    """Fixed systemd exit metadata only; malformed or out-of-domain values are unknown."""
+    return int(value) if re.fullmatch(r"[0-9]{1,3}", value) and int(value) <= maximum else None
+
+
+def unknown_http(status: bool = False) -> dict[str, object]:
+    value: dict[str, object] = {"transport": "unknown", "http": "unknown", "json": "unknown"}
+    if status:
+        value.update(mode_network_match=None, last_sync_present=None, halted=None, journal_ok=None)
+    return value
+
+
+def failure_evidence(
+    output: Path,
+    phase: str,
+    operation: object,
+    failure: str,
+    *,
+    source: dict[str, object] | None = None,
+) -> None:
+    """Finite terminal diagnostics only; never runtime/cleanup or gate authority."""
+    require(
+        output.is_dir() and not output.is_symlink() and output.stat().st_mode & 0o077 == 0,
+        "private evidence directory required",
+    )
+    phase = phase if type(phase) is str and phase in LIFECYCLE_PHASES else "unknown"
+    operation = (
+        operation if type(operation) is str and operation in LIFECYCLE_OPERATIONS else "unknown"
+    )
+    failure = (
+        failure
+        if type(failure) is str and failure in {"command", "invariant", "scan", "unknown"}
+        else "unknown"
+    )
+    with (output / ("lifecycle-" + phase + "-failure.json")).open("x") as stream:
+        os.chmod(stream.name, 0o600)
+        json.dump(
+            {
+                "schema": 1,
+                "result": "failed",
+                "gate_eligible": False,
+                "phase": phase,
+                "operation": operation,
+                "failure": failure,
+                **(source or {}),
+            },
+            stream,
+        )
+        stream.write("\n")
+        stream.flush()
+        os.fsync(stream.fileno())
 
 
 def no_exchange(home: Path) -> int:
@@ -161,7 +285,18 @@ class TestnetLifecycle:
         previous_binary_sha256: str,
         image: str,
         previous_image: str,
+        source_component: bool = False,
+        installer_harness_commit: str = "",
+        source_installer_sha256: str = "",
     ) -> None:
+        self.operation = "admission"
+        self.source_metadata = component_metadata(
+            source_component,
+            installer_harness_commit,
+            source_installer_sha256,
+            scenario=inputs.scenario,
+            actual_digest=inputs.installer_sha256,
+        )
         inputs.validate()
         require(route in {"native", "container"}, "protected route refused")
         require(inputs.account_network == "testnet", "Testnet read network required")
@@ -191,16 +326,18 @@ class TestnetLifecycle:
         self.record_path = inputs.output / "testnet-lifecycle.json"
         inputs.output.mkdir(mode=0o700, parents=True, exist_ok=True)
 
-    def command(self, name: str, words: list[str]) -> str:
+    def command(self, name: str, words: list[str], *, timeout: float = 600) -> str:
+        self.operation = name if type(name) is str and name in LIFECYCLE_OPERATIONS else "unknown"
         return run(
             words,
             log=self.inputs.output / (name + ".log"),
-            timeout=600,
+            timeout=timeout,
             sensitive_output=True,
             env={"PATH": ROOT_PATH, "HOME": "/root"},
         ).output.strip()
 
     def flat(self) -> None:
+        self.operation = "flat-scan"
         self.read.start_phase(timeout=SCAN_TIMEOUT)
         flat_scan(self.read, self.inputs.account)
 
@@ -210,6 +347,7 @@ class TestnetLifecycle:
 
     def audit(self) -> None:
         """Same-scenario controls use durable no-exchange evidence, never venue-flat credit."""
+        self.operation = "audit"
         no_exchange(self.home)
         config = tomllib.loads((self.home / "guard.toml").read_text())
         require(
@@ -422,6 +560,7 @@ class TestnetLifecycle:
         ]
 
     def healthy(self, version: str, digest: str, image: str) -> None:
+        self.operation = "readiness"
         deadline = time.monotonic() + 180
         while True:
             try:
@@ -505,24 +644,176 @@ class TestnetLifecycle:
             )
             self.admitted_release = (self.inputs.version, self.binary_sha256, self.image)
             return
-        value = TestnetService(
-            installer,
-            digest,
-            self.inputs.account,
-            self.inputs.rules,
-            self.port,
-            self.inputs.output,
-            self.inputs.marker,
-            container=self.route == "container",
-        ).setup(key)
+        self.operation = "install"
+        try:
+            value = TestnetService(
+                installer,
+                digest,
+                self.inputs.account,
+                self.inputs.rules,
+                self.port,
+                self.inputs.output,
+                self.inputs.marker,
+                container=self.route == "container",
+            ).setup(key)
+        except RunError:
+            self.retain_service_failure("install")
+            raise
+
         self.home = Path(value["home"])
         if not initial:
             self.admitted_release = (self.inputs.version, self.binary_sha256, self.image)
 
     def write(self, value: dict[str, Any]) -> None:
-        self.record_path.write_text(json.dumps(value) + "\n")
+        self.record_path.write_text(
+            json.dumps({**value, **getattr(self, "source_metadata", {})}) + "\n"
+        )
+
+    def service_state(self) -> tuple[dict[str, object], int | None]:
+        """Read only fixed unit properties; the numeric PID remains private."""
+        raw = self.command(
+            "service-state",
+            [
+                "systemctl",
+                "show",
+                "--property=ActiveState",
+                "--property=SubState",
+                "--property=Result",
+                "--property=MainPID",
+                "--property=ExecMainCode",
+                "--property=ExecMainStatus",
+                self.unit,
+            ],
+            timeout=5,
+        )
+        require(len(raw) <= 2048, "service state exceeds bound")
+        fields: dict[str, str] = {}
+        for line in raw.splitlines():
+            key, separator, value = line.partition("=")
+            require(
+                separator == "="
+                and key
+                in {
+                    "ActiveState",
+                    "SubState",
+                    "Result",
+                    "MainPID",
+                    "ExecMainCode",
+                    "ExecMainStatus",
+                }
+                and key not in fields,
+                "service state shape differs",
+            )
+            fields[key] = value
+        require(
+            set(fields)
+            == {"ActiveState", "SubState", "Result", "MainPID", "ExecMainCode", "ExecMainStatus"},
+            "service state fields incomplete",
+        )
+        pid = (
+            int(fields["MainPID"])
+            if re.fullmatch(r"[0-9]{1,10}", fields["MainPID"])
+            and int(fields["MainPID"]) <= 2**31 - 1
+            else None
+        )
+        return {
+            "active_state": fields["ActiveState"]
+            if fields["ActiveState"] in SERVICE_STATES["ActiveState"]
+            else "unknown",
+            "sub_state": fields["SubState"]
+            if fields["SubState"] in SERVICE_STATES["SubState"]
+            else "unknown",
+            "result": fields["Result"]
+            if fields["Result"] in SERVICE_STATES["Result"]
+            else "unknown",
+            "main_pid_present": pid > 1 if pid is not None else None,
+            "exec_main_code": bounded_status(fields["ExecMainCode"], 6),
+            "exec_main_status": bounded_status(fields["ExecMainStatus"], 255),
+        }, pid
+
+    def local_failure_observations(self) -> dict[str, dict[str, object]]:
+        """Two credential-free, bounded GETs; unknown errors/bodies stay private."""
+        observations: dict[str, dict[str, object]] = {}
+        deadline = time.monotonic() + 4
+        for label, path in (("health", "/healthz"), ("status", "/guard/status")):
+            observed = unknown_http(label == "status")
+            observations[label] = observed
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                continue
+            try:
+                body = bounded_read(self.guard.url + path, None, timeout=min(2, remaining))
+            except urllib.error.URLError as error:
+                if isinstance(error.reason, OSError) and error.reason.errno == errno.ECONNREFUSED:
+                    observed["transport"] = "connection-refused"
+                continue
+            except Exception:
+                continue
+            observed.update(transport="response", http="success")
+            try:
+                decoded = body.decode()
+                json.loads(decoded)
+                observed["json"] = "valid"
+                if label == "status":
+                    status = decode_json(decoded, STATUS_SCHEMA)
+                    observed["mode_network_match"] = (
+                        status["mode"] == status["network"] == "testnet"
+                    )
+                    stamp = status.get("last_sync_ms")
+                    observed["last_sync_present"] = (
+                        stamp > 0 if type(stamp) is int and 0 <= stamp <= 2**63 - 1 else None
+                    )
+                    observed["halted"] = status["halted"]
+                    observed["journal_ok"] = status["journal"]["ok"]
+            except Exception:
+                observed["json"] = "invalid"
+        return observations
+
+    def retain_service_failure(self, operation: str) -> None:
+        """Diagnostic only; read/write failure never masks failed install or kill."""
+        operation = (
+            operation if type(operation) is str and operation in {"install", "crash"} else "unknown"
+        )
+        state: dict[str, object] = {
+            "active_state": "unknown",
+            "sub_state": "unknown",
+            "result": "unknown",
+            "main_pid_present": None,
+            "exec_main_code": None,
+            "exec_main_status": None,
+        }
+        try:
+            state, _ = self.service_state()
+        except Exception:
+            pass
+        if operation == "install":
+            try:
+                state["local_http"] = self.local_failure_observations()
+            except Exception:
+                state["local_http"] = {"health": unknown_http(), "status": unknown_http(True)}
+        try:
+            with (self.inputs.output / (operation + "-service-state.json")).open("x") as stream:
+                os.chmod(stream.name, 0o600)
+                json.dump(
+                    {
+                        "schema": 1,
+                        "diagnostic": True,
+                        "gate_eligible": False,
+                        **state,
+                        **getattr(self, "source_metadata", {}),
+                    },
+                    stream,
+                )
+                stream.write("\n")
+                stream.flush()
+                os.fsync(stream.fileno())
+        except Exception:
+            pass
+        finally:
+            self.operation = operation
 
     def before(self, key: bytes) -> None:
+        self.operation = "before-reboot"
         unit = Path("/etc/systemd/system") / self.unit
         require(not unit.exists() and not self.private.exists(), "fresh owned lifecycle required")
         if self.route == "native":
@@ -592,14 +883,30 @@ class TestnetLifecycle:
         self.audit()
         self.command("daemon-reload", ["systemctl", "daemon-reload"])
         self.control("reload-restart", "restart")
+        self.healthy(
+            self.inputs.initial[2],
+            self.binary_sha256 if self.inputs.scenario == "fresh" else self.previous_binary_sha256,
+            self.image if self.inputs.scenario == "fresh" else self.previous_image,
+        )
         pid = self.command(
             "old-pid", ["systemctl", "show", "--property=MainPID", "--value", self.unit]
         )
         require(pid.isdigit() and int(pid) > 1, "service PID missing")
         self.audit()
-        self.command(
-            "crash", ["systemctl", "kill", "--kill-whom=main", "--signal=SIGKILL", self.unit]
+        state, current_pid = self.service_state()
+        require(
+            state["active_state"] == "active"
+            and state["sub_state"] == "running"
+            and current_pid == int(pid),
+            "owned service not running at captured PID before crash",
         )
+        try:
+            self.command(
+                "crash", ["systemctl", "kill", "--kill-whom=main", "--signal=SIGKILL", self.unit]
+            )
+        except RunError:
+            self.retain_service_failure("crash")
+            raise
         deadline = time.monotonic() + 120
         while self.command(
             "recovered-pid", ["systemctl", "show", "--property=MainPID", "--value", self.unit]
@@ -629,6 +936,7 @@ class TestnetLifecycle:
         )
 
     def after(self, key: bytes, *, reboot_required: bool) -> None:
+        self.operation = "after-reboot"
         record = json.loads(self.record_path.read_bytes())
         require(
             record.get("stage") == "awaiting-reboot"
@@ -867,6 +1175,9 @@ def main() -> None:
     parser.add_argument("--scenario", choices=("fresh", "upgrade"), default="upgrade")
     parser.add_argument("--image", default="")
     parser.add_argument("--previous-image", default="")
+    parser.add_argument("--source-component", action="store_true")
+    parser.add_argument("--installer-harness-commit", default="")
+    parser.add_argument("--source-installer-sha256", default="")
     parser.add_argument(
         "--phase",
         choices=("before-reboot", "after-reboot", "all-no-reboot", "check-flat"),
@@ -876,8 +1187,28 @@ def main() -> None:
     phase, route = values.pop("phase"), values.pop("route")
     extras = {
         name: values.pop(name)
-        for name in ("binary_sha256", "previous_binary_sha256", "image", "previous_image")
+        for name in (
+            "binary_sha256",
+            "previous_binary_sha256",
+            "image",
+            "previous_image",
+            "source_component",
+            "installer_harness_commit",
+            "source_installer_sha256",
+        )
     }
+    source = component_metadata(
+        extras["source_component"],
+        extras["installer_harness_commit"],
+        extras["source_installer_sha256"],
+        scenario=values["scenario"],
+        actual_digest=values["installer_sha256"],
+    )
+    if not source:
+        for name in ("source_component", "installer_harness_commit", "source_installer_sha256"):
+            extras.pop(name)
+    else:
+        verify_file(values["installer"], extras["source_installer_sha256"])
     key = b"" if phase == "check-flat" else sys.stdin.buffer.read(66)
     if phase != "check-flat":
         require(
@@ -885,6 +1216,7 @@ def main() -> None:
             "exact protected stdin frame required",
         )
     old = os.umask(0o077)
+    lifecycle: TestnetLifecycle | None = None
     try:
         lifecycle = TestnetLifecycle(
             Inputs(**values, account_network="testnet"), route=route, **extras
@@ -897,6 +1229,24 @@ def main() -> None:
             lifecycle.before(key)
         if phase in {"after-reboot", "all-no-reboot"}:
             lifecycle.after(key, reboot_required=phase != "all-no-reboot")
+    except Exception as error:
+        kind = (
+            "command"
+            if isinstance(error, RunError)
+            else "invariant"
+            if isinstance(error, LifecycleError)
+            else "scan"
+            if isinstance(error, ScanError)
+            else "unknown"
+        )
+        failure_evidence(
+            values["output"],
+            phase,
+            getattr(lifecycle, "operation", "admission"),
+            kind,
+            **({"source": source} if source else {}),
+        )
+        raise
     finally:
         os.umask(old)
 
