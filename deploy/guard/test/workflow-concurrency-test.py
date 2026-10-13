@@ -61,4 +61,35 @@ class QueueCustody(unittest.TestCase):
             path.write_text(yaml.safe_dump({"jobs": {"caller": {"uses": "./journey.yml", "secrets": {"key": "${{ secrets.E2E_TESTNET_OWNER_KEY }}"}}}}))
             module.validate([path])
 
+
+
+
+class RecoveryQueueGraph(unittest.TestCase):
+    def test_operator_leaf_admitted_only_by_complete_sealed_contract(self):
+        names = ("verify.yml", "nightly.yml", "install-matrix.yml", "journey.yml")
+        project = Path(__file__).resolve().parents[3]
+        base = project / "deploy/guard/github/workflows"
+        if not base.is_dir():
+            base = project / ".github/workflows"
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = []
+            for name in names:
+                path = Path(tmp) / name
+                path.write_text((base / name).read_text())
+                paths.append(path)
+            module.validate(paths)
+            install = paths[2]
+            original = install.read_text()
+            doc = module.contract.document(original)
+            doc["jobs"]["operator-recovery"]["if"] = "${{ always() }}"
+            install.write_text(yaml.safe_dump(doc))
+            with self.assertRaises(ValueError): module.validate(paths)
+            install.write_text(original)
+            doc = module.contract.document(original)
+            doc["jobs"]["unknown-custody"] = {
+                "runs-on": "ubuntu-24.04", "steps": [{"run": "true", "env": {
+                    "KEY": "${{ secrets.E2E_TESTNET_API_WALLET_KEY }}"}}]}
+            install.write_text(yaml.safe_dump(doc))
+            with self.assertRaises(ValueError): module.validate(paths)
+
 if __name__ == "__main__": unittest.main()

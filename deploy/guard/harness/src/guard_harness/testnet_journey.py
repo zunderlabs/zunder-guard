@@ -132,6 +132,10 @@ def execute(
     stop_guard: Callable[[], None],
     admit_entry: Callable[[], None] = lambda: None,
     begin_cleanup: Callable[[], None] = lambda: None,
+    begin_final_scan: Callable[[], None] = lambda: None,
+    check_owned_work: Callable[[], None] = lambda: None,
+    record_attempt: Callable[[Entry, int], None] = lambda *_: None,
+    persist_ownership: Callable[[list[dict[str, Any]], Entry, int], None] = lambda *_: None,
     capture_entry: Callable[[Ownership, int, int], None] = lambda *_: None,
     observe_phase: Callable[[str], None] = lambda _: None,
     now_ms: Callable[[], int] = lambda: time.time_ns() // 1_000_000,
@@ -210,17 +214,29 @@ def execute(
     begun = now_ms()
     _need(type(begun) is int and begun > 0)
 
+    record_attempt(entry, begun)  # Exclusive fsync before the single attempted send.
+    check_owned_work()  # Persistence cannot spend the reserve and still authorize a send.
+
     def observe(*, cleaning: bool) -> Ownership:
+        check_owned_work()
         events = _orders(guard.request(f"/guard/events?since={baseline}"))
         _need(all(type(event.get("seq")) is int and event["seq"] > baseline for event in events))
-        return collect_ownership(
+        check_owned_work()
+        # Preserve validated run ownership before expensive venue collection, including
+        # the unknown-entry-response branch. Missing evidence still refuses mutation.
+        persist_ownership(events, entry, begun)
+        check_owned_work()
+        observed = collect_ownership(
             read, account, events, client, entry, started_ms=begun, cleanup=cleaning
         )
+        check_owned_work()
+        return observed
 
     protected, cleaned, failure, stopped = None, None, None, False
     try:
         # Set the attempt boundary before transmission: timeout can mean the order arrived.
         observe_phase("entry-attempt")
+        check_owned_work()  # Also recheck after the final receipt hook, immediately before send.
         result, error = mcp.tool(
             "place_order",
             {
@@ -232,15 +248,28 @@ def execute(
                 "time_in_force": "ioc",
             },
         )
+        check_owned_work()
         _need(not error and result.get("sent") is True)
         protected = observe(cleaning=False)
         capture_entry(protected, begun, now_ms())
+        check_owned_work()
     except (Exception, KeyboardInterrupt):
         failure = "entry_or_protection"
     finally:
         try:
-            begin_cleanup()  # Cleanup must not inherit an exhausted preflight window.
-            cleaned = cleanup(lambda: observe(cleaning=True), mcp, lambda: flat_scan(read, account))
+            begin_cleanup()  # Owned cleanup shares the absolute entry-work deadline.
+
+            def final_scan() -> dict[str, object]:
+                begin_final_scan()
+                return flat_scan(read, account)
+
+            cleaned = cleanup(
+                lambda: observe(cleaning=True),
+                mcp,
+                final_scan,
+                check_work=check_owned_work,
+                timeout=1280,
+            )
         except (Exception, KeyboardInterrupt):
             failure = "cleanup_incomplete_keep_guard_running"
         if cleaned is not None:

@@ -54,6 +54,7 @@ class ServiceOwner(Foreground):
             port,
             work,
             marker,
+            ip_share="0.4",
         ).setup(key)
         key = b""
         self.binary, self.home = Path(installed["binary"]), Path(installed["home"])
@@ -68,6 +69,7 @@ class ServiceOwner(Foreground):
         _need(config.get("account", "").lower() == account.lower())
         _need(config.get("api_wallet", "").lower() == api_wallet.lower())
         _need(config.get("allow_mainnet", False) is False)
+        _need(config.get("ip_share") == "0.4")
         # Pair as the installed service user so its atomic config update preserves
         # custody/ownership. MCP uses a separate root-private client home, never a
         # permission relaxation of the service's protected data directory.

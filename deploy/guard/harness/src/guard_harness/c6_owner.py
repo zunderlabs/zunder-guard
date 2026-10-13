@@ -59,6 +59,7 @@ JOBS = {
         "native-mainnet",
         "mainnet-setup",
         "mainnet-admission",
+        "operator-recovery",
     },
     "journey.yml": {
         "testnet-foreground",
@@ -76,6 +77,12 @@ REF = re.compile(
     r"refs/(?:heads/(?:main|preview/[a-z0-9-]+)|tags/v\d+\.\d+\.\d+(?:-rc\.[1-9]\d*)?)\Z"
 )
 READERS = ("linux-amd64", "linux-arm64", "linux-container", "native", "docker")
+RECOVERY_IF = (
+    "${{ inputs.target == 'operator-recovery' && inputs.diagnostic == true "
+    "&& inputs.profile == 'all' && inputs.scenario == 'fresh' "
+    "&& contains(github.workflow_ref, '/.github/workflows/install-matrix.yml@') "
+    "&& github.event_name == 'workflow_dispatch' }}"
+)
 
 
 class OwnerError(ValueError):
@@ -201,6 +208,17 @@ def _readers(source: str) -> None:
     matrix = document(source)
     _lock(matrix.get("concurrency"), INSTALL_LOCK)
     leaves = _leaves(matrix, "install-matrix.yml")
+    recovery = _job(leaves, "operator-recovery")
+    _singular(recovery)
+    if (
+        recovery.get("if") != RECOVERY_IF
+        or recovery.get("needs") != "subjects"
+        or recovery.get("runs-on") != "ubuntu-24.04"
+        or recovery.get("environment") != "e2e"
+        or recovery.get("timeout-minutes") != 120
+        or "concurrency" in recovery
+    ):
+        raise OwnerError("C6 operator recovery must be a bounded standalone diagnostic")
     for name in READERS:
         if "concurrency" in _job(leaves, name):
             raise OwnerError("C6 reader holds an inner account lock")

@@ -117,6 +117,7 @@ def execute(
     dummy = home / "api-wallet-key"
     dummy.write_text("not-a-private-key\n")
     dummy.chmod(0o600)
+    failed: list[str] = []
     for case, args, extra in (
         ("plain-key-file", [], {}),
         ("key-file-option", ["--key-stdin", "--key-file", str(dummy)], {}),
@@ -136,6 +137,9 @@ def execute(
         )
         literal = LITERAL if case == "plain-key-file" else "cannot be used with"
         output = (result.stdout + result.stderr).replace(account.encode(), b"[ACCOUNT]")
+        passed = result.returncode != 0 and literal.encode() in output
+        if not passed:
+            failed.append(case)
         record(
             release,
             case=case,
@@ -145,7 +149,7 @@ def execute(
             output=output,
             exit_code=result.returncode,
             literal=literal,
-            passed=result.returncode != 0 and literal.encode() in output,
+            passed=passed,
         )
     # Hide only the credential utility in an isolated PATH. The real signed installer
     # must refuse before binary installation, key parsing, units or credential writes.
@@ -181,6 +185,10 @@ def execute(
             account,
             "--equity-cap",
             "100",
+            "--ip-share",
+            "1",
+            "--listen",
+            "127.0.0.1:18548",
             "--key-file",
             str(dummy),
         ],
@@ -191,6 +199,9 @@ def execute(
     )
     output = (result.stdout + result.stderr).replace(account.encode(), b"[ACCOUNT]")
     literal = "service instance requires systemd-creds; plaintext fallback is refused"
+    passed = result.returncode != 0 and literal.encode() in output
+    if not passed:
+        failed.append("missing-credential-store")
     record(
         release,
         case="missing-credential-store",
@@ -200,8 +211,10 @@ def execute(
         output=output,
         exit_code=result.returncode,
         literal=literal,
-        passed=result.returncode != 0 and literal.encode() in output,
+        passed=passed,
     )
+    if failed:
+        raise MatrixError("mainnet attack refusal evidence incomplete")
 
 
 def containers(release: Release, *, image: str, home: Path, work: Path, account: str) -> None:
@@ -262,6 +275,7 @@ def containers(release: Release, *, image: str, home: Path, work: Path, account:
     inputs.chmod(0o755)
     compose = work / "authenticated-compose.yaml"
     compose.write_bytes(release.asset("compose.yaml"))
+    failed: list[str] = []
     for case, words in (
         (
             "plain-docker",
@@ -310,6 +324,9 @@ def containers(release: Release, *, image: str, home: Path, work: Path, account:
         )
         literal = LITERAL
         output = (result.stdout + result.stderr).replace(account.encode(), b"[ACCOUNT]")
+        passed = result.returncode != 0 and literal.encode() in output
+        if not passed:
+            failed.append(case)
         record(
             release,
             case=case,
@@ -319,5 +336,8 @@ def containers(release: Release, *, image: str, home: Path, work: Path, account:
             output=output,
             exit_code=result.returncode,
             literal=literal,
-            passed=result.returncode != 0 and literal.encode() in output,
+            passed=passed,
         )
+
+    if failed:
+        raise MatrixError("mainnet container refusal evidence incomplete")

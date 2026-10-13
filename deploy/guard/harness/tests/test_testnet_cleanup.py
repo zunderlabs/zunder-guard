@@ -120,3 +120,18 @@ def test_orphan_cancel_must_be_observed_before_flat_credit() -> None:
     with pytest.raises(CleanupError, match="orphan cancellation"):
         cleanup(lambda: observation("0"), tools, lambda: pytest.fail("no flat credit"))
     assert tools.calls == [("cancel_order", {"coin": "BTC", "order_id": 42})]
+
+
+def test_final_all_dex_scan_has_its_own_deadline_after_owned_work() -> None:
+    now = [0.0]
+    tools = Tools()
+
+    def independent() -> dict[str, object]:
+        now[0] += 1800
+        return {"complete": True}
+
+    result = cleanup(
+        lambda: observation("0", None), tools, independent, clock=lambda: now[0], timeout=1
+    )
+    assert result.flat_scan == {"complete": True} and now[0] == 1800
+    assert not tools.calls

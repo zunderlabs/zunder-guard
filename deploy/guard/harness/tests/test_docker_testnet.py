@@ -690,3 +690,51 @@ def test_legacy_builder_approval_error_still_refuses_credit() -> None:
     with pytest.raises(PaperError, match="error_category=fee-approved") as caught:
         inspect(archive(journal_body=body))
     assert "private-sentinel" not in str(caught.value)
+
+
+def test_completed_slow_full_scan_keeps_pacing_for_separate_fill_audit() -> None:
+    from unittest.mock import MagicMock
+
+    from guard_harness.testnet_scan import TestnetReads, flat_scan
+
+    now = [0.0]
+    calls: list[str] = []
+    budgets: list[int] = []
+
+    def sleep(seconds: float) -> None:
+        now[0] += seconds
+
+    reads = TestnetReads(clock=lambda: now[0], sleep=sleep)
+
+    def opened(request: Any, *, timeout: float) -> MagicMock:
+        assert timeout == 10
+        payload = json.loads(request.data)
+        kind = payload["type"]
+        calls.append(kind)
+        budgets.append(sum(weight for _, weight in reads.reservations))
+        now[0] += 2.18
+        if kind == "userAbstraction":
+            value: object = "disabled"
+        elif kind == "perpDexs":
+            value = [None] + [{"name": f"fixture{n}"} for n in range(269)]
+        elif kind == "clearinghouseState":
+            value = {"assetPositions": [], "marginSummary": {"accountValue": "400"}}
+        else:
+            assert kind in {"frontendOpenOrders", "userFillsByTime"}
+            value = []
+        response = MagicMock()
+        response.__enter__.return_value.read.return_value = json.dumps(value).encode()
+        return response
+
+    reads.opener = MagicMock()
+    reads.opener.open.side_effect = opened
+    dexes = flat_scan(reads, ACCOUNT)["dexes"]
+    assert isinstance(dexes, list) and len(dexes) == 270
+    assert now[0] == pytest.approx(1783.740)
+    prefix = reads.reservations.copy()
+    subject.no_exchange(reads, ACCOUNT, 1000)
+    assert calls[-1] == "userFillsByTime" and len(calls) == 544
+    assert reads.reservations[-1][1] == 120
+    assert any(reservation in reads.reservations for reservation in prefix)
+    assert max(budgets) <= 600
+    assert reads.deadline == pytest.approx(1783.740 + 90)

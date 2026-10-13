@@ -197,8 +197,104 @@ def test_container_refusals_require_the_boundary_actually_exercised(
         return subprocess.CompletedProcess(argv, 1, b"", output.encode())
 
     monkeypatch.setattr(subprocess, "run", process)
-    attacks.containers(release, image=image, home=home, work=tmp_path / "work", account="public")
+    if output == attacks.LITERAL:
+        attacks.containers(
+            release, image=image, home=home, work=tmp_path / "work", account="public"
+        )
+    else:
+        with pytest.raises(MatrixError, match="container refusal evidence incomplete"):
+            attacks.containers(
+                release, image=image, home=home, work=tmp_path / "work", account="public"
+            )
     assert len(calls) == 2
     assert {item["case"] for item in records} == {"plain-docker", "compose"}
     assert all(item["literal"] == attacks.LITERAL for item in records)
     assert all(item["passed"] is (output == attacks.LITERAL) for item in records)
+
+
+@pytest.mark.parametrize(
+    "bad_case",
+    [None, "plain-key-file", "key-file-option", "environment-key", "missing-credential-store"],
+)
+def test_actual_negative_installer_inputs_pass_setup_admission_and_failed_cases_fail_batch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    bad_case: str | None,
+) -> None:
+    import subprocess
+
+    # Exercise unchanged real shell parsing/service admission plus its credential-store
+    # guard, omitting the intervening download/verification/install phases entirely.
+    # No keys, network access, systemd or root operations are involved in this regression.
+    installer = (Path(__file__).parents[2] / "install.sh").read_text()
+    prefix = installer.split(
+        "# ---------------------------------------------------------------- platform", 1
+    )[0]
+    boundary = installer.split("  if ! { command -v systemd-creds", 1)[1]
+    credential_guard = "if ! { command -v systemd-creds" + boundary.split("  # Linux shells", 1)[0]
+    inert = tmp_path / "installer-admission-only.sh"
+    inert.write_text(prefix + "\n" + credential_guard)
+    actual_process = subprocess.run
+    binary = tmp_path / "signed-subject"
+    binary.write_bytes(b"fixture")
+    release = Release("v1.0.0-rc.14", "a" * 40, tmp_path / "assets")
+    monkeypatch.setattr(Release, "binary", lambda *_: b"fixture")
+    monkeypatch.setattr(Release, "asset", lambda *_: installer.encode())
+
+    def setup(argv: list[str], **kwargs: Any) -> None:
+        if "init" in argv:
+            (Path(argv[2]) / "guard.toml").write_text(CONFIG)
+
+    monkeypatch.setattr(attacks, "run", setup)
+    records: list[dict[str, Any]] = []
+    commands: list[list[str]] = []
+    monkeypatch.setattr(attacks, "record", lambda release, **kwargs: records.append(kwargs))
+
+    def process(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess[bytes]:
+        commands.append(argv)
+        assert kwargs["input"] == b""
+        if "/bin/sh" in argv:
+            assert argv[argv.index("--ip-share") + 1] == "1"
+            assert argv[argv.index("--listen") + 1] == "127.0.0.1:18548"
+            shell = argv.index("/bin/sh")
+            environment = dict(field.split("=", 1) for field in argv[argv.index("-i") + 1 : shell])
+            result = actual_process(
+                ["/bin/sh", str(inert), *argv[shell + 2 :]],
+                env=environment,
+                input=b"",
+                capture_output=True,
+                timeout=10,
+                check=False,
+            )
+            expected = b"service instance requires systemd-creds; plaintext fallback is refused"
+            assert result.returncode != 0 and expected in result.stderr
+            assert b"needs explicit" not in result.stderr and b"listen must" not in result.stderr
+            case = "missing-credential-store"
+            output = result.stderr
+        else:
+            case = (
+                "environment-key"
+                if "ZUNDER_GUARD_KEY_FILE" in kwargs["env"]
+                else "key-file-option"
+                if "--key-stdin" in argv
+                else "plain-key-file"
+            )
+            output = (
+                attacks.LITERAL.encode() if case == "plain-key-file" else b"cannot be used with"
+            )
+        if case == bad_case:
+            output = b"PRIVATE-SENTINEL generic unrelated refusal"
+        return subprocess.CompletedProcess(argv, 1, b"", output)
+
+    monkeypatch.setattr(subprocess, "run", process)
+    options: dict[str, Any] = dict(
+        account="0x" + "1" * 40, rules="zr1_fixture", work=tmp_path / "work"
+    )
+    if bad_case is None:
+        attacks.execute(release, binary, **options)
+    else:
+        with pytest.raises(MatrixError, match="attack refusal evidence incomplete") as caught:
+            attacks.execute(release, binary, **options)
+        assert "PRIVATE" not in str(caught.value)
+    assert len(commands) == len(records) == 4  # A bad early row cannot conceal later rows.
+    assert all(record["passed"] is (record["case"] != bad_case) for record in records)

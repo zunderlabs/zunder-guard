@@ -341,7 +341,7 @@ def test_missing_git_object_fails_closed(monkeypatch: pytest.MonkeyPatch) -> Non
 @pytest.mark.parametrize(
     "workflow,leaves",
     [
-        ("install-matrix.yml", c6_owner.READERS),
+        ("install-matrix.yml", (*c6_owner.READERS, "operator-recovery")),
         ("journey.yml", ("testnet-foreground", "testnet-systemd")),
     ],
 )
@@ -364,5 +364,29 @@ def test_actual_owner_admission_precedes_every_custody_step(
                 assert n > admission
             if n <= admission:
                 assert "WALLET_FRAME" not in env and "WALLET_INPUT" not in env
-        if workflow == "install-matrix.yml":
+        if workflow == "install-matrix.yml" and name != "operator-recovery":
             assert jobs[name]["strategy"]["fail-fast"] is False
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("if", "${{ always() }}"),
+        ("needs", []),
+        ("runs-on", "self-hosted"),
+        ("environment", "production"),
+        ("timeout-minutes", 121),
+        ("concurrency", c6_owner.LOCK),
+        ("strategy", {"matrix": {"copy": [1, 2]}}),
+        ("continue-on-error", True),
+    ],
+)
+def test_operator_recovery_never_inherits_formal_or_unbounded_custody(
+    field: str, value: Any
+) -> None:
+    files = sources()
+    doc = c6_owner.document(files["install-matrix.yml"])
+    doc["jobs"]["operator-recovery"][field] = value
+    files["install-matrix.yml"] = yaml.safe_dump(doc)
+    with pytest.raises(c6_owner.OwnerError):
+        check("verify.yml", files)

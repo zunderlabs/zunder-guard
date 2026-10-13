@@ -347,6 +347,10 @@ def retained(old: dict[str, bytes], new: dict[str, bytes]) -> None:
 
 
 def no_exchange(read: Read, account: str, started_ms: int) -> None:
+    if isinstance(read, TestnetReads):
+        # One 120-weight read: at most 60.001s retained carry +12s pacing +10s HTTP.
+        # Keep the same rolling reservations; a completed scan may consume its 1800s phase.
+        read.start_phase(timeout=90)
     fills = read({"type": "userFillsByTime", "user": account, "startTime": started_ms})
     require(isinstance(fills, list) and not fills, "unexpected Testnet fills; no empty fallback")
 

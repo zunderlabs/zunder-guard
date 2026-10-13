@@ -31,7 +31,8 @@ def cleanup(
     scan: Callable[[], dict[str, object]],
     *,
     clock: Callable[[], float] = time.monotonic,
-    timeout: float = 900,
+    timeout: float = 1280,
+    check_work: Callable[[], None] = lambda: None,
 ) -> Cleaned:
     """Use fresh collect_ownership(cleanup=True) before/after each exact mutation.
 
@@ -42,23 +43,27 @@ def cleanup(
     total close attempts, each with freshly proved decreasing net exposure and exact size.
     Returned facts are observations, never release or journey attestations.
     """
-    if not 0 < timeout <= 900:
+    if not 0 < timeout <= 1280:
         raise CleanupError("bounded cleanup deadline required")
     deadline = clock() + timeout
     actions: list[str] = []
 
     def fresh() -> Ownership:
+        check_work()
         if clock() >= deadline:
             raise CleanupError("cleanup deadline; keep Guard running")
         value = observe()
         if clock() >= deadline:
             raise CleanupError("cleanup deadline; keep Guard running")
+        check_work()
         return value
 
     def mutate(name: Tool, arguments: dict[str, Any]) -> None:
+        check_work()
         if clock() >= deadline:
             raise CleanupError("cleanup deadline; keep Guard running")
         result, error = mcp.tool(name, arguments)
+        check_work()
         if error or result.get("sent") is not True:
             raise CleanupError("cleanup send unconfirmed; reconcile privately")
         actions.append(name)
@@ -95,7 +100,8 @@ def cleanup(
             raise CleanupError("orphan cancellation incomplete; keep Guard running")
     if clock() >= deadline:
         raise CleanupError("cleanup deadline; keep Guard running")
+    check_work()
+    # A separate full-scan phase owns its 1800-second transport deadline. It must not
+    # inherit or be enclosed by the shorter owned-mutation deadline.
     flat = scan()  # Must independently inspect every DEX; empty ownership is insufficient.
-    if clock() >= deadline:
-        raise CleanupError("cleanup deadline; keep Guard running")
     return Cleaned(tuple(actions), flat)
