@@ -347,6 +347,7 @@ class Foreground:
                 check_owned_work=check_owned_work,
                 record_attempt=store.begin,
                 persist_ownership=store.capture,
+                persist_response=store.response,
                 capture_entry=capture_entry,
                 observe_phase=observe_phase,
             )

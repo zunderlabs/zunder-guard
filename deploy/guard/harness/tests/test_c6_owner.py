@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import json
+import os
 import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -341,7 +344,7 @@ def test_missing_git_object_fails_closed(monkeypatch: pytest.MonkeyPatch) -> Non
 @pytest.mark.parametrize(
     "workflow,leaves",
     [
-        ("install-matrix.yml", (*c6_owner.READERS, "operator-recovery")),
+        ("install-matrix.yml", (*c6_owner.READERS, "operator-recovery", "testnet-foreground")),
         ("journey.yml", ("testnet-foreground", "testnet-systemd")),
     ],
 )
@@ -364,7 +367,7 @@ def test_actual_owner_admission_precedes_every_custody_step(
                 assert n > admission
             if n <= admission:
                 assert "WALLET_FRAME" not in env and "WALLET_INPUT" not in env
-        if workflow == "install-matrix.yml" and name != "operator-recovery":
+        if workflow == "install-matrix.yml" and name in c6_owner.READERS:
             assert jobs[name]["strategy"]["fail-fast"] is False
 
 
@@ -390,3 +393,307 @@ def test_operator_recovery_never_inherits_formal_or_unbounded_custody(
     files["install-matrix.yml"] = yaml.safe_dump(doc)
     with pytest.raises(c6_owner.OwnerError):
         check("verify.yml", files)
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("if", "${{ inputs.target == 'all' }}"),
+        ("needs", []),
+        ("runs-on", "self-hosted"),
+        ("environment", "production"),
+        ("timeout-minutes", 121),
+        ("concurrency", c6_owner.LOCK),
+        ("strategy", {"matrix": {"copy": [1, 2]}}),
+        ("continue-on-error", True),
+        ("permissions", {"id-token": "write", "attestations": "write"}),
+    ],
+)
+def test_foreground_diagnostic_never_inherits_formal_or_unbounded_custody(
+    field: str, value: Any
+) -> None:
+    files = sources()
+    doc = c6_owner.document(files["install-matrix.yml"])
+    doc["jobs"]["testnet-foreground"][field] = value
+    files["install-matrix.yml"] = yaml.safe_dump(doc)
+    with pytest.raises(c6_owner.OwnerError):
+        check("verify.yml", files)
+
+
+def test_foreground_diagnostic_cannot_gain_attestation() -> None:
+    files = sources()
+    doc = c6_owner.document(files["install-matrix.yml"])
+    doc["jobs"]["testnet-foreground"]["steps"].append({"uses": "actions/attest@fixture"})
+    files["install-matrix.yml"] = yaml.safe_dump(doc)
+    with pytest.raises(c6_owner.OwnerError, match="without attestation"):
+        check("verify.yml", files)
+
+
+def test_standalone_foreground_role_admits_only_exact_target_and_fresh_scenario(
+    caller_git: dict[str, str],
+) -> None:
+    caller_git.update(
+        WORKFLOW_REF=caller_git["WORKFLOW_REF"].replace("verify.yml", "install-matrix.yml"),
+        DIAGNOSTIC="true",
+        INSTALL_MATRIX_TARGET="testnet-foreground",
+        INSTALL_MATRIX_SCENARIO="fresh",
+    )
+    c6_owner.admit(
+        caller_git, callee="install-matrix.yml", profile="all", role="testnet-foreground"
+    )
+    for key, bad in (
+        ("INSTALL_MATRIX_TARGET", "all"),
+        ("INSTALL_MATRIX_TARGET", "operator-recovery"),
+        ("INSTALL_MATRIX_SCENARIO", "all"),
+        ("INSTALL_MATRIX_SCENARIO", "upgrade"),
+        ("DIAGNOSTIC", "false"),
+        ("CALLER_EVENT", "workflow_call"),
+        ("WORKFLOW_REF", caller_git["WORKFLOW_REF"].replace("install-matrix.yml", "verify.yml")),
+    ):
+        with pytest.raises(c6_owner.OwnerError):
+            c6_owner.admit(
+                dict(caller_git, **{key: bad}),
+                callee="install-matrix.yml",
+                profile="all",
+                role="testnet-foreground",
+            )
+    for profile in ("nightly", "unknown"):
+        with pytest.raises(c6_owner.OwnerError):
+            c6_owner.admit(
+                caller_git, callee="install-matrix.yml", profile=profile, role="testnet-foreground"
+            )
+
+
+def test_foreground_diagnostic_workflow_preserves_custody_deadline_and_private_evidence() -> None:
+    doc = c6_owner.document(source("install-matrix.yml"))
+    job = doc["jobs"]["testnet-foreground"]
+    assert job["if"] == c6_owner.FOREGROUND_IF
+    steps = job["steps"]
+    runs = [step.get("run", "") for step in steps]
+    admission = next(n for n, command in enumerate(runs) if "guard_harness.c6_owner" in command)
+    deadline = next(n for n, command in enumerate(runs) if "guard_harness.job_deadline" in command)
+    custody = next(n for n, command in enumerate(runs) if "guard_harness.testnet_run" in command)
+    assert admission < deadline < custody
+    assert "--role testnet-foreground" in runs[admission]
+    assert steps[deadline]["env"]["JOB_TIMEOUT_SECONDS"] == "7200"
+    assert "attempts/$GITHUB_RUN_ATTEMPT/jobs?per_page=100" in runs[deadline]
+    assert '--deadline "$JOURNEY_DEADLINE"' in runs[custody]
+    assert "printf '%s\\n' \"$WALLET_INPUT\" | env -u WALLET_INPUT" in runs[custody]
+    assert steps[custody]["env"]["WALLET_INPUT"] == "${{ secrets.E2E_TESTNET_API_WALLET_KEY }}"
+    assert "--builder-approval" not in runs[custody]
+    assert "--service-marker" not in runs[custody]
+    assert not any("E2E_TESTNET_OWNER_KEY" in str(step) for step in steps)
+    assert not any("actions/attest" in step.get("uses", "") for step in steps)
+    assert not any("purchase_" in command or "builder_journey" in command for command in runs)
+    failure_scan = next(
+        n for n, command in enumerate(runs) if "guard_harness.failure_scan" in command
+    )
+    uploads = [
+        n for n, step in enumerate(steps) if "actions/upload-artifact" in step.get("uses", "")
+    ]
+    assert len(uploads) == 2 and uploads[0] < failure_scan < uploads[1]
+    for n in uploads:
+        assert steps[n]["if"] == "${{ always() }}"
+        paths = steps[n]["with"]["path"].splitlines()
+        expected = {
+            "receipt.json",
+            "assets.log",
+            "runtime/init.log",
+            "runtime/pair.log",
+            "runtime/process.log",
+            "runtime/mcp.log",
+            "runtime/entry-attempt.json",
+            "runtime/ownership.json",
+            "runtime/entry-response.json",
+        }
+        assert {path.split("/T1/")[1] for path in paths if "/T1/" in path} == expected
+        assert all("*" not in path and "predicate" not in path for path in paths)
+    label = next(command for command in runs if "value.update(diagnostic=True" in command)
+    assert "gate_eligible=False" in label and "release_ready=False" in label
+
+
+def payment_diagnostic_job() -> dict[str, Any]:
+    return c6_owner.document(source("journey.yml"))["jobs"]["payment-diagnostic"]  # type: ignore[no-any-return]
+
+
+def test_payment_diagnostic_is_singular_non_c6_and_keeps_network_purchase_lease() -> None:
+    job = payment_diagnostic_job()
+    assert job["if"] == (
+        "${{ github.event_name == 'workflow_dispatch' && inputs.profile == 'payment' "
+        "&& contains(github.workflow_ref, '/.github/workflows/journey.yml@') }}"
+    )
+    assert job["environment"] == "e2e" and job["runs-on"] == "ubuntu-24.04"
+    assert "strategy" not in job and "needs" not in job and "uses" not in job
+    assert job["concurrency"] == {
+        "group": "guard-e2e-purchase-${{ inputs.payment_network }}",
+        "cancel-in-progress": False,
+        "queue": "max",
+    }
+    serialized = yaml.safe_dump(job)
+    for forbidden in (
+        "E2E_TESTNET_API_WALLET_KEY",
+        "E2E_TESTNET_OWNER_KEY",
+        "E2E_INBOX_TOKEN",
+        "GUARD_INBOX_URL",
+        "E2E_MERCHANT_TESTNET_KEY",
+        "purchase_evidence",
+        "actions/attest@",
+        "GUARD_TEST_PROOF",
+    ):
+        assert forbidden not in serialized
+    steps = job["steps"]
+    auth = next(i for i, step in enumerate(steps) if "native_release --tag" in step.get("run", ""))
+    pay = next(
+        i for i, step in enumerate(steps) if "E2E_PAYER_EVM_SEPOLIA_KEY" in step.get("env", {})
+    )
+    assert auth < pay
+    assert steps[auth]["env"]["DIAGNOSTIC"] == "true"
+    assert "value['harness_commit'] != os.environ['GITHUB_SHA']" in steps[auth]["run"]
+    env = steps[pay]["env"]
+    assert env["PROFILE"] == env["GUARD_PAYMENT_DIAGNOSTIC_PROFILE"] == "payment"
+    assert env["GUARD_PAYMENT_DIAGNOSTIC"] == "1"
+    assert env["GUARD_DIAGNOSTIC_HARNESS_COMMIT"] == "${{ github.sha }}"
+    assert "GUARD_CHECKOUT_DIAGNOSTIC" not in env
+    assert steps[pay]["run"].count("npm test -- purchase/paid.test.ts") == 1
+    upload = next(
+        step for step in steps if step.get("uses", "").startswith("actions/upload-artifact@")
+    )
+    prefix = "${{ runner.temp }}/payment-diagnostic/payment/"
+    assert upload["with"]["path"].splitlines()[:-1] == [
+        prefix + suffix
+        for suffix in (
+            "payment/payment-attempt.json",
+            "payment/payment-failure.json",
+            "payment/payment-receipt.json",
+            "payment-diagnostic.json",
+        )
+    ]
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("PROFILE", "all"),
+        ("PROFILE", "nightly"),
+        ("PAYMENT_NETWORK", "hyperliquid"),
+        ("GITHUB_REPOSITORY", "foreign/guard"),
+        ("GITHUB_EVENT_NAME", "workflow_call"),
+        ("GITHUB_REF", "refs/tags/v1.0.0-rc.14"),
+        ("GITHUB_REF", "refs/heads/untrusted"),
+        ("WORKFLOW_SHA", "c" * 40),
+        ("SOURCE", "unbound"),
+        ("PREVIOUS_SOURCE", ""),
+        ("TAG", "v1.0.0"),
+        ("PREVIOUS_TAG", "v1.0.0-rc.14"),
+        ("WORKFLOW_REF", "zunderlabs/zunder-guard/.github/workflows/foreign.yml@refs/heads/main"),
+    ],
+)
+def test_payment_source_seal_refuses_before_checkout_or_custody(field: str, value: str) -> None:
+    env = {
+        "GITHUB_REPOSITORY": "zunderlabs/zunder-guard",
+        "GITHUB_EVENT_NAME": "workflow_dispatch",
+        "PROFILE": "payment",
+        "PAYMENT_NETWORK": "arbitrum",
+        "GITHUB_SHA": "a" * 40,
+        "SOURCE": "b" * 40,
+        "PREVIOUS_SOURCE": "c" * 40,
+        "TAG": "v1.0.0-rc.14",
+        "PREVIOUS_TAG": "v1.0.0-rc.13",
+        "GITHUB_REF": "refs/heads/main",
+        "WORKFLOW_REF": "zunderlabs/zunder-guard/.github/workflows/journey.yml@refs/heads/main",
+        "WORKFLOW_SHA": "a" * 40,
+    }
+    seal = payment_diagnostic_job()["steps"][0]["run"]
+    assert subprocess.run(["bash", "-c", seal], env=env, capture_output=True).returncode == 0
+    env[field] = value
+    assert subprocess.run(["bash", "-c", seal], env=env, capture_output=True).returncode != 0
+
+
+def test_p5_attempt_and_receipt_paths_are_exactly_retained() -> None:
+    job = c6_owner.document(source("journey.yml"))["jobs"]["purchase"]
+    upload = next(
+        step for step in job["steps"] if step.get("name") == "Retain sanitized purchase evidence"
+    )
+    paths = upload["with"]["path"].splitlines()
+    for kind in ("under", "over", "late", "blocked"):
+        for outcome in ("attempt", "receipt"):
+            path = "${{ runner.temp }}/quote-evidence/P5/" + kind + "/payment-" + outcome + ".json"
+            assert path in paths
+    assert not any(path.endswith("/P5/**") or path.endswith("/P5/*") for path in paths)
+
+
+def test_payment_authored_phase_extractor_never_retains_private_body(tmp_path: Path) -> None:
+    root = tmp_path / "payment-diagnostic"
+    root.mkdir(mode=0o700)
+    private = "PRIVATE_SENTINEL"
+    (root / "private-journey.log").write_text(
+        private
+        + "\ncheckout-phase "
+        + json.dumps(
+            {
+                "phase": "checkout-quote",
+                "quoteRequested": True,
+                "quoteResponded": False,
+                "state": private,
+                "secret": private,
+            }
+        )
+        + "\ncheckout-phase "
+        + json.dumps(
+            {
+                "phase": private,
+                "quoteRequested": True,
+                "quoteResponded": True,
+            }
+        )
+        + "\ncheckout-phase "
+        + json.dumps(
+            {
+                "phase": "checkout-email",
+                "quoteRequested": private,
+                "quoteResponded": False,
+            }
+        )
+        + "\n"
+    )
+    step = next(
+        step
+        for step in payment_diagnostic_job()["steps"]
+        if step.get("name")
+        == "Retain bounded authored failure phases without private Playwright output"
+    )
+    run = subprocess.run(
+        ["bash", "-c", step["run"]],
+        env={
+            "RUNNER_TEMP": str(tmp_path),
+            "PAYMENT_STEP_OUTCOME": "failure",
+            "PATH": str(Path(sys.executable).parent) + os.pathsep + os.environ["PATH"],
+        },
+        capture_output=True,
+    )
+    assert run.returncode == 0
+    body = (root / "phase-diagnostic.json").read_text()
+    assert private not in body and private.encode() not in run.stdout + run.stderr
+    assert json.loads(body) == {
+        "schema": 1,
+        "diagnostic": True,
+        "gate_eligible": False,
+        "payment_step_outcome": "failure",
+        "checkout_phases": [
+            {
+                "phase": "checkout-quote",
+                "quoteRequested": True,
+                "quoteResponded": False,
+            }
+        ],
+    }
+    assert (root / "phase-diagnostic.json").stat().st_mode & 0o077 == 0
+    upload = next(
+        step
+        for step in payment_diagnostic_job()["steps"]
+        if step.get("uses", "").startswith("actions/upload-artifact@")
+    )
+    assert upload["with"]["path"].splitlines()[-1] == (
+        "${{ runner.temp }}/payment-diagnostic/phase-diagnostic.json"
+    )
+    assert "private-journey.log" not in upload["with"]["path"]

@@ -60,6 +60,7 @@ JOBS = {
         "mainnet-setup",
         "mainnet-admission",
         "operator-recovery",
+        "testnet-foreground",
     },
     "journey.yml": {
         "testnet-foreground",
@@ -70,6 +71,7 @@ JOBS = {
         "signing-gate",
         "testnet-failure-alert",
         "checkout-diagnostic",
+        "payment-diagnostic",
     },
 }
 SHA = re.compile(r"[0-9a-f]{40}\Z")
@@ -83,6 +85,7 @@ RECOVERY_IF = (
     "&& contains(github.workflow_ref, '/.github/workflows/install-matrix.yml@') "
     "&& github.event_name == 'workflow_dispatch' }}"
 )
+FOREGROUND_IF = RECOVERY_IF.replace("'operator-recovery'", "'testnet-foreground'")
 
 
 class OwnerError(ValueError):
@@ -219,6 +222,22 @@ def _readers(source: str) -> None:
         or "concurrency" in recovery
     ):
         raise OwnerError("C6 operator recovery must be a bounded standalone diagnostic")
+    foreground = _job(leaves, "testnet-foreground")
+    _singular(foreground)
+    if (
+        foreground.get("if") != FOREGROUND_IF
+        or foreground.get("needs") != "subjects"
+        or foreground.get("runs-on") != "ubuntu-24.04"
+        or foreground.get("environment") != "e2e"
+        or foreground.get("timeout-minutes") != 120
+        or foreground.get("permissions")
+        != {"contents": "read", "actions": "read", "packages": "read"}
+        or "concurrency" in foreground
+        or any("actions/attest" in str(step.get("uses", "")) for step in foreground["steps"])
+    ):
+        raise OwnerError(
+            "C6 foreground must be a bounded standalone diagnostic without attestation"
+        )
     for name in READERS:
         if "concurrency" in _job(leaves, name):
             raise OwnerError("C6 reader holds an inner account lock")
@@ -239,7 +258,7 @@ def _git(*args: str) -> str:
     return result.stdout
 
 
-def admit(context: dict[str, str], *, callee: str, profile: str) -> None:
+def admit(context: dict[str, str], *, callee: str, profile: str, role: str = "reader") -> None:
     """Trusted step context, not workflow inputs or an unauthenticated file claim."""
     workflow_ref = context.get("WORKFLOW_REF", "")
     sha = context.get("WORKFLOW_SHA", "")
@@ -262,6 +281,15 @@ def admit(context: dict[str, str], *, callee: str, profile: str) -> None:
     caller, ref = suffix.split("@")
     if ref != github_ref:
         raise OwnerError("C6 caller reference differs")
+    if role not in {"reader", "testnet-foreground"} or (
+        role == "testnet-foreground"
+        and (
+            caller != "install-matrix.yml"
+            or context.get("INSTALL_MATRIX_TARGET") != "testnet-foreground"
+            or context.get("INSTALL_MATRIX_SCENARIO") != "fresh"
+        )
+    ):
+        raise OwnerError("C6 foreground target requires standalone fresh diagnostic ownership")
 
     def show(name: str) -> str:
         return _git("show", f"{sha}:.github/workflows/{name}")
@@ -289,9 +317,10 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--callee", required=True, choices=("install-matrix.yml", "journey.yml"))
     parser.add_argument("--profile", required=True)
+    parser.add_argument("--role", choices=("reader", "testnet-foreground"), default="reader")
     args = parser.parse_args()
     try:
-        admit(dict(os.environ), callee=args.callee, profile=args.profile)
+        admit(dict(os.environ), callee=args.callee, profile=args.profile, role=args.role)
     except OwnerError as error:
         raise SystemExit(str(error)) from None
     print("C6 exact whole-run owner admitted; runtime safety checks remain required")

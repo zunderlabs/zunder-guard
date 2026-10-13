@@ -59,6 +59,15 @@ JOURNEY_PHASES = frozenset(
         "preview-price-bound",
         "entry-budget",
         "entry-attempt",
+        "entry-response",
+        "entry-call-unconfirmed",
+        "ownership-events",
+        "ownership-events-unavailable",
+        "ownership-validation",
+        "ownership-validation-refused",
+        "ownership-storage-failed",
+        "ownership-captured",
+        "venue-collection",
     }
 )
 
@@ -136,6 +145,7 @@ def execute(
     check_owned_work: Callable[[], None] = lambda: None,
     record_attempt: Callable[[Entry, int], None] = lambda *_: None,
     persist_ownership: Callable[[list[dict[str, Any]], Entry, int], None] = lambda *_: None,
+    persist_response: Callable[[object, bool | None, str], None] = lambda *_: None,
     capture_entry: Callable[[Ownership, int, int], None] = lambda *_: None,
     observe_phase: Callable[[str], None] = lambda _: None,
     now_ms: Callable[[], int] = lambda: time.time_ns() // 1_000_000,
@@ -217,15 +227,37 @@ def execute(
     record_attempt(entry, begun)  # Exclusive fsync before the single attempted send.
     check_owned_work()  # Persistence cannot spend the reserve and still authorize a send.
 
+    def diagnostic(stage: str) -> None:
+        observe_phase(stage)
+        persist_response(None, None, stage)
+        check_owned_work()  # Durable diagnostic writes cannot spend reserve before reads/mutations.
+
     def observe(*, cleaning: bool) -> Ownership:
         check_owned_work()
-        events = _orders(guard.request(f"/guard/events?since={baseline}"))
-        _need(all(type(event.get("seq")) is int and event["seq"] > baseline for event in events))
+        diagnostic("ownership-events")
+        try:
+            events = _orders(guard.request(f"/guard/events?since={baseline}"))
+            _need(
+                all(type(event.get("seq")) is int and event["seq"] > baseline for event in events)
+            )
+        except (Exception, KeyboardInterrupt):
+            diagnostic("ownership-events-unavailable")
+            raise
         check_owned_work()
         # Preserve validated run ownership before expensive venue collection, including
         # the unknown-entry-response branch. Missing evidence still refuses mutation.
-        persist_ownership(events, entry, begun)
+        diagnostic("ownership-validation")
+        try:
+            persist_ownership(events, entry, begun)
+        except OSError:
+            diagnostic("ownership-storage-failed")
+            raise
+        except (Exception, KeyboardInterrupt):
+            diagnostic("ownership-validation-refused")
+            raise
+        diagnostic("ownership-captured")
         check_owned_work()
+        diagnostic("venue-collection")
         observed = collect_ownership(
             read, account, events, client, entry, started_ms=begun, cleanup=cleaning
         )
@@ -237,19 +269,27 @@ def execute(
         # Set the attempt boundary before transmission: timeout can mean the order arrived.
         observe_phase("entry-attempt")
         check_owned_work()  # Also recheck after the final receipt hook, immediately before send.
-        result, error = mcp.tool(
-            "place_order",
-            {
-                "coin": "BTC",
-                "side": "buy",
-                "stop": "guard_policy",
-                "size": str(entry.size),
-                "limit_price": str(entry.limit),
-                "time_in_force": "ioc",
-            },
-        )
-        check_owned_work()
-        _need(not error and result.get("sent") is True)
+        result: dict[str, Any] | None = None
+        entry_error: bool | None = None
+        try:
+            result, entry_error = mcp.tool(
+                "place_order",
+                {
+                    "coin": "BTC",
+                    "side": "buy",
+                    "stop": "guard_policy",
+                    "size": str(entry.size),
+                    "limit_price": str(entry.limit),
+                    "time_in_force": "ioc",
+                },
+            )
+        finally:
+            response_stage = "entry-response" if result is not None else "entry-call-unconfirmed"
+            observe_phase(response_stage)
+            persist_response(result, entry_error, response_stage)
+            check_owned_work()  # Recheck after the response record's file and directory fsync.
+        _need(result is not None and not entry_error and result.get("sent") is True)
+        assert result is not None
         protected = observe(cleaning=False)
         capture_entry(protected, begun, now_ms())
         check_owned_work()
