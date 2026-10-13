@@ -236,7 +236,11 @@ def execute(release: Release, work: Path, *, account: str, shell: str) -> dict[s
         }
     }
     clean["TERM"] = "dumb"
-    home = Path(clean["USERPROFILE"] if windows else clean["HOME"]) / ".zunder-guard"
+    home = (
+        Path(clean["LOCALAPPDATA"]) / "zunder-guard"
+        if windows
+        else Path(clean["HOME"]) / ".zunder-guard"
+    )
     channel = "D2" if windows else "D1"
     target = "windows-amd64" if windows else "darwin-arm64"
     forms = commands(channel, canonical=os.environ.get("INSTALL_MATRIX_PROFILE") == "nightly")

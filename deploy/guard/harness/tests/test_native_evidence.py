@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 from test_install_evidence import release, write
 from test_testnet_run import COMMIT
+from test_windows_policy import policy_fixture
 
 from guard_harness.channel_evidence import commands, required
 from guard_harness.lifecycle_coverage import LIFECYCLE_COVERAGE
@@ -94,6 +95,14 @@ def fixture(root: Path, row: str) -> Path:
                         else [],
                     ),
                 )
+                if row == "I4" and name == "testnet/testnet.receipt.json":
+                    from guard_harness.windows_policy import REFUSAL_TOKEN, REMOVAL_TOKEN
+
+                    path = directory / name
+                    value = json.loads(path.read_bytes())
+                    value.update(policy_fixture(current, directory / "testnet/windows-policy"))
+                    value["coverage"] += [REFUSAL_TOKEN, REMOVAL_TOKEN]
+                    write(path, value)
             if scenario == "fresh":
                 channel = "D1" if row == "I3" else "D2"
                 url = "https://zunderlabs.com/i-staging" + (".ps1" if row == "I4" else "")
@@ -152,6 +161,25 @@ def test_complete_exact_source_row(row: str, tmp_path: Path) -> None:
     value = predicate(row, tmp_path, manifest, COMMIT, tmp_path / "subjects")
     assert value["journey"] == row and value["result"] == "passed"
     assert value["coverage"] == sorted(LIFECYCLE_COVERAGE[row])
+
+
+@pytest.mark.parametrize("mutation", ["absent", "upgrade-only", "token-in-lifecycle"])
+def test_d3_requires_fresh_homebrew_measurement(tmp_path: Path, mutation: str) -> None:
+    manifest = fixture(tmp_path, "I3")
+    path = tmp_path / "macos/fresh/paper/paper.receipt.json"
+    value = json.loads(path.read_bytes())
+    value.pop("channel_coverage")
+    if mutation == "upgrade-only":
+        value["channel_coverage"] = []
+        upgrade = tmp_path / "macos/upgrade/paper/paper.receipt.json"
+        previous = json.loads(upgrade.read_bytes())
+        previous["channel_coverage"] = ["D3:homebrew"]
+        write(upgrade, previous)
+    elif mutation == "token-in-lifecycle":
+        value["coverage"].append("D3:homebrew")
+    write(path, value)
+    with pytest.raises(LifecycleError):
+        predicate("I3", tmp_path, manifest, COMMIT, tmp_path / "subjects")
 
 
 @pytest.mark.parametrize(
@@ -574,3 +602,48 @@ def test_macos_ambiguous_journal_is_never_initialized_or_reset(
     with pytest.raises(subprocess.CalledProcessError):
         controller.ensure_macos_journal()
     assert journal.exists() or journal.is_symlink()
+
+
+@pytest.mark.parametrize("scenario", ["fresh", "upgrade"])
+def test_per_user_receipt_precedes_independent_scm_admission(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, scenario: str
+) -> None:
+    import guard_harness.native_testnet as native
+
+    monkeypatch.setenv("ProgramData", str(tmp_path / "program-data"))
+    monkeypatch.setattr(platform, "system", lambda: "Windows")
+    current = release(tmp_path / "current/assets")
+    previous = release(tmp_path / "previous/assets", old=True)
+    controller = native.NativeTestnet(
+        current, previous, tmp_path / "work", "fixture-account", "pwsh.exe", scenario
+    )
+    frame = b"inert fixture frame never used for custody"
+    calls: list[str] = []
+
+    def per_user(driver: native.NativeTestnet, work: Path, key: bytes) -> None:
+        assert driver is controller and work == controller.work / "per-user"
+        assert key == frame and controller.work.is_dir()
+        work.mkdir()
+        (work / "receipt.json").write_text("inert completed per-user evidence")
+        driver.key = b""  # The real per-user driver clears its private frame on exit.
+        calls.append("per-user")
+
+    def scm_install(item: object, *, fresh: bool = False) -> None:
+        assert calls == ["per-user", "policy"] and fresh is True
+        assert controller.key == frame  # SCM receives its own frame after per-user cleanup.
+        calls.append("scm-refusal")
+        raise LifecycleError("fixture independent SCM policy refusal")
+
+    def prepare(subject: object, work: Path, env: object) -> dict[str, object]:
+        assert calls == ["per-user"]  # W7's hosted policy step follows per-user custody.
+        calls.append("policy")
+        return {}
+
+    monkeypatch.setattr(native, "per_user", per_user)
+    monkeypatch.setattr("guard_harness.windows_policy.prepare", prepare)
+    monkeypatch.setattr(controller, "install", scm_install)
+    with pytest.raises(LifecycleError, match="independent SCM policy refusal"):
+        controller.execute(frame)
+    assert calls == ["per-user", "policy", "scm-refusal"]
+    assert (controller.work / "per-user/receipt.json").is_file()
+    assert controller.key == b""

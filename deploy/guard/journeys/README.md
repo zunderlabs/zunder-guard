@@ -57,7 +57,9 @@ staging requests only and blocks redirects. Its real-browser regression runs bef
 The Sepolia helper pins both RPC and signing chain IDs to the selected testnet, sends exact
 integer micro-USDC to the admitted merchant, and caps gas at 0.0002 test ETH. It refuses pending
 payer transactions before signing. A durable exclusive attempt precedes the only broadcast;
-confirmation polling never replaces, cancels or resends it. The licence receipt binds the row.
+confirmation polling never replaces, cancels or resends it. A send that errors is looked up by its
+hash for 30 seconds and receipt polling retries for 90 seconds, read-only. Delivery waits for the
+finalized block: 40 minutes on the EVM chains (17–21 observed), 10 on Hyperliquid. The licence receipt binds the row.
 A passing fixture or source review does not prove a paid licence was delivered or accepted.
 
 The production checkout/issuer subset of P9 is separate:

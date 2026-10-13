@@ -176,6 +176,15 @@ def predicate(
             )
             if row == "I4":
                 paper = paper - {"crash-recovery"} | {"manual-crash-restart"}
+                from guard_harness.windows_policy import REFUSAL_TOKEN, REMOVAL_TOKEN
+                from guard_harness.windows_policy import admit as admit_policy
+
+                testnet.update({REFUSAL_TOKEN, REMOVAL_TOKEN})
+                admit_policy(
+                    current,
+                    directory / "testnet/windows-policy",
+                    read(directory / "testnet/testnet.receipt.json"),
+                )
             for mode, name, required in (
                 ("paper", "paper/paper.receipt.json", paper),
                 ("testnet", "testnet/testnet.receipt.json", testnet),

@@ -5,8 +5,12 @@ name: ci
 
 on:
   push:
-    branches: [main, "preview/**"]
+    # Not on preview/**: a preview exists for one diagnostic against released binaries, and a full
+    # run per preview (macOS and Windows jobs included) took the org's runners from the
+    # diagnostics (13 Oct). Dispatch this workflow on a preview when its checks are wanted.
+    branches: [main]
   pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -80,6 +84,23 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with: {python-version: '3.13'}
+      - name: Native isolated HTTP worker regression before Rust builds
+        shell: pwsh
+        timeout-minutes: 3
+        working-directory: deploy/guard/harness
+        run: |
+          # This worker and its test use stdlib plus pytest; no trading SDK/build.
+          Write-Host 'Native HTTP smoke: installing pytest'
+          python -m pip install --only-binary=:all: --timeout 15 --retries 1 'pytest>=8,<10'
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Write-Host 'Native HTTP smoke: running isolated worker tests'
+          # Inherit console handles: the watchdog never drains a descendant pipe.
+          python -u -c "import subprocess, sys; subprocess.run([sys.executable, '-u', '-m', 'pytest', '-vv', '-s', 'tests/test_bounded_http_read.py'], timeout=90, check=True)"
+          $testExit = $LASTEXITCODE
+          Write-Host 'Native HTTP smoke: test process exited'
+          exit $testExit
       - name: Protected Windows file creation (PowerShell 5.1)
         shell: powershell
         run: ./deploy/guard/test/windows-mainnet-loader.ps1

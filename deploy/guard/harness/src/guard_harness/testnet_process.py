@@ -13,16 +13,19 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any, BinaryIO
 
+from guard_harness.bounded_http_read import bounded_read
 from guard_harness.cli import PAIR_SCHEMA, Pair, decode_json
 from guard_harness.mcp_client import MCP
 from guard_harness.paper_bot import GuardUnavailable, LocalGuard
 from guard_harness.runner import run
 from guard_harness.staged_subjects import _private
+from guard_harness.testnet_collect import retain_failure
 from guard_harness.testnet_journey import Journey, execute
 from guard_harness.testnet_ownership import Ownership
 from guard_harness.testnet_protection import Entry, _object, _orders, entry_plan
 from guard_harness.testnet_scan import SCAN_TIMEOUT, TestnetReads
 from guard_harness.testnet_snapshot import OwnershipStore
+from guard_harness.testnet_warm import MARGIN_MS, TTL_MS, warm
 
 OWNED_WORK_TIMEOUT = 1280
 ENTRY_REMAINING = OWNED_WORK_TIMEOUT + SCAN_TIMEOUT + 60
@@ -322,6 +325,39 @@ class Foreground:
         def check_owned_work() -> None:
             _need(work_deadline is not None and time.monotonic() < work_deadline)
 
+        def warm_info(client: str) -> tuple[object, Callable[[], None]]:
+            def local_read(path: str, payload: dict[str, object] | None, timeout: float) -> object:
+                self.alive()
+                remaining = deadline - time.monotonic()
+                _need(remaining > 0)
+                data = None if payload is None else json.dumps(payload, allow_nan=False).encode()
+                try:
+                    value: object = json.loads(
+                        bounded_read(self.url + path, data, timeout=min(5.0, timeout, remaining))
+                    )
+                except Exception:
+                    raise ProcessError("owned Guard warm read refused") from None
+                self.alive()
+                _need(time.monotonic() < deadline)
+                return value
+
+            warming = warm(
+                local_read,
+                client,
+                deadline=deadline,
+                observe=observe_phase,
+                clock=time.monotonic,
+                sleep=time.sleep,
+            )
+            warming.check()
+            remaining = (
+                min(warming.meta_started, warming.role_started) + TTL_MS - MARGIN_MS
+            ) / 1000 - time.monotonic()
+            _need(remaining > 0)
+            status = local_read("/guard/status", None, min(5.0, remaining))
+            warming.check()
+            return status, warming.check
+
         observe_phase("mcp-initialize")
         with MCP(
             self.binary,
@@ -347,7 +383,10 @@ class Foreground:
                 check_owned_work=check_owned_work,
                 record_attempt=store.begin,
                 persist_ownership=store.capture,
+                persist_response=store.response,
+                persist_collection_failure=lambda value: retain_failure(self.work, value),
                 capture_entry=capture_entry,
+                warm_info=warm_info,
                 observe_phase=observe_phase,
             )
 

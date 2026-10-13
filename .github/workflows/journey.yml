@@ -5,9 +5,14 @@ on:
     inputs:
       profile:
         type: choice
-        options: [checkout]
+        options: [checkout, payment]
         default: checkout
-        description: Diagnostic-only pre-payment checkout; never release evidence
+        description: Diagnostic-only checkout or payment; never release evidence
+      tag: {type: string, required: false, default: ''}
+      commit: {type: string, required: false, default: ''}
+      previous_tag: {type: string, required: false, default: ''}
+      previous_commit: {type: string, required: false, default: ''}
+      payment_network: {type: choice, options: [arbitrum, base], default: arbitrum}
   workflow_call:
     inputs:
       tag:
@@ -205,6 +210,18 @@ jobs:
             ${{ steps.fee-evidence.outputs.bundle-path }}
           if-no-files-found: warn
           retention-days: 7
+      - name: Retain finite T1 failure evidence before cleanup scan
+        if: ${{ failure() || cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: T1-early-failure-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/guard-release/T1/receipt.json
+            ${{ runner.temp }}/guard-release/T1/runtime/entry-attempt.json
+            ${{ runner.temp }}/guard-release/T1/runtime/entry-response.json
+            ${{ runner.temp }}/guard-release/T1/runtime/ownership.json
+          if-no-files-found: warn
+          retention-days: 7
       - name: Independent keyless C6 flat scan after failure
         if: ${{ failure() || cancelled() }}
         env:
@@ -225,6 +242,7 @@ jobs:
             ${{ runner.temp }}/guard-release/T1/runtime/process.log
             ${{ runner.temp }}/guard-release/T1/runtime/mcp.log
             ${{ runner.temp }}/guard-release/T1/runtime/entry-attempt.json
+            ${{ runner.temp }}/guard-release/T1/runtime/entry-response.json
             ${{ runner.temp }}/guard-release/T1/runtime/ownership.json
             ${{ runner.temp }}/guard-release/T1/T1.predicate.json
             ${{ steps.evidence.outputs.bundle-path }}
@@ -324,7 +342,7 @@ jobs:
           ROOT_WORK="/root/guard-release-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT/T2"
           install -d -m 700 "$RUNNER_TEMP/guard-release/T2"
           FILES=()
-          for FILE in assets/release-manifest.json receipt.json assets.log runtime/init.log runtime/pair.log runtime/process.log runtime/mcp.log runtime/entry-attempt.json runtime/ownership.json T2.predicate.json; do
+          for FILE in assets/release-manifest.json receipt.json assets.log runtime/init.log runtime/testnet-service-install.log runtime/service-stop.log runtime/service-start.log runtime/pair.log runtime/process.log runtime/mcp.log runtime/entry-attempt.json runtime/entry-response.json runtime/ownership.json T2.predicate.json; do
             if sudo test -f "$ROOT_WORK/$FILE" && ! sudo test -L "$ROOT_WORK/$FILE"; then
               FILES+=("$FILE")
             fi
@@ -340,6 +358,21 @@ jobs:
           subject-path: ${{ runner.temp }}/guard-release/T2/assets/release-manifest.json
           predicate-type: https://zunderlabs.com/guard/journey/v1
           predicate-path: ${{ runner.temp }}/guard-release/T2/T2.predicate.json
+      - name: Retain finite T2 failure evidence before cleanup scan
+        if: ${{ failure() || cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: T2-early-failure-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/guard-release/T2/receipt.json
+            ${{ runner.temp }}/guard-release/T2/runtime/testnet-service-install.log
+            ${{ runner.temp }}/guard-release/T2/runtime/service-stop.log
+            ${{ runner.temp }}/guard-release/T2/runtime/service-start.log
+            ${{ runner.temp }}/guard-release/T2/runtime/entry-attempt.json
+            ${{ runner.temp }}/guard-release/T2/runtime/entry-response.json
+            ${{ runner.temp }}/guard-release/T2/runtime/ownership.json
+          if-no-files-found: warn
+          retention-days: 7
       - name: Independent keyless C6 flat scan after failure
         if: ${{ failure() || cancelled() }}
         env:
@@ -356,10 +389,14 @@ jobs:
             ${{ runner.temp }}/guard-release/T2-failure/postfailure-flat.json
             ${{ runner.temp }}/guard-release/T2/assets.log
             ${{ runner.temp }}/guard-release/T2/runtime/init.log
+            ${{ runner.temp }}/guard-release/T2/runtime/testnet-service-install.log
+            ${{ runner.temp }}/guard-release/T2/runtime/service-stop.log
+            ${{ runner.temp }}/guard-release/T2/runtime/service-start.log
             ${{ runner.temp }}/guard-release/T2/runtime/pair.log
             ${{ runner.temp }}/guard-release/T2/runtime/process.log
             ${{ runner.temp }}/guard-release/T2/runtime/mcp.log
             ${{ runner.temp }}/guard-release/T2/runtime/entry-attempt.json
+            ${{ runner.temp }}/guard-release/T2/runtime/entry-response.json
             ${{ runner.temp }}/guard-release/T2/runtime/ownership.json
             ${{ runner.temp }}/guard-release/T2/T2.predicate.json
             ${{ steps.evidence.outputs.bundle-path }}
@@ -370,7 +407,7 @@ jobs:
     if: ${{ inputs.profile == 'all' || inputs.profile == 'nightly' }}
     name: ${{ matrix.journey }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 60
     environment: e2e
     concurrency:
       group: guard-e2e-purchase-${{ (matrix.journey == 'P1' || matrix.journey == 'P5' || matrix.journey == 'P6') && 'hyperliquid' || matrix.journey == 'P2' && 'arbitrum' || matrix.journey == 'P3' && 'base' || matrix.journey }}
@@ -539,8 +576,18 @@ jobs:
             ${{ runner.temp }}/quote-evidence/click-diagnostics/pricing-buy-pro/diagnostics.json
             ${{ runner.temp }}/quote-evidence/predicate.json
             ${{ runner.temp }}/quote-evidence/P*/payment/payment-attempt.json
+            ${{ runner.temp }}/quote-evidence/P*/payment/payment-failure.json
             ${{ runner.temp }}/quote-evidence/P*/payment/payment-receipt.json
+            ${{ runner.temp }}/quote-evidence/P5/under/payment-attempt.json
+            ${{ runner.temp }}/quote-evidence/P5/under/payment-receipt.json
+            ${{ runner.temp }}/quote-evidence/P5/over/payment-attempt.json
+            ${{ runner.temp }}/quote-evidence/P5/over/payment-receipt.json
+            ${{ runner.temp }}/quote-evidence/P5/late/payment-attempt.json
+            ${{ runner.temp }}/quote-evidence/P5/late/payment-receipt.json
+            ${{ runner.temp }}/quote-evidence/P5/blocked/payment-attempt.json
+            ${{ runner.temp }}/quote-evidence/P5/blocked/payment-receipt.json
             ${{ runner.temp }}/quote-evidence/P*/renewal-payment/payment-attempt.json
+            ${{ runner.temp }}/quote-evidence/P*/renewal-payment/payment-failure.json
             ${{ runner.temp }}/quote-evidence/P*/renewal-payment/payment-receipt.json
             ${{ runner.temp }}/quote-evidence/P*/licensed/licence-receipt.json
             ${{ steps.evidence.outputs.bundle-path }}
@@ -871,5 +918,176 @@ jobs:
             ${{ runner.temp }}/checkout-diagnostic/*.json
             ${{ runner.temp }}/checkout-diagnostic/pricing-buy-pro/diagnostics.json
             ${{ runner.temp }}/checkout-diagnostic-proof.json
+          if-no-files-found: warn
+          retention-days: 7
+
+
+  payment-diagnostic:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.profile == 'payment' && contains(github.workflow_ref, '/.github/workflows/journey.yml@') }}
+    name: ${{ inputs.payment_network }} payment diagnostic only (no gate credit)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    environment: e2e
+    concurrency:
+      group: guard-e2e-purchase-${{ inputs.payment_network }}
+      cancel-in-progress: false
+      queue: max
+    permissions:
+      contents: read
+      actions: read
+      packages: read
+    steps:
+      - name: Seal standalone trusted harness and exact released identities before checkout
+        env:
+          PROFILE: ${{ inputs.profile }}
+          PAYMENT_NETWORK: ${{ inputs.payment_network }}
+          TAG: ${{ inputs.tag }}
+          SOURCE: ${{ inputs.commit }}
+          PREVIOUS_TAG: ${{ inputs.previous_tag }}
+          PREVIOUS_SOURCE: ${{ inputs.previous_commit }}
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+          WORKFLOW_SHA: ${{ github.workflow_sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [ "$GITHUB_REPOSITORY" = zunderlabs/zunder-guard ]
+          [ "$GITHUB_EVENT_NAME" = workflow_dispatch ]
+          [ "$PROFILE" = payment ]
+          case "$PAYMENT_NETWORK" in arbitrum|base) ;; *) exit 1 ;; esac
+          [[ $GITHUB_SHA =~ ^[0-9a-f]{40}$ ]] || exit 1
+          [[ $SOURCE =~ ^[0-9a-f]{40}$ ]] || exit 1
+          [[ $PREVIOUS_SOURCE =~ ^[0-9a-f]{40}$ ]] || exit 1
+          [[ $TAG =~ ^v[0-9]+\.[0-9]+\.[0-9]+-rc\.[1-9][0-9]*$ ]] || exit 1
+          [[ $PREVIOUS_TAG =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-rc\.[1-9][0-9]*)?$ ]] || exit 1
+          [ "$TAG" != "$PREVIOUS_TAG" ]
+          [[ $GITHUB_REF =~ ^refs/heads/(main|preview/[a-z0-9-]+)$ ]]
+          [ "$WORKFLOW_REF" = "zunderlabs/zunder-guard/.github/workflows/journey.yml@$GITHUB_REF" ]
+          [ "$WORKFLOW_SHA" = "$GITHUB_SHA" ]
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: {ref: '${{ github.sha }}', persist-credentials: false}
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with: {python-version: '3.13'}
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with: {node-version: '24'}
+      - uses: slsa-framework/slsa-verifier/actions/installer@ea584f4502babc6f60d9bc799dbbb13c1caa9ee6 # v2.7.1
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with: {cosign-release: v3.1.3}
+      - name: Install only the source-bound diagnostic harness
+        run: |
+          python -m pip install --require-hashes --only-binary=:all: -r deploy/guard/harness/requirements-runtime.lock
+          python -m pip install --no-deps --no-build-isolation -e ./deploy/guard/harness
+          npm ci --prefix deploy/guard/journeys
+      - name: Authenticate exact released candidate and predecessor before staging or payer custody
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+          SOURCE: ${{ inputs.commit }}
+          PREVIOUS_TAG: ${{ inputs.previous_tag }}
+          PREVIOUS_SOURCE: ${{ inputs.previous_commit }}
+          DIAGNOSTIC: 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          set +x
+          umask 077
+          install -d -m 700 "$RUNNER_TEMP/payment-diagnostic"
+          python -m guard_harness.native_release --tag "$TAG" --commit "$SOURCE" \
+            --previous-tag "$PREVIOUS_TAG" --previous-commit "$PREVIOUS_SOURCE" \
+            --work "$RUNNER_TEMP/payment-diagnostic/subjects"
+          python - <<'PY_IDENTITY'
+          import json, os
+          from pathlib import Path
+          from guard_harness.native_release import Release
+          root = Path(os.environ['RUNNER_TEMP']) / 'payment-diagnostic/subjects'
+          value = json.loads((root / 'input.json').read_bytes())
+          if (value['diagnostic'] is not True or value['harness_commit'] != os.environ['GITHUB_SHA']
+              or value['tag'] != os.environ['TAG'] or value['commit'] != os.environ['SOURCE']
+              or value['previous_tag'] != os.environ['PREVIOUS_TAG']
+              or value['previous_commit'] != os.environ['PREVIOUS_SOURCE']):
+              raise SystemExit('payment diagnostic release identity refused')
+          Release(value['tag'], value['commit'], root / 'candidate/assets').asset('install.sh')
+          PY_IDENTITY
+      - name: Install Chromium for one fresh staging quote
+        working-directory: deploy/guard/journeys
+        run: npx playwright install --with-deps chromium
+      - name: One fresh testnet payment only; no delivery or installed licence gate
+        id: payment
+        working-directory: deploy/guard/journeys
+        env:
+          PROFILE: payment
+          GUARD_PAYMENT_DIAGNOSTIC: '1'
+          GUARD_PAYMENT_DIAGNOSTIC_PROFILE: payment
+          GUARD_DIAGNOSTIC_HARNESS_COMMIT: ${{ github.sha }}
+          GUARD_PAID_JOURNEY: ${{ inputs.payment_network == 'arbitrum' && 'P2' || 'P3' }}
+          GUARD_PURCHASE_WORK: ${{ runner.temp }}/payment-diagnostic/payment
+          GUARD_RELEASE_ASSETS: ${{ runner.temp }}/payment-diagnostic/subjects/candidate/assets
+          GUARD_RELEASE_TAG: ${{ inputs.tag }}
+          GUARD_RELEASE_COMMIT: ${{ inputs.commit }}
+          GUARD_LICENSE_ACCOUNT: ${{ vars.E2E_TESTNET_ACCOUNT }}
+          GUARD_STAGING_URL: ${{ vars.GUARD_STAGING_URL }}
+          GUARD_EMAIL_DOMAIN: ${{ vars.GUARD_EMAIL_DOMAIN }}
+          GUARD_PAY_TO_ARBITRUM: ${{ inputs.payment_network == 'arbitrum' && vars.E2E_PAY_TO_ARBITRUM || '' }}
+          GUARD_PAY_TO_BASE: ${{ inputs.payment_network == 'base' && vars.E2E_PAY_TO_BASE || '' }}
+          GUARD_ACCESS_CLIENT_ID: ${{ secrets.E2E_ACCESS_CLIENT_ID }}
+          GUARD_ACCESS_CLIENT_SECRET: ${{ secrets.E2E_ACCESS_CLIENT_SECRET }}
+          GUARD_ORDER_TOKEN: ${{ secrets.E2E_ORDER_TOKEN }}
+          E2E_PAYER_EVM_SEPOLIA_KEY: ${{ secrets.E2E_PAYER_EVM_SEPOLIA_KEY }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          set +x
+          umask 077
+          npm test -- purchase/paid.test.ts > "$RUNNER_TEMP/payment-diagnostic/private-journey.log" 2>&1
+      - name: Retain bounded authored failure phases without private Playwright output
+        if: ${{ always() }}
+        env:
+          PAYMENT_STEP_OUTCOME: ${{ steps.payment.outcome }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          python - <<'PY_PHASE'
+          import json, os
+          from pathlib import Path
+          root = Path(os.environ['RUNNER_TEMP']) / 'payment-diagnostic'
+          root.mkdir(mode=0o700, exist_ok=True)
+          outcome = os.environ.get('PAYMENT_STEP_OUTCOME', '')
+          if outcome not in {'success', 'failure', 'cancelled', 'skipped'}: outcome = 'unknown'
+          phases = {'checkout-plan-pro', 'checkout-term-month', 'checkout-accounts',
+                    'checkout-company', 'checkout-street', 'checkout-postcode', 'checkout-city',
+                    'checkout-email', 'checkout-country', 'checkout-network', 'checkout-business',
+                    'checkout-terms', 'checkout-quote'}
+          authored = []
+          log = root / 'private-journey.log'
+          if log.is_file() and not log.is_symlink() and log.stat().st_size <= 1024 * 1024:
+              for line in log.read_text(errors='replace').splitlines():
+                  # Playwright prefixes console records; only a strict literal prefix is admitted.
+                  if not line.startswith('checkout-phase '): continue
+                  try: value = json.loads(line[len('checkout-phase '):])
+                  except (ValueError, RecursionError): continue
+                  if (not isinstance(value, dict) or not isinstance(value.get('phase'), str)
+                      or value['phase'] not in phases
+                      or type(value.get('quoteRequested')) is not bool
+                      or type(value.get('quoteResponded')) is not bool): continue
+                  authored.append({k: value[k] for k in ('phase', 'quoteRequested', 'quoteResponded')})
+                  if len(authored) == 16: break
+          value = {'schema':1, 'diagnostic':True, 'gate_eligible':False,
+                   'payment_step_outcome':outcome, 'checkout_phases':authored}
+          with (root / 'phase-diagnostic.json').open('x') as stream:
+              stream.write(json.dumps(value) + '\n')
+              stream.flush()
+              os.fsync(stream.fileno())
+          PY_PHASE
+      - name: Retain only finite payment diagnostic evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: payment-diagnostic-${{ inputs.payment_network }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/payment-diagnostic/payment/payment/payment-attempt.json
+            ${{ runner.temp }}/payment-diagnostic/payment/payment/payment-failure.json
+            ${{ runner.temp }}/payment-diagnostic/payment/payment/payment-receipt.json
+            ${{ runner.temp }}/payment-diagnostic/payment/payment-diagnostic.json
+            ${{ runner.temp }}/payment-diagnostic/phase-diagnostic.json
           if-no-files-found: warn
           retention-days: 7

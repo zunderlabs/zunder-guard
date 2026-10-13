@@ -6,6 +6,8 @@ import { join } from 'node:path';
 import { renewPurchase } from './renewal.js';
 import { emailedLicence } from './licence-key.js';
 import { paidTestTimeoutMs, waitForDelivery } from './delivery-deadline.js';
+import { requireQuoteMail } from './quote-mail-admission.js';
+import { admitPaymentDiagnostic, completePaymentDiagnostic } from './payment-diagnostic.js';
 import { test, expect, type Page } from '@playwright/test';
 import { safe, get, post, validInboxMessage } from './safe.js';
 import { command } from './subprocess.js';
@@ -49,6 +51,7 @@ async function checkoutState(page: Page) {
   });
 }
 
+const paymentDiagnostic = admitPaymentDiagnostic(process.env);
 const journey = process.env['GUARD_PAID_JOURNEY'] ?? 'P1';
 const network = journey === 'P2' ? 'arbitrum' : journey === 'P3' ? 'base' : 'hyperliquid';
 const checkoutDiagnostic = process.env['GUARD_CHECKOUT_DIAGNOSTIC'] === '1';
@@ -56,7 +59,8 @@ if (process.env['GUARD_CHECKOUT_DIAGNOSTIC'] !== undefined && !checkoutDiagnosti
 if (checkoutDiagnostic && !['P1', 'P2', 'P3'].includes(journey)) throw new Error('checkout diagnostics require P1, P2 or P3');
 test.skip(!['P1', 'P2', 'P3', 'P6'].includes(process.env['GUARD_PAID_JOURNEY'] ?? ''), 'paid journey requires explicit hosted release inputs');
 
-test(`${journey} pricing to paid email to installed released licence`, async ({ page, request }) => {
+test(paymentDiagnostic ? `${journey} ${network} payment diagnostic only; no gate credit`
+  : `${journey} pricing to paid email to installed released licence`, async ({ page, request }) => {
   test.setTimeout(checkoutDiagnostic ? 2 * 60_000 : paidTestTimeoutMs(network));
   const clickDiagnostics = stagingClickDiagnostics(page, 'pricing-buy-pro');
   const root = process.env['GUARD_PURCHASE_WORK'];
@@ -142,6 +146,10 @@ test(`${journey} pricing to paid email to installed released licence`, async ({ 
   await mkdir(privateWork, { mode: 0o700 });
   const clean = { PATH: process.env['PATH'], HOME: privateWork };
   await mkdir(join(privateWork, 'payment'), { mode: 0o700 });
+  if (!paymentDiagnostic) await requireQuoteMail(request, {
+    inboxUrl: process.env['GUARD_INBOX_URL'] ?? '', token: process.env['GUARD_INBOX_TOKEN'] ?? '',
+    email, since, order: order.number,
+  });
   const paymentEnv = { ...clean, GUARD_STAGING_URL: origin,
     ['GUARD_PAY_TO_' + network.toUpperCase()]: pinnedPayTo,
     GUARD_ACCESS_CLIENT_ID: process.env['GUARD_ACCESS_CLIENT_ID'],
@@ -157,6 +165,10 @@ test(`${journey} pricing to paid email to installed released licence`, async ({ 
     await command('guard_harness.purchase_evm', ['--network', network, ...paymentArgs], { ...paymentEnv,
       E2E_PAYER_EVM_SEPOLIA_KEY: process.env['E2E_PAYER_EVM_SEPOLIA_KEY'],
     });
+  }
+  if (paymentDiagnostic) {
+    await completePaymentDiagnostic(privateWork, paymentDiagnostic, order.number, order.usdc);
+    return; // Explicit payment diagnostic stops before delivery, inbox and installed licence.
   }
   let licence = '';
   let renewalToken = '';

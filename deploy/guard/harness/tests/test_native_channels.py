@@ -234,7 +234,7 @@ def test_native_executes_both_literal_user_forms_and_measured_cleanup(
         assert "WALLET_FRAME" not in kwargs["env"]
         binary.parent.mkdir(parents=True, exist_ok=True)
         binary.write_bytes(current.binary(target))
-        home = tmp_path / "user/.zunder-guard"
+        home = tmp_path / ("local/zunder-guard" if windows else "user/.zunder-guard")
         home.mkdir(parents=True)
         (home / "guard.toml").write_text(
             'mode="paper"\nnetwork="testnet"\naccount="inert-account"\n'
@@ -324,7 +324,7 @@ def test_native_executes_both_literal_user_forms_and_measured_cleanup(
         assert all("sudo" not in call for call in calls)
     assert result["cleanup_complete"] is True and not binary.exists()
     assert [item["form"] for item in result["executions"]] == ["manifest-bare", "website-parameter"]
-    assert not (tmp_path / "user/.zunder-guard").exists()
+    assert not (tmp_path / ("local/zunder-guard" if windows else "user/.zunder-guard")).exists()
     assert all(
         item["cleanup_method"]
         == ("released-per-user-uninstall" if windows else "owned-manual-cleanup")
@@ -332,3 +332,29 @@ def test_native_executes_both_literal_user_forms_and_measured_cleanup(
     )
     if not windows:
         assert "uninstall" not in result["coverage"]
+
+
+def test_windows_literal_channel_refuses_existing_actual_default_home(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    current = release(tmp_path / "assets")
+    monkeypatch.setenv("GITHUB_ACTIONS", "true")
+    monkeypatch.setenv("RUNNER_ENVIRONMENT", "github-hosted")
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "local"))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path / "user"))
+    monkeypatch.setattr("guard_harness.native_channels.platform.system", lambda: "Windows")
+    home = tmp_path / "local/zunder-guard"
+    home.mkdir(parents=True)
+    retained = home / "guard.toml"
+    retained.write_text("existing customer state must be retained")
+
+    def forbidden(*args: Any, **kwargs: Any) -> None:
+        pytest.fail("existing default state must refuse before loader or terminal setup")
+
+    monkeypatch.setattr(native_channels, "staged_loader", forbidden)
+    monkeypatch.setattr(native_channels, "dialogue", forbidden)
+    with pytest.raises(LifecycleError, match="fresh default user state"):
+        native_channels.execute(
+            current, tmp_path / "work", account="fixture-account", shell="powershell.exe"
+        )
+    assert retained.read_text() == "existing customer state must be retained"

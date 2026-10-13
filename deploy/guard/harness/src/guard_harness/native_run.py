@@ -12,6 +12,7 @@ from pathlib import Path
 from guard_harness.native_channels import execute as channel_execute
 from guard_harness.native_release import Release, diagnostic_mode
 from guard_harness.native_testnet import sanitize_logs
+from guard_harness.source_installer import prepare, verify_file
 from guard_harness.testnet_process import ProcessError
 from guard_harness.testnet_scan import TestnetReads, flat_scan
 
@@ -41,12 +42,21 @@ def execute(*, subjects: Path, output: Path, scenario: str, account: str, shell:
     )
     manifest = current.asset("release-manifest.json")
     previous.asset("release-manifest.json")
+    source = prepare(current.tag, current.commit, scenario=scenario, row="I3")
+    if source is not None and sys.platform != "darwin":
+        raise ProcessError("source installer component is Mac-only on native runners")
     if not output.is_absolute() or output.exists() or output.is_symlink():
         raise ProcessError("fresh absolute native evidence directory required")
+    source_path = None
+    if source is not None:
+        output.mkdir(mode=0o700)
+        source_path = source.stage(output)
+        verify_file(source_path, source.digest)
     key = os.environ.pop("WALLET_FRAME", "").strip().removeprefix("0x").encode() + b"\n"
     if not re.fullmatch(rb"[0-9a-fA-F]{64}\n", key):
         raise ProcessError("bounded private Testnet frame required")
-    output.mkdir(mode=0o700)
+    if source is None:
+        output.mkdir(mode=0o700)
     clean = {
         name: value
         for name, value in os.environ.items()
@@ -58,6 +68,8 @@ def execute(*, subjects: Path, output: Path, scenario: str, account: str, shell:
             "LOCALAPPDATA",
             "ProgramData",
             "ProgramFiles",
+            "PROGRAMDATA",
+            "PROGRAMFILES",
             "SystemRoot",
             "SYSTEMROOT",
             "TEMP",
@@ -68,6 +80,21 @@ def execute(*, subjects: Path, output: Path, scenario: str, account: str, shell:
             "INSTALL_MATRIX_PROFILE",
             "DIAGNOSTIC",
         }
+        or (
+            source is not None
+            and name
+            in {
+                "SOURCE_INSTALLER_DIAGNOSTIC",
+                "GITHUB_SHA",
+                "WORKFLOW_REF",
+                "CALLER_REF",
+                "CALLER_EVENT",
+                "CALLER_REPOSITORY",
+                "CALLER_SHA",
+                "INSTALL_MATRIX_TARGET",
+                "SCENARIO",
+            }
+        )
     }
     common = [
         "--tag",
@@ -95,10 +122,11 @@ def execute(*, subjects: Path, output: Path, scenario: str, account: str, shell:
         flat()
         channel = (
             channel_execute(current, output / "channel-runtime", account=account, shell=shell)
-            if scenario == "fresh"
+            if scenario == "fresh" and source is None
             else None
         )
-        for mode, frame in (("paper", b""), ("testnet", key)):
+        modes = (("testnet", key),) if source is not None else (("paper", b""), ("testnet", key))
+        for mode, frame in modes:
             subprocess.run(
                 [
                     sys.executable,
@@ -107,6 +135,7 @@ def execute(*, subjects: Path, output: Path, scenario: str, account: str, shell:
                     *common,
                     "--work",
                     str(output / mode),
+                    *(["--source-installer", str(source_path)] if source_path is not None else []),
                 ],
                 input=frame,
                 check=True,
@@ -135,20 +164,21 @@ def execute(*, subjects: Path, output: Path, scenario: str, account: str, shell:
             )
         (output / "identities.json").write_text(
             json.dumps(
-                dict(
-                    diagnostic=diagnostic,
+                {
+                    "diagnostic": diagnostic,
                     **({"gate_eligible": False} if diagnostic else {}),
-                    release_commit=current.commit,
-                    harness_commit=os.environ["GITHUB_SHA"],
-                    tag=current.tag,
-                    manifest_sha256=hashlib.sha256(manifest).hexdigest(),
-                    scenario=scenario,
+                    "release_commit": current.commit,
+                    "harness_commit": os.environ["GITHUB_SHA"],
+                    "tag": current.tag,
+                    "manifest_sha256": hashlib.sha256(manifest).hexdigest(),
+                    "scenario": scenario,
+                    **(source.record() if source is not None else {}),
                     **(
                         dict(previous_tag=previous.tag, previous_commit=previous.commit)
                         if scenario == "upgrade"
                         else {}
                     ),
-                )
+                }
             )
             + "\n"
         )

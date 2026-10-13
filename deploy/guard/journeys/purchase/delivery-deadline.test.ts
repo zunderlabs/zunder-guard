@@ -19,8 +19,8 @@ for (const network of ['arbitrum', 'base'] as const) {
     expect(value).toBe('synthetic-delivered-key');
     expect(now).toBeGreaterThan(10 * 60_000);
     expect(payments).toBe(1);
-    expect(deliveryWaitMs(network)).toBe(30 * 60_000);
-    expect(paidTestTimeoutMs(network)).toBe(40 * 60_000);
+    expect(deliveryWaitMs(network)).toBe(40 * 60_000);
+    expect(paidTestTimeoutMs(network)).toBe(50 * 60_000);
   });
 }
 for (const network of ['hyperliquid', 'arbitrum', 'base'] as const) {
