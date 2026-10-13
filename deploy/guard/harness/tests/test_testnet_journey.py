@@ -151,6 +151,113 @@ def test_actual_collector_and_cleanup_core_prove_protection_then_flat() -> None:
     assert result.cleaned.flat_scan["dexes"] == ["", "fixture"]
 
 
+@pytest.mark.parametrize("permanent", [False, True])
+def test_confirmed_close_settles_only_torn_complete_reads_without_resending(
+    monkeypatch: pytest.MonkeyPatch, permanent: bool
+) -> None:
+    scenario = Scenario()
+    original = scenario.read
+    fills_after_close = 0
+    waits: list[float] = []
+    phases: list[str] = []
+
+    def read(payload: dict[str, Any]) -> object:
+        nonlocal fills_after_close
+        value = original(payload)
+        if "close_position" in scenario.calls and payload["type"] == "userFillsByTime":
+            fills_after_close += 1
+            if fills_after_close == 1 or permanent and fills_after_close % 2 == 1:
+                assert isinstance(value, list) and len(value) == 2
+                return value[:1]  # Close fill arrives between the two complete reads.
+        return value
+
+    monkeypatch.setattr(scenario, "read", read)  # Same read object and phase/budget.
+    monkeypatch.setattr("guard_harness.testnet_journey.time.sleep", waits.append)
+    result = scenario.execute(
+        admit_entry=lambda: phases.append("entry"),
+        begin_cleanup=lambda: phases.append("cleanup"),
+        begin_final_scan=lambda: phases.append("scan"),
+    )
+    assert scenario.calls == ["preview_order", "place_order", "close_position"]
+    assert waits == [1] * (2 if permanent else 1)
+    assert fills_after_close == (6 if permanent else 4)
+    assert result.passed is (not permanent)
+    assert result.guard_stopped is (not permanent)
+    assert phases == ["entry", "cleanup"] + ([] if permanent else ["scan"])
+
+
+@pytest.mark.parametrize("failure", ["malformed", "interrupt", "guard", "journal"])
+def test_post_close_nonrace_failure_is_never_recollected(
+    monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    scenario = Scenario()
+    original = scenario.read
+    reads_after_close: list[str] = []
+
+    def read(payload: dict[str, Any]) -> object:
+        if "close_position" in scenario.calls:
+            reads_after_close.append(payload["type"])
+            if failure == "interrupt":
+                raise KeyboardInterrupt
+            if failure == "malformed":
+                return None
+        return original(payload)
+
+    monkeypatch.setattr(scenario, "read", read)
+    monkeypatch.setattr(
+        "guard_harness.testnet_journey.time.sleep", lambda _: pytest.fail("no settling")
+    )
+
+    def refuse_after_close(*_: object) -> None:
+        if "close_position" in scenario.calls:
+            raise OSError("private details withheld")
+
+    if failure == "guard":
+        request = scenario.request
+
+        def guarded(path: str) -> object:
+            refuse_after_close()
+            return request(path)
+
+        monkeypatch.setattr(scenario, "request", guarded)
+    options = {"persist_ownership": refuse_after_close} if failure == "journal" else {}
+    result = scenario.execute(**options)
+    assert result.cleaned is None and not result.guard_stopped
+    assert result.failure == "cleanup_incomplete_keep_guard_running"
+    assert len(reads_after_close) == (1 if failure in {"malformed", "interrupt"} else 0)
+    assert scenario.calls.count("close_position") == 1
+
+
+def test_settling_wait_cannot_spend_the_owned_deadline(monkeypatch: pytest.MonkeyPatch) -> None:
+    from guard_harness.testnet_collect import CollectionRace, collect_ownership
+
+    scenario = Scenario()
+    actual = collect_ownership
+    expired = False
+    calls = 0
+
+    def collect(*args: Any, **kwargs: Any) -> Any:
+        nonlocal calls
+        if "close_position" in scenario.calls:
+            calls += 1
+            raise CollectionRace("owned read-only snapshots changed")
+        return actual(*args, **kwargs)
+
+    def wait(_: float) -> None:
+        nonlocal expired
+        expired = True
+
+    def check() -> None:
+        if expired:
+            raise RuntimeError("owned deadline exhausted")
+
+    monkeypatch.setattr("guard_harness.testnet_journey.collect_ownership", collect)
+    monkeypatch.setattr("guard_harness.testnet_journey.time.sleep", wait)
+    result = scenario.execute(check_owned_work=check)
+    assert not result.passed and not result.guard_stopped and calls == 1
+    assert scenario.calls.count("close_position") == 1
+
+
 def test_ambiguous_entry_still_cleans_owned_fills_without_retry_or_journey_credit() -> None:
     scenario = Scenario("entry-timeout")
     result = scenario.execute()
@@ -567,3 +674,468 @@ def test_owned_snapshot_persistence_stall_prevents_collection_and_close() -> Non
     assert not result.passed and not result.guard_stopped
     assert scenario.calls == ["preview_order", "place_order"]
     assert paced_after_entry[0] == 0
+
+
+def test_warming_follows_complete_flat_scan_before_fresh_plan_and_keeps_single_entry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scenario = Scenario()
+    timeline: list[str] = []
+    original = __import__("guard_harness.testnet_journey", fromlist=["flat_scan"]).flat_scan
+
+    def scan(read: Any, account: str) -> Any:
+        result = original(read, account)
+        timeline.append("full-flat")
+        return result
+
+    def warming(client: str) -> tuple[object, Any]:
+        assert client == scenario.opening[1].lower() and timeline == ["full-flat"]
+        timeline.append("warm")
+        return scenario.request("/guard/status"), lambda: None
+
+    def plan() -> Entry:
+        assert timeline == ["full-flat", "warm"]
+        timeline.append("fresh-plan")
+        return scenario.opening[2]  # type: ignore[no-any-return]
+
+    monkeypatch.setattr("guard_harness.testnet_journey.flat_scan", scan)
+    result = scenario.execute(entry=plan, warm_info=warming)
+    assert result.passed and timeline[:3] == ["full-flat", "warm", "fresh-plan"]
+    assert scenario.calls.count("place_order") == 1
+
+
+@pytest.mark.parametrize("stall", ["plan", "preview", "attempt-fsync", "entry-phase-fsync"])
+def test_stale_warm_performance_refuses_before_single_place_call(stall: str) -> None:
+    scenario = Scenario()
+    stale = [False]
+    original = scenario.tool
+
+    def check() -> None:
+        if stale[0]:
+            raise RuntimeError("owned Guard info warm prerequisite refused")
+
+    def warming(client: str) -> tuple[object, Any]:
+        return scenario.request("/guard/status"), check
+
+    def plan() -> Entry:
+        stale[0] = stall == "plan"
+        return scenario.opening[2]  # type: ignore[no-any-return]
+
+    def tool(name: Tool, arguments: dict[str, Any] | None = None) -> tuple[dict[str, Any], bool]:
+        result = original(name, arguments)
+        if name == "preview_order" and stall == "preview":
+            stale[0] = True
+        return result
+
+    def record(entry: Entry, at: int) -> None:
+        if stall == "attempt-fsync":
+            stale[0] = True
+
+    def phase(name: str) -> None:
+        if name == "entry-attempt" and stall == "entry-phase-fsync":
+            stale[0] = True
+
+    scenario.tool = tool  # type: ignore[method-assign]
+    if stall == "entry-phase-fsync":
+        result = scenario.execute(
+            entry=plan, warm_info=warming, record_attempt=record, observe_phase=phase
+        )
+        assert not result.passed and not result.guard_stopped
+    else:
+        with pytest.raises(RuntimeError, match="owned Guard info warm prerequisite refused"):
+            scenario.execute(
+                entry=plan, warm_info=warming, record_attempt=record, observe_phase=phase
+            )
+    assert "place_order" not in scenario.calls and "close_position" not in scenario.calls
+    assert not scenario.stopped
+
+
+@pytest.mark.parametrize(
+    "field,value", [("mode", "mainnet"), ("last_error", "PRIVATE"), ("killed", "PRIVATE")]
+)
+def test_identical_status_safety_admission_rechecked_after_warm_before_planning(
+    field: str, value: Any
+) -> None:
+    scenario = Scenario()
+    status = scenario.request("/guard/status")
+    assert isinstance(status, dict)
+    status[field] = value
+    with pytest.raises(RuntimeError):
+        scenario.execute(
+            warm_info=lambda client: (status, lambda: None),
+            entry=lambda: pytest.fail("no plan after unsafe post-warm status"),
+        )
+    assert not scenario.calls and not scenario.stopped
+
+
+@pytest.mark.parametrize("permanent", [False, True])
+def test_only_escaping_collection_failure_is_persisted_after_existing_settling(
+    monkeypatch: pytest.MonkeyPatch, permanent: bool
+) -> None:
+    scenario = Scenario()
+    original = scenario.read
+    seen: list[dict[str, object]] = []
+    fills = 0
+    waits: list[float] = []
+
+    def read(payload: dict[str, Any]) -> object:
+        nonlocal fills
+        value = original(payload)
+        if "close_position" in scenario.calls and payload["type"] == "userFillsByTime":
+            fills += 1
+            if fills == 1 or permanent and fills % 2 == 1:
+                assert isinstance(value, list)
+                return value[:1]
+        return value
+
+    monkeypatch.setattr(scenario, "read", read)
+    monkeypatch.setattr("guard_harness.testnet_journey.time.sleep", waits.append)
+    result = scenario.execute(persist_collection_failure=seen.append)
+    assert scenario.calls == ["preview_order", "place_order", "close_position"]
+    assert result.passed is (not permanent) and waits == [1] * (2 if permanent else 1)
+    assert fills == (6 if permanent else 4)
+    if not permanent:
+        assert seen == []
+    else:
+        assert len(seen) == 1
+        assert seen[0]["attempt"] == 3 and seen[0]["settling_enabled"] is True
+        assert seen[0]["subphase"] == "stability" and seen[0]["family"] == "collection-race"
+        assert seen[0]["positions_equal"] is seen[0]["orders_equal"] is True
+        assert seen[0]["fills_equal"] is False and seen[0]["net_vs_remaining"] is None
+
+
+@pytest.mark.parametrize("write_failure", ["none", "io", "interrupt"])
+def test_persistent_accounting_disagreement_retains_terminal_failure_without_resending(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch, write_failure: str
+) -> None:
+    import json
+
+    from guard_harness.testnet_collect import retain_failure
+
+    tmp_path.chmod(0o700)
+    scenario = Scenario()
+    original = scenario.read
+    after: list[str] = []
+    seen: list[dict[str, object]] = []
+    waits: list[float] = []
+
+    def read(payload: dict[str, Any]) -> object:
+        value = original(payload)
+        if "close_position" in scenario.calls:
+            after.append(payload["type"])
+            if payload["type"] == "userFillsByTime":
+                assert isinstance(value, list)
+                return value[:1]  # Both reads identically lag the actual confirmed close.
+        return value
+
+    def persist(facts: dict[str, object]) -> None:
+        seen.append(facts)
+        if write_failure == "io":
+            raise OSError("PRIVATE-ACCOUNT-KEY")
+        if write_failure == "interrupt":
+            raise KeyboardInterrupt("PRIVATE-ACCOUNT-KEY")
+        retain_failure(tmp_path, facts)
+
+    monkeypatch.setattr(scenario, "read", read)
+    monkeypatch.setattr("guard_harness.testnet_journey.time.sleep", waits.append)
+    result = scenario.execute(persist_collection_failure=persist)
+    assert result.failure == "cleanup_incomplete_keep_guard_running" and not result.guard_stopped
+    assert (
+        scenario.calls == ["preview_order", "place_order", "close_position"]
+        and len(after) == 33
+        and waits == [1, 1]
+    )
+    assert (
+        len(seen) == 1
+        and seen[0]["family"] == "accounting-view"
+        and seen[0]["subphase"] == "reconcile"
+    )
+    assert seen[0]["positions_equal"] is seen[0]["orders_equal"] is seen[0]["fills_equal"] is True
+    assert seen[0]["net_vs_remaining"] is False
+    assert seen[0]["attempt"] == 3 and seen[0]["settling_enabled"] is True
+    assert "PRIVATE" not in json.dumps(seen)
+    path = tmp_path / "collection-failure.json"
+    assert path.exists() is (write_failure == "none")
+    if path.exists():
+        assert json.loads(path.read_text()) == seen[0] and path.stat().st_mode & 0o777 == 0o600
+
+
+def test_escaping_owned_deadline_never_reuses_a_handled_collection_race(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scenario = Scenario()
+    original = scenario.read
+    filled = 0
+    expired = False
+    seen: list[dict[str, object]] = []
+
+    def read(payload: dict[str, Any]) -> object:
+        nonlocal filled
+        value = original(payload)
+        if "close_position" in scenario.calls and payload["type"] == "userFillsByTime":
+            filled += 1
+            if filled == 1:
+                assert isinstance(value, list)
+                return value[:1]
+        return value
+
+    def wait(_: float) -> None:
+        nonlocal expired
+        expired = True
+
+    def check() -> None:
+        if expired:
+            raise RuntimeError("PRIVATE-DEADLINE")
+
+    monkeypatch.setattr(scenario, "read", read)
+    monkeypatch.setattr("guard_harness.testnet_journey.time.sleep", wait)
+    result = scenario.execute(check_owned_work=check, persist_collection_failure=seen.append)
+    assert result.failure == "cleanup_incomplete_keep_guard_running" and filled == 2
+    assert len(seen) == 1 and seen[0]["subphase"] == "owned-work" and seen[0]["family"] == "unknown"
+    assert all(
+        seen[0][key] is None
+        for key in ("positions_equal", "orders_equal", "fills_equal", "net_vs_remaining")
+    )
+    assert scenario.calls.count("close_position") == 1
+
+
+@pytest.mark.parametrize("direction", ["fills", "holdings"])
+@pytest.mark.parametrize("partial", [False, True])
+def test_after_confirmed_close_accounting_views_settle_with_one_original_close(
+    monkeypatch: pytest.MonkeyPatch, direction: str, partial: bool
+) -> None:
+    scenario = Scenario()
+    original_read, original_tool = scenario.read, scenario.tool
+    collection = 0
+    calls: list[str] = []
+    waits: list[float] = []
+    seen: list[dict[str, object]] = []
+    stop_cloid = scenario.closed[3]["stop_lookup"]["order"]["order"]["cloid"]
+
+    def tool(name: Tool, arguments: dict[str, Any] | None = None) -> tuple[dict[str, Any], bool]:
+        result = original_tool(name, arguments)
+        if name == "close_position" and partial:
+            # .0002 entry = .0001 confirmed close + .0001 authenticated original stop.
+            scenario.fields["fills"][1]["sz"] = "0.0001"
+            scenario.fields["fills"].append(
+                dict(
+                    scenario.fields["fills"][1],
+                    oid=42,
+                    tid=3,
+                    time=1002,
+                    px="58800",
+                )
+            )
+            scenario.fields["stop_lookup"]["order"]["status"] = "filled"
+        return result
+
+    def read(payload: dict[str, Any]) -> object:
+        nonlocal collection
+        value = original_read(payload)
+        if "close_position" not in scenario.calls:
+            return value
+        calls.append(payload["type"])
+        if payload["type"] == "userAbstraction":
+            collection += 1
+        if collection != 1:
+            return value
+        if direction == "fills" and payload["type"] == "userFillsByTime":
+            assert isinstance(value, list)
+            return value[:1]
+        if direction == "holdings":
+            if payload["type"] == "clearinghouseState":
+                assert isinstance(value, dict)
+                value["assetPositions"] = [
+                    {"position": copy.deepcopy(scenario.opening[3]["positions"][0])}
+                ]
+            elif payload["type"] == "frontendOpenOrders":
+                return copy.deepcopy(scenario.opening[3]["orders"])
+            elif payload["type"] == "orderStatus" and payload["oid"] == stop_cloid:
+                return copy.deepcopy(scenario.opening[3]["stop_lookup"])
+        return value
+
+    monkeypatch.setattr(scenario, "read", read)
+    monkeypatch.setattr(scenario, "tool", tool)
+    monkeypatch.setattr("guard_harness.testnet_journey.time.sleep", waits.append)
+    result = scenario.execute(persist_collection_failure=seen.append)
+    assert result.passed and scenario.stopped and result.cleaned.actions == ("close_position",)
+    assert scenario.calls == ["preview_order", "place_order", "close_position"]
+    assert waits == [1] and seen == []
+    assert collection == 3  # Two complete ownership collections, then independent full scan.
+    assert calls[:11] == calls[11:22]  # Every retried ownership proof uses identical read sequence.
+
+
+def test_accounting_disagreement_before_close_is_one_attempt_and_never_authorizes_close(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scenario = Scenario()
+    original = scenario.read
+    cleaning = False
+    seen: list[dict[str, object]] = []
+    reads: list[str] = []
+
+    def begin() -> None:
+        nonlocal cleaning
+        cleaning = True
+
+    def read(payload: dict[str, Any]) -> object:
+        value = original(payload)
+        if cleaning:
+            reads.append(payload["type"])
+            if payload["type"] == "clearinghouseState":
+                assert isinstance(value, dict)
+                value["assetPositions"][0]["position"].update(szi="0.0001", positionValue="6")
+        return value
+
+    monkeypatch.setattr(scenario, "read", read)
+    monkeypatch.setattr(
+        "guard_harness.testnet_journey.time.sleep",
+        lambda _: pytest.fail("no settling before close"),
+    )
+    result = scenario.execute(begin_cleanup=begin, persist_collection_failure=seen.append)
+    assert result.failure == "cleanup_incomplete_keep_guard_running" and not scenario.stopped
+    assert scenario.calls == ["preview_order", "place_order"] and len(reads) == 10
+    assert len(seen) == 1 and seen[0]["family"] == "accounting-view"
+    assert seen[0]["attempt"] == 1 and seen[0]["settling_enabled"] is False
+
+
+def test_persistent_partial_close_view_mismatch_keeps_original_protection_without_second_close(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scenario = Scenario()
+    original_read, original_tool = scenario.read, scenario.tool
+    waits: list[float] = []
+    seen: list[dict[str, object]] = []
+    reads: list[str] = []
+
+    def tool(name: Tool, arguments: dict[str, Any] | None = None) -> tuple[dict[str, Any], bool]:
+        result = original_tool(name, arguments)
+        if name == "close_position":
+            scenario.fields["fills"][1]["sz"] = "0.0001"
+            scenario.fields["positions"] = [
+                {
+                    "coin": "BTC",
+                    "szi": "0.0001",
+                    "positionValue": "6",
+                    "leverage": {"type": "isolated"},
+                }
+            ]
+            scenario.fields["stop_lookup"]["order"]["status"] = "open"
+            scenario.fields["orders"] = copy.deepcopy(scenario.opening[3]["orders"])
+        return result
+
+    def read(payload: dict[str, Any]) -> object:
+        value = original_read(payload)
+        if "close_position" in scenario.calls:
+            reads.append(payload["type"])
+            if payload["type"] == "userFillsByTime":
+                assert isinstance(value, list)
+                return value[:1]
+        return value
+
+    monkeypatch.setattr(scenario, "read", read)
+    monkeypatch.setattr(scenario, "tool", tool)
+    monkeypatch.setattr("guard_harness.testnet_journey.time.sleep", waits.append)
+    result = scenario.execute(persist_collection_failure=seen.append)
+    assert result.failure == "cleanup_incomplete_keep_guard_running" and not scenario.stopped
+    assert scenario.calls == ["preview_order", "place_order", "close_position"]
+    assert len(reads) == 33 and waits == [1, 1]
+    assert len(seen) == 1 and seen[0]["family"] == "accounting-view" and seen[0]["attempt"] == 3
+    assert scenario.fields["positions"][0]["szi"] == "0.0001" and scenario.fields["orders"]
+
+
+@pytest.mark.parametrize("later", [False, True])
+@pytest.mark.parametrize(
+    "fault",
+    [
+        "foreign-fill",
+        "foreign-order",
+        "wrong-coin",
+        "cross",
+        "duplicate",
+        "oversell",
+        "stale-fill",
+        "stale-exit",
+        "bad-exit",
+        "invalid-ack",
+        "unknown-stop",
+        "bad-price",
+    ],
+)
+def test_first_or_later_non_accounting_faults_never_settle_or_mutate_again(
+    monkeypatch: pytest.MonkeyPatch, later: bool, fault: str
+) -> None:
+    scenario = Scenario()
+    original, original_request = scenario.read, scenario.request
+    collection = 0
+    captured_events: list[dict[str, Any]] = []
+    waits: list[float] = []
+    seen: list[dict[str, object]] = []
+
+    def mutate() -> None:
+        fields = scenario.fields
+        fill = fields["fills"][1]
+        if fault == "foreign-fill":
+            fill["oid"] = 99
+        elif fault == "foreign-order":
+            fields["orders"] = [dict(scenario.opening[3]["orders"][0], oid=99, cloid="foreign")]
+            fields["positions"] = [dict(scenario.opening[3]["positions"][0], szi="0.0001")]
+        elif fault == "wrong-coin":
+            fill["coin"] = "ETH"
+        elif fault == "cross":
+            fields["positions"] = copy.deepcopy(scenario.opening[3]["positions"])
+            fields["positions"][0]["leverage"]["type"] = "cross"
+        elif fault == "duplicate":
+            fields["fills"].append(copy.deepcopy(fill))
+        elif fault == "oversell":
+            fill["sz"] = "0.0003"
+        elif fault == "stale-fill":
+            fill["time"] = 999
+        elif fault in {"stale-exit", "bad-exit"}:
+            lookup = next(iter(fields["exit_lookups"].values()))["order"]["order"]
+            lookup["timestamp" if fault == "stale-exit" else "origSz"] = (
+                999 if fault == "stale-exit" else "0.0003"
+            )
+        elif fault == "invalid-ack":
+            sent = next(event for event in captured_events if event.get("kind") == "sent")
+            sent["reply"]["response"]["data"]["statuses"][0]["filled"]["oid"] = 99
+            fields["fills"].pop()  # Exercise invalid ack on the typed failed-net branch.
+        elif fault == "unknown-stop":
+            fields["stop_lookup"]["order"]["status"] = "PRIVATE-STATUS"
+        elif fault == "bad-price":
+            fill["px"] = "1"
+
+    def request(path: str) -> object:
+        nonlocal captured_events
+        value = original_request(path)
+        if "close_position" in scenario.calls and path.startswith("/guard/events"):
+            assert isinstance(value, list)
+            captured_events = value
+        return value
+
+    def read(payload: dict[str, Any]) -> object:
+        nonlocal collection
+        if "close_position" in scenario.calls and payload["type"] == "userAbstraction":
+            collection += 1
+            if collection == (2 if later else 1):
+                mutate()
+        value = original(payload)
+        if (
+            later
+            and collection == 1
+            and "close_position" in scenario.calls
+            and payload["type"] == "userFillsByTime"
+        ):
+            assert isinstance(value, list)
+            return value[:1]
+        return value
+
+    monkeypatch.setattr(scenario, "read", read)
+    monkeypatch.setattr(scenario, "request", request)
+    monkeypatch.setattr("guard_harness.testnet_journey.time.sleep", waits.append)
+    result = scenario.execute(persist_collection_failure=seen.append)
+    assert result.failure == "cleanup_incomplete_keep_guard_running" and not scenario.stopped
+    assert scenario.calls == ["preview_order", "place_order", "close_position"]
+    assert waits == ([1] if later else []) and collection == (2 if later else 1)
+    assert len(seen) == 1 and seen[0]["family"] == "protection"
+    assert seen[0]["attempt"] == (2 if later else 1)

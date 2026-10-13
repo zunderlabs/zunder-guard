@@ -12,7 +12,7 @@ import pytest
 
 from guard_harness import linux_guest, linux_testnet_lifecycle, linux_testnet_service
 from guard_harness.linux_guest import Guest
-from guard_harness.linux_lifecycle import LifecycleError
+from guard_harness.linux_lifecycle import ROOT_PATH, LifecycleError
 from guard_harness.linux_testnet_lifecycle import (
     TestnetLifecycle as ProtectedLifecycle,
 )
@@ -695,3 +695,463 @@ def test_legacy_builder_approval_error_still_refuses_credit(tmp_path: Path) -> N
     with pytest.raises(LifecycleError, match="error_category=fee-approved") as caught:
         no_exchange(tmp_path)
     assert "private-sentinel" not in str(caught.value)
+
+
+@pytest.mark.parametrize("operation", ["crash", "install", "readiness", "PRIVATE-ACCOUNT-KEY"])
+def test_lifecycle_cli_retains_finite_terminal_failure_without_credit_or_body(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, operation: str
+) -> None:
+    import io
+    import sys
+
+    from guard_harness.runner import RunError
+
+    output = tmp_path / "evidence"
+    output.mkdir(mode=0o700)
+    completed: list[str] = []
+
+    class FailedLifecycle:
+        def __init__(self, inputs: Any, **kwargs: Any) -> None:
+            self.operation = operation
+
+        def before(self, key: bytes) -> None:
+            assert key == b"a" * 64 + b"\n"
+            raise RunError("PRIVATE-ACCOUNT-KEY raw command args/body")
+
+        def after(self, *args: Any, **kwargs: Any) -> None:
+            completed.append("after")
+
+        def flat(self) -> None:
+            pytest.fail("no new venue reads on diagnostic failure")
+
+    argv = ["testnet-lifecycle"]
+    for name, value in {
+        "installer": str(tmp_path / "installer"),
+        "previous-installer": str(tmp_path / "previous"),
+        "output": str(output),
+        "installer-sha256": "a" * 64,
+        "previous-installer-sha256": "b" * 64,
+        "version": "v1.0.0-rc.14",
+        "previous-version": "v1.0.0-rc.13",
+        "rules": "fixture",
+        "account": "0x" + "1" * 40,
+        "marker": "c" * 32,
+        "binary-sha256": "d" * 64,
+        "previous-binary-sha256": "e" * 64,
+        "route": "container",
+        "phase": "before-reboot",
+    }.items():
+        argv.extend(["--" + name, value])
+    monkeypatch.setattr(sys, "argv", argv)
+    monkeypatch.setattr(sys, "stdin", SimpleNamespace(buffer=io.BytesIO(b"a" * 64 + b"\n")))
+    monkeypatch.setattr(linux_testnet_lifecycle, "TestnetLifecycle", FailedLifecycle)
+    with pytest.raises(RunError):
+        linux_testnet_lifecycle.main()
+    record = output / "lifecycle-before-reboot-failure.json"
+    value = json.loads(record.read_bytes())
+    assert value == {
+        "schema": 1,
+        "result": "failed",
+        "gate_eligible": False,
+        "phase": "before-reboot",
+        "operation": operation if operation != "PRIVATE-ACCOUNT-KEY" else "unknown",
+        "failure": "command",
+    }
+    assert "PRIVATE" not in record.read_text() and completed == []
+    assert record.stat().st_mode & 0o777 == 0o600
+    assert not (output / "testnet-lifecycle.json").exists()
+
+
+def test_sensitive_crash_command_failure_retains_exact_exit_and_authored_operation(
+    tmp_path: Path,
+) -> None:
+    import sys
+
+    from guard_harness.runner import RunError
+
+    lifecycle = object.__new__(ProtectedLifecycle)
+    lifecycle.inputs = cast(Any, SimpleNamespace(output=tmp_path))
+    with pytest.raises(RunError):
+        lifecycle.command(
+            "crash", [sys.executable, "-c", "print('PRIVATE-BODY'); raise SystemExit(7)"]
+        )
+    assert lifecycle.operation == "crash"
+    assert (tmp_path / "crash.log").read_text() == (
+        "[sensitive command output withheld]\nexit status: 7\ncommand outcome: exited\n"
+    )
+
+
+def test_failure_evidence_filters_non_authored_phase_type_and_operation(tmp_path: Path) -> None:
+    tmp_path.chmod(0o700)
+    linux_testnet_lifecycle.failure_evidence(
+        tmp_path, "PRIVATE-PHASE", "PRIVATE-KEY", "PRIVATE-ERROR"
+    )
+    value = json.loads((tmp_path / "lifecycle-unknown-failure.json").read_bytes())
+    assert value["phase"] == value["operation"] == value["failure"] == "unknown"
+    assert "PRIVATE" not in json.dumps(value)
+
+
+def before_crash_fixture(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, route: str, refusal: str
+) -> tuple[ProtectedLifecycle, list[str]]:
+    from guard_harness.runner import RunError
+
+    lifecycle = object.__new__(ProtectedLifecycle)
+    lifecycle.route, lifecycle.unit = (
+        route,
+        "zunder-guard-container.service"
+        if route == "container"
+        else "zunder-guard-testnet.service",
+    )
+    lifecycle.home, lifecycle.binary = tmp_path / "home", tmp_path / "binary"
+    lifecycle.private = tmp_path / "private"
+    lifecycle.inputs = cast(
+        Any,
+        SimpleNamespace(
+            initial=(tmp_path / "installer", "a" * 64, "v1.0.0-rc.14"),
+            scenario="fresh",
+            output=tmp_path,
+        ),
+    )
+    lifecycle.binary_sha256 = lifecycle.previous_binary_sha256 = "b" * 64
+    lifecycle.image = lifecycle.previous_image = "signed-image-fixture"
+    trace: list[str] = []
+    healthy_calls = 0
+    state_calls = 0
+
+    def install(*args: Any, **kwargs: Any) -> None:
+        trace.append("install")
+        lifecycle.home.mkdir(mode=0o700)
+        for name in linux_testnet_lifecycle.JOURNALS:
+            (lifecycle.home / name).write_bytes(b"private retained fixture\n")
+
+    def healthy(*args: Any) -> None:
+        nonlocal healthy_calls
+        healthy_calls += 1
+        trace.append("healthy")
+        if healthy_calls == 4 and refusal == "health":
+            raise LifecycleError("public readiness fixture")
+
+    def command(name: str, argv: list[str], **kwargs: Any) -> str:
+        nonlocal state_calls
+        lifecycle.operation = name
+        trace.append(name)
+        if name == "private-pair":
+            return json.dumps({"client_address": "0x" + "1" * 40, "client_key": "0x" + "2" * 64})
+        if name == "old-pid":
+            return "42"
+        if name == "service-state":
+            state_calls += 1
+            if state_calls == 2 and refusal == "snapshot-read":
+                raise OSError("PRIVATE-read-failure")
+            active = "inactive" if refusal == "inactive" else "active"
+            sub = "auto-restart" if refusal == "restarting" else "running"
+            pid = "43" if refusal == "pid-changed" else "42"
+            return (
+                f"ActiveState={active}\nSubState={sub}\nResult=success\nMainPID={pid}\n"
+                "ExecMainCode=0\nExecMainStatus=0"
+            )
+        if name == "crash":
+            assert argv == [
+                "systemctl",
+                "kill",
+                "--kill-whom=main",
+                "--signal=SIGKILL",
+                lifecycle.unit,
+            ]
+            raise RunError("original fixed crash failure")
+        return ""
+
+    monkeypatch.setattr(lifecycle, "install", install)
+    monkeypatch.setattr(lifecycle, "healthy", healthy)
+    monkeypatch.setattr(lifecycle, "audit", lambda: trace.append("audit"))
+    monkeypatch.setattr(lifecycle, "control", lambda name, action: trace.append(name))
+    monkeypatch.setattr(lifecycle, "command", command)
+    monkeypatch.setattr(lifecycle, "docker", lambda words, **kwargs: ["fixture-docker", *words])
+    return lifecycle, trace
+
+
+@pytest.mark.parametrize("route", ["native", "container"])
+@pytest.mark.parametrize(
+    "refusal", ["none", "health", "inactive", "restarting", "pid-changed", "snapshot-read"]
+)
+def test_reload_restart_requires_health_and_running_captured_pid_before_one_crash(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, route: str, refusal: str
+) -> None:
+    from guard_harness.runner import RunError
+
+    lifecycle, trace = before_crash_fixture(tmp_path, monkeypatch, route=route, refusal=refusal)
+    error = RunError if refusal in {"none", "snapshot-read"} else LifecycleError
+    with pytest.raises(error) as caught:
+        lifecycle.before(b"a" * 64 + b"\n")
+    reload_index = trace.index("reload-restart")
+    assert trace[reload_index + 1] == "healthy"
+    if refusal in {"none", "snapshot-read"}:
+        assert trace.index("old-pid") > reload_index + 1
+        assert trace.index("service-state") < trace.index("crash")
+        assert trace.count("crash") == 1
+        assert str(caught.value) == "original fixed crash failure"
+        value = json.loads((tmp_path / "crash-service-state.json").read_bytes())
+        assert value["diagnostic"] is True and value["gate_eligible"] is False
+        assert value["main_pid_present"] is (True if refusal == "none" else None)
+        assert value["active_state"] == ("active" if refusal == "none" else "unknown")
+        assert "42" not in json.dumps(value) and "PRIVATE" not in json.dumps(value)
+        assert lifecycle.operation == "crash"
+    else:
+        assert "crash" not in trace and not (tmp_path / "crash-service-state.json").exists()
+    if refusal == "health":
+        assert "old-pid" not in trace
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "ActiveState=PRIVATE\nSubState=PRIVATE\nResult=PRIVATE\nMainPID=PRIVATE\nExecMainCode=PRIVATE\nExecMainStatus=PRIVATE",
+        "ActiveState=active\nSubState=running\nResult=success\nMainPID=999999999999999999\nExecMainCode=999\nExecMainStatus=999",
+    ],
+)
+def test_service_state_snapshot_never_copies_unrecognized_values_or_numeric_pid(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, raw: str
+) -> None:
+    lifecycle = object.__new__(ProtectedLifecycle)
+    lifecycle.unit = "zunder-guard-container.service"
+    monkeypatch.setattr(lifecycle, "command", lambda *args, **kwargs: raw)
+    state, pid = lifecycle.service_state()
+    assert pid is None and state["main_pid_present"] is None
+    assert state["exec_main_code"] is None and state["exec_main_status"] is None
+    assert "PRIVATE" not in json.dumps(state) and "999999" not in json.dumps(state)
+
+
+def diagnostic_status_body() -> bytes:
+    return json.dumps(
+        {
+            "version": "1.0.0-rc.14",
+            "network": "testnet",
+            "account": "0x" + "1" * 40,
+            "mode": "testnet",
+            "halted": False,
+            "kill_switch": False,
+            "last_sync_ms": 10,
+            "licence": {
+                "state": "valid",
+                "licensee": "PRIVATE-EMAIL",
+                "expires_at_ms": None,
+                "fee_free": False,
+                "source": "file",
+            },
+            "journal": {"ok": True},
+            "extra": "PRIVATE-KEY-BODY",
+        }
+    ).encode()
+
+
+@pytest.mark.parametrize(
+    "route,initial", [("native", True), ("container", True), ("container", False)]
+)
+@pytest.mark.parametrize(
+    "observer", ["ready", "read-failed", "http-failed", "bad-json", "write-failed"]
+)
+def test_initial_install_failure_retains_only_typed_unit_and_local_read_diagnostics(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, observer: str, route: str, initial: bool
+) -> None:
+    import urllib.error
+
+    from guard_harness.runner import RunError
+
+    lifecycle = object.__new__(ProtectedLifecycle)
+    lifecycle.route, lifecycle.unit, lifecycle.port = (
+        route,
+        "zunder-guard-container.service"
+        if route == "container"
+        else "zunder-guard-testnet.service",
+        18548,
+    )
+    lifecycle.guard = cast(Any, SimpleNamespace(url="http://127.0.0.1:18548"))
+    lifecycle.inputs = cast(
+        Any,
+        SimpleNamespace(account="0x" + "1" * 40, rules="fixture", marker="a" * 32, output=tmp_path),
+    )
+    trace: list[str] = []
+    calls: list[tuple[str, float]] = []
+
+    def setup(self: Any, key: bytes) -> dict[str, str]:
+        trace.append("setup")
+        assert key == b"a" * 64 + b"\n"
+        raise RunError("original fixed initial install failure")
+
+    def command(name: str, argv: list[str], **kwargs: Any) -> str:
+        assert name == "service-state" and kwargs["timeout"] == 5
+        assert argv == [
+            "systemctl",
+            "show",
+            "--property=ActiveState",
+            "--property=SubState",
+            "--property=Result",
+            "--property=MainPID",
+            "--property=ExecMainCode",
+            "--property=ExecMainStatus",
+            lifecycle.unit,
+        ]
+        if observer == "read-failed":
+            raise OSError("PRIVATE-provider-error")
+        return (
+            "ActiveState=activating\nSubState=auto-restart\nResult=exit-code\nMainPID=0\n"
+            "ExecMainCode=1\nExecMainStatus=1"
+        )
+
+    def read(url: str, data: bytes | None, *, timeout: float) -> bytes:
+        assert data is None and 0 < timeout <= 2
+        calls.append((url, timeout))
+        if observer == "http-failed":
+            raise urllib.error.URLError("PRIVATE-network-body")
+        if observer == "bad-json":
+            return b"PRIVATE-malformed-body"
+        return b'{"ok":false}' if url.endswith("/healthz") else diagnostic_status_body()
+
+    monkeypatch.setattr(lifecycle, "flat", lambda: trace.append("flat"))
+    monkeypatch.setattr(lifecycle, "command", command)
+    monkeypatch.setattr(linux_testnet_service.TestnetService, "setup", setup)
+    monkeypatch.setattr(linux_testnet_lifecycle, "bounded_read", read)
+    if observer == "write-failed":
+        (tmp_path / "install-service-state.json").mkdir()
+    with pytest.raises(RunError, match="original fixed initial install failure"):
+        lifecycle.install(tmp_path / "installer", "b" * 64, b"a" * 64 + b"\n", initial=initial)
+    assert trace == ["flat", "setup"] and lifecycle.operation == "install"
+    assert [url for url, _ in calls] == [
+        "http://127.0.0.1:18548/healthz",
+        "http://127.0.0.1:18548/guard/status",
+    ]
+    if observer == "write-failed":
+        return
+    path = tmp_path / "install-service-state.json"
+    state = json.loads(path.read_bytes())
+    assert state["diagnostic"] is True and state["gate_eligible"] is False
+    assert "PRIVATE" not in path.read_text() and "account" not in state
+    assert path.stat().st_mode & 0o777 == 0o600
+    assert state["active_state"] == ("unknown" if observer == "read-failed" else "activating")
+    assert state["exec_main_code"] == (None if observer == "read-failed" else 1)
+    assert state["exec_main_status"] == (None if observer == "read-failed" else 1)
+    status = state["local_http"]["status"]
+    if observer in {"ready", "read-failed"}:
+        assert status == {
+            "transport": "response",
+            "http": "success",
+            "json": "valid",
+            "mode_network_match": True,
+            "last_sync_present": True,
+            "halted": False,
+            "journal_ok": True,
+        }
+    elif observer == "bad-json":
+        assert status["json"] == "invalid" and status["mode_network_match"] is None
+    else:
+        assert status["http"] == "unknown" and status["json"] == "unknown"
+
+
+def test_local_failure_observations_never_start_second_read_after_shared_short_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    lifecycle = object.__new__(ProtectedLifecycle)
+    lifecycle.guard = cast(Any, SimpleNamespace(url="http://127.0.0.1:18548"))
+    clock = [0.0]
+    calls: list[str] = []
+    monkeypatch.setattr("guard_harness.linux_testnet_lifecycle.time.monotonic", lambda: clock[0])
+
+    def read(url: str, data: bytes | None, *, timeout: float) -> bytes:
+        calls.append(url)
+        assert timeout == 2
+        clock[0] = 4.0
+        return b"{}"
+
+    monkeypatch.setattr(linux_testnet_lifecycle, "bounded_read", read)
+    value = lifecycle.local_failure_observations()
+    assert calls == ["http://127.0.0.1:18548/healthz"]
+    assert value["status"]["transport"] == "unknown"
+
+
+@pytest.mark.parametrize(
+    "mutation", ["string-halted", "bool-stamp", "negative-stamp", "string-journal"]
+)
+def test_local_status_diagnostic_has_no_untyped_predicate_values(
+    monkeypatch: pytest.MonkeyPatch, mutation: str
+) -> None:
+    value = json.loads(diagnostic_status_body())
+    if mutation == "string-halted":
+        value["halted"] = "PRIVATE"
+    elif mutation == "bool-stamp":
+        value["last_sync_ms"] = True
+    elif mutation == "negative-stamp":
+        value["last_sync_ms"] = -1
+    else:
+        value["journal"]["ok"] = "PRIVATE"
+    lifecycle = object.__new__(ProtectedLifecycle)
+    lifecycle.guard = cast(Any, SimpleNamespace(url="http://127.0.0.1:18548"))
+    monkeypatch.setattr(
+        linux_testnet_lifecycle, "bounded_read", lambda *args, **kwargs: json.dumps(value).encode()
+    )
+    observed = lifecycle.local_failure_observations()["status"]
+    assert "PRIVATE" not in json.dumps(observed)
+    if mutation in {"bool-stamp", "negative-stamp"}:
+        assert observed["last_sync_present"] is None
+    else:
+        assert observed["json"] == "invalid" and observed["halted"] is None
+
+
+@pytest.mark.parametrize(
+    "code,status,expected",
+    [
+        ("0", "0", (0, 0)),
+        ("1", "1", (1, 1)),
+        ("2", "9", (2, 9)),
+        ("6", "255", (6, 255)),
+        ("7", "256", (None, None)),
+        ("-1", "-1", (None, None)),
+        ("PRIVATE-KEY-BYTES", "PRIVATE-KEY-BYTES", (None, None)),
+        ("0" * 8192, "0" * 8192, None),
+    ],
+    ids=["zero", "exit", "signal", "upper", "outside", "negative", "private", "oversized"],
+)
+def test_systemd_exit_metadata_is_nullable_and_finitely_bounded(
+    monkeypatch: pytest.MonkeyPatch, code: str, status: str, expected: tuple[int, int] | None
+) -> None:
+    lifecycle = object.__new__(ProtectedLifecycle)
+    lifecycle.unit = "zunder-guard-testnet.service"
+    raw = (
+        "ActiveState=failed\nSubState=failed\nResult=exit-code\nMainPID=0\n"
+        f"ExecMainCode={code}\nExecMainStatus={status}"
+    )
+    monkeypatch.setattr(lifecycle, "command", lambda *args, **kwargs: raw)
+    if expected is None:
+        with pytest.raises(LifecycleError, match="service state exceeds bound"):
+            lifecycle.service_state()
+        return
+    observed, _ = lifecycle.service_state()
+    assert (observed["exec_main_code"], observed["exec_main_status"]) == expected
+    assert "PRIVATE" not in json.dumps(observed)
+
+
+def test_service_state_command_wholly_withholds_private_stdout_and_stderr(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    lifecycle = object.__new__(ProtectedLifecycle)
+    lifecycle.unit = "zunder-guard-testnet.service"
+    lifecycle.inputs = cast(Any, SimpleNamespace(output=tmp_path))
+    private = "PRIVATE-KEY-BYTES-" + "b" * 64
+    raw = (
+        f"ActiveState={private}\nSubState=failed\nResult=exit-code\nMainPID=0\n"
+        f"ExecMainCode={private}\nExecMainStatus={private}"
+    )
+
+    def child(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess[bytes]:
+        assert argv[0:2] == ["systemctl", "show"] and argv[-1] == lifecycle.unit
+        assert kwargs["timeout"] == 5 and kwargs["input"] is None
+        assert kwargs["env"] == {"PATH": ROOT_PATH, "HOME": "/root"}
+        return subprocess.CompletedProcess(argv, 0, raw.encode(), private.encode())
+
+    monkeypatch.setattr(subprocess, "run", child)
+    observed, _ = lifecycle.service_state()
+    assert observed["active_state"] == "unknown"
+    assert observed["exec_main_code"] is None and observed["exec_main_status"] is None
+    log = tmp_path / "service-state.log"
+    assert log.read_text() == "[sensitive command output withheld]\n"
+    assert private not in json.dumps(observed) and private not in log.read_text()
