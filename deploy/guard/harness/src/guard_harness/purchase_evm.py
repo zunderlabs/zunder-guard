@@ -43,6 +43,7 @@ PAY_PHASES = frozenset(
         "evm-nonce",
         "evm-gas-estimate",
         "evm-gas-price",
+        "evm-base-fee",
         "evm-signing",
         "evm-attempt",
         "evm-broadcast",
@@ -55,6 +56,7 @@ RPC_FAMILIES = frozenset(
         "nonce-low",
         "nonce-conflict",
         "underpriced",
+        "fee-cap-low",
         "gas-limit",
         "insufficient-funds",
         "rate-limit",
@@ -79,15 +81,35 @@ RPC_MESSAGES = {
 }
 
 
+# Only fixed standard JSON-RPC codes and the reproduced Arbitrum server code are retained.
+RPC_CODES = frozenset({-32700, -32600, -32601, -32602, -32603, -32000})
+FEE_CAP_MESSAGE = re.compile(
+    r"err: max fee per gas less than block base fee: address 0x[0-9a-fA-F]{40}, "
+    r"maxFeePerGas: ([1-9][0-9]{0,77}), baseFee: ([1-9][0-9]{0,77}) "
+    r"\(supplied gas ([1-9][0-9]{0,77})\)"
+)
+
+
 class RpcRejection(PaymentError):
-    def __init__(self, family: str) -> None:
+    def __init__(self, family: str, code: object = None) -> None:
+        self.code = code if type(code) is int and code in RPC_CODES else None
         self.family = family if type(family) is str and family in RPC_FAMILIES else "unknown"
         super().__init__("Sepolia RPC admission failed; diagnostics withheld")
 
 
 def rpc_family(error: object) -> str:
     message = error.get("message") if type(error) is dict else None
-    return RPC_MESSAGES.get(message, "unknown") if type(message) is str else "unknown"
+    if type(message) is not str:
+        return "unknown"
+    exact = RPC_MESSAGES.get(message)
+    if exact is not None:
+        return exact
+    matched = FEE_CAP_MESSAGE.fullmatch(message)
+    if matched is not None:
+        values = tuple(int(value) for value in matched.groups())
+        if all(0 < value < 2**256 for value in values) and values[0] < values[1]:
+            return "fee-cap-low"
+    return "unknown"
 
 
 def rpc(network: str, method: str, params: list[object]) -> Any:
@@ -100,7 +122,9 @@ def rpc(network: str, method: str, params: list[object]) -> Any:
         response.get("jsonrpc") == "2.0" and type(response.get("id")) is int and response["id"] == 1
     )
     if valid_identity and "error" in response and "result" not in response:
-        raise RpcRejection(rpc_family(response["error"]))
+        error = response["error"]
+        code = error.get("code") if type(error) is dict else None
+        raise RpcRejection(rpc_family(error), code)
     if (
         response.get("jsonrpc") != "2.0"
         or type(response.get("id")) is not int
@@ -118,6 +142,30 @@ def quantity(value: Any) -> int:
     ):
         raise PaymentError("canonical bounded RPC quantity required")
     return int(value, 16)
+
+
+def admitted_gas_price(gas: int, suggested: int, latest: object) -> int:
+    """One fresh header, integer headroom, unchanged total cap before any signing.
+
+    This only admits a new order's legacy gasPrice. It never replaces or retries
+    a previously attempted transaction; the existing exclusive attempt remains binding.
+    """
+    if (
+        type(gas) is not int
+        or not 21_000 <= gas <= 1_000_000
+        or type(suggested) is not int
+        or not 0 < suggested < 2**256
+        or not isinstance(latest, dict)
+    ):
+        raise PaymentError("Sepolia gas exceeds fixed test budget")
+    base_fee = quantity(latest.get("baseFeePerGas"))
+    if not 0 < base_fee < 2**255:
+        raise PaymentError("canonical positive bounded Sepolia base fee required")
+    # Hand-computed headroom: twice the latest base fee, or the higher RPC quote.
+    price = max(suggested, 2 * base_fee)
+    if not 0 < gas * price <= MAX_FEE_WEI:
+        raise PaymentError("Sepolia gas exceeds fixed test budget")
+    return price
 
 
 def pay(
@@ -158,8 +206,9 @@ def pay(
         gas = quantity(rpc(network, "eth_estimateGas", [call]))
         phase("evm-gas-price")
         price = quantity(rpc(network, "eth_gasPrice", []))
-        if not 21_000 <= gas <= 1_000_000 or not 0 < gas * price <= MAX_FEE_WEI:
-            raise PaymentError("Sepolia gas exceeds fixed test budget")
+        phase("evm-base-fee")
+        latest = rpc(network, "eth_getBlockByNumber", ["latest", False])
+        price = admitted_gas_price(gas, price, latest)
         transaction = {
             "chainId": chain_id,
             "nonce": nonce,
@@ -185,6 +234,9 @@ def pay(
         "amount_micro": micro,
         "nonce": nonce,
         "transaction_hash": transaction_hash,
+        "gas": gas,
+        "gas_price": price,
+        "max_total_fee_wei": gas * price,
     }
     phase("evm-attempt")
     record(work, "payment-attempt.json", attempt)
@@ -245,15 +297,16 @@ def main() -> int:
         try:
             _private(args.work, directory=True)
             attempt = attempt or (args.work / "payment-attempt.json").exists()
-            record(
-                args.work,
-                "payment-failure.json",
-                {
-                    "phase": label,
-                    "attempt": attempt,
-                    "broadcast_started": broadcast_started,
-                },
-            )
+            failure: dict[str, object] = {
+                "phase": label,
+                "attempt": attempt,
+                "broadcast_started": broadcast_started,
+            }
+            if type(error) is RpcRejection:
+                failure["rpc_family"] = error.family
+                if error.code is not None:
+                    failure["rpc_code"] = error.code
+            record(args.work, "payment-failure.json", failure)
         except Exception:
             pass  # Never overwrite evidence or let diagnostics obscure an ambiguous outcome.
         print(

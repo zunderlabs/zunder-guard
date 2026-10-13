@@ -11,6 +11,8 @@ from eth_account import Account
 from guard_harness import purchase_evm as evm
 from guard_harness import purchase_payment as common
 
+REAL_RPC = evm.rpc
+
 
 @pytest.fixture
 def setup(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Any:
@@ -33,6 +35,7 @@ def setup(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Any:
         "latest": 2,
         "gas": 50000,
         "price": 1000000000,
+        "base_fee": 400000000,
         "receipt_status": "0x1",
         "broadcast": "ok",
         "state": "quoted",
@@ -88,6 +91,9 @@ def setup(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Any:
             return hex(state["gas"])
         if method == "eth_gasPrice":
             return hex(state["price"])
+        if method == "eth_getBlockByNumber":
+            assert params == ["latest", False]
+            return {"baseFeePerGas": hex(state["base_fee"])}
         if method == "eth_sendRawTransaction":
             assert (tmp_path / "payment-attempt.json").stat().st_mode & 0o777 == 0o600
             raw = str(params[0])
@@ -272,6 +278,7 @@ def test_rpc_unknown_or_suffixed_private_error_is_unknown(message: object) -> No
     "method,phase,attempt",
     [
         ("eth_estimateGas", "evm-gas-estimate", False),
+        ("eth_getBlockByNumber", "evm-base-fee", False),
         ("eth_sendRawTransaction", "evm-broadcast", True),
         ("eth_getTransactionReceipt", "evm-confirm", True),
     ],
@@ -322,7 +329,10 @@ def test_actual_main_failure_stderr_and_receipt_are_private_and_finite(
     )
     assert len(label) <= 40
     failure = json.loads((work / "payment-failure.json").read_text())
-    assert failure == {"phase": label, "attempt": attempt, "broadcast_started": attempt}
+    expected: dict[str, object] = {"phase": label, "attempt": attempt, "broadcast_started": attempt}
+    if family is not None:
+        expected["rpc_family"] = family
+    assert failure == expected
     assert (work / "payment-failure.json").stat().st_mode & 0o777 == 0o600
     assert sentinel not in captured.err and sentinel not in json.dumps(failure)
     assert (work / "payment-attempt.json").exists() is attempt
@@ -345,6 +355,7 @@ def test_phase_observer_tracks_admission_attempt_and_single_broadcast(setup: Any
         "evm-nonce",
         "evm-gas-estimate",
         "evm-gas-price",
+        "evm-base-fee",
         "evm-signing",
         "evm-attempt",
         "evm-broadcast",
@@ -396,3 +407,293 @@ def test_ambiguous_confirmation_cli_receipt_does_not_rebroadcast(
     with pytest.raises(common.PaymentError, match="never retry"):
         evm.pay("base", "ZL-2026-000001", "0.180001", work)
     assert len(broadcasts) == 1
+
+
+def fee_cap_message(*, price: str = "20000000", base: str = "20096000", gas: str = "62989") -> str:
+    return (
+        "err: max fee per gas less than block base fee: address 0x"
+        + "a" * 40
+        + ", maxFeePerGas: "
+        + price
+        + ", baseFee: "
+        + base
+        + " (supplied gas "
+        + gas
+        + ")"
+    )
+
+
+def test_exact_reproduced_fee_cap_message_is_finite_without_retaining_wallet() -> None:
+    assert evm.rpc_family({"message": fee_cap_message()}) == "fee-cap-low"
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        fee_cap_message() + " PRIVATE-SECRET",
+        fee_cap_message() + "\n",
+        "\n" + fee_cap_message(),
+        fee_cap_message().replace("a" * 40, "PRIVATE-SECRET"),
+        fee_cap_message(price="1" * 79),
+        fee_cap_message(base="0"),
+        fee_cap_message(gas="-1"),
+        fee_cap_message(gas="01"),
+        fee_cap_message(base=str(2**256)),
+        fee_cap_message(price="20096001", base="20096000"),
+        fee_cap_message().replace("err:", "error:"),
+        fee_cap_message().replace(" (supplied gas", "\n(supplied gas"),
+    ],
+)
+def test_fee_cap_grammar_refuses_suffix_newline_secret_overflow_and_noncanonical_numbers(
+    message: str,
+) -> None:
+    assert evm.rpc_family({"message": message}) == "unknown"
+
+
+@pytest.mark.parametrize("code", [True, -31999, -32001, 1, 0, "-32000", "PRIVATE-SECRET", None])
+def test_unrecognized_or_noninteger_rpc_codes_never_retained(code: object) -> None:
+    assert evm.RpcRejection("fee-cap-low", code).code is None
+
+
+@pytest.mark.parametrize("code", sorted(evm.RPC_CODES))
+def test_only_finite_recognized_rpc_integer_codes_retained(code: int) -> None:
+    assert evm.RpcRejection("fee-cap-low", code).code == code
+
+
+@pytest.mark.parametrize("network,chain", [("base", 84532), ("arbitrum", 421614)])
+def test_attempt_retains_exact_signed_fee_numbers_with_no_extra_rpc_or_send(
+    setup: Any, monkeypatch: pytest.MonkeyPatch, network: str, chain: int
+) -> None:
+    state, transactions, broadcasts, _, work = setup
+    state.update(network=network, chain_id=chain)
+    original = evm.rpc
+    methods: list[str] = []
+
+    def rpc(net: str, method: str, params: list[object]) -> Any:
+        methods.append(method)
+        return original(net, method, params)
+
+    monkeypatch.setattr(evm, "rpc", rpc)
+    evm.pay(network, "ZL-2026-000001", "0.180001", work)
+    attempt = json.loads((work / "payment-attempt.json").read_text())
+    signed = transactions[0]
+    assert attempt["gas"] == signed["gas"] == state["gas"]
+    assert attempt["gas_price"] == signed["gasPrice"] == state["price"]
+    assert attempt["max_total_fee_wei"] == signed["gas"] * signed["gasPrice"] <= evm.MAX_FEE_WEI
+    assert methods == [
+        "eth_chainId",
+        "eth_getTransactionCount",
+        "eth_getTransactionCount",
+        "eth_estimateGas",
+        "eth_gasPrice",
+        "eth_getBlockByNumber",
+        "eth_sendRawTransaction",
+        "eth_getTransactionReceipt",
+    ]
+    assert len(broadcasts) == 1
+    assert set(attempt) == {
+        "order",
+        "network",
+        "amount_micro",
+        "nonce",
+        "transaction_hash",
+        "gas",
+        "gas_price",
+        "max_total_fee_wei",
+    }
+    assert (
+        "offline-key" not in json.dumps(attempt) and "from" not in attempt and "raw" not in attempt
+    )
+
+
+def test_actual_rpc_cli_fee_cap_failure_retains_only_finite_fields_and_one_broadcast(
+    setup: Any, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    state, _, broadcasts, _, work = setup
+    state.update(network="arbitrum", chain_id=421614)
+    original = evm.rpc
+    calls: list[str] = []
+
+    def rejection(
+        url: str, *, headers: dict[str, str], data: bytes | None = None
+    ) -> dict[str, Any]:
+        assert url == evm.NETWORKS["arbitrum"][0] and data is not None
+        request = json.loads(data)
+        assert request["method"] == "eth_sendRawTransaction"
+        assert (work / "payment-attempt.json").exists()
+        broadcasts.append(str(request["params"][0]))
+        return {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "error": {"code": -32000, "message": fee_cap_message(), "data": "PRIVATE-SECRET"},
+        }
+
+    def routed(network: str, method: str, params: list[object]) -> Any:
+        calls.append(method)
+        if method == "eth_sendRawTransaction":
+            return REAL_RPC(network, method, params)
+        return original(network, method, params)
+
+    monkeypatch.setattr(evm, "request", rejection)
+    monkeypatch.setattr(evm, "rpc", routed)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "purchase_evm",
+            "--network",
+            "arbitrum",
+            "--order",
+            "ZL-2026-000001",
+            "--amount",
+            "0.180001",
+            "--work",
+            str(work),
+        ],
+    )
+    assert evm.main() == 1
+    captured = capsys.readouterr()
+    assert (
+        captured.err == "Testnet payment failed at evm-broadcast-fee-cap-low; "
+        "reconcile private receipts; never retry\n"
+    )
+    failure = json.loads((work / "payment-failure.json").read_text())
+    assert failure == {
+        "phase": "evm-broadcast-fee-cap-low",
+        "attempt": True,
+        "broadcast_started": True,
+        "rpc_family": "fee-cap-low",
+        "rpc_code": -32000,
+    }
+    assert "PRIVATE-SECRET" not in json.dumps(
+        failure
+    ) and "0x" + "a" * 40 not in captured.err + json.dumps(failure)
+    assert len(broadcasts) == 1 and calls.count("eth_sendRawTransaction") == 1
+    assert not (work / "payment-receipt.json").exists()
+    with pytest.raises(common.PaymentError, match="never retry"):
+        evm.pay("arbitrum", "ZL-2026-000001", "0.180001", work)
+    assert len(broadcasts) == 1
+
+
+def test_explicit_failure_receipt_allowlist_excludes_raw_payment_diagnostics() -> None:
+    from guard_harness.c6_owner import document
+    from guard_harness.testnet_run import ROOT
+
+    workflows = ROOT / "github/workflows"
+    if not workflows.is_dir():
+        workflows = ROOT.parents[1] / ".github/workflows"
+    source = document((workflows / "journey.yml").read_text())
+    uploads = [
+        step["with"]["path"]
+        for step in source["jobs"]["purchase"]["steps"]
+        if "actions/upload-artifact@" in step.get("uses", "")
+    ]
+    assert len(uploads) == 1
+    for leaf in ("payment", "renewal-payment"):
+        assert (
+            "${{ runner.temp }}/quote-evidence/P*/" + leaf + "/payment-failure.json"
+            in uploads[0].splitlines()
+        )
+    assert "payment/*.json" not in uploads[0] and "payment/*.log" not in uploads[0]
+
+
+@pytest.mark.parametrize(
+    "gas,suggested,base,chosen,total",
+    [
+        # Observed admission counterexample: 20m quote below 20.15m base;
+        # 45,439 * (2 * 20,150,000) = 1,831,191,700,000 wei, below unchanged 200e12 cap.
+        (45439, 20000000, 20150000, 40300000, 1831191700000),
+        # A higher suggestion remains selected; 50k * 1g = 50e12 wei.
+        (50000, 1000000000, 400000000, 1000000000, 50000000000000),
+        # Cap equality: 50k * (2 * 2g) = exactly 200e12 wei.
+        (50000, 1, 2000000000, 4000000000, 200000000000000),
+    ],
+)
+def test_fee_admission_hand_computed_headroom_and_exact_cap(
+    gas: int, suggested: int, base: int, chosen: int, total: int
+) -> None:
+    assert evm.admitted_gas_price(gas, suggested, {"baseFeePerGas": hex(base)}) == chosen
+    assert gas * chosen == total <= evm.MAX_FEE_WEI
+
+
+@pytest.mark.parametrize(
+    "header",
+    [
+        None,
+        [],
+        "PRIVATE_SENTINEL",
+        {},
+        {"baseFeePerGas": None},
+        {"baseFeePerGas": True},
+        {"baseFeePerGas": 20000000},
+        {"baseFeePerGas": "0x0"},
+        {"baseFeePerGas": "0x00"},
+        {"baseFeePerGas": "0x01"},
+        {"baseFeePerGas": "0x-1"},
+        {"baseFeePerGas": "0x" + "f" * 65},
+        {"baseFeePerGas": hex(2**255)},
+        {"baseFeePerGas": "PRIVATE_SENTINEL"},
+    ],
+)
+def test_malformed_or_overflowed_header_refuses_before_sign_attempt_or_send(
+    setup: Any, monkeypatch: pytest.MonkeyPatch, header: object
+) -> None:
+    _, transactions, broadcasts, _, work = setup
+    original = evm.rpc
+    monkeypatch.setattr(
+        evm,
+        "rpc",
+        lambda network, method, params: (
+            header if method == "eth_getBlockByNumber" else original(network, method, params)
+        ),
+    )
+    with pytest.raises(common.PaymentError) as caught:
+        evm.pay("base", "ZL-2026-000001", "0.180001", work)
+    assert "PRIVATE_SENTINEL" not in str(caught.value)
+    assert not transactions and not broadcasts and not list(work.iterdir())
+
+
+@pytest.mark.parametrize(
+    "gas,price,base",
+    [
+        (50000, 4000000001, 1),  # Quote makes product 50,000 wei over the fixed cap.
+        (50000, 1, 2000000001),  # Headroom makes product 100,000 wei over the cap.
+        (21000, 2**256, 1),
+        (21000, 1, 2**255),
+        (True, 1, 1),
+        (50000, True, 1),
+        (50000, 0, 1),
+        (20999, 1, 1),
+        (1000001, 1, 1),
+    ],
+)
+def test_fee_cap_overflow_and_invalid_integer_arguments_refuse(
+    gas: int, price: int, base: int
+) -> None:
+    with pytest.raises(common.PaymentError):
+        evm.admitted_gas_price(gas, price, {"baseFeePerGas": hex(base)})
+
+
+@pytest.mark.parametrize("network,chain", [("base", 84532), ("arbitrum", 421614)])
+def test_current_base_fee_headroom_is_exact_signed_attempt_and_one_broadcast(
+    setup: Any, network: str, chain: int
+) -> None:
+    state, transactions, broadcasts, _, work = setup
+    state.update(network=network, chain_id=chain, gas=45439, price=20000000, base_fee=20150000)
+    evm.pay(network, "ZL-2026-000001", "0.180001", work)
+    attempt = json.loads((work / "payment-attempt.json").read_bytes())
+    assert transactions[0]["gasPrice"] == attempt["gas_price"] == 40300000
+    assert attempt["gas"] == transactions[0]["gas"] == 45439
+    assert attempt["max_total_fee_wei"] == 1831191700000
+    assert len(transactions) == len(broadcasts) == 1
+    with pytest.raises(common.PaymentError, match="never retry"):
+        evm.pay(network, "ZL-2026-000001", "0.180001", work)
+    assert len(broadcasts) == 1
+
+
+def test_headroom_over_cap_refuses_in_actual_payer_before_sign_attempt_send(setup: Any) -> None:
+    state, transactions, broadcasts, _, work = setup
+    state.update(price=1, base_fee=2000000001)
+    with pytest.raises(common.PaymentError):
+        evm.pay("base", "ZL-2026-000001", "0.180001", work)
+    assert not transactions and not broadcasts and not list(work.iterdir())

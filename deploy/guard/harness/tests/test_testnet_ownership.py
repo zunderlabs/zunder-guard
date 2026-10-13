@@ -298,3 +298,107 @@ def test_market_crossing_stop_keeps_owned_cleanup_but_refuses_journey_credit(cas
     assert result.remaining == Decimal("0.0002") and result.stop_oid == 42
     with pytest.raises(RuntimeError):
         reconcile_ownership(*case[:3], **fields)
+
+
+def test_authenticated_original_reduce_only_canceled_stop_proves_closed_cleanup(
+    closed_case: Any,
+) -> None:
+    closed_case[3]["stop_lookup"]["order"]["status"] = "reduceOnlyCanceled"
+    result = reconcile_ownership(*closed_case[:3], **closed_case[3], cleanup=True)
+    # .0002 BTC bought and .0002 sold through the authenticated close: exact net0,
+    # no venue positions/orders; the original protective stop is terminal only.
+    assert result.filled == Decimal("0.0002") and result.remaining == 0
+    assert result.stop_oid is None and not result.resting_entry
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "remaining",
+        "orphan-stop",
+        "foreign-order",
+        "missing-close-fill",
+        "foreign-close-fill",
+        "duplicate-fill",
+        "stop-cloid",
+        "stop-oid",
+        "stop-side",
+        "stop-reduce",
+        "stop-trigger",
+        "stop-size",
+        "stop-time",
+        "stop-coin",
+        "entry-status",
+        "close-status",
+    ],
+)
+def test_terminal_reduce_only_cancel_requires_exact_original_stop_and_zero_owned_net(
+    closed_case: Any, mutation: str
+) -> None:
+    fields = closed_case[3]
+    stop = fields["stop_lookup"]["order"]
+    stop["status"] = "reduceOnlyCanceled"
+    if mutation == "remaining":
+        fields["fills"][1]["sz"] = "0.0001"
+        fields["positions"] = [
+            {"coin": "BTC", "szi": "0.0001", "positionValue": "6", "leverage": {"type": "isolated"}}
+        ]
+    elif mutation == "orphan-stop":
+        fields["orders"] = [copy.deepcopy(stop["order"])]
+    elif mutation == "foreign-order":
+        fields["orders"] = [dict(copy.deepcopy(stop["order"]), oid=99, cloid="foreign")]
+    elif mutation == "missing-close-fill":
+        fields["fills"].pop()
+    elif mutation == "foreign-close-fill":
+        fields["fills"][1]["oid"] = 99
+    elif mutation == "duplicate-fill":
+        fields["fills"].append(copy.deepcopy(fields["fills"][1]))
+    elif mutation == "entry-status":
+        fields["entry_lookup"]["order"]["status"] = "reduceOnlyCanceled"
+    elif mutation == "close-status":
+        for lookup in fields["exit_lookups"].values():
+            lookup["order"]["status"] = "reduceOnlyCanceled"
+    else:
+        key, value = {
+            "stop-cloid": ("cloid", "0x7a67" + "f" * 28),
+            "stop-oid": ("oid", 99),
+            "stop-side": ("side", "B"),
+            "stop-reduce": ("reduceOnly", False),
+            "stop-trigger": ("isTrigger", False),
+            "stop-size": ("origSz", "0.0001"),
+            "stop-time": ("timestamp", 999),
+            "stop-coin": ("coin", "ETH"),
+        }[mutation]
+        if mutation == "stop-oid":
+            # When the entry reply names a resting stop OID, that identity must still match.
+            # The ordinary waitingForTrigger schema has no OID to cross-check.
+            acknowledged = 0
+            for event in closed_case[0]:
+                statuses = (
+                    event.get("reply", {}).get("response", {}).get("data", {}).get("statuses", [])
+                )
+                if len(statuses) == 2 and statuses[0].get("filled", {}).get("oid") == 41:
+                    statuses[1] = {"resting": {"oid": 42, "cloid": stop["order"]["cloid"]}}
+                    acknowledged += 1
+            assert acknowledged == 1
+        stop["order"][key] = value
+    with pytest.raises(RuntimeError):
+        reconcile_ownership(*closed_case[:3], **fields, cleanup=True)
+
+
+def test_terminal_reduce_only_cancel_never_proves_normal_journey_success(closed_case: Any) -> None:
+    closed_case[3]["stop_lookup"]["order"]["status"] = "reduceOnlyCanceled"
+    with pytest.raises(RuntimeError):
+        reconcile_ownership(*closed_case[:3], **closed_case[3], cleanup=False)
+
+
+@pytest.mark.parametrize(
+    "status",
+    ["reduceonlycanceled", "reduceOnlyCanceled PRIVATE", "reduceOnlyCanceled\n", "unknown"],
+)
+def test_terminal_stop_does_not_admit_status_variants_or_private_suffix(
+    closed_case: Any, status: str
+) -> None:
+    closed_case[3]["stop_lookup"]["order"]["status"] = status
+    with pytest.raises(RuntimeError):
+        reconcile_ownership(*closed_case[:3], **closed_case[3], cleanup=True)

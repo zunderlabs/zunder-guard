@@ -216,9 +216,69 @@ def correlate_fee(
     sequence = decision.get("seq")
     need(type(sequence) is int and sequence > 0)
     statuses = order_statuses(events, cast(int, sequence))
-    need(len(statuses) == 1 and isinstance(statuses[0], dict))
+    orders = wire.get("orders")
+    need(isinstance(orders, list) and len(orders) in {1, 2} and len(statuses) == len(orders))
+    need(isinstance(statuses[0], dict) and set(statuses[0]) in ({"filled"}, {"resting"}))
     ack = statuses[0].get("filled", statuses[0].get("resting"))
     need(isinstance(ack, dict) and type(ack.get("oid")) is int and ack["oid"] == oid)
+    if len(orders) == 2:
+        # A passed owned T journey has already proved venue protection. Correlate
+        # its complete observed forward/ack pair, never manufacture a StopProof.
+        buy, stop = orders
+        need(isinstance(buy, dict) and isinstance(stop, dict))
+        need(wire.get("grouping") == "normalTpsl")
+        need(set(stop) == {"a", "b", "r", "c", "s", "p", "t"})
+        need(type(stop["a"]) is int and stop["a"] >= 0)
+        need(stop["b"] is False and stop["r"] is True)
+        need(
+            isinstance(stop["c"], str)
+            and re.fullmatch(r"0x7a67[0-9a-f]{28}", stop["c"]) is not None
+        )
+        need(isinstance(stop["t"], dict) and set(stop["t"]) == {"trigger"})
+        trigger = stop["t"]["trigger"]
+        need(isinstance(trigger, dict) and set(trigger) == {"triggerPx", "tpsl", "isMarket"})
+        need(trigger["tpsl"] == "sl" and trigger["isMarket"] is True)
+        need(amount(stop["s"]) > 0 and amount(stop["p"]) > 0 and amount(trigger["triggerPx"]) > 0)
+        need(type(buy.get("a")) is int and buy["a"] == stop["a"])
+        need(buy.get("b") is True and buy.get("r") is False)
+        need(
+            isinstance(buy.get("c"), str)
+            and re.fullmatch(r"0x7a6d[0-9a-f]{28}", buy["c"]) is not None
+        )
+        need(buy.get("t") == {"limit": {"tif": "Ioc"}})
+        need(amount(buy.get("p")) > 0 and amount(buy.get("s")) == amount(stop["s"]))
+        need(amount(observed["filled"]) <= amount(buy["s"]))
+        request = decision.get("request")
+        need(isinstance(request, dict) and isinstance(request.get("orders"), list))
+        request = cast(dict[str, Any], request)
+        requested = request["orders"]
+        need(
+            len(requested) == 1
+            and isinstance(requested[0], dict)
+            and requested[0].get("c") == buy["c"]
+        )
+        original = requested[0]
+        need(request.get("type") == "order" and request.get("grouping") == "na")
+        need(type(original.get("a")) is int and original["a"] == buy["a"])
+        need(original.get("b") is True and original.get("r") is False)
+        need(original.get("t") == buy["t"])
+        requested_size, requested_price = amount(original.get("s")), amount(original.get("p"))
+        need(0 < amount(buy["s"]) <= requested_size)
+        need(0 < amount(buy["p"]) <= requested_price)
+        need(Decimal("10") <= requested_size * requested_price <= Decimal("40"))
+        need("cloid" not in ack or ack["cloid"] == buy["c"])
+        stop_oid = observed.get("stop_oid")
+        need(type(stop_oid) is int and stop_oid > 0 and stop_oid != oid)
+        if statuses[1] != "waitingForTrigger":
+            stopped = statuses[1]
+            need(isinstance(stopped, dict) and set(stopped) == {"resting"})
+            resting = stopped["resting"]
+            need(
+                isinstance(resting, dict)
+                and type(resting.get("oid")) is int
+                and resting["oid"] == stop_oid
+            )
+            need("cloid" not in resting or resting["cloid"] == stop["c"])
     for sent in events:
         if sent.get("kind") == "sent" and sent.get("decision") == decision.get("seq"):
             need(sent.get("action") is None or sent.get("action") == wire)
