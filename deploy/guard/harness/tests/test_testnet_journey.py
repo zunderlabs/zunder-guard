@@ -567,3 +567,95 @@ def test_owned_snapshot_persistence_stall_prevents_collection_and_close() -> Non
     assert not result.passed and not result.guard_stopped
     assert scenario.calls == ["preview_order", "place_order"]
     assert paced_after_entry[0] == 0
+
+
+def test_warming_follows_complete_flat_scan_before_fresh_plan_and_keeps_single_entry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scenario = Scenario()
+    timeline: list[str] = []
+    original = __import__("guard_harness.testnet_journey", fromlist=["flat_scan"]).flat_scan
+
+    def scan(read: Any, account: str) -> Any:
+        result = original(read, account)
+        timeline.append("full-flat")
+        return result
+
+    def warming(client: str) -> tuple[object, Any]:
+        assert client == scenario.opening[1].lower() and timeline == ["full-flat"]
+        timeline.append("warm")
+        return scenario.request("/guard/status"), lambda: None
+
+    def plan() -> Entry:
+        assert timeline == ["full-flat", "warm"]
+        timeline.append("fresh-plan")
+        return scenario.opening[2]  # type: ignore[no-any-return]
+
+    monkeypatch.setattr("guard_harness.testnet_journey.flat_scan", scan)
+    result = scenario.execute(entry=plan, warm_info=warming)
+    assert result.passed and timeline[:3] == ["full-flat", "warm", "fresh-plan"]
+    assert scenario.calls.count("place_order") == 1
+
+
+@pytest.mark.parametrize("stall", ["plan", "preview", "attempt-fsync", "entry-phase-fsync"])
+def test_stale_warm_performance_refuses_before_single_place_call(stall: str) -> None:
+    scenario = Scenario()
+    stale = [False]
+    original = scenario.tool
+
+    def check() -> None:
+        if stale[0]:
+            raise RuntimeError("owned Guard info warm prerequisite refused")
+
+    def warming(client: str) -> tuple[object, Any]:
+        return scenario.request("/guard/status"), check
+
+    def plan() -> Entry:
+        stale[0] = stall == "plan"
+        return scenario.opening[2]  # type: ignore[no-any-return]
+
+    def tool(name: Tool, arguments: dict[str, Any] | None = None) -> tuple[dict[str, Any], bool]:
+        result = original(name, arguments)
+        if name == "preview_order" and stall == "preview":
+            stale[0] = True
+        return result
+
+    def record(entry: Entry, at: int) -> None:
+        if stall == "attempt-fsync":
+            stale[0] = True
+
+    def phase(name: str) -> None:
+        if name == "entry-attempt" and stall == "entry-phase-fsync":
+            stale[0] = True
+
+    scenario.tool = tool  # type: ignore[method-assign]
+    if stall == "entry-phase-fsync":
+        result = scenario.execute(
+            entry=plan, warm_info=warming, record_attempt=record, observe_phase=phase
+        )
+        assert not result.passed and not result.guard_stopped
+    else:
+        with pytest.raises(RuntimeError, match="owned Guard info warm prerequisite refused"):
+            scenario.execute(
+                entry=plan, warm_info=warming, record_attempt=record, observe_phase=phase
+            )
+    assert "place_order" not in scenario.calls and "close_position" not in scenario.calls
+    assert not scenario.stopped
+
+
+@pytest.mark.parametrize(
+    "field,value", [("mode", "mainnet"), ("last_error", "PRIVATE"), ("killed", "PRIVATE")]
+)
+def test_identical_status_safety_admission_rechecked_after_warm_before_planning(
+    field: str, value: Any
+) -> None:
+    scenario = Scenario()
+    status = scenario.request("/guard/status")
+    assert isinstance(status, dict)
+    status[field] = value
+    with pytest.raises(RuntimeError):
+        scenario.execute(
+            warm_info=lambda client: (status, lambda: None),
+            entry=lambda: pytest.fail("no plan after unsafe post-warm status"),
+        )
+    assert not scenario.calls and not scenario.stopped

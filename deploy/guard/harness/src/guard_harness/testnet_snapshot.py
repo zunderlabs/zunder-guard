@@ -21,6 +21,194 @@ from guard_harness.testnet_protection import (
 )
 from guard_harness.testnet_reconcile import _oid, order_statuses
 
+# Exact public Outcome codes emitted by tools.rs, including preview.rs sanity refusals
+# and contract.rs known_reason/known_code (dynamic Guard preview and exchange vetoes).
+# Never retain arbitrary strings or quoted text.
+ENTRY_CODES = frozenset(
+    {
+        "invalid_arguments",
+        "no_price",
+        "unknown_market",
+        "venue_unreadable",
+        "not_a_guard",
+        "guard_rules_unreadable",
+        "guard_unreachable",
+        "guard_timeout",
+        "guard_http_error",
+        "guard_unreadable",
+        "preview_unsupported",
+        "preview_unavailable",
+        "preview_rate_limited",
+        "preview_view_stale",
+        "preview_refused",
+        "preview_unreadable",
+        "network_mismatch",
+        "no_client_key",
+        "expected_mode_unsupported",
+        "client_not_registered",
+        "mainnet_not_confirmed",
+        "client_key_is_a_wallet",
+        "unsignable",
+        "check_first",
+        "below_minimum",
+        "max_unavailable",
+        "rate_limited",
+        "kill_switch",
+        "journal",
+        "daily_loss_stop",
+        "drawdown_halt",
+        "venue_reply_unreadable",
+        "venue_refused",
+        "partly_refused",
+        "refused",
+        "outcome_unknown",
+        "not_an_entry",
+        "absurd_price",
+        "absurd_size",
+        "account_unknown",
+        "account_unreadable",
+        "action_not_allowed",
+        "allowed",
+        "auth_bad_signature",
+        "auth_expired",
+        "auth_nonce_before_start",
+        "auth_nonce_too_new",
+        "auth_nonce_too_old",
+        "auth_replay",
+        "auth_too_large",
+        "auth_unknown_signer",
+        "client_builder",
+        "client_not_allowed",
+        "coin_not_allowed",
+        "cross_margin",
+        "dex_margin",
+        "dex_not_allowed",
+        "fee_not_approved",
+        "flip",
+        "funds_or_permissions",
+        "guard_stop",
+        "halted_for_day",
+        "invalid",
+        "invalid_request",
+        "killed",
+        "leverage",
+        "leverage_exhausted",
+        "liquidation_too_close",
+        "malformed",
+        "margin_not_set",
+        "margin_removal",
+        "market_halted",
+        "market_not_allowed",
+        "mode_mismatch",
+        "modify_entry",
+        "no_protective_stop",
+        "nonce_reused",
+        "one_entry_per_action",
+        "open_interest_cap",
+        "open_risk",
+        "open_risk_exhausted",
+        "position_cap",
+        "position_cap_reached",
+        "reduce_only_unjudged",
+        "resized",
+        "schedule_cancel",
+        "stop_loosened",
+        "stop_loosening_ignored",
+        "stop_on_wrong_side",
+        "stop_removed",
+        "stop_required",
+        "stop_wrong_side",
+        "stopped",
+        "thin_book",
+        "unknown_order",
+        "unprotected_order",
+        "unprotected_position",
+        "unsupported_action",
+        "unsupported_market",
+        "unsupported_order",
+        "vault",
+        "venue_refused_leverage",
+        "venue_unreachable",
+    }
+)
+ENTRY_OUTCOMES = frozenset(
+    {
+        "sent",
+        "unknown",
+        "venue_refused",
+        "partly_refused",
+        "vetoed_by_guard",
+        "paper_mode_not_sent",
+        "refused_or_unknown",
+    }
+)
+RESPONSE_STAGES = {
+    "entry-response": "mcp-result",
+    "entry-call-unconfirmed": "mcp-call",
+    "ownership-events": "guard-events",
+    "ownership-events-unavailable": "guard-events",
+    "ownership-validation": "ownership-validation",
+    "ownership-validation-refused": "ownership-validation",
+    "ownership-storage-failed": "ownership-storage",
+    "ownership-captured": "ownership-validation",
+    "venue-collection": "venue-collection",
+}
+
+
+def entry_response(result: object, error: bool | None) -> dict[str, object]:
+    """Finite observations only, never mutation/ownership/flat evidence."""
+    value = result if type(result) is dict else {}
+    is_error = error if type(error) is bool else None
+    detail = value.get("error")
+    # Outcome::fail stores its code in error.code. A conflicting top-level field
+    # never overrides that schema; malformed nested errors never fall back to it.
+    code = detail.get("code") if is_error is True and type(detail) is dict else None
+    if is_error is False and "error" not in value and value.get("outcome") == "paper_mode_not_sent":
+        code = value.get("code")  # The shipped paper reply is the one top-level-code schema.
+    outcome = value.get("outcome")
+    code = code if type(code) is str and code in ENTRY_CODES else "unknown"
+    http_status: int | None = None
+    # GuardError::Http's exact public Display, never response bodies or free text.
+    if code == "guard_http_error" and is_error is True and type(detail) is dict:
+        reason = detail.get("reason")
+        matched = (
+            re.fullmatch(r"Guard answered with HTTP status ([1-5][0-9]{2})", reason)
+            if type(reason) is str
+            else None
+        )
+        if matched is not None:
+            http_status = int(matched[1])
+    outcome = outcome if type(outcome) is str and outcome in ENTRY_OUTCOMES else "unknown"
+    sent = value.get("sent") if type(value.get("sent")) is bool else None
+    ok = value.get("ok") if type(value.get("ok")) is bool else None
+    category = "unknown"
+    if code in {"preview_unsupported", "expected_mode_unsupported"}:
+        category = "unsupported"
+    elif outcome == "vetoed_by_guard":
+        category = "vetoed"
+    elif outcome in {"venue_refused", "partly_refused"}:
+        category = "venue_refused"
+    elif (
+        (outcome == "unknown" and value.get("outcome") == "unknown")
+        or outcome == "refused_or_unknown"
+        or code in {"outcome_unknown", "venue_reply_unreadable"}
+    ):
+        category = "outcome_unknown"
+    elif is_error is True and sent is False:
+        category = "refused_before_send"
+    elif outcome == "sent" and is_error is False and sent is True and ok is True:
+        category = "reported_sent"
+    return {
+        "response_available": type(result) is dict,
+        "isError": is_error,
+        "ok": ok,
+        "sent": sent,
+        "code": code,
+        "http_status": http_status,
+        "outcome": outcome,
+        "category": category,
+    }
+
 
 def _wire(value: object, entry: Entry) -> dict[str, Any]:
     wire = _object(value)
@@ -295,6 +483,7 @@ class OwnershipStore:
             "version": version,
         }
         self.attempt: dict[str, object] | None = None
+        self.response_record: dict[str, object] | None = None
 
     def begin(self, entry: Entry, started_ms: int) -> None:
         entry.validate()
@@ -320,6 +509,24 @@ class OwnershipStore:
             entry_outcome="unknown",
         )
         _write(self.work / "entry-attempt.json", self.attempt, exclusive=True)
+
+    def response(self, result: object, error: bool | None, stage: str) -> None:
+        """Fsync finite response/capture diagnostics, without granting any ownership credit."""
+        _need(self.attempt is not None and stage in RESPONSE_STAGES)
+        if stage in {"entry-response", "entry-call-unconfirmed"}:
+            _need(self.response_record is None)
+            self.response_record = {
+                "schema": 1,
+                "attempt_id": self.identity["attempt_id"],
+                "binary_sha256": self.identity["binary_sha256"],
+                "version": self.identity["version"],
+                "gate_eligible": False,
+                **entry_response(result, error),
+            }
+        _need(self.response_record is not None)
+        assert self.response_record is not None
+        self.response_record.update(stage=stage, origin=RESPONSE_STAGES[stage])
+        _write(self.work / "entry-response.json", self.response_record, exclusive=False)
 
     def capture(self, events: Sequence[dict[str, Any]], entry: Entry, started_ms: int) -> None:
         attempt = self.attempt

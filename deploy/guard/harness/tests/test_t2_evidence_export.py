@@ -25,6 +25,7 @@ def test_export_only_allowlisted_public_evidence_never_custody_or_links(
     (source / "assets/release-manifest.json").write_bytes(b"authenticated manifest fixture")
     (source / "receipt.json").write_bytes(b"sanitized receipt fixture")
     (runtime / "process.log").write_bytes(b"sanitized runtime fixture")
+    (runtime / "entry-response.json").write_bytes(b'{"sent":false,"outcome":"refused"}')
     (runtime / "client-key").write_bytes(b"private pairing fixture")
     (runtime / "guard.toml").write_bytes(b"private custody fixture")
     (runtime / "pair.log").symlink_to(runtime / "client-key")
@@ -67,8 +68,36 @@ def test_export_only_allowlisted_public_evidence_never_custody_or_links(
     )
     output = runner / "guard-release/T2"
     files = {str(path.relative_to(output)) for path in output.rglob("*") if path.is_file()}
-    assert files == {"assets/release-manifest.json", "receipt.json", "runtime/process.log"}
+    assert files == {
+        "assets/release-manifest.json",
+        "receipt.json",
+        "runtime/process.log",
+        "runtime/entry-response.json",
+    }
+    assert (output / "runtime/entry-response.json").read_bytes() == (
+        b'{"sent":false,"outcome":"refused"}'
+    )
     assert (output / "receipt.json").read_bytes() == b"sanitized receipt fixture"
     assert not any(path.is_symlink() for path in output.rglob("*"))
     assert (runtime / "client-key").read_bytes() == b"private pairing fixture"
     assert b"private pairing" not in result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("row", ["T1", "T2"])
+def test_finite_failure_upload_precedes_slow_scan_without_custody(row: str) -> None:
+    text = workflow(ROOT).read_text()
+    label = f"      - name: Retain finite {row} failure evidence before cleanup scan\n"
+    step = text.split(label, 1)[1].split("      - name:", 1)[0]
+    assert "failure() || cancelled()" in step
+    paths = step.split("          path: |\n", 1)[1].split("          if-no-files-found:", 1)[0]
+    files = {line.strip().split(f"/guard-release/{row}/", 1)[1] for line in paths.splitlines()}
+    assert files == {
+        "receipt.json",
+        "runtime/entry-attempt.json",
+        "runtime/entry-response.json",
+        "runtime/ownership.json",
+    }
+    assert text.index(label) < text.index(
+        f'guard_harness.failure_scan --work "$RUNNER_TEMP/guard-release/{row}-failure/'
+    )
+    assert "include-hidden-files" not in step and "attest" not in step

@@ -133,6 +133,7 @@ def payload(current: Release, previous: Release) -> bytes:
         "runner.py",
         "cli.py",
         "paper_bot.py",
+        "bounded_http_read.py",
         "paper_roundtrip.py",
         "aws_paper.py",
         "mainnet_terminal.py",

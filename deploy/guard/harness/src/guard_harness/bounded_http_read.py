@@ -22,6 +22,15 @@ LIMIT = 1_048_576
 INFO = "https://api.hyperliquid-testnet.xyz/info"
 
 
+def _unique_local(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    value: dict[str, Any] = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError("read refused")
+        value[key] = item
+    return value
+
+
 def _admit(url: str, data: bytes | None) -> float:
     if url == INFO and data is not None:
         value = json.loads(data)
@@ -43,16 +52,31 @@ def _admit(url: str, data: bytes | None) -> float:
         or parsed.username is not None
         or parsed.password is not None
         or parsed.fragment
-        or data is not None
         or not ipaddress.ip_address(parsed.hostname or "").is_loopback
         or parsed.port is None
         or not 1024 <= parsed.port <= 65535
-        or not (
-            parsed.path in {"/guard/status", "/healthz"}
-            and not parsed.query
-            or parsed.path == "/guard/events"
-            and re.fullmatch(r"since=[0-9]{1,20}", parsed.query)
-        )
+    ):
+        raise ValueError("read refused")
+    if data is not None:
+        value = json.loads(data, object_pairs_hook=_unique_local)
+        if (
+            parsed.path != "/info"
+            or parsed.query
+            or not (
+                value == {"type": "meta"}
+                or type(value) is dict
+                and set(value) == {"type", "user"}
+                and value["type"] == "userRole"
+                and type(value["user"]) is str
+                and re.fullmatch(r"0x[0-9a-f]{40}", value["user"]) is not None
+            )
+        ):
+            raise ValueError("read refused")
+    elif not (
+        parsed.path in {"/guard/status", "/healthz"}
+        and not parsed.query
+        or parsed.path == "/guard/events"
+        and re.fullmatch(r"since=[0-9]{1,20}", parsed.query)
     ):
         raise ValueError("read refused")
     return 5
@@ -71,6 +95,7 @@ def bounded_read(url: str, data: bytes | None, *, timeout: float) -> bytes:
             stderr=subprocess.DEVNULL,
             timeout=timeout,
             env={"PATH": os.defpath, "LANG": "C.UTF-8"},
+            close_fds=True,
             check=False,
         )
     except (subprocess.TimeoutExpired, OSError):
