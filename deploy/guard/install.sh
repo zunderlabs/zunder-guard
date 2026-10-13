@@ -671,16 +671,16 @@ if [ "$OS" = linux ] && { [ -n "$SERVICE_INSTANCE" ] || [ "$INSTALL_ONLY" -eq 1 
   case "$PREFIX" in
     /opt/zunder-guard-testnet/bin | /opt/zunder-guard-mainnet/bin)
       instance_software_check() {
-        [ ! -L "$1" ] && [ -d "$1" ] || die "managed software path is not a real directory"
+        if [ -L "$1" ] || [ ! -d "$1" ]; then die "managed software path is not a real directory"; fi
         software_owner=$($SUDO_BIN stat -c %u "$1")
         software_mode=$($SUDO_BIN stat -c %a "$1")
         [ "$software_owner" = 0 ] || die "managed software directory is not root-owned"
         case "$software_mode" in "" | *[!0-7]*) die "managed software directory mode is invalid" ;; esac
         [ "${#software_mode}" -le 4 ] || die "managed software directory mode is invalid"
         software_permissions=$((0$software_mode))
-        [ "$((software_permissions & 0022))" -eq 0 ] \
-          && [ "$((software_permissions & 07000))" -eq 0 ] \
-          || die "managed software directory has unsafe permissions"
+        if [ "$((software_permissions & 0022))" -ne 0 ] || [ "$((software_permissions & 07000))" -ne 0 ]; then
+          die "managed software directory has unsafe permissions"
+        fi
       }
       instance_software_check /opt
       [ "$((software_permissions & 0001))" -ne 0 ] || die "managed software parent is not publicly traversable"

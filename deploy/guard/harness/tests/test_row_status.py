@@ -13,6 +13,13 @@ from guard_harness import row_status as rs
 
 SOURCE = "a" * 40
 ROOT = Path(__file__).resolve().parents[2]
+# Private source keeps the workflows in deploy/guard/github/workflows;
+# the export moves them to .github/workflows.
+WORKFLOWS = (
+    ROOT / "github/workflows"
+    if (ROOT / "github/workflows").is_dir()
+    else ROOT.parents[1] / ".github/workflows"
+)
 
 
 def job(
@@ -48,7 +55,7 @@ def row(runs: Sequence[rs.Run], name: str) -> rs.Result:
 
 
 def workflow_steps(workflow: str, job_name: str) -> tuple[str, ...]:
-    definition = yaml.safe_load((ROOT / "github/workflows" / workflow).read_text())
+    definition = yaml.safe_load((WORKFLOWS / workflow).read_text())
     return tuple(step["name"] for step in definition["jobs"][job_name]["steps"] if "name" in step)
 
 

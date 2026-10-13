@@ -13,7 +13,14 @@ import pytest
 
 from guard_harness.c6_owner import document
 
-WORKFLOW = Path(__file__).resolve().parents[2] / "github/workflows/install-matrix.yml"
+_GUARD = Path(__file__).resolve().parents[2]
+# Private source keeps the workflows in deploy/guard/github/workflows;
+# the export moves them to .github/workflows.
+WORKFLOW = (
+    _GUARD / "github/workflows/install-matrix.yml"
+    if (_GUARD / "github/workflows").is_dir()
+    else _GUARD.parents[1] / ".github/workflows/install-matrix.yml"
+)
 SOURCE_FLAG = "${{ inputs.source_installer_diagnostic == true && 'true' || 'false' }}"
 ALIASES = {
     "WORKFLOW_REF": "${{ github.workflow_ref }}",
