@@ -33,6 +33,7 @@ def cleanup(
     clock: Callable[[], float] = time.monotonic,
     timeout: float = 1280,
     check_work: Callable[[], None] = lambda: None,
+    observe_after_close: Callable[[], Ownership] | None = None,
 ) -> Cleaned:
     """Use fresh collect_ownership(cleanup=True) before/after each exact mutation.
 
@@ -48,11 +49,11 @@ def cleanup(
     deadline = clock() + timeout
     actions: list[str] = []
 
-    def fresh() -> Ownership:
+    def fresh(*, after_close: bool = False) -> Ownership:
         check_work()
         if clock() >= deadline:
             raise CleanupError("cleanup deadline; keep Guard running")
-        value = observe()
+        value = (observe_after_close or observe)() if after_close else observe()
         if clock() >= deadline:
             raise CleanupError("cleanup deadline; keep Guard running")
         check_work()
@@ -64,15 +65,15 @@ def cleanup(
             raise CleanupError("cleanup deadline; keep Guard running")
         result, error = mcp.tool(name, arguments)
         check_work()
-        if error or result.get("sent") is not True:
+        if error is not False or result.get("sent") is not True:
             raise CleanupError("cleanup send unconfirmed; reconcile privately")
         actions.append(name)
 
     current = fresh()
     identity = current.entry_oid, current.filled
 
-    def next_read() -> Ownership:
-        value = fresh()
+    def next_read(*, after_close: bool = False) -> Ownership:
+        value = fresh(after_close=after_close)
         if (value.entry_oid, value.filled) != identity:
             raise CleanupError("cleanup ownership changed; keep Guard running")
         return value
@@ -87,7 +88,7 @@ def cleanup(
             break
         before = current.remaining
         mutate("close_position", {"coin": "BTC", "expected_size": str(before)})
-        current = next_read()
+        current = next_read(after_close=True)
         if current.resting_entry or not 0 <= current.remaining < before:
             raise CleanupError("close made no proved progress; keep Guard running")
     if current.remaining:

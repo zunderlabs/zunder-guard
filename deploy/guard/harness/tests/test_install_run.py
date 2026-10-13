@@ -11,11 +11,68 @@ import pytest
 
 from guard_harness import install_run
 from guard_harness.install_evidence import EvidenceError, predicate
+from guard_harness.source_installer import Candidate
 from guard_harness.testnet_process import ProcessError
 from guard_harness.testnet_run import ROOT
 
 COMMIT = "a" * 40
 KEY = "b" * 64
+
+
+@pytest.mark.parametrize("row", ["I1", "I6"])
+def test_source_component_skips_only_paper_and_preserves_signed_runtime_subjects(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, row: str
+) -> None:
+    subjects, calls = prepared(tmp_path, monkeypatch, row)
+    sys.argv[sys.argv.index("--scenario") + 1] = "fresh"
+    identity = json.loads((subjects / "input.json").read_bytes())
+    identity["diagnostic"] = True
+    (subjects / "input.json").write_text(json.dumps(identity))
+    monkeypatch.setenv("DIAGNOSTIC", "true")
+    candidate = Candidate(b'VERSION="v1.0.0"\n', COMMIT, "d" * 64, "v1.0.0", COMMIT)
+
+    def prepare(*args: Any, **kwargs: Any) -> Candidate:
+        assert os.environ["WALLET_FRAME"] == KEY
+        assert kwargs == {"scenario": "fresh", "row": row}
+        return candidate
+
+    monkeypatch.setattr(install_run, "prepare", prepare)
+    install_run.main()
+    assert len(calls) == 1
+    words = calls[0][0]
+    path = Path(words[words.index("--candidate") + 1])
+    assert path.read_bytes() == candidate.rendered
+    assert "--testnet-lifecycle" in words and "public-paper-account" not in words
+    assert words[words.index("--source-installer-sha256") + 1] == candidate.digest
+    assert str(subjects / "previous/assets/install.sh") in words
+    record = json.loads((tmp_path / "evidence/source-installer.json").read_bytes())
+    assert record["source_component"] is True and record["gate_eligible"] is False
+    if row == "I6":
+        assert words[words.index("--release-image") + 1].endswith("sha256:" + "d" * 64)
+
+
+def test_source_stage_tampering_refuses_before_wallet_capture(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    subjects, calls = prepared(tmp_path, monkeypatch, "I1")
+    sys.argv[sys.argv.index("--scenario") + 1] = "fresh"
+    identity = json.loads((subjects / "input.json").read_bytes())
+    identity["diagnostic"] = True
+    (subjects / "input.json").write_text(json.dumps(identity))
+    monkeypatch.setenv("DIAGNOSTIC", "true")
+    candidate = Candidate(b"admitted source", COMMIT, "d" * 64, "v1.0.0", COMMIT)
+    monkeypatch.setattr(install_run, "prepare", lambda *args, **kwargs: candidate)
+    original = Candidate.stage
+
+    def stage(self: Candidate, directory: Path) -> Path:
+        path = original(self, directory)
+        path.write_bytes(b"changed")
+        return path
+
+    monkeypatch.setattr(Candidate, "stage", stage)
+    with pytest.raises(ProcessError):
+        install_run.main()
+    assert os.environ["WALLET_FRAME"] == KEY and calls == []
 
 
 def prepared(

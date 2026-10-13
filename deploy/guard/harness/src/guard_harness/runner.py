@@ -77,6 +77,7 @@ def run(
     if any(secret and secret in arg for secret in secrets for arg in argv):
         raise ValueError("secret in command arguments")
     log.parent.mkdir(parents=True, exist_ok=True)
+    timed_out = False
     try:
         completed = subprocess.run(
             list(argv),
@@ -96,6 +97,7 @@ def run(
         )
         returncode = completed.returncode
     except subprocess.TimeoutExpired as error:
+        timed_out = True
         failure_output = error.stderr or b""
         output = (error.stdout or b"") + (error.stderr or b"") + b"\ncommand timed out\n"
         diagnostic_output = (
@@ -117,6 +119,15 @@ def run(
     # pair --json creates a key unknown before invocation. Retaining that output
     # would leak it into CI artifacts; keep only a marker for sensitive commands.
     logged = "[sensitive command output withheld]\n" if sensitive_output else diagnostic_text
+    if sensitive_output and returncode and failure_classifier is None:
+        status = (
+            str(returncode)
+            if type(returncode) is int and -(2**31) <= returncode <= 2**32 - 1
+            else "unknown"
+        )
+        logged += (
+            f"exit status: {status}\ncommand outcome: {'timeout' if timed_out else 'exited'}\n"
+        )
     category = None
     if returncode and failure_classifier is not None:
         category = "unknown"

@@ -208,3 +208,51 @@ def test_all_private_output_takes_precedence(tmp_path: Path) -> None:
         sensitive_output=True,
     )
     assert result.log.read_text() == "[sensitive command output withheld]\n"
+
+
+@pytest.mark.parametrize("timeout", [False, True])
+def test_sensitive_failure_retains_bounded_exit_and_timeout_without_body(
+    tmp_path: Path, timeout: bool
+) -> None:
+    log = tmp_path / "sensitive-command.log"
+    code = "import sys,time; print('PRIVATE-BODY',flush=True); " + (
+        "time.sleep(30)" if timeout else "raise SystemExit(9)"
+    )
+    with pytest.raises(RunError):
+        run(
+            [sys.executable, "-c", code],
+            log=log,
+            timeout=0.2 if timeout else 5,
+            sensitive_output=True,
+        )
+    assert log.read_text() == (
+        "[sensitive command output withheld]\n"
+        + (
+            "exit status: 124\ncommand outcome: timeout\n"
+            if timeout
+            else "exit status: 9\ncommand outcome: exited\n"
+        )
+    )
+
+
+@pytest.mark.parametrize(
+    "exit_status,expected",
+    [(-9, "-9"), (2**32 - 1, str(2**32 - 1)), (2**32, "unknown"), (True, "unknown")],
+)
+def test_sensitive_failure_status_has_fixed_integer_bound(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, exit_status: int, expected: str
+) -> None:
+    import subprocess
+
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda *a, **k: subprocess.CompletedProcess(a, exit_status, b"PRIVATE", b"PRIVATE"),
+    )
+    log = tmp_path / "bounded-status.log"
+    with pytest.raises(RunError):
+        run([sys.executable], log=log, timeout=5, sensitive_output=True)
+    assert (
+        log.read_text() == f"[sensitive command output withheld]\nexit status: {expected}\n"
+        "command outcome: exited\n"
+    )
