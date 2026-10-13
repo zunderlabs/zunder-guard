@@ -29,3 +29,32 @@ for (const diagnostic of [false, true]) {
     }
   });
 }
+
+for (const journey of ['P2', 'P3']) {
+  test(`admitted ${journey} payment diagnostic proof never claims ordinary pass`, () => {
+    const work = mkdtempSync(join(tmpdir(), 'guard-payment-proof-'));
+    const fields = { GUARD_TEST_PROOF: join(work, 'proof.json'), GUARD_PAYMENT_DIAGNOSTIC: '1',
+      GUARD_PAYMENT_DIAGNOSTIC_PROFILE: 'payment', PROFILE: 'payment', GUARD_PAID_JOURNEY: journey,
+      GUARD_DIAGNOSTIC_HARNESS_COMMIT: 'a'.repeat(40), GUARD_RELEASE_COMMIT: 'b'.repeat(40) };
+    const old = { ...process.env };
+    try {
+      delete process.env['GUARD_CHECKOUT_DIAGNOSTIC'];
+      Object.assign(process.env, fields);
+      const reporter = new ProofReporter();
+      reporter.onTestEnd({ title: `${journey} payment diagnostic only; no gate credit` } as TestCase,
+        { status: 'passed', error: { message: 'PRIVATE_SENTINEL' }, attachments: [{ body: 'PRIVATE_SENTINEL' }] } as unknown as TestResult);
+      reporter.onEnd({ status: 'passed' } as FullResult);
+      const bytes = readFileSync(join(work, 'proof.json'), 'utf8');
+      expect(JSON.parse(bytes)).toEqual({ status: 'diagnostic_only', tests: [
+        { title: `${journey} payment diagnostic only; no gate credit`, status: 'passed' }] });
+      expect(bytes).not.toContain('PRIVATE_SENTINEL');
+    } finally {
+      for (const field of Object.keys(fields)) {
+        if (old[field] === undefined) delete process.env[field]; else process.env[field] = old[field];
+      }
+      if (old['GUARD_CHECKOUT_DIAGNOSTIC'] === undefined) delete process.env['GUARD_CHECKOUT_DIAGNOSTIC'];
+      else process.env['GUARD_CHECKOUT_DIAGNOSTIC'] = old['GUARD_CHECKOUT_DIAGNOSTIC'];
+      rmSync(work, { recursive: true, force: true });
+    }
+  });
+}

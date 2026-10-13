@@ -71,6 +71,8 @@ def validate(paths):
         # contract.validate seals the standalone diagnostic condition and whole-run lock.
         covered = {("install-matrix.yml", job) for job in contract.READERS}
         covered.add(("install-matrix.yml", "operator-recovery"))
+        covered.add(("install-matrix.yml", "testnet-foreground"))
+        covered.add(("install-matrix.yml", "testnet-systemd"))
         covered.update(("journey.yml", job) for job in ("testnet-foreground", "testnet-systemd"))
         if required != covered or set(shared) != {("verify.yml", "workflow"), ("nightly.yml", "workflow")}:
             raise ValueError("complete run-wide C6 custody ownership required")

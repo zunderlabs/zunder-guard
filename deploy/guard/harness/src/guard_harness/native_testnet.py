@@ -15,6 +15,7 @@ from guard_harness.native_paper import LifecycleError, Paper
 from guard_harness.native_release import Release, staged_loader
 from guard_harness.paper_bot import LocalGuard, PaperError
 from guard_harness.runner import run
+from guard_harness.source_installer import Candidate, prepare, verify_file
 from guard_harness.testnet_run import ROOT
 from guard_harness.testnet_scan import TestnetReads, flat_scan
 
@@ -28,6 +29,8 @@ class NativeTestnet:
         account: str,
         shell: str,
         scenario: str = "upgrade",
+        source: Candidate | None = None,
+        source_path: Path | None = None,
     ) -> None:
         self.current, self.previous, self.work, self.account = current, previous, work, account
         self.shell = shell
@@ -35,6 +38,15 @@ class NativeTestnet:
             raise LifecycleError("native lifecycle scenario refused")
         self.scenario = scenario
         self.mac = platform.system() == "Darwin"
+        if source is not None and (
+            not self.mac
+            or scenario != "fresh"
+            or source.tag != current.tag
+            or source.release_commit != current.commit
+            or source_path is None
+        ):
+            raise LifecycleError("source installer must bind the current Mac component")
+        self.source, self.source_path = source, source_path
         self.sequence = 0
         self.key: bytes = b""
         self.observed: dict[str, dict[str, str]] = {}
@@ -189,6 +201,11 @@ class NativeTestnet:
             loader.write_bytes(release.asset("i" if self.mac else "i.ps1"))
         rules = json.loads((ROOT / "rules/vectors.json").read_bytes())["valid"][0]["canonical"]
         if self.mac:
+            if self.source is not None and release == self.current:
+                if self.source_path is None:
+                    raise LifecycleError("source installer path missing")
+                verify_file(self.source_path, self.source.digest)
+                loader = self.source_path
             words = [
                 "sudo",
                 "-n",
@@ -441,6 +458,7 @@ class NativeTestnet:
                 )
             self.retained(old)
             return {
+                **(self.source.record() if self.source is not None else {}),
                 "schema": 1,
                 "result": "passed",
                 "mode": "testnet",
@@ -691,7 +709,15 @@ def main() -> None:
     parser.add_argument("--shell", default="powershell.exe")
     parser.add_argument("--scenario", choices=("fresh", "upgrade"), default="upgrade")
     parser.add_argument("--mode", choices=("testnet", "mainnet-refusal"), default="testnet")
+    parser.add_argument("--source-installer", type=Path)
     args = parser.parse_args()
+    source = prepare(args.tag, args.commit, scenario=args.scenario, row="I3")
+    if source is not None:
+        if args.mode != "testnet" or platform.system() != "Darwin" or args.source_installer is None:
+            raise LifecycleError("source installer requires current Mac Testnet component")
+        verify_file(args.source_installer, source.digest)
+    elif args.source_installer is not None:
+        raise LifecycleError("unexpected source installer override")
     if (
         os.environ.get("GITHUB_ACTIONS") != "true"
         or os.environ.get("RUNNER_ENVIRONMENT") != "github-hosted"
@@ -717,6 +743,8 @@ def main() -> None:
         args.account,
         args.shell,
         args.scenario,
+        source,
+        args.source_installer,
     )
     try:
         receipt = native.execute(key)

@@ -23,6 +23,7 @@ from pathlib import Path
 
 from guard_harness.linux_lifecycle import require
 from guard_harness.runner import RunError, run
+from guard_harness.source_installer import verify_file
 from guard_harness.testnet_scan import SCAN_TIMEOUT
 
 IMAGE_DIR = "https://cloud-images.ubuntu.com/releases/noble/release-20260911/"
@@ -377,6 +378,8 @@ def main() -> None:
     parser.add_argument("--allow-tcg-local", action="store_true")
     parser.add_argument("--harness-root", type=Path, default=ROOT / "deploy/guard/harness")
     parser.add_argument("--source-paper-script", type=Path)
+    parser.add_argument("--source-installer-sha256", default="")
+    parser.add_argument("--installer-harness-commit", default="")
     parser.add_argument("--candidate-image", type=Path)
     parser.add_argument("--previous-image", type=Path)
     parser.add_argument("--candidate-archive", type=Path)
@@ -398,6 +401,18 @@ def main() -> None:
     parser.add_argument("--diagnostic", action="store_true")
     parser.add_argument("--scenario", choices=("fresh", "upgrade", "both"), default="both")
     args = parser.parse_args()
+    source_component = bool(args.source_installer_sha256 or args.installer_harness_commit)
+    if source_component:
+        require(
+            args.diagnostic
+            and args.testnet_lifecycle
+            and args.scenario == "fresh"
+            and not args.source_paper_script
+            and not args.allow_tcg_local
+            and re.fullmatch(r"[0-9a-f]{40}", args.installer_harness_commit) is not None,
+            "source installer requires explicit fresh nongate Testnet component",
+        )
+        verify_file(args.candidate, args.source_installer_sha256)
     key = None
     if args.testnet_lifecycle:
         require(
@@ -485,6 +500,8 @@ def main() -> None:
                     else info
                 ),
             )
+            if source_component:
+                verify_file(args.candidate, args.source_installer_sha256)
             tar.add(args.candidate, arcname="candidate-install.sh")
             tar.add(args.previous, arcname="previous-install.sh")
             if args.candidate_archive:
@@ -523,7 +540,9 @@ def main() -> None:
             "--installer",
             prefix + "candidate-install.sh",
             "--installer-sha256",
-            hashlib.sha256(args.candidate.read_bytes()).hexdigest(),
+            args.source_installer_sha256
+            if source_component
+            else hashlib.sha256(args.candidate.read_bytes()).hexdigest(),
             "--previous-installer",
             prefix + "previous-install.sh",
             "--previous-installer-sha256",
@@ -558,6 +577,16 @@ def main() -> None:
 
         if args.testnet_lifecycle:
             arguments = arguments[4:]  # Sending driver uses route, never paper account mode.
+            if source_component:
+                arguments.extend(
+                    [
+                        "--source-component",
+                        "--installer-harness-commit",
+                        args.installer_harness_commit,
+                        "--source-installer-sha256",
+                        args.source_installer_sha256,
+                    ]
+                )
             arguments.extend(
                 [
                     "--route",
@@ -652,12 +681,21 @@ def main() -> None:
                     "sudo cat /opt/guard-release-harness/evidence/" + receipt_name, timeout=10
                 )
                 receipt = json.loads(record)
+                if source_component:
+                    receipt.update(
+                        source_component=True,
+                        diagnostic=True,
+                        gate_eligible=False,
+                        installer_harness_commit=args.installer_harness_commit,
+                        installer_rendered_sha256=args.source_installer_sha256,
+                    )
                 receipt["guest_acceleration"] = guest.acceleration
                 receipt["guest_image_sha256"] = IMAGE_SHA
                 receipt["gate_eligible"] = (
                     guest.acceleration == "kvm"
                     and not args.source_paper_script
                     and not args.diagnostic
+                    and not source_component
                 )
                 (args.output / receipt_name).write_text(json.dumps(receipt, indent=2) + "\n")
                 if (

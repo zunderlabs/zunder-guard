@@ -365,10 +365,18 @@ done
 if [ "$INSTALL_ONLY" -eq 1 ]; then
   : # No terminal, setup values or credentials are needed to replace verified release files.
 elif [ "$NONINTERACTIVE" -eq 1 ]; then
-  [ -n "$RULES" ] || die "--non-interactive needs --rules"
+  # Authenticated managed helpers distinguish fresh setup from an owned reinstall.
+  # Existing Testnet configuration refuses setup overrides; the helper validates
+  # fresh required values and existing account/network/custody before reading a key.
+  MANAGED_TESTNET_SETUP=0
+  if [ "$NETWORK" = testnet ] && [ "$KEY_STDIN$NO_SERVICE" = 10 ] \
+    && { [ "$CONTAINER" -eq 1 ] || [ "$(uname -s)" = Darwin ]; }; then
+    MANAGED_TESTNET_SETUP=1
+  fi
+  [ "$MANAGED_TESTNET_SETUP" -eq 1 ] || [ -n "$RULES" ] || die "--non-interactive needs --rules"
   [ -n "$NETWORK" ] || die "--non-interactive needs --network"
   if [ "$NETWORK" != paper ]; then
-    [ -n "$ACCOUNT" ] || die "$NETWORK needs --account"
+    [ "$MANAGED_TESTNET_SETUP" -eq 1 ] || [ -n "$ACCOUNT" ] || die "$NETWORK needs --account"
     if [ "$KEY_STDIN" -eq 0 ] && { [ -z "$KEY_FILE" ] || [ ! -r "$KEY_FILE" ]; }; then
       die "$NETWORK needs --key-file with a readable file (protected testnet also accepts --key-stdin)"
     fi
@@ -655,6 +663,41 @@ fi
 # Symlinks are refused rather than following a destination outside the selected prefix.
 PREFIX=${PREFIX%/}
 PREFIX=${PREFIX:-/}
+# The sending unit runs as its own unprivileged user. Under a caller's private
+# umask, mkdir -p would make its public executable directory inaccessible. Admit
+# only these fixed Linux software paths; never change a custom prefix or custody.
+# BEGIN managed instance software directories
+if [ "$OS" = linux ] && { [ -n "$SERVICE_INSTANCE" ] || [ "$INSTALL_ONLY" -eq 1 ]; }; then
+  case "$PREFIX" in
+    /opt/zunder-guard-testnet/bin | /opt/zunder-guard-mainnet/bin)
+      instance_software_check() {
+        [ ! -L "$1" ] && [ -d "$1" ] || die "managed software path is not a real directory"
+        software_owner=$($SUDO_BIN stat -c %u "$1")
+        software_mode=$($SUDO_BIN stat -c %a "$1")
+        [ "$software_owner" = 0 ] || die "managed software directory is not root-owned"
+        case "$software_mode" in "" | *[!0-7]*) die "managed software directory mode is invalid" ;; esac
+        [ "${#software_mode}" -le 4 ] || die "managed software directory mode is invalid"
+        software_permissions=$((0$software_mode))
+        [ "$((software_permissions & 0022))" -eq 0 ] \
+          && [ "$((software_permissions & 07000))" -eq 0 ] \
+          || die "managed software directory has unsafe permissions"
+      }
+      instance_software_check /opt
+      [ "$((software_permissions & 0001))" -ne 0 ] || die "managed software parent is not publicly traversable"
+      for software_directory in "${PREFIX%/bin}" "$PREFIX"; do
+        if $SUDO_BIN test -e "$software_directory" || $SUDO_BIN test -L "$software_directory"; then
+          instance_software_check "$software_directory"
+        fi
+      done
+      # Existing safe root-owned 0700 directories may come from an older loader.
+      # Parents are admitted first; no recursive chmod or private-state adoption.
+      for software_directory in "${PREFIX%/bin}" "$PREFIX"; do
+        $SUDO_BIN install -d -m 0755 -o 0 -g 0 "$software_directory"
+      done
+      ;;
+  esac
+fi
+# END managed instance software directories
 case "$PREFIX" in
   */bin) NOTICE_ROOT=${PREFIX%/bin}/share ;;
   *) NOTICE_ROOT=$PREFIX/share ;;

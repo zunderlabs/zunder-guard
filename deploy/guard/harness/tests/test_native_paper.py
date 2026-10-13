@@ -2,17 +2,21 @@ import os
 import plistlib
 import subprocess
 from pathlib import Path
+from typing import cast
 
 import pytest
 
 from guard_harness.native_paper import LifecycleError, Paper, retained, verify_retained
+from guard_harness.native_release import Release
+from guard_harness.runner import RunError
 
 
+@pytest.mark.parametrize("label", ["homebrew.mxcl.zunder-guard", "sh.brew.zunder-guard"])
 @pytest.mark.parametrize("domains", [("user",), ("gui",), (), ("user", "gui")])
 def test_crash_discovers_only_owned_nonroot_homebrew_service_domain(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, domains: tuple[str, ...]
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, domains: tuple[str, ...], label: str
 ) -> None:
-    paper, plist, arguments, uid = launchd_fixture(tmp_path, monkeypatch)
+    paper, plist, arguments, uid = launchd_fixture(tmp_path, monkeypatch, label=label)
     probes: list[str] = []
     kills: list[list[str]] = []
 
@@ -20,8 +24,8 @@ def test_crash_discovers_only_owned_nonroot_homebrew_service_domain(
         assert words[:2] == ["launchctl", "print"]
         target = words[2]
         assert target in {
-            f"user/{uid}/homebrew.mxcl.zunder-guard",
-            f"gui/{uid}/homebrew.mxcl.zunder-guard",
+            f"user/{uid}/{label}",
+            f"gui/{uid}/{label}",
         }
         probes.append(target)
         if target.split("/")[0] not in domains:
@@ -39,9 +43,7 @@ def test_crash_discovers_only_owned_nonroot_homebrew_service_domain(
     monkeypatch.setattr(paper, "command", capture_kill)
     if len(domains) == 1:
         paper.crash()
-        assert kills == [
-            ["launchctl", "kill", "SIGKILL", f"{domains[0]}/{uid}/homebrew.mxcl.zunder-guard"]
-        ]
+        assert kills == [["launchctl", "kill", "SIGKILL", f"{domains[0]}/{uid}/{label}"]]
     else:
         with pytest.raises(LifecycleError, match="missing or ambiguous"):
             paper.crash()
@@ -52,7 +54,7 @@ def test_crash_discovers_only_owned_nonroot_homebrew_service_domain(
 
 
 def launchd_fixture(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, label: str = "homebrew.mxcl.zunder-guard"
 ) -> tuple[Paper, Path, list[str], int]:
     uid = os.getuid() or 501
     monkeypatch.setattr("guard_harness.native_paper.os.getuid", lambda: uid)
@@ -67,11 +69,11 @@ def launchd_fixture(
     arguments = [str(opt), "run", "--network", "paper"]
     agents = tmp_path / "Library/LaunchAgents"
     agents.mkdir(parents=True)
-    plist = agents / "homebrew.mxcl.zunder-guard.plist"
+    plist = agents / (label + ".plist")
     plist.write_bytes(
         plistlib.dumps(
             {
-                "Label": "homebrew.mxcl.zunder-guard",
+                "Label": label,
                 "ProgramArguments": arguments,
                 "EnvironmentVariables": {"ZUNDER_GUARD_HOME": str(paper.home)},
             }
@@ -105,6 +107,7 @@ def launchd_text(target: str, plist: Path, paper: Paper, arguments: list[str]) -
     ).encode()
 
 
+@pytest.mark.parametrize("label", ["homebrew.mxcl.zunder-guard", "sh.brew.zunder-guard"])
 @pytest.mark.parametrize(
     "mutation",
     [
@@ -119,9 +122,9 @@ def launchd_text(target: str, plist: Path, paper: Paper, arguments: list[str]) -
     ],
 )
 def test_crash_refuses_unsafe_registration_or_unknown_domain_probe(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mutation: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mutation: str, label: str
 ) -> None:
-    paper, plist, arguments, uid = launchd_fixture(tmp_path, monkeypatch)
+    paper, plist, arguments, uid = launchd_fixture(tmp_path, monkeypatch, label=label)
     if mutation == "root":
         monkeypatch.setattr("guard_harness.native_paper.os.getuid", lambda: 0)
     elif mutation == "plist-link":
@@ -218,3 +221,101 @@ def test_paper_lifecycle_rejects_replaced_config_or_journal_prefix(
     (tmp_path / name).write_bytes(b"replacement\n")
     with pytest.raises(LifecycleError, match="changed across lifecycle"):
         verify_retained(before, tmp_path)
+
+
+@pytest.mark.parametrize("ambiguous", [False, True])
+def test_missing_or_two_known_plists_never_selects_a_process(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, ambiguous: bool
+) -> None:
+    paper, plist, _, _ = launchd_fixture(tmp_path, monkeypatch)
+    if ambiguous:
+        (plist.parent / "sh.brew.zunder-guard.plist").write_bytes(plist.read_bytes())
+    else:
+        plist.unlink()
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: pytest.fail("no domain probe"))
+    monkeypatch.setattr(paper, "command", lambda _: pytest.fail("no kill"))
+    with pytest.raises(LifecycleError, match="missing or ambiguous"):
+        paper.crash()
+
+
+def cleanup_fixture(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Paper:
+    monkeypatch.setattr("guard_harness.native_paper.platform.system", lambda: "Darwin")
+    release = cast(Release, object())
+    return Paper(release=release, previous=release, work=tmp_path, shell="sh")
+
+
+def test_final_stop_after_uninstall_does_not_reload_removed_formula(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    paper = cleanup_fixture(tmp_path, monkeypatch)
+    calls: list[list[str]] = []
+    uninstalled = False
+
+    def command(words: list[str]) -> str:
+        nonlocal uninstalled
+        calls.append(words)
+        if words == ["brew", "uninstall", "zunder-guard"]:
+            uninstalled = True
+        elif uninstalled:
+            raise RunError("Refusing to load formula from untrusted tap")
+        return ""
+
+    monkeypatch.setattr(paper, "command", command)
+    try:
+        paper.start()
+        paper.stop()
+        paper.command(["brew", "uninstall", "zunder-guard"])
+    finally:
+        paper.stop()
+    assert calls == [
+        ["brew", "services", "start", "zunder-guard"],
+        ["brew", "services", "stop", "zunder-guard"],
+        ["brew", "uninstall", "zunder-guard"],
+    ]
+
+
+def test_failed_start_still_requires_actual_service_cleanup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    paper = cleanup_fixture(tmp_path, monkeypatch)
+    calls: list[list[str]] = []
+
+    def command(words: list[str]) -> str:
+        calls.append(words)
+        if words[2] == "start":
+            raise RunError("start failed after registering service")
+        return ""
+
+    monkeypatch.setattr(paper, "command", command)
+    with pytest.raises(RunError, match="start failed"):
+        try:
+            paper.start()
+        finally:
+            paper.stop()
+    assert [words[2] for words in calls] == ["start", "stop"]
+    assert not paper.brew_stop_required
+
+
+def test_failed_stop_is_not_treated_as_completed_cleanup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    paper = cleanup_fixture(tmp_path, monkeypatch)
+
+    def command(words: list[str]) -> str:
+        if words[2] == "stop":
+            raise RunError("stop failed")
+        return ""
+
+    monkeypatch.setattr(paper, "command", command)
+    paper.start()
+    with pytest.raises(RunError, match="stop failed"):
+        paper.stop()
+    assert paper.brew_stop_required
+
+
+def test_never_started_service_needs_no_brew_cleanup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    paper = cleanup_fixture(tmp_path, monkeypatch)
+    monkeypatch.setattr(paper, "command", lambda words: pytest.fail("no service was started"))
+    paper.stop()

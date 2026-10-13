@@ -593,6 +593,11 @@ def main():
     # Held through main; a second installer never performs concurrent mutations.
     existing = sup.load() if (BASE / 'config.json').exists() else None
     pending_record = ops.read(GATE) if GATE.exists() else None
+    # The public shell delegates setup values to this authenticated helper so an
+    # owned reinstall can preserve them. A fresh unattended home still needs
+    # explicit rules, before any transaction/service/volume change or key read.
+    if args.non_interactive and not existing and not pending_record:
+        require(bool(args.rules), 'Unattended fresh Testnet setup requires explicit rules.')
     account = args.account or (existing or pending_record or {}).get('account') or prompt('Hyperliquid account (public 0x address):')
     volume = args.volume or (existing or pending_record or {}).get('volume') or (
         'zunder-guard-testnet-data' if args.network == 'testnet' else 'zunder-guard-data')
