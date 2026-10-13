@@ -534,3 +534,71 @@ def test_actual_connection_refusal_can_wait_for_owned_listener(
     monkeypatch.setattr(urllib.request, "build_opener", lambda *args: Opener())
     owner.wait_ready()
     assert len(calls) == 2 and clock[0] == 0.25
+
+
+@pytest.mark.parametrize("service", [False, True])
+def test_foreground_and_inherited_service_wire_same_bounded_warming_before_entry_reserve(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, service: bool
+) -> None:
+    from guard_harness.testnet_service_owner import ServiceOwner
+
+    kind = ServiceOwner if service else process.Foreground
+    assert ServiceOwner.journey is process.Foreground.journey
+    owner = kind.__new__(kind)
+    owner.binary, owner.home = tmp_path / "binary", tmp_path / "home"
+    owner.sha256, owner.url, owner.work = "a" * 64, "http://127.0.0.1:18547", tmp_path
+    owner.client_key, owner.account = tmp_path / "client", ACCOUNT
+    owner.pair = Pair(CLIENT, SYNTHETIC_CLIENT_KEY)
+    owner.started_ms = 1000
+    clock = [100.0]
+    alive: list[str] = []
+    waits: list[float] = []
+    calls: list[tuple[str, object, float]] = []
+    monkeypatch.setattr(owner, "wait_ready", lambda: None)
+    monkeypatch.setattr(owner, "alive", lambda: alive.append("alive"))
+    monkeypatch.setattr(time, "monotonic", lambda: clock[0])
+
+    def sleep(seconds: float) -> None:
+        waits.append(seconds)
+        clock[0] += seconds
+
+    monkeypatch.setattr(time, "sleep", sleep)
+
+    def bounded(url: str, data: bytes | None, *, timeout: float) -> bytes:
+        body = None if data is None else json.loads(data)
+        calls.append((url, body, timeout))
+        assert 0 < timeout <= 5
+        if body == {"type": "meta"}:
+            return b'{"universe":[{"name":"BTC"}]}'
+        if body is not None:
+            assert body == {"type": "userRole", "user": CLIENT}
+            return b'{"role":"missing"}'
+        return b'{"ip_share":"0.4","budgets":{"info":{"per_second":"0.639","burst":60}}}'
+
+    class FakeMCP:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            pass
+
+        def __enter__(self) -> "FakeMCP":
+            return self
+
+        def __exit__(self, *args: Any) -> None:
+            pass
+
+    def execute(*args: Any, **kwargs: Any) -> Journey:
+        read = args[2]
+        before = (read.next_read, list(read.reservations))
+        status, check = kwargs["warm_info"](CLIENT)
+        assert status["ip_share"] == "0.4"
+        check()
+        assert (read.next_read, read.reservations) == before
+        kwargs["admit_entry"]()
+        assert read.deadline == clock[0] + process.OWNED_WORK_TIMEOUT
+        return Journey(None, None, "offline-stop", False)
+
+    monkeypatch.setattr(process, "bounded_read", bounded)
+    monkeypatch.setattr(process, "MCP", FakeMCP)
+    monkeypatch.setattr(process, "execute", execute)
+    owner.journey(VenueReads(clock=lambda: clock[0]), version="1.0.0-rc.1", deadline=10000)
+    assert waits == [31.299, 12.520]
+    assert len(calls) == 4 and len(alive) >= 8

@@ -154,6 +154,25 @@ def test_complete_exact_source_row(row: str, tmp_path: Path) -> None:
     assert value["coverage"] == sorted(LIFECYCLE_COVERAGE[row])
 
 
+@pytest.mark.parametrize("mutation", ["absent", "upgrade-only", "token-in-lifecycle"])
+def test_d3_requires_fresh_homebrew_measurement(tmp_path: Path, mutation: str) -> None:
+    manifest = fixture(tmp_path, "I3")
+    path = tmp_path / "macos/fresh/paper/paper.receipt.json"
+    value = json.loads(path.read_bytes())
+    value.pop("channel_coverage")
+    if mutation == "upgrade-only":
+        value["channel_coverage"] = []
+        upgrade = tmp_path / "macos/upgrade/paper/paper.receipt.json"
+        previous = json.loads(upgrade.read_bytes())
+        previous["channel_coverage"] = ["D3:homebrew"]
+        write(upgrade, previous)
+    elif mutation == "token-in-lifecycle":
+        value["coverage"].append("D3:homebrew")
+    write(path, value)
+    with pytest.raises(LifecycleError):
+        predicate("I3", tmp_path, manifest, COMMIT, tmp_path / "subjects")
+
+
 @pytest.mark.parametrize(
     "mutation", ["diagnostic", "other-harness", "missing-mode", "partial", "missing-variant"]
 )

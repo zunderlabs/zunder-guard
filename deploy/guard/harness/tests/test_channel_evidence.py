@@ -4,9 +4,11 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from test_install_evidence import release
+from test_install_evidence import COMMIT, release
+from test_install_evidence import fixture as install_fixture
 
 from guard_harness.channel_evidence import admit, commands, required
+from guard_harness.native_release import Release
 from guard_harness.testnet_process import ProcessError
 
 
@@ -125,3 +127,59 @@ def test_missing_parameter_run_or_false_user_cleanup_is_refused(
     path.write_text(json.dumps(value))
     with pytest.raises(ProcessError):
         admit(path, "D1", current, "darwin-arm64")
+
+
+@pytest.mark.parametrize(
+    "channel,target,step",
+    [
+        (channel, target, step)
+        for channel, target in (
+            ("D1", "linux-amd64"),
+            ("D1", "darwin-arm64"),
+            ("D2", "windows-amd64"),
+        )
+        for step in (
+            "manifest-bare-form",
+            "website-parameter-form",
+            "interactive-paper-init",
+            "installed-binary-readback",
+            "paper-allow-resize-veto",
+            "cleanup",
+            "literal-irm-iex" if channel == "D2" else "literal-curl-pipe",
+            "owned-manual-cleanup" if target.startswith("darwin-") else "uninstall",
+        )
+    ],
+)
+def test_passed_loader_receipt_requires_every_measured_step(
+    tmp_path: Path, channel: str, target: str, step: str
+) -> None:
+    path, current, value = fixture(tmp_path, channel, target)
+    value["coverage"].remove(step)
+    path.write_text(json.dumps(value))
+    with pytest.raises(ProcessError, match="identity/runtime/cleanup"):
+        admit(path, channel, current, target)
+
+
+@pytest.mark.parametrize(
+    "step",
+    [
+        "manual-release-download",
+        "signed-checksums",
+        "archive-extract",
+        "interactive-paper-init",
+        "installed-binary-readback",
+        "paper-allow-resize-veto",
+        "owned-process-stop",
+        "cleanup",
+    ],
+)
+def test_passed_archive_receipt_requires_every_measured_step(tmp_path: Path, step: str) -> None:
+    subjects, evidence, _ = install_fixture(tmp_path, "I1")
+    current = Release("v1.0.0", COMMIT, subjects / "candidate/assets")
+    path = evidence / "channels/D5.json"
+    assert admit(path, "D5", current, "linux-amd64") == "D5:manual-archive"
+    value = json.loads(path.read_bytes())
+    value["coverage"].remove(step)
+    path.write_text(json.dumps(value))
+    with pytest.raises(ProcessError, match="identity/runtime/cleanup"):
+        admit(path, "D5", current, "linux-amd64")

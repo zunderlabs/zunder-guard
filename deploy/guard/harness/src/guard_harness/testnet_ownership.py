@@ -1,11 +1,11 @@
 """Combine fresh readbacks into immutable run-owned exposure observations for T1/T2."""
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from decimal import Decimal
 from typing import Any
 
-from guard_harness.testnet_exits import owned_balance, prove_exits
+from guard_harness.testnet_exits import AccountingViewMismatch, Exit, owned_balance, prove_exits
 from guard_harness.testnet_protection import (
     Entry,
     StopProof,
@@ -36,6 +36,34 @@ def _entry_order(order: dict[str, Any], proof: StopProof, entry: Entry) -> int:
     return _oid(order.get("oid"))
 
 
+def _cleanup_stop(
+    events: Sequence[dict[str, Any]],
+    proof: StopProof,
+    entry_oid: int,
+    stop_lookup: dict[str, Any],
+    exits: Mapping[int, Exit],
+    orders: Sequence[dict[str, Any]],
+    *,
+    entry_status: object,
+    needs_stop: bool,
+) -> int | None:
+    """The same pure protection checks gate valid cleanup and failed accounting views."""
+    _need(entry_status in {"filled", "canceled"})
+    historical = _object(_object(stop_lookup.get("order")).get("order"))
+    acknowledged_stop = _oid(historical.get("oid"))
+    _need(acknowledged_stop in exits)
+    protected_ack(events, proof, entry_oid, acknowledged_stop, cleanup=True)
+    if needs_stop:
+        stop_oid = open_stop(orders, stop_lookup, proof)
+        _need(all(type(order.get("oid")) is int and order["oid"] == stop_oid for order in orders))
+        return stop_oid
+    _need(
+        _object(stop_lookup.get("order")).get("status")
+        in {"filled", "canceled", "reduceOnlyCanceled"}
+    )
+    return None
+
+
 def reconcile_ownership(
     events: Sequence[dict[str, Any]],
     client: str,
@@ -50,6 +78,7 @@ def reconcile_ownership(
     started_ms: int,
     cleanup: bool = False,
     exit_lookups: Mapping[str, dict[str, Any]] | None = None,
+    observe_net: Callable[[bool], None] = lambda _: None,
 ) -> Ownership:
     """Refuse unrelated orders and ambiguous entry ownership before any cleanup action.
 
@@ -88,23 +117,50 @@ def reconcile_ownership(
         lookups = dict(exit_lookups)
         _need(proof.cloid not in lookups)
         lookups[proof.cloid] = stop_lookup
-        exits = prove_exits(events, client, proof, entry, lookups, started_ms=started_ms)
-        quantity, remaining = owned_balance(
-            positions, fills, entry_oid, entry, exits, started_ms=started_ms
+        exits = prove_exits(
+            events,
+            client,
+            proof,
+            entry,
+            lookups,
+            started_ms=started_ms,
+            allow_closed_stop=not positions and not orders,
         )
-        _need(quantity > 0 and resolved.get("status") in {"filled", "canceled"})
-        historical = _object(_object(stop_lookup.get("order")).get("order"))
-        acknowledged_stop = _oid(historical.get("oid"))
-        _need(acknowledged_stop in exits)
-        protected_ack(events, proof, entry_oid, acknowledged_stop, cleanup=True)
-        stop_oid = None
-        if remaining or orders:
-            stop_oid = open_stop(orders, stop_lookup, proof)
-            _need(
-                all(type(order.get("oid")) is int and order["oid"] == stop_oid for order in orders)
+        try:
+            quantity, remaining = owned_balance(
+                positions,
+                fills,
+                entry_oid,
+                entry,
+                exits,
+                started_ms=started_ms,
+                observe_net=observe_net,
             )
-        else:
-            _need(_object(stop_lookup.get("order")).get("status") in {"filled", "canceled"})
+        except AccountingViewMismatch:
+            # A failed net view cannot hide foreign orders, invalid acknowledgements or
+            # missing protection. Retain the same typed object only after these proofs.
+            _cleanup_stop(
+                events,
+                proof,
+                entry_oid,
+                stop_lookup,
+                exits,
+                orders,
+                entry_status=resolved.get("status"),
+                needs_stop=bool(positions or orders),
+            )
+            raise
+        _need(quantity > 0)
+        stop_oid = _cleanup_stop(
+            events,
+            proof,
+            entry_oid,
+            stop_lookup,
+            exits,
+            orders,
+            entry_status=resolved.get("status"),
+            needs_stop=bool(remaining or orders),
+        )
         return Ownership(entry_oid, stop_oid, quantity, remaining, False)
     # Ordinary journey success still requires the complete entry and its live stop.
     for fill in fills:

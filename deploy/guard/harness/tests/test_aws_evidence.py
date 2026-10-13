@@ -89,6 +89,16 @@ def test_literal_d6_cannot_be_derived_without_each_measured_launch_field(field: 
         predicate(record, MANIFEST, tag=TAG, commit=COMMIT)
 
 
+@pytest.mark.parametrize("mutation", ["absent", "token-only"])
+def test_d6_cannot_replace_template_launch_with_a_coverage_token(mutation: str) -> None:
+    record = receipt()
+    record.pop("template_launch")
+    if mutation == "token-only":
+        record["coverage"].append("D6:cloudformation")
+    with pytest.raises(ValueError):
+        predicate(record, MANIFEST, tag=TAG, commit=COMMIT)
+
+
 @pytest.mark.parametrize(
     "field,value",
     [

@@ -10,7 +10,13 @@ from typing import Any
 from guard_harness.mcp_client import MCP
 from guard_harness.paper_bot import LocalGuard
 from guard_harness.testnet_cleanup import Cleaned, cleanup
-from guard_harness.testnet_collect import collect_ownership
+from guard_harness.testnet_collect import (
+    CollectionRace,
+    collect_ownership,
+    failure_family,
+    finite_failure,
+)
+from guard_harness.testnet_exits import AccountingViewMismatch
 from guard_harness.testnet_ownership import Ownership
 from guard_harness.testnet_protection import (
     Entry,
@@ -45,6 +51,13 @@ class Journey:
 JOURNEY_PHASES = frozenset(
     {
         "guard-readiness",
+        "guard-status-after-warm",
+        "warm-info-budget",
+        "warm-info-meta",
+        "warm-info-role-budget",
+        "warm-info-role",
+        "warm-info-light-budget",
+        "warm-info-ttl",
         "mcp-initialize",
         "guard-status",
         "flat-scan",
@@ -59,6 +72,15 @@ JOURNEY_PHASES = frozenset(
         "preview-price-bound",
         "entry-budget",
         "entry-attempt",
+        "entry-response",
+        "entry-call-unconfirmed",
+        "ownership-events",
+        "ownership-events-unavailable",
+        "ownership-validation",
+        "ownership-validation-refused",
+        "ownership-storage-failed",
+        "ownership-captured",
+        "venue-collection",
     }
 )
 
@@ -119,41 +141,11 @@ def admit_preview(
     )
 
 
-def execute(
-    guard: LocalGuard,
-    mcp: MCP,
-    read: Read,
-    *,
-    account: str,
-    client: str,
-    entry: Entry | Callable[[], Entry],
-    version: str,
-    process_started_ms: int,
-    stop_guard: Callable[[], None],
-    admit_entry: Callable[[], None] = lambda: None,
-    begin_cleanup: Callable[[], None] = lambda: None,
-    begin_final_scan: Callable[[], None] = lambda: None,
-    check_owned_work: Callable[[], None] = lambda: None,
-    record_attempt: Callable[[Entry, int], None] = lambda *_: None,
-    persist_ownership: Callable[[list[dict[str, Any]], Entry, int], None] = lambda *_: None,
-    capture_entry: Callable[[Ownership, int, int], None] = lambda *_: None,
-    observe_phase: Callable[[str], None] = lambda _: None,
-    now_ms: Callable[[], int] = lambda: time.time_ns() // 1_000_000,
-) -> Journey:
-    """One entry attempt, actual protection readback, owned cleanup and independent scan.
-
-    Caller must hold account serialization and authenticate Guard process/binary, MCP bytes,
-    fresh paired client, and T1 owned process or T2 owned service. This core never initializes
-    a wallet, reads its key or starts a service. Pre-entry failures send nothing. Once an entry
-    is attempted, cleanup always runs; failed cleanup preserves the Guard and its protection.
-    An exception message or response body never enters the returned diagnostic.
-    """
-    if isinstance(entry, Entry):
-        entry.validate()
-    observe_phase("guard-status")
-    _need(mcp.writes_bound and mcp.close_size_bound and mcp.limit_price_ioc)
-    _need(type(process_started_ms) is int and process_started_ms > 0)
-    status = _object(guard.request("/guard/status"))
+def admit_status(
+    value: object, *, account: str, version: str, process_started_ms: int, now_ms: Callable[[], int]
+) -> None:
+    """The identical initial and post-warm safety admission; no cache/risk authority."""
+    status = _object(value)
     _need(status.get("mode") == "testnet" and status.get("network") == "testnet")
     _need(status.get("account", "").lower() == account.lower() and status.get("version") == version)
     _need(_object(status.get("capabilities")).get("exchange_expected_mode") is True)
@@ -182,12 +174,73 @@ def execute(
     started, synced = _oid(status.get("started_at_ms")), _oid(status.get("last_sync_ms"))
     current = now_ms()
     _need(process_started_ms <= started <= synced <= current and current - synced <= 60000)
+
+
+def execute(
+    guard: LocalGuard,
+    mcp: MCP,
+    read: Read,
+    *,
+    account: str,
+    client: str,
+    entry: Entry | Callable[[], Entry],
+    version: str,
+    process_started_ms: int,
+    stop_guard: Callable[[], None],
+    admit_entry: Callable[[], None] = lambda: None,
+    begin_cleanup: Callable[[], None] = lambda: None,
+    begin_final_scan: Callable[[], None] = lambda: None,
+    check_owned_work: Callable[[], None] = lambda: None,
+    record_attempt: Callable[[Entry, int], None] = lambda *_: None,
+    persist_ownership: Callable[[list[dict[str, Any]], Entry, int], None] = lambda *_: None,
+    persist_response: Callable[[object, bool | None, str], None] = lambda *_: None,
+    persist_collection_failure: Callable[[dict[str, object]], None] = lambda _: None,
+    capture_entry: Callable[[Ownership, int, int], None] = lambda *_: None,
+    warm_info: Callable[[str], tuple[object, Callable[[], None]]] | None = None,
+    observe_phase: Callable[[str], None] = lambda _: None,
+    now_ms: Callable[[], int] = lambda: time.time_ns() // 1_000_000,
+) -> Journey:
+    """One entry attempt, actual protection readback, owned cleanup and independent scan.
+
+    Caller must hold account serialization and authenticate Guard process/binary, MCP bytes,
+    fresh paired client, and T1 owned process or T2 owned service. This core never initializes
+    a wallet, reads its key or starts a service. Pre-entry failures send nothing. Once an entry
+    is attempted, cleanup always runs; failed cleanup preserves the Guard and its protection.
+    An exception message or response body never enters the returned diagnostic.
+    """
+    if isinstance(entry, Entry):
+        entry.validate()
+    observe_phase("guard-status")
+    _need(mcp.writes_bound and mcp.close_size_bound and mcp.limit_price_ioc)
+    _need(type(process_started_ms) is int and process_started_ms > 0)
+    admit_status(
+        guard.request("/guard/status"),
+        account=account,
+        version=version,
+        process_started_ms=process_started_ms,
+        now_ms=now_ms,
+    )
     initial = _orders(guard.request("/guard/events?since=0"))
     sequences = [_oid(event.get("seq")) for event in initial]
     _need(len(sequences) == len(set(sequences)))
     baseline = max(sequences, default=0)
     observe_phase("flat-scan")
     flat_scan(read, account)  # C6 floor and every DEX, before any entry attempt.
+
+    def check_warm() -> None:
+        pass
+
+    if warm_info is not None:
+        warm_status, check_warm = warm_info(client.lower())
+        observe_phase("guard-status-after-warm")
+        admit_status(
+            warm_status,
+            account=account,
+            version=version,
+            process_started_ms=process_started_ms,
+            now_ms=now_ms,
+        )
+        check_warm()
     observe_phase("entry-plan")
     # Production planning reads fresh market data after the long mandatory scan.
     # Fixed explicit Entry values remain available for independent offline fixtures.
@@ -195,6 +248,7 @@ def execute(
         entry = entry()
     _need(isinstance(entry, Entry))
     entry.validate()
+    check_warm()
     observe_phase("preview-response")
     preview, error = mcp.tool(
         "preview_order",
@@ -214,42 +268,125 @@ def execute(
     begun = now_ms()
     _need(type(begun) is int and begun > 0)
 
+    check_warm()
     record_attempt(entry, begun)  # Exclusive fsync before the single attempted send.
     check_owned_work()  # Persistence cannot spend the reserve and still authorize a send.
+    check_warm()  # Fsync cannot leave a cold cache and still start the one tool call.
 
-    def observe(*, cleaning: bool) -> Ownership:
+    def diagnostic(stage: str) -> None:
+        observe_phase(stage)
+        persist_response(None, None, stage)
+        check_owned_work()  # Durable diagnostic writes cannot spend reserve before reads/mutations.
+
+    def observe(*, cleaning: bool, after_close: bool = False) -> Ownership:
         check_owned_work()
-        events = _orders(guard.request(f"/guard/events?since={baseline}"))
-        _need(all(type(event.get("seq")) is int and event["seq"] > baseline for event in events))
+        diagnostic("ownership-events")
+        try:
+            events = _orders(guard.request(f"/guard/events?since={baseline}"))
+            _need(
+                all(type(event.get("seq")) is int and event["seq"] > baseline for event in events)
+            )
+        except (Exception, KeyboardInterrupt):
+            diagnostic("ownership-events-unavailable")
+            raise
         check_owned_work()
         # Preserve validated run ownership before expensive venue collection, including
         # the unknown-entry-response branch. Missing evidence still refuses mutation.
-        persist_ownership(events, entry, begun)
+        diagnostic("ownership-validation")
+        try:
+            persist_ownership(events, entry, begun)
+        except OSError:
+            diagnostic("ownership-storage-failed")
+            raise
+        except (Exception, KeyboardInterrupt):
+            diagnostic("ownership-validation-refused")
+            raise
+        diagnostic("ownership-captured")
         check_owned_work()
-        observed = collect_ownership(
-            read, account, events, client, entry, started_ms=begun, cleanup=cleaning
-        )
-        check_owned_work()
-        return observed
+        diagnostic("venue-collection")
+        # After a confirmed close, only typed pairwise or fully checked accounting
+        # view disagreements permit bounded fresh reads. Neither permits another
+        # send, a new deadline/budget, or credit from an incomplete snapshot.
+        captured: dict[str, object] = {}
+        last_error: BaseException | None = None
+        attempt = 0
+
+        def capture_failure(value: dict[str, object]) -> None:
+            captured.update(value)
+
+        try:
+            for attempt in range(3 if after_close else 1):
+                check_owned_work()
+                captured.clear()
+                try:
+                    observed = collect_ownership(
+                        read,
+                        account,
+                        events,
+                        client,
+                        entry,
+                        started_ms=begun,
+                        cleanup=cleaning,
+                        observe_failure=capture_failure,
+                    )
+                except (CollectionRace, AccountingViewMismatch) as error:
+                    last_error = error
+                    check_owned_work()
+                    if not after_close or attempt == 2:
+                        raise
+                    time.sleep(1)
+                    check_owned_work()
+                except (Exception, KeyboardInterrupt) as error:
+                    last_error = error
+                    raise
+                else:
+                    check_owned_work()
+                    return observed
+            raise AssertionError("bounded collection loop always returns or raises")
+        except (Exception, KeyboardInterrupt) as error:
+            # A prior handled Race must never stand in for an escaping deadline/check error.
+            context = (
+                captured
+                if last_error is error
+                else {
+                    "subphase": "owned-work",
+                    "family": failure_family(error),
+                }
+            )
+            context = dict(context, attempt=attempt + 1, settling_enabled=after_close)
+            try:
+                persist_collection_failure(finite_failure(context))
+            except (Exception, KeyboardInterrupt):
+                pass  # Preserve the exact escaping exception and existing cleanup behavior.
+            raise
 
     protected, cleaned, failure, stopped = None, None, None, False
     try:
         # Set the attempt boundary before transmission: timeout can mean the order arrived.
         observe_phase("entry-attempt")
         check_owned_work()  # Also recheck after the final receipt hook, immediately before send.
-        result, error = mcp.tool(
-            "place_order",
-            {
-                "coin": "BTC",
-                "side": "buy",
-                "stop": "guard_policy",
-                "size": str(entry.size),
-                "limit_price": str(entry.limit),
-                "time_in_force": "ioc",
-            },
-        )
-        check_owned_work()
-        _need(not error and result.get("sent") is True)
+        check_warm()  # The phase receipt can fsync; freshness is checked again before the tool.
+        result: dict[str, Any] | None = None
+        entry_error: bool | None = None
+        try:
+            result, entry_error = mcp.tool(
+                "place_order",
+                {
+                    "coin": "BTC",
+                    "side": "buy",
+                    "stop": "guard_policy",
+                    "size": str(entry.size),
+                    "limit_price": str(entry.limit),
+                    "time_in_force": "ioc",
+                },
+            )
+        finally:
+            response_stage = "entry-response" if result is not None else "entry-call-unconfirmed"
+            observe_phase(response_stage)
+            persist_response(result, entry_error, response_stage)
+            check_owned_work()  # Recheck after the response record's file and directory fsync.
+        _need(result is not None and not entry_error and result.get("sent") is True)
+        assert result is not None
         protected = observe(cleaning=False)
         capture_entry(protected, begun, now_ms())
         check_owned_work()
@@ -269,6 +406,7 @@ def execute(
                 final_scan,
                 check_work=check_owned_work,
                 timeout=1280,
+                observe_after_close=lambda: observe(cleaning=True, after_close=True),
             )
         except (Exception, KeyboardInterrupt):
             failure = "cleanup_incomplete_keep_guard_running"
