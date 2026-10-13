@@ -84,6 +84,7 @@ class Paper:
         self.child: subprocess.Popen[bytes] | None = None
         self.output: Any = None
         self.brew = platform.system() == "Darwin"
+        self.brew_stop_required = False
         if scenario not in {"fresh", "upgrade"}:
             raise LifecycleError("native paper scenario refused")
         self.scenario = scenario
@@ -180,6 +181,8 @@ class Paper:
 
     def start(self) -> None:
         if self.brew:
+            # A failed start may already have registered the service.
+            self.brew_stop_required = True
             self.command(["brew", "services", "start", "zunder-guard"])
         else:
             self.output = (self.work / f"guard-{self.sequence}.log").open("ab")
@@ -193,7 +196,9 @@ class Paper:
 
     def stop(self) -> None:
         if self.brew:
-            self.command(["brew", "services", "stop", "zunder-guard"])
+            if self.brew_stop_required:
+                self.command(["brew", "services", "stop", "zunder-guard"])
+                self.brew_stop_required = False
         elif self.child is not None:
             self.child.terminate()
             try:
@@ -227,14 +232,23 @@ class Paper:
         uid = os.getuid()
         if uid == 0:
             raise LifecycleError("paper Homebrew service must belong to a non-root user")
-        label = "homebrew.mxcl.zunder-guard"
         user_home = Path(self.env["HOME"])
-        plist = user_home / "Library/LaunchAgents" / (label + ".plist")
-        for directory in (user_home, plist.parent.parent, plist.parent):
+        agents = user_home / "Library/LaunchAgents"
+        for directory in (user_home, agents.parent, agents):
             info = directory.lstat()
             if not stat.S_ISDIR(info.st_mode) or info.st_uid != uid or info.st_mode & 0o022:
                 raise LifecycleError("Homebrew service directory ownership differs")
-        info = plist.lstat()
+        registrations = []
+        for label in ("homebrew.mxcl.zunder-guard", "sh.brew.zunder-guard"):
+            plist = agents / (label + ".plist")
+            try:
+                info = plist.lstat()
+            except FileNotFoundError:
+                continue
+            registrations.append((label, plist, info))
+        if len(registrations) != 1:
+            raise LifecycleError("owned Homebrew service plist missing or ambiguous")
+        label, plist, info = registrations[0]
         if (
             not stat.S_ISREG(info.st_mode)
             or info.st_uid != uid

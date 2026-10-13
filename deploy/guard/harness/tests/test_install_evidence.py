@@ -506,3 +506,31 @@ def test_managed_file_loader_cannot_claim_literal_d7_pipe(tmp_path: Path) -> Non
     write(path, value)
     with pytest.raises(EvidenceError, match="entry route"):
         predicate("I6", evidence, subjects, manifest, COMMIT)
+
+
+@pytest.mark.parametrize("channel", ["docker", "compose"])
+@pytest.mark.parametrize("scenario", ["fresh", "upgrade"])
+@pytest.mark.parametrize("mode", ["paper", "testnet"])
+def test_d4_requires_each_measured_channel_execution(
+    tmp_path: Path, channel: str, scenario: str, mode: str
+) -> None:
+    subjects, evidence, manifest = fixture(tmp_path, "I5")
+    # Other passed receipts cannot stand in for this channel/mode/scenario.
+    (evidence / mode / scenario / channel / "receipt.json").unlink()
+    with pytest.raises(EvidenceError, match="regular runtime receipt"):
+        predicate("I5", evidence, subjects, manifest, COMMIT)
+
+
+@pytest.mark.parametrize("mutation", ["absent", "upgrade-only", "token-in-lifecycle"])
+def test_d7_requires_fresh_channel_measurement(tmp_path: Path, mutation: str) -> None:
+    subjects, evidence, manifest = fixture(tmp_path, "I6")
+    path = evidence / "paper/fresh/linux-lifecycle.json"
+    value = json.loads(path.read_bytes())
+    value.pop("channel_coverage")
+    if mutation == "upgrade-only":
+        value["channel_coverage"] = []
+    elif mutation == "token-in-lifecycle":
+        value["coverage"].append("D7:container-native")
+    write(path, value)
+    with pytest.raises(EvidenceError):
+        predicate("I6", evidence, subjects, manifest, COMMIT)

@@ -65,7 +65,7 @@ class QueueCustody(unittest.TestCase):
 
 
 class RecoveryQueueGraph(unittest.TestCase):
-    def test_operator_leaf_admitted_only_by_complete_sealed_contract(self):
+    def test_diagnostic_leaves_admitted_only_by_complete_sealed_contract(self):
         names = ("verify.yml", "nightly.yml", "install-matrix.yml", "journey.yml")
         project = Path(__file__).resolve().parents[3]
         base = project / "deploy/guard/github/workflows"
@@ -80,16 +80,32 @@ class RecoveryQueueGraph(unittest.TestCase):
             module.validate(paths)
             install = paths[2]
             original = install.read_text()
+            for leaf in ("operator-recovery", "testnet-foreground", "testnet-systemd"):
+                doc = module.contract.document(original)
+                doc["jobs"][leaf]["if"] = "${{ always() }}"
+                install.write_text(yaml.safe_dump(doc))
+                with self.assertRaises(ValueError): module.validate(paths)
+            # The newly covered leaf is exact: dropping its declared custody cannot
+            # silently skip the sealed graph's accounting of every producer.
             doc = module.contract.document(original)
-            doc["jobs"]["operator-recovery"]["if"] = "${{ always() }}"
+            for step in doc["jobs"]["testnet-systemd"]["steps"]:
+                if "WALLET_INPUT" in step.get("env", {}):
+                    step["env"]["WALLET_INPUT"] = "untrusted-input"
             install.write_text(yaml.safe_dump(doc))
-            with self.assertRaises(ValueError): module.validate(paths)
-            install.write_text(original)
+            with self.assertRaisesRegex(ValueError, "custody ownership"):
+                module.validate(paths)
             doc = module.contract.document(original)
             doc["jobs"]["unknown-custody"] = {
                 "runs-on": "ubuntu-24.04", "steps": [{"run": "true", "env": {
                     "KEY": "${{ secrets.E2E_TESTNET_API_WALLET_KEY }}"}}]}
             install.write_text(yaml.safe_dump(doc))
+            with self.assertRaises(ValueError): module.validate(paths)
+            install.write_text(original)
+            # A foreground target never supplies the lock its formal callers lack.
+            verify = paths[0]
+            doc = module.contract.document(verify.read_text())
+            doc["concurrency"]["group"] = "untrusted-caller"
+            verify.write_text(yaml.safe_dump(doc))
             with self.assertRaises(ValueError): module.validate(paths)
 
 if __name__ == "__main__": unittest.main()

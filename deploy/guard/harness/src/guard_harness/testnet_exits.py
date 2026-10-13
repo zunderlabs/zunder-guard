@@ -1,7 +1,7 @@
 """Authenticate durable reduce-only exit identities and account for all run fills."""
 
 import re
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from decimal import Decimal
 from typing import Any
@@ -20,6 +20,51 @@ from guard_harness.testnet_reconcile import _oid, order_statuses, owned_quantity
 from guard_harness.testnet_scan import amount
 
 
+class AccountingViewMismatch(ProtectionError):
+    """Fully checked owned fills and isolated holdings disagree; grants no ownership."""
+
+
+# Public compiled Testnet recipient for this default-fee E2E scope. Alternate
+# licensed builders require a separately bound proof; syntax alone grants none.
+TESTNET_BUILDER = "0x4d91ba8f33d2199045ff46dde384f2c49deb3a3f"
+
+
+def validate_close_forward(request: object, forward: object) -> None:
+    """Only Guard's exact default fee may differ from the builder-free MCP close.
+
+    The shipped fee application clones the order action and replaces only builder.
+    This checks the raw actions before privacy projection can omit that field; it
+    neither grants fee approval nor changes any order, ownership or accounting proof.
+    """
+    original, sent = _object(request), _object(forward)
+    fields = {"type", "orders", "grouping"}
+    _need(set(original) == fields and original["type"] == "order")
+    _need(set(sent) == fields or set(sent) == fields | {"builder"})
+    for action in (original, sent):
+        _need(type(action["type"]) is str and type(action["grouping"]) is str)
+        _need(action["grouping"] == "na")
+        wires = _orders(action["orders"])
+        _need(len(wires) == 1)
+        wire = wires[0]
+        _need(set(wire) == {"a", "b", "r", "p", "s", "c", "t"})
+        _need(type(wire["a"]) is int and type(wire["b"]) is bool and type(wire["r"]) is bool)
+        _need(all(type(wire[name]) is str for name in ("p", "s", "c")))
+        kind = _object(wire["t"])
+        _need(set(kind) == {"limit"})
+        limit = _object(kind["limit"])
+        _need(set(limit) == {"tif"} and type(limit["tif"]) is str and limit["tif"] == "Ioc")
+    if "builder" in sent:
+        builder = _object(sent["builder"])
+        _need(set(builder) == {"b", "f"})
+        _need(
+            isinstance(builder["b"], str)
+            and builder["b"].lower() == TESTNET_BUILDER
+            and type(builder["f"]) is int
+            and builder["f"] == 20
+        )
+    _need({name: sent[name] for name in fields} == original)
+
+
 @dataclass(frozen=True)
 class Exit:
     oid: int
@@ -28,11 +73,18 @@ class Exit:
     timestamp: int
 
 
-def _lookup(value: dict[str, Any], cloid: str, started_ms: int) -> tuple[dict[str, Any], str]:
+def _lookup(
+    value: dict[str, Any], cloid: str, started_ms: int, *, allow_closed_stop: bool = False
+) -> tuple[dict[str, Any], str]:
     _need(value.get("status") == "order")
     resolved = _object(value.get("order"))
     status = resolved.get("status")
-    _need(status in {"open", "filled", "canceled"})
+    _need(type(allow_closed_stop) is bool)
+    _need(
+        status in {"open", "filled", "canceled"}
+        or allow_closed_stop
+        and status == "reduceOnlyCanceled"
+    )
     order = _object(resolved.get("order"))
     stamp = order.get("timestamp")
     _need(type(stamp) is int and stamp >= started_ms)
@@ -49,18 +101,24 @@ def prove_exits(
     lookups: Mapping[str, dict[str, Any]],
     *,
     started_ms: int,
+    allow_closed_stop: bool = False,
 ) -> dict[int, Exit]:
     """No caller-provided OID is trusted without durable wire and fresh cloid lookup.
 
-    Only the entry's unchanged default stop and paired-client, unchanged reduce-only BTC
-    sell IOC decisions after the entry qualify. A successful close acknowledgement must
+    Only the entry's unchanged default stop and paired-client reduce-only BTC sell IOC
+    decisions after the entry qualify: every close field remains exact, with only Guard's
+    validated compiled default fee permitted on its forward. A close acknowledgement must
     agree with its lookup; every fill still requires net accounting below. Unknown exits
     refuse instead of permitting a broad account close. No venue calls or mutations.
+    Only cleanup with empty positions/orders may opt in to the original stop's
+    reduceOnlyCanceled status; owned_balance must still prove exact net zero.
     """
-    _need(type(started_ms) is int and started_ms > 0)
+    _need(type(started_ms) is int and started_ms > 0 and type(allow_closed_stop) is bool)
     exits: dict[int, Exit] = {}
     if proof.cloid in lookups:
-        order, _ = _lookup(lookups[proof.cloid], proof.cloid, started_ms)
+        order, _ = _lookup(
+            lookups[proof.cloid], proof.cloid, started_ms, allow_closed_stop=allow_closed_stop
+        )
         _need(_positive(order.get("origSz")) == proof.size)
         historical = dict(order, sz=order["origSz"])
         oid = validate_stop_order(historical, proof)
@@ -81,9 +139,8 @@ def prove_exits(
             continue
         sequence = _oid(event.get("seq"))
         _need(sequence > proof.decision and event.get("verdict") == "allow")
-        _need(
-            request.get("grouping") == "na" and len(wires) == 1 and event.get("forward") == request
-        )
+        _need(request.get("grouping") == "na" and len(wires) == 1)
+        validate_close_forward(request, event.get("forward"))
         wire = wires[0]
         _need(type(wire.get("a")) is int and wire["a"] == entry.asset)
         _need(wire.get("b") is False and wire.get("r") is True)
@@ -122,6 +179,7 @@ def owned_balance(
     exits: Mapping[int, Exit],
     *,
     started_ms: int,
+    observe_net: Callable[[bool], None] = lambda _: None,
 ) -> tuple[Decimal, Decimal]:
     """Sum actual buys and authenticated sells; missing/foreign/duplicate fills refuse.
 
@@ -158,5 +216,11 @@ def owned_balance(
         _need(_object(position.get("leverage")).get("type") == "isolated")
         remaining = amount(position.get("szi"))
         _need(remaining > 0)
-    _need(net == remaining)
+    matched = net == remaining
+    try:
+        observe_net(matched)
+    except (Exception, KeyboardInterrupt):
+        pass  # Passive diagnostics cannot mask or change the accounting proof.
+    if not matched:
+        raise AccountingViewMismatch("owned accounting views disagree")
     return bought, remaining

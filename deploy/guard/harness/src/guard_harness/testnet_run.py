@@ -194,7 +194,14 @@ def execute_release(
                 key_stdin=key_stdin,
             )
         else:
-            from guard_harness.testnet_service_owner import ServiceOwner
+            from guard_harness.testnet_service_owner import STARTUP_PHASES, ServiceOwner
+
+            def observe_startup(phase: str) -> None:
+                # Only constructor-authored phases; never retain exceptions or custody.
+                receipt["startup_phase"] = (
+                    phase if type(phase) is str and phase in STARTUP_PHASES else "unknown"
+                )
+                _receipt(work, receipt)
 
             owner = ServiceOwner(
                 work / "subject",
@@ -208,6 +215,7 @@ def execute_release(
                 tag=tag,
                 commit=commit,
                 marker=service_marker,
+                observe_phase=observe_startup,
             )
         receipt["stage"] = "journey"
         _receipt(work, receipt)

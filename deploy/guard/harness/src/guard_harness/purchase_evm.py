@@ -43,6 +43,7 @@ PAY_PHASES = frozenset(
         "evm-nonce",
         "evm-gas-estimate",
         "evm-gas-price",
+        "evm-base-fee",
         "evm-signing",
         "evm-attempt",
         "evm-broadcast",
@@ -55,6 +56,7 @@ RPC_FAMILIES = frozenset(
         "nonce-low",
         "nonce-conflict",
         "underpriced",
+        "fee-cap-low",
         "gas-limit",
         "insufficient-funds",
         "rate-limit",
@@ -79,15 +81,35 @@ RPC_MESSAGES = {
 }
 
 
+# Only fixed standard JSON-RPC codes and the reproduced Arbitrum server code are retained.
+RPC_CODES = frozenset({-32700, -32600, -32601, -32602, -32603, -32000})
+FEE_CAP_MESSAGE = re.compile(
+    r"err: max fee per gas less than block base fee: address 0x[0-9a-fA-F]{40}, "
+    r"maxFeePerGas: ([1-9][0-9]{0,77}), baseFee: ([1-9][0-9]{0,77}) "
+    r"\(supplied gas ([1-9][0-9]{0,77})\)"
+)
+
+
 class RpcRejection(PaymentError):
-    def __init__(self, family: str) -> None:
+    def __init__(self, family: str, code: object = None) -> None:
+        self.code = code if type(code) is int and code in RPC_CODES else None
         self.family = family if type(family) is str and family in RPC_FAMILIES else "unknown"
         super().__init__("Sepolia RPC admission failed; diagnostics withheld")
 
 
 def rpc_family(error: object) -> str:
     message = error.get("message") if type(error) is dict else None
-    return RPC_MESSAGES.get(message, "unknown") if type(message) is str else "unknown"
+    if type(message) is not str:
+        return "unknown"
+    exact = RPC_MESSAGES.get(message)
+    if exact is not None:
+        return exact
+    matched = FEE_CAP_MESSAGE.fullmatch(message)
+    if matched is not None:
+        values = tuple(int(value) for value in matched.groups())
+        if all(0 < value < 2**256 for value in values) and values[0] < values[1]:
+            return "fee-cap-low"
+    return "unknown"
 
 
 def rpc(network: str, method: str, params: list[object]) -> Any:
@@ -100,7 +122,9 @@ def rpc(network: str, method: str, params: list[object]) -> Any:
         response.get("jsonrpc") == "2.0" and type(response.get("id")) is int and response["id"] == 1
     )
     if valid_identity and "error" in response and "result" not in response:
-        raise RpcRejection(rpc_family(response["error"]))
+        error = response["error"]
+        code = error.get("code") if type(error) is dict else None
+        raise RpcRejection(rpc_family(error), code)
     if (
         response.get("jsonrpc") != "2.0"
         or type(response.get("id")) is not int
@@ -118,6 +142,87 @@ def quantity(value: Any) -> int:
     ):
         raise PaymentError("canonical bounded RPC quantity required")
     return int(value, 16)
+
+
+def admitted_gas_price(gas: int, suggested: int, latest: object) -> int:
+    """One fresh header, integer headroom, unchanged total cap before any signing.
+
+    This only admits a new order's legacy gasPrice. It never replaces or retries
+    a previously attempted transaction; the existing exclusive attempt remains binding.
+    """
+    if (
+        type(gas) is not int
+        or not 21_000 <= gas <= 1_000_000
+        or type(suggested) is not int
+        or not 0 < suggested < 2**256
+        or not isinstance(latest, dict)
+    ):
+        raise PaymentError("Sepolia gas exceeds fixed test budget")
+    base_fee = quantity(latest.get("baseFeePerGas"))
+    if not 0 < base_fee < 2**255:
+        raise PaymentError("canonical positive bounded Sepolia base fee required")
+    # Hand-computed headroom: twice the latest base fee, or the higher RPC quote.
+    price = max(suggested, 2 * base_fee)
+    if not 0 < gas * price <= MAX_FEE_WEI:
+        raise PaymentError("Sepolia gas exceeds fixed test budget")
+    return price
+
+
+# Read-only windows after the one broadcast. Both run from the send and end inside the journey's
+# 180-second subprocess limit (subprocess.ts), admission included: 30 s to find the transaction
+# by hash after the send errored, 90 s from the send to a receipt. Arbitrum Sepolia makes a block
+# about every 0.25 s and Base Sepolia every 2 s, so a transaction the network has is mined well
+# inside either window.
+LOOKUP_SECONDS = 30
+CONFIRM_SECONDS = 90
+POLL_SECONDS = 3
+
+
+class BroadcastUnseen(PaymentError):
+    """The send errored and the signed hash was not found by lookup; the send's error stands."""
+
+    def __init__(self, cause: PaymentError) -> None:
+        self.cause = cause
+        super().__init__("Sepolia broadcast not found by hash; reconcile, never retry")
+
+
+# Marker: the network knows the transaction (by hash) but no receipt was read yet.
+SEEN = object()
+
+
+def lookup(network: str, transaction_hash: str, until: float) -> object:
+    """After an errored send: the receipt, SEEN, or None once `until` passes unseen.
+
+    Read-only and keyed by the signed hash; an RPC error here is retried until `until`,
+    since it says nothing about the transaction.
+    """
+    while True:
+        try:
+            receipt = rpc(network, "eth_getTransactionReceipt", [transaction_hash])
+            if receipt is not None:
+                return receipt
+            seen = rpc(network, "eth_getTransactionByHash", [transaction_hash])
+            if isinstance(seen, dict) and seen.get("hash") == transaction_hash:
+                return SEEN
+        except PaymentError:
+            pass
+        if time.monotonic() >= until:
+            return None
+        time.sleep(POLL_SECONDS)
+
+
+def await_receipt(network: str, transaction_hash: str, deadline: float) -> object:
+    """The receipt of a transaction the network accepted; an RPC error is retried to `deadline`."""
+    while True:
+        try:
+            receipt = rpc(network, "eth_getTransactionReceipt", [transaction_hash])
+            if receipt is not None:
+                return receipt
+        except PaymentError:
+            pass
+        if time.monotonic() >= deadline:
+            raise PaymentError("Sepolia confirmation deadline; reconcile, never retry")
+        time.sleep(POLL_SECONDS)
 
 
 def pay(
@@ -158,8 +263,9 @@ def pay(
         gas = quantity(rpc(network, "eth_estimateGas", [call]))
         phase("evm-gas-price")
         price = quantity(rpc(network, "eth_gasPrice", []))
-        if not 21_000 <= gas <= 1_000_000 or not 0 < gas * price <= MAX_FEE_WEI:
-            raise PaymentError("Sepolia gas exceeds fixed test budget")
+        phase("evm-base-fee")
+        latest = rpc(network, "eth_getBlockByNumber", ["latest", False])
+        price = admitted_gas_price(gas, price, latest)
         transaction = {
             "chainId": chain_id,
             "nonce": nonce,
@@ -185,30 +291,42 @@ def pay(
         "amount_micro": micro,
         "nonce": nonce,
         "transaction_hash": transaction_hash,
+        "gas": gas,
+        "gas_price": price,
+        "max_total_fee_wei": gas * price,
     }
     phase("evm-attempt")
     record(work, "payment-attempt.json", attempt)
-    # Exactly one broadcast, preceded by a fsynced attempt. Read-only receipt polling
-    # never re-sends, replaces or cancels the transaction, even after a timeout.
+    # Exactly one broadcast, preceded by a fsynced attempt. Everything after it is read-only
+    # and keyed by the signed hash: it never re-sends, replaces or cancels the transaction.
     phase("evm-broadcast")
-    if rpc(network, "eth_sendRawTransaction", [raw]) != transaction_hash:
-        raise PaymentError("Sepolia broadcast unconfirmed; reconcile, never retry")
+    deadline = time.monotonic() + CONFIRM_SECONDS
+    send_error: PaymentError | None = None
+    try:
+        if rpc(network, "eth_sendRawTransaction", [raw]) != transaction_hash:
+            send_error = PaymentError("Sepolia broadcast unconfirmed; reconcile, never retry")
+    except PaymentError as error:
+        send_error = error
+    receipt: object = None
+    if send_error is not None:
+        # The node's answer is not the outcome: a signed transaction can be in a pool or a
+        # block although the send errored (lost response, a load-balanced RPC, "already
+        # known"). Look for it by hash within a bounded window; unseen, the error stands.
+        receipt = lookup(
+            network, transaction_hash, min(deadline, time.monotonic() + LOOKUP_SECONDS)
+        )
+        if receipt is None:
+            raise BroadcastUnseen(send_error)
     phase("evm-confirm")
-    deadline = time.monotonic() + 90
-    while True:
-        receipt = rpc(network, "eth_getTransactionReceipt", [transaction_hash])
-        if receipt is not None:
-            if (
-                not isinstance(receipt, dict)
-                or receipt.get("transactionHash") != transaction_hash
-                or receipt.get("status") != "0x1"
-                or quantity(receipt.get("blockNumber")) == 0
-            ):
-                raise PaymentError("Sepolia transaction not successful; reconcile, never retry")
-            break
-        if time.monotonic() >= deadline:
-            raise PaymentError("Sepolia confirmation deadline; reconcile, never retry")
-        time.sleep(5)
+    if receipt is None or receipt is SEEN:
+        receipt = await_receipt(network, transaction_hash, deadline)
+    if (
+        not isinstance(receipt, dict)
+        or receipt.get("transactionHash") != transaction_hash
+        or receipt.get("status") != "0x1"
+        or quantity(receipt.get("blockNumber")) == 0
+    ):
+        raise PaymentError("Sepolia transaction not successful; reconcile, never retry")
     result = {**attempt, "accepted": True}
     phase("evm-receipt")
     record(work, "payment-receipt.json", result)
@@ -238,22 +356,28 @@ def main() -> int:
         print("Sepolia test payment confirmed; follow C4 order and inbox to completion")
         return 0
     except Exception as error:
-        family = error.family if type(error) is RpcRejection else None
+        # An unseen broadcast reports the send's own error, plus that the hash was not found.
+        unseen = type(error) is BroadcastUnseen
+        cause = error.cause if isinstance(error, BroadcastUnseen) else error
+        family = cause.family if type(cause) is RpcRejection else None
         label = current_phase
         if type(family) is str and family in RPC_FAMILIES:
             label += "-" + family
         try:
             _private(args.work, directory=True)
             attempt = attempt or (args.work / "payment-attempt.json").exists()
-            record(
-                args.work,
-                "payment-failure.json",
-                {
-                    "phase": label,
-                    "attempt": attempt,
-                    "broadcast_started": broadcast_started,
-                },
-            )
+            failure: dict[str, object] = {
+                "phase": label,
+                "attempt": attempt,
+                "broadcast_started": broadcast_started,
+            }
+            if type(cause) is RpcRejection:
+                failure["rpc_family"] = cause.family
+                if cause.code is not None:
+                    failure["rpc_code"] = cause.code
+            if unseen:
+                failure["seen_by_hash"] = False
+            record(args.work, "payment-failure.json", failure)
         except Exception:
             pass  # Never overwrite evidence or let diagnostics obscure an ambiguous outcome.
         print(

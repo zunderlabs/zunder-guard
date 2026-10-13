@@ -8,7 +8,41 @@ import pytest
 
 from guard_harness import native_run
 from guard_harness.native_release import Release
+from guard_harness.source_installer import Candidate
 from guard_harness.testnet_process import ProcessError
+
+
+def test_source_mac_component_skips_green_prephases_and_passes_no_extra_secret_env(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    subjects, identity = setup(tmp_path, monkeypatch)
+    identity["diagnostic"] = True
+    (subjects / "input.json").write_text(json.dumps(identity))
+    monkeypatch.setenv("DIAGNOSTIC", "true")
+    monkeypatch.setattr(native_run.sys, "platform", "darwin")
+    candidate = Candidate(b"admitted source", "b" * 40, "d" * 64, "v1.0.0", "b" * 40)
+
+    def prepare(*args: Any, **kwargs: Any) -> Candidate:
+        assert os.environ["WALLET_FRAME"] == "e" * 64
+        return candidate
+
+    monkeypatch.setattr(native_run, "prepare", prepare)
+    monkeypatch.setattr(
+        native_run, "channel_execute", lambda *args, **kwargs: pytest.fail("channel replay")
+    )
+    calls: list[tuple[list[str], dict[str, Any]]] = []
+    monkeypatch.setattr(
+        native_run.subprocess, "run", lambda argv, **kwargs: calls.append((argv, kwargs))
+    )
+    output = tmp_path / "component"
+    native_run.execute(
+        subjects=subjects, output=output, scenario="fresh", account="fixture", shell="sh"
+    )
+    assert len(calls) == 1 and "guard_harness.native_testnet" in calls[0][0]
+    assert "--source-installer" in calls[0][0]
+    assert "UNRELATED_TOKEN" not in calls[0][1]["env"]
+    record = json.loads((output / "identities.json").read_bytes())
+    assert record["source_component"] is True and record["gate_eligible"] is False
 
 
 def setup(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path, dict[str, Any]]:
