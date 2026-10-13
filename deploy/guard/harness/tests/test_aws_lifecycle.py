@@ -1,6 +1,7 @@
 import hashlib
 import io
 import json
+import os
 import subprocess
 import zipfile
 from pathlib import Path
@@ -188,6 +189,7 @@ def test_payload_contains_only_public_code_and_authenticated_loaders(
                 "runner.py",
                 "cli.py",
                 "paper_bot.py",
+                "bounded_http_read.py",
                 "paper_roundtrip.py",
                 "aws_paper.py",
                 "mainnet_terminal.py",
@@ -553,3 +555,59 @@ def test_unknown_malformed_failed_output_stays_withheld_and_fails(output: Any) -
 @pytest.mark.parametrize("plugins", [None, [], [{}, {}], [None], [{"Output": []}]])
 def test_ambiguous_failed_plugins_cannot_export_coordinate(plugins: Any) -> None:
     assert harness.public_failure_frame({"CommandPlugins": plugins}) == "unknown"
+
+
+@pytest.mark.parametrize("omit_read_boundary", [False, True])
+def test_actual_remote_payload_import_closure_isolated_from_checkout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, omit_read_boundary: bool
+) -> None:
+    import sys
+
+    monkeypatch.setattr(Release, "asset", lambda self, name: b"authenticated release loader")
+    release = Release("v1.0.0", "b" * 40, tmp_path)
+    remote = tmp_path / "remote"
+    remote.mkdir()
+    with zipfile.ZipFile(io.BytesIO(harness.payload(release, release))) as package:
+        for name in package.namelist():
+            if name.startswith("guard_harness/"):
+                if omit_read_boundary and name == "guard_harness/bounded_http_read.py":
+                    continue
+                path = remote / name
+                path.parent.mkdir(exist_ok=True)
+                path.write_bytes(package.read(name))
+    # Import the actual entrypoint, retaining its locked third-party dependencies but
+    # removing editable harness fallbacks. No simulated AWS, socket or Guard is called.
+    probe = """
+import json, pathlib, sys
+root = pathlib.Path(sys.argv[1]).resolve()
+sys.path.insert(0, str(root))
+sys.meta_path = [finder for finder in sys.meta_path
+                 if not getattr(finder, '__module__', type(finder).__module__)
+                 .startswith('__editable__')]
+try:
+    import guard_harness.aws_paper
+    import guard_harness.bounded_http_read
+    for name, module in tuple(sys.modules.items()):
+        if name == 'guard_harness' or name.startswith('guard_harness.'):
+            assert pathlib.Path(module.__file__).resolve().is_relative_to(root)
+except ModuleNotFoundError as error:
+    print(json.dumps({'phase':'import', 'missing_module':error.name}))
+    raise SystemExit(2)
+print(json.dumps({'phase':'import', 'result':'closed'}))
+"""
+    result = subprocess.run(
+        [sys.executable, "-I", "-c", probe, str(remote)],
+        capture_output=True,
+        text=True,
+        timeout=15,
+        cwd=tmp_path,
+        env={"PATH": os.defpath},
+    )
+    expected = (
+        {"phase": "import", "missing_module": "guard_harness.bounded_http_read"}
+        if omit_read_boundary
+        else {"phase": "import", "result": "closed"}
+    )
+    assert result.returncode == (2 if omit_read_boundary else 0)
+    assert json.loads(result.stdout) == expected
+    assert result.stderr == ""

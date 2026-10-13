@@ -8,6 +8,7 @@ import errno
 import io
 import ipaddress
 import json
+import ntpath
 import os
 import re
 import subprocess
@@ -20,6 +21,15 @@ from urllib.parse import urlsplit
 
 LIMIT = 1_048_576
 INFO = "https://api.hyperliquid-testnet.xyz/info"
+
+
+def _unique_local(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    value: dict[str, Any] = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError("read refused")
+        value[key] = item
+    return value
 
 
 def _admit(url: str, data: bytes | None) -> float:
@@ -43,19 +53,56 @@ def _admit(url: str, data: bytes | None) -> float:
         or parsed.username is not None
         or parsed.password is not None
         or parsed.fragment
-        or data is not None
         or not ipaddress.ip_address(parsed.hostname or "").is_loopback
         or parsed.port is None
         or not 1024 <= parsed.port <= 65535
-        or not (
-            parsed.path in {"/guard/status", "/healthz"}
-            and not parsed.query
-            or parsed.path == "/guard/events"
-            and re.fullmatch(r"since=[0-9]{1,20}", parsed.query)
-        )
+    ):
+        raise ValueError("read refused")
+    if data is not None:
+        value = json.loads(data, object_pairs_hook=_unique_local)
+        if (
+            parsed.path != "/info"
+            or parsed.query
+            or not (
+                value == {"type": "meta"}
+                or type(value) is dict
+                and set(value) == {"type", "user"}
+                and value["type"] == "userRole"
+                and type(value["user"]) is str
+                and re.fullmatch(r"0x[0-9a-f]{40}", value["user"]) is not None
+            )
+        ):
+            raise ValueError("read refused")
+    elif not (
+        parsed.path in {"/guard/status", "/healthz"}
+        and not parsed.query
+        or parsed.path == "/guard/events"
+        and re.fullmatch(r"since=[0-9]{1,20}", parsed.query)
     ):
         raise ValueError("read refused")
     return 5
+
+
+def _child_environment() -> dict[str, str]:
+    env = {"PATH": os.defpath, "LANG": "C.UTF-8"}
+    if sys.platform == "win32":
+        # Python's subprocess Windows contract requires a valid SystemRoot for
+        # OS assemblies. Carry only this OS bootstrap path, never caller PATH,
+        # credentials, proxies, certificate overrides or Python import settings.
+        root = os.environ.get("SystemRoot", "")
+        drive, _ = ntpath.splitdrive(root)
+        if (
+            not 3 < len(root) <= 260
+            or re.fullmatch(r"[A-Za-z]:", drive) is None
+            or not ntpath.isabs(root)
+            or ":" in root[2:]
+            or ntpath.normpath(root) != root
+            or any(ord(char) < 32 or ord(char) == 127 or char in '%<>|"*?' for char in root)
+            or not os.path.isdir(root)
+        ):
+            raise ValueError("read refused")
+        env["SystemRoot"] = root
+    return env
 
 
 def bounded_read(url: str, data: bytes | None, *, timeout: float) -> bytes:
@@ -70,7 +117,8 @@ def bounded_read(url: str, data: bytes | None, *, timeout: float) -> bytes:
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
             timeout=timeout,
-            env={"PATH": os.defpath, "LANG": "C.UTF-8"},
+            env=_child_environment(),
+            close_fds=True,
             check=False,
         )
     except (subprocess.TimeoutExpired, OSError):

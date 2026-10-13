@@ -405,3 +405,53 @@ def test_verification_elapsed_budget_refuses_both_owners_before_key_read(
     assert command.execute_release(**values) == 1
     assert key.tell() == 0
     assert json.loads((tmp_path / "run/receipt.json").read_bytes())["stage"] == "authenticate"
+
+
+@pytest.mark.parametrize(
+    "phase",
+    ["staged-loader", "key-frame", "service-setup", "service-pid", "private-provider-body", None],
+)
+def test_service_constructor_exception_retains_only_finite_startup_phase(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, phase: Any
+) -> None:
+    from guard_harness import testnet_service_owner
+
+    key = io.BytesIO(b"FIXTURE-PRIVATE-INPUT")
+    writes: list[str] = []
+    real_receipt = command._receipt
+
+    def persist(work: Path, receipt: dict[str, object]) -> None:
+        real_receipt(work, receipt)
+        if "startup_phase" in receipt:
+            writes.append(str(receipt["startup_phase"]))
+
+    def verify(argv: list[str], **kwargs: Any) -> None:
+        assets(Path(argv[-1]))
+
+    class FailedService:
+        def __init__(self, *values: Any, **kwargs: Any) -> None:
+            kwargs["observe_phase"](phase)
+            assert writes
+            saved = json.loads((tmp_path / "run/receipt.json").read_bytes())
+            assert saved["startup_phase"] == writes[-1]
+            raise RuntimeError("FIXTURE-PRIVATE-INPUT " + ACCOUNT + " private-provider-body")
+
+    monkeypatch.setattr(command, "run", verify)
+    monkeypatch.setattr(command, "_receipt", persist)
+    monkeypatch.setattr(testnet_service_owner, "ServiceOwner", FailedService)
+    values = args(tmp_path, key)
+    values["service_marker"] = "c" * 32
+    assert command.execute_release(**values) == 1
+    text = (tmp_path / "run/receipt.json").read_text()
+    receipt = json.loads(text)
+    assert receipt["startup_phase"] == (
+        phase if phase in testnet_service_owner.STARTUP_PHASES else "unknown"
+    )
+    assert receipt["stage"] == "foreground" and receipt["journey"] == "T2"
+    assert receipt["failure"] == "journey_incomplete_keep_protection"
+    assert receipt["release_ready"] is False and receipt["result"] == "failed"
+    assert all(
+        name not in receipt for name in ["guard_stopped", "cleanup_complete", "protected_entry"]
+    )
+    assert all(value not in text for value in ["FIXTURE", ACCOUNT, WALLET, "private-provider-body"])
+    assert not (tmp_path / "run/T2.predicate.json").exists() and key.tell() == 0

@@ -1,19 +1,36 @@
 """T2 owns a protected systemd Guard; shares T1's exact bounded order/cleanup core."""
 
 import hashlib
-import os
 import pwd
 import subprocess
 import time
 import tomllib
+from collections.abc import Callable
 from pathlib import Path
 from typing import BinaryIO
 
 from guard_harness.cli import PAIR_SCHEMA, Pair, decode_json
+from guard_harness.linux_lifecycle import ROOT_PATH
 from guard_harness.linux_testnet_service import TestnetService
 from guard_harness.native_release import Release, staged_loader
 from guard_harness.runner import run
 from guard_harness.testnet_process import Foreground, _need
+
+STARTUP_PHASES = frozenset(
+    {
+        "runtime-create",
+        "staged-loader",
+        "key-frame",
+        "service-setup",
+        "installed-binary",
+        "service-stop",
+        "service-config",
+        "pair",
+        "mcp-home",
+        "service-start",
+        "service-pid",
+    }
+)
 
 
 class ServiceOwner(Foreground):
@@ -33,19 +50,29 @@ class ServiceOwner(Foreground):
         tag: str,
         commit: str,
         marker: str,
+        observe_phase: Callable[[str], None] = lambda phase: None,
     ) -> None:
+        observe_phase("runtime-create")
         _need(not work.exists() and work.is_absolute() and not work.is_symlink())
         _need(hashlib.sha256(binary.read_bytes()).hexdigest() == sha256)
         _need(not key_stdin.isatty())
         work.mkdir(mode=0o700)
         self.work, self.account, self.sha256 = work, account, sha256
+        observe_phase("staged-loader")
         installer = staged_loader(
             Release(tag, commit, assets), windows=False, output=work / "i-staging"
         )
-        key = key_stdin.read(68)
+        observe_phase("key-frame")
+        key = key_stdin.read(257)
+        _need(0 < len(key) <= 256)
+        # Match the bounded raw-key caller contract; the protected installer still
+        # receives exactly one canonical frame. Never normalize internal whitespace.
+        key = key.strip(b" \t\n\r\v\f")
         if key.startswith(b"0x"):
             key = key[2:]
-        _need(len(key) == 65 and key.endswith(b"\n"))
+        _need(len(key) == 64 and all(byte in b"0123456789abcdefABCDEF" for byte in key))
+        key += b"\n"
+        observe_phase("service-setup")
         installed = TestnetService(
             installer,
             hashlib.sha256(installer.read_bytes()).hexdigest(),
@@ -57,13 +84,16 @@ class ServiceOwner(Foreground):
             ip_share="0.4",
         ).setup(key)
         key = b""
+        observe_phase("installed-binary")
         self.binary, self.home = Path(installed["binary"]), Path(installed["home"])
         _need(hashlib.sha256(self.binary.read_bytes()).hexdigest() == sha256)
         self.url = installed["url"]
         self.unit = installed["unit"]
-        self.env = {"PATH": os.defpath, "HOME": str(work), "LANG": "C.UTF-8"}
+        self.env = {"PATH": ROOT_PATH, "HOME": str(work), "LANG": "C.UTF-8"}
         self.log, self.client_key = work / "process.log", work / "client-key"
+        observe_phase("service-stop")
         self._control("stop")
+        observe_phase("service-config")
         config = tomllib.loads((self.home / "guard.toml").read_text())
         _need(config.get("mode") == config.get("network") == "testnet")
         _need(config.get("account", "").lower() == account.lower())
@@ -73,6 +103,7 @@ class ServiceOwner(Foreground):
         # Pair as the installed service user so its atomic config update preserves
         # custody/ownership. MCP uses a separate root-private client home, never a
         # permission relaxation of the service's protected data directory.
+        observe_phase("pair")
         service_user = pwd.getpwuid(self.home.stat().st_uid).pw_name
         paired = run(
             [
@@ -93,6 +124,7 @@ class ServiceOwner(Foreground):
         )
         decoded = decode_json(paired.output, PAIR_SCHEMA)
         self.pair = Pair(decoded["client_address"], decoded["client_key"])
+        observe_phase("mcp-home")
         service_config = (self.home / "guard.toml").read_bytes()
         self.home = work / "mcp-home"
         self.home.mkdir(mode=0o700)
@@ -102,7 +134,9 @@ class ServiceOwner(Foreground):
             self.client_key.chmod(0o600)
             stream.write((self.pair.key + "\n").encode())
         self.started_ms = time.time_ns() // 1_000_000
+        observe_phase("service-start")
         self._control("start")
+        observe_phase("service-pid")
         self.pid = self._pid()
         self.log.write_text("owned protected testnet service started; logs withheld\n")
 

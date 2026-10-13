@@ -12,6 +12,7 @@ import sys
 from pathlib import Path
 
 from guard_harness.native_release import Release, diagnostic_mode
+from guard_harness.source_installer import prepare, verify_file
 from guard_harness.testnet_process import ProcessError
 from guard_harness.testnet_run import ROOT
 
@@ -210,6 +211,11 @@ def main() -> None:
     archive_digest = hashlib.sha256(current.asset(archive_name)).hexdigest()
     candidate_binary_digest = hashlib.sha256(current.binary(target)).hexdigest()
     previous_binary_digest = hashlib.sha256(previous.binary(target)).hexdigest()
+    source = prepare(current.tag, current.commit, scenario=args.scenario, row=args.row)
+    source_path = None
+    if source is not None:
+        args.output.mkdir(mode=0o700)
+        source_path = source.stage(args.output)
     paper_identity = [
         "--release-commit",
         current.commit,
@@ -222,11 +228,14 @@ def main() -> None:
         "--archive-sha256",
         archive_digest,
     ]
+    if source is not None and source_path is not None:
+        verify_file(source_path, source.digest)
     framed = os.environ.pop("WALLET_FRAME", "").strip()
     key = framed.removeprefix("0x").encode() + b"\n"
     if re.fullmatch(rb"[0-9a-fA-F]{64}\n", key) is None:
         raise ProcessError("private framed Testnet key required")
-    args.output.mkdir(mode=0o700)
+    if source is None:
+        args.output.mkdir(mode=0o700)
     if diagnostic:
         (args.output / "diagnostic-only.json").write_text(
             json.dumps(
@@ -238,6 +247,7 @@ def main() -> None:
                     "scenario": args.scenario,
                     "commit": current.commit,
                     "harness_commit": harness_commit,
+                    **(source.record() if source is not None else {}),
                 }
             )
             + "\n"
@@ -263,28 +273,29 @@ def main() -> None:
         if diagnostic:
             base.append("--diagnostic")
         mode = "container" if args.row == "I6" else "native"
-        child(
-            [
-                *base,
-                "--mode",
-                mode,
-                "--account",
-                args.paper_account,
-                "--account-network",
-                "testnet",
-                "--output",
-                str(
-                    args.output / "paper"
-                    if args.scenario == "both"
-                    else args.output / "paper" / args.scenario
-                ),
-                *paper_identity,
-                "--candidate-archive",
-                str(current.assets / archive_name),
-            ],
-            check=True,
-            env=env,
-        )
+        if source is None:
+            child(
+                [
+                    *base,
+                    "--mode",
+                    mode,
+                    "--account",
+                    args.paper_account,
+                    "--account-network",
+                    "testnet",
+                    "--output",
+                    str(
+                        args.output / "paper"
+                        if args.scenario == "both"
+                        else args.output / "paper" / args.scenario
+                    ),
+                    *paper_identity,
+                    "--candidate-archive",
+                    str(current.assets / archive_name),
+                ],
+                check=True,
+                env=env,
+            )
         target = "linux-amd64"
         testnet = [
             *base,
@@ -302,6 +313,17 @@ def main() -> None:
             ),
             "--testnet-lifecycle",
         ]
+        if source is not None and source_path is not None:
+            verify_file(source_path, source.digest)
+            testnet[testnet.index("--candidate") + 1] = str(source_path)
+            testnet.extend(
+                [
+                    "--source-installer-sha256",
+                    source.digest,
+                    "--installer-harness-commit",
+                    source.harness_commit,
+                ]
+            )
         if mode == "container":
             for release, flag in (
                 (current, "--release-image"),
@@ -365,7 +387,7 @@ def main() -> None:
             "--output",
             str(I2_PRIVATE / marker / "testnet" / args.scenario),
         ]
-    if args.row in {"I1", "I2"} and args.scenario in {"fresh", "both"}:
+    if source is None and args.row in {"I1", "I2"} and args.scenario in {"fresh", "both"}:
         (args.output / "channels").mkdir()
         for channel in ("D1", "D5"):
             source = args.output / "paper/fresh/channels" / (channel + ".json")
