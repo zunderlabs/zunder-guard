@@ -21,24 +21,102 @@ from guard_harness.paper_bot import LocalGuard
 from guard_harness.paper_roundtrip import round_trip
 from guard_harness.runner import run
 
+# Ordered from specific refusals to wrapper/cmdlet failures. Never return a
+# regex capture: paths, exception details and even successful setup output can
+# contain private material. The per-user install has no machine ACL admission;
+# ownership/inventory refusals below belong to its later -Uninstall path.
+PAPER_FAILURE_PATTERNS = (
+    (
+        "verifier-trust-root",
+        r"(?:getting trusted root|setting trusted material|tuf refresh failed)",
+    ),
+    ("signature-verification", r"signature\s+check\s+FAILED"),
+    ("checksum-missing", r"is not in the signed checksums; refusing"),
+    ("checksum", r"checksum mismatch|pinned SHA-256; refusing"),
+    ("archive-missing-binary", r"the archive holds no zunder-guard\.exe"),
+    ("install-copy", r"could not replace .+?\(is Guard running\?"),
+    ("installed-version", r"installed binary reports"),
+    ("download", r"download failed"),
+    ("rules-refused", r"the rules code is refused|a rules string is zr1_"),
+    ("console-required", r"init is interactive: run it on a terminal"),
+    (
+        "init-config-exists",
+        r"exists; pass --force to replace it \(the old client keys stop working; "
+        r"the journal is kept\)",
+    ),
+    ("init-runtime", r"zunder-guard: starting the async runtime:"),
+    ("init-input-ended", r"zunder-guard: input ended"),
+    ("uninstall-options", r"Per-user uninstall accepts only InstallDir and NonInteractive"),
+    ("uninstall-directory", r"Noncanonical per-user uninstall directory"),
+    ("uninstall-ancestor", r"Per-user uninstall ancestor is not a plain directory"),
+    ("uninstall-executable", r"Owned per-user executable missing; removal refused"),
+    ("uninstall-entry", r"Unknown or aliased per-user install entry; removal refused"),
+    ("uninstall-ownership", r"Per-user installation ownership record refused"),
+    ("uninstall-inventory", r"Per-user release inventory differs"),
+    ("uninstall-changed-files", r"Installed release files changed; uninstall refused"),
+    ("init-refused", r"zunder-guard init stopped"),
+    # PowerShell's fixed command/error identifiers cover exceptions from
+    # cmdlets and .NET, which the loader does not wrap in a fixed throw.
+    (
+        "archive-extraction",
+        r"\bExpand-Archive\b|\b(?:ExpandArchiveHelper|ZipArchiveHelper)\b|"
+        r"Microsoft\.PowerShell\.Archive\.psm1",
+    ),
+    (
+        "install-directory",
+        r"New-Item -ItemType Directory -Force -Path \$InstallDir|"
+        r"Microsoft\.PowerShell\.Commands\.NewItemCommand",
+    ),
+    (
+        "install-notices",
+        r"Copy-Item -LiteralPath \$From -Destination|"
+        r"Microsoft\.PowerShell\.Commands\.CopyItemCommand",
+    ),
+    ("install-inventory-write", r"\bSet-Content\b|\bConvertTo-Json\b"),
+    ("file-hash", r"\bGet-FileHash\b"),
+    ("signed-checksums-read", r"Get-Content -LiteralPath \$Sums"),
+    ("user-path", r"\bSetEnvironmentVariable\b"),
+    ("binary-version-call", r"\$Version = \(& \$Exe --version\)"),
+)
+
 
 def paper_failure_category(text: str) -> str:
     """Fixed categories only: terminal text can contain private material."""
-    for category, pattern in (
-        (
-            "verifier-trust-root",
-            r"(?:getting trusted root|setting trusted material|tuf refresh failed)",
-        ),
-        ("signature-verification", r"signature\s+check\s+FAILED"),
-        ("checksum", r"checksum mismatch|pinned SHA-256; refusing"),
-        ("download", r"download failed"),
-        ("rules-refused", r"the rules code is refused|a rules string is zr1_"),
-        ("console-required", r"init is interactive: run it on a terminal"),
-        ("init-refused", r"zunder-guard init stopped"),
-    ):
+    text = re.sub(r"\s+", " ", text)  # ConPTY wraps long refusals across terminal rows.
+    for category, pattern in PAPER_FAILURE_PATTERNS:
         if re.search(pattern, text, flags=re.IGNORECASE):
             return category
     return "unknown"
+
+
+def channel_environment() -> dict[str, str]:
+    """Keep OS/profile/module locations, never arbitrary runner credentials."""
+    allowed = {
+        "PATH",
+        "HOME",
+        "LOCALAPPDATA",
+        "USERPROFILE",
+        "SYSTEMROOT",
+        "TEMP",
+        "TMP",
+    }
+    if platform.system() == "Windows":
+        # PowerShell and module discovery need the normal Windows profile and
+        # program roots. Python normalizes Windows environment names to upper
+        # case; use a case-insensitive allow-list for the two PowerShell editions.
+        allowed |= {
+            "APPDATA",
+            "PROGRAMFILES",
+            "PROGRAMFILES(X86)",
+            "PROGRAMW6432",
+            "WINDIR",
+            "COMSPEC",
+            "PATHEXT",
+            "PSMODULEPATH",
+        }
+    clean = {name: value for name, value in os.environ.items() if name.upper() in allowed}
+    clean["TERM"] = "dumb"
+    return clean
 
 
 def dialogue(
@@ -82,8 +160,10 @@ def dialogue(
         "Paper mode reads which network's account": "read-network",
     }
     deadline = time.monotonic() + timeout
+    drain_deadline = None
     try:
         while time.monotonic() < deadline:
+            chunk = ""
             readable, _, _ = select.select(
                 [child.fileobj if child is not None else descriptor], [], [], 0.2
             )
@@ -108,7 +188,7 @@ def dialogue(
                 observed = paper_failure_category(pending)
                 if observed != "unknown":
                     category = observed
-                while index < len(replies) and replies[index][0] in pending:
+                while status is None and index < len(replies) and replies[index][0] in pending:
                     prompt, reply = replies[index]
                     pending = pending.split(prompt, 1)[1]
                     if child is None:
@@ -124,6 +204,15 @@ def dialogue(
             elif not child.isalive():
                 status = child.exitstatus
             if status is not None:
+                # ConPTY can report process exit while its socket still holds
+                # the final error. Drain readable output (bounded) before
+                # recording the category; never send replies after known exit.
+                if child is not None and chunk:
+                    now = time.monotonic()
+                    if drain_deadline is None:
+                        drain_deadline = now + 2
+                    if now < drain_deadline:
+                        continue
                 break
         if status != 0 or index != len(replies):
             outcome = (
@@ -259,22 +348,7 @@ def execute(release: Release, work: Path, *, account: str, shell: str) -> dict[s
     if not windows and (platform.system() != "Darwin" or os.geteuid() == 0):
         raise LifecycleError("macOS documented channel must run as the hosted runner user")
     work.mkdir(mode=0o700)
-    clean = {
-        name: value
-        for name, value in os.environ.items()
-        if name
-        in {
-            "PATH",
-            "HOME",
-            "LOCALAPPDATA",
-            "USERPROFILE",
-            "SystemRoot",
-            "SYSTEMROOT",
-            "TEMP",
-            "TMP",
-        }
-    }
-    clean["TERM"] = "dumb"
+    clean = channel_environment()
     home = (
         Path(clean["LOCALAPPDATA"]) / "zunder-guard"
         if windows
@@ -312,7 +386,17 @@ def execute(release: Release, work: Path, *, account: str, shell: str) -> dict[s
             )
             if step == "before":
                 argv = (
-                    [shell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", literal]
+                    [
+                        shell,
+                        "-NoProfile",
+                        "-ExecutionPolicy",
+                        "Bypass",
+                        "-Command",
+                        # PS7's ConciseView can omit the command/error identifier
+                        # on a module exception. NormalView matches PS5.1 and
+                        # lets the allow-list classify it; text stays withheld.
+                        "$ErrorView = 'NormalView'; " + literal,
+                    ]
                     if windows
                     else ["/bin/sh", "-c", literal]
                 )

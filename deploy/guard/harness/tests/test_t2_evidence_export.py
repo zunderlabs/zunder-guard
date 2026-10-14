@@ -108,15 +108,34 @@ def test_finite_failure_upload_precedes_slow_scan_without_custody(row: str) -> N
         # collection and refused cleanup exits from the artifact alone.
         "runtime/collection-failure.json",
         "runtime/cleanup-responses.json",
+        # rc.16 T2 (verify 38569322248) attempt 1's GitHub 500 was only in the final
+        # artifact; authentication failures now explain themselves from the early one.
+        "assets.log",
     }
     if row == "T2":
         expected |= {
             "runtime/testnet-service-install.log",
             "runtime/service-stop.log",
             "runtime/service-start.log",
+            "runtime/linux-opt-refusal.receipt.json",
+            "runtime/linux-opt-normalized.receipt.json",
         }
     assert files == expected
     assert text.index(label) < text.index(
         f'guard_harness.failure_scan --work "$RUNNER_TEMP/guard-release/{row}-failure/'
     )
     assert "include-hidden-files" not in step and "attest" not in step
+
+
+@pytest.mark.parametrize("name", ["journey.yml", "install-matrix.yml"])
+def test_root_t2_sees_the_hosted_markers_the_opt_step_requires(name: str) -> None:
+    # sudo resets the environment: without these two names linux_policy.hosted() is
+    # False as root and the /opt step never runs (rc.16 verify 38569322248, T2).
+    path = workflow(ROOT).with_name(name)
+    lines = path.read_text().splitlines()
+    starts = [n for n, line in enumerate(lines) if "testnet_run --service-marker" in line]
+    assert len(starts) == 1
+    command = lines[starts[0] - 1]
+    assert command.endswith(
+        "env -u WALLET_INPUT sudo --preserve-env=GH_TOKEN,PATH,GITHUB_ACTIONS,RUNNER_ENVIRONMENT \\"
+    )

@@ -84,11 +84,102 @@ def test_open_or_unreadable_orders_refuse_cleanup(value: object) -> None:
         flat_scan(fixture, ACCOUNT)
 
 
-def test_inventory_race_refuses_flat_credit() -> None:
+def test_inventory_change_restarts_the_whole_scan_once_over_the_new_inventory() -> None:
+    # A DEX appeared mid-scan (rc.16, 14 Oct): the first pass is discarded, the second pass
+    # checks every DEX of the unchanged new inventory, and only that pass is reported.
     fixture = Fixture()
-    fixture.after = [None, {"name": "new-dex"}]
+    fixture.after = [None, {"name": "fixture"}, {"name": "new-dex"}]
+    report = flat_scan(fixture, ACCOUNT)
+    assert report["dexes"] == ["", "fixture", "new-dex"]
+    assert fixture.inventory_reads == 4
+    second = fixture.calls[[c["type"] for c in fixture.calls].index("perpDexs", 2) :]
+    assert [c.get("dex", "") for c in second if c["type"] == "clearinghouseState"] == [
+        "",
+        "fixture",
+        "new-dex",
+    ]
+    observations = report["observations"]
+    assert isinstance(observations, list)
+    assert [o["dex"] for o in observations] == ["", "fixture", "new-dex"]
+
+
+def test_inventory_that_keeps_changing_refuses_flat_credit() -> None:
+    fixture = Fixture()
+    original = fixture.__call__
+
+    def churning(payload: dict[str, str]) -> object:
+        # Every read adds one more DEX: additions only, but never one unchanged inventory.
+        if payload["type"] == "perpDexs":
+            fixture.inventory_reads += 1
+            return [None, *({"name": f"dex-{n}"} for n in range(fixture.inventory_reads))]
+        return original(payload)
+
+    with pytest.raises(ScanError, match="inventory changed"):
+        flat_scan(churning, ACCOUNT)
+    assert fixture.inventory_reads == 4
+
+
+def test_a_dex_added_then_removed_before_the_restart_refuses() -> None:
+    # Independent review, 14 Oct: x appears at the end of the first pass and is gone before the
+    # second; the second pass never reads x, so flat must not be reported.
+    fixture = Fixture()
+    inventories = iter(
+        [
+            [None, {"name": "a"}],
+            [None, {"name": "a"}, {"name": "x"}],
+            [None, {"name": "a"}],
+            [None, {"name": "a"}],
+        ]
+    )
+    original = fixture.__call__
+
+    def read(payload: dict[str, str]) -> object:
+        if payload["type"] == "perpDexs":
+            fixture.inventory_reads += 1
+            return next(inventories)
+        return original(payload)
+
+    with pytest.raises(ScanError, match="inventory changed"):
+        flat_scan(read, ACCOUNT)
+    assert fixture.inventory_reads == 4
+
+
+def test_a_position_on_the_new_dex_in_the_second_pass_refuses() -> None:
+    fixture = Fixture()
+    fixture.after = [None, {"name": "fixture"}, {"name": "new-dex"}]
+    original = fixture.__call__
+
+    def read(payload: dict[str, str]) -> object:
+        if payload["type"] == "clearinghouseState" and payload.get("dex") == "new-dex":
+            return {
+                "assetPositions": [{"position": {"coin": "new-dex:BTC", "szi": "0.001"}}],
+                "marginSummary": {"accountValue": "200"},
+            }
+        return original(payload)
+
+    with pytest.raises(ScanError, match="not flat"):
+        flat_scan(read, ACCOUNT)
+
+
+def test_a_removed_dex_refuses_without_a_restart() -> None:
+    # A DEX that drops out of the list mid-scan could still hold state; never rescan without it.
+    fixture = Fixture()
+    fixture.after = [None]
     with pytest.raises(ScanError, match="inventory changed"):
         flat_scan(fixture, ACCOUNT)
+    assert fixture.inventory_reads == 2
+
+
+def test_restart_never_hides_a_position_found_in_the_first_pass() -> None:
+    fixture = Fixture()
+    fixture.after = [None, {"name": "new-dex"}]
+    fixture.state = {
+        "assetPositions": [{"position": {"coin": "BTC", "szi": "0.001"}}],
+        "marginSummary": {"accountValue": "200"},
+    }
+    with pytest.raises(ScanError, match="not flat"):
+        flat_scan(fixture, ACCOUNT)
+    assert fixture.inventory_reads == 1
 
 
 @pytest.mark.parametrize("value", ["199.999999", "NaN", 200, None])

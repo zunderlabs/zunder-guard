@@ -2,6 +2,7 @@ import hashlib
 import io
 import json
 import os
+import re
 import subprocess
 import sys
 import tarfile
@@ -15,6 +16,7 @@ from test_install_evidence import release
 from guard_harness import native_channels
 from guard_harness.cli import GuardCLI, Pair
 from guard_harness.native_paper import LifecycleError
+from guard_harness.testnet_run import ROOT
 
 
 @pytest.mark.parametrize(
@@ -217,6 +219,9 @@ def test_native_executes_both_literal_user_forms_and_measured_cleanup(
     monkeypatch.setenv("USERPROFILE", str(tmp_path / "user"))
     monkeypatch.setenv("HOME", str(tmp_path / "user"))
     monkeypatch.setenv("WALLET_FRAME", "inert-must-not-pass")
+    monkeypatch.setenv("PSModulePath", "inert-module-location")
+    monkeypatch.setenv("ProgramFiles", "inert-program-location")
+    monkeypatch.setenv("APPDATA", "inert-profile-location")
     monkeypatch.setattr(
         "guard_harness.native_channels.platform.system", lambda: "Windows" if windows else "Darwin"
     )
@@ -238,6 +243,8 @@ def test_native_executes_both_literal_user_forms_and_measured_cleanup(
     def dialogue(argv: list[str], account: str, **kwargs: Any) -> None:
         dialogues.append(argv)
         assert "WALLET_FRAME" not in kwargs["env"]
+        for name in ("PSModulePath", "ProgramFiles", "APPDATA"):
+            assert (name in kwargs["env"]) is windows
         binary.parent.mkdir(parents=True, exist_ok=True)
         binary.write_bytes(current.binary(target))
         home = tmp_path / ("local/zunder-guard" if windows else "user/.zunder-guard")
@@ -295,7 +302,7 @@ def test_native_executes_both_literal_user_forms_and_measured_cleanup(
             "-ExecutionPolicy",
             "Bypass",
             "-Command",
-            "irm https://zunderlabs.com/i-staging.ps1 | iex",
+            "$ErrorView = 'NormalView'; irm https://zunderlabs.com/i-staging.ps1 | iex",
         ],
         [
             "pwsh.exe",
@@ -303,6 +310,7 @@ def test_native_executes_both_literal_user_forms_and_measured_cleanup(
             "-ExecutionPolicy",
             "Bypass",
             "-Command",
+            "$ErrorView = 'NormalView'; "
             "& ([scriptblock]::Create((irm https://zunderlabs.com/i-staging.ps1))) -Network paper",
         ],
     ]
@@ -419,6 +427,61 @@ def test_only_windows_signature_failure_probes_and_preserves_original_refusal(
         ("download failed: private-url-sentinel", "download"),
         ("the rules code is refused: private-rules-sentinel", "rules-refused"),
         ("init is interactive: run it on a terminal", "console-required"),
+        (
+            "zunder-guard-v1.0.0-rc.16-windows-amd64.zip is not in the signed checksums; refusing",
+            "checksum-missing",
+        ),
+        ("checksum mismatch for private-archive-sentinel; refusing", "checksum"),
+        ("the archive holds no zunder-guard.exe", "archive-missing-binary"),
+        (
+            "could not replace private-path-sentinel (is Guard running? stop it first): "
+            "private-detail-sentinel",
+            "install-copy",
+        ),
+        (
+            "installed binary reports 'private-version-sentinel', expected v1.0.0-rc.16",
+            "installed-version",
+        ),
+        (
+            "private-path-sentinel exists; pass --force to replace it (the old client keys "
+            "stop working; the journal is kept)",
+            "init-config-exists",
+        ),
+        ("zunder-guard: starting the async runtime: private-detail-sentinel", "init-runtime"),
+        ("zunder-guard: input ended", "init-input-ended"),
+        ("zunder-guard init stopped (exit 2); nothing was started", "init-refused"),
+        ("Per-user uninstall accepts only InstallDir and NonInteractive.", "uninstall-options"),
+        ("Noncanonical per-user uninstall directory.", "uninstall-directory"),
+        ("Per-user uninstall ancestor is not a plain directory.", "uninstall-ancestor"),
+        ("Owned per-user executable missing; removal refused.", "uninstall-executable"),
+        ("Unknown or aliased per-user install entry; removal refused.", "uninstall-entry"),
+        ("Per-user installation ownership record refused.", "uninstall-ownership"),
+        ("Per-user release inventory differs.", "uninstall-inventory"),
+        ("Installed release files changed; uninstall refused.", "uninstall-changed-files"),
+        (
+            "The term 'Expand-Archive' is not recognized: private-detail-sentinel",
+            "archive-extraction",
+        ),
+        ("FullyQualifiedErrorId : ZipArchiveHelper private-detail-sentinel", "archive-extraction"),
+        (
+            "At private-path-sentinel/Microsoft.PowerShell.Archive.psm1:969 char:13",
+            "archive-extraction",
+        ),
+        (
+            "New-Item -ItemType Directory -Force -Path $InstallDir private-path-sentinel",
+            "install-directory",
+        ),
+        (
+            "FullyQualifiedErrorId : Microsoft.PowerShell.Commands.NewItemCommand",
+            "install-directory",
+        ),
+        ("Copy-Item -LiteralPath $From -Destination private-path-sentinel", "install-notices"),
+        ("Set-Content : private-detail-sentinel", "install-inventory-write"),
+        ("ConvertTo-Json : private-detail-sentinel", "install-inventory-write"),
+        ("Get-FileHash : private-detail-sentinel", "file-hash"),
+        ("Get-Content -LiteralPath $Sums private-detail-sentinel", "signed-checksums-read"),
+        ("Exception calling SetEnvironmentVariable: private-detail-sentinel", "user-path"),
+        ("$Version = (& $Exe --version) -join '' private-detail-sentinel", "binary-version-call"),
         ("private-unrecognized-sentinel", "unknown"),
     ],
 )
@@ -428,8 +491,12 @@ def test_pre_rules_failure_keeps_fixed_artifact_category(
     class Child:
         fileobj = object()
         exitstatus = 1
+        read_once = False
 
         def read(self, size: int) -> str:
+            if self.read_once:
+                raise EOFError
+            self.read_once = True
             return "\x1b[31;1m" + text + "\x1b[0m"
 
         def write(self, value: str) -> None:
@@ -482,6 +549,8 @@ def test_conpty_drives_bare_and_website_paper_prompts(
         replies: list[str] = []
 
         def read(self, size: int) -> str:
+            if len(self.replies) == len(prompts):
+                raise EOFError
             return prompts[len(self.replies)] + " private-output-sentinel"
 
         def write(self, value: str) -> None:
@@ -519,3 +588,183 @@ def test_conpty_drives_bare_and_website_paper_prompts(
     ) + ["testnet\r\n"]
     assert "outcome: passed" in log.read_text()
     assert "sentinel" not in log.read_text()
+
+
+@pytest.mark.parametrize("windows", [False, True])
+def test_channel_environment_keeps_windows_locations_only_on_windows(
+    monkeypatch: pytest.MonkeyPatch, windows: bool
+) -> None:
+    ordinary = {"PATH", "HOME", "LOCALAPPDATA", "USERPROFILE", "SystemRoot", "TEMP", "TMP"}
+    windows_locations = {
+        "APPDATA",
+        "ProgramFiles",
+        "ProgramFiles(x86)",
+        "ProgramW6432",
+        "WINDIR",
+        "ComSpec",
+        "PATHEXT",
+        "PSModulePath",
+    }
+    # Lower and mixed case occur in offline modeling; Windows os.environ uses
+    # upper case. Neither spelling may silently strip the OS/module locations.
+    for spelling in (lambda name: name, str.upper, str.lower):
+        environment = {spelling(name): "inert-location" for name in ordinary | windows_locations}
+        environment |= {
+            "WALLET_FRAME": "private-frame-sentinel",
+            "GITHUB_TOKEN": "private-token-sentinel",
+            "CLOUD_CREDENTIAL_SENTINEL": "private-cloud-sentinel",
+            "ZUNDER_GUARD_HOME": "private-home-sentinel",
+            "ZUNDER_GUARD_RULES": "private-rules-sentinel",
+            "ZUNDER_GUARD_COSIGN": "private-verifier-sentinel",
+            "UNRELATED": "private-unrelated-sentinel",
+        }
+        monkeypatch.setattr("guard_harness.native_channels.os.environ", environment)
+        monkeypatch.setattr(
+            "guard_harness.native_channels.platform.system",
+            lambda: "Windows" if windows else "Darwin",
+        )
+        expected = {spelling(name): "inert-location" for name in ordinary}
+        if windows:
+            expected |= {spelling(name): "inert-location" for name in windows_locations}
+        assert native_channels.channel_environment() == {**expected, "TERM": "dumb"}
+
+
+@pytest.mark.parametrize("failure", ["archive", "config"])
+def test_conpty_drains_final_refusal_after_process_exit_without_sending_replies(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    category = "archive-extraction" if failure == "archive" else "init-config-exists"
+    message = (
+        "Expand-Archive : private-error-sentinel"
+        if failure == "archive"
+        else "private-home-sentinel exists; pass --force to replace it (the old client keys "
+        "stop working; the journal is kept)\nzunder-guard init stopped (exit 2); "
+        "nothing was started"
+    )
+
+    class Child:
+        fileobj = object()
+        exitstatus = 1
+        chunks = iter(
+            [
+                "signature: SHA256SUMS signed by zunderlabs/zunder-guard\n",
+                message + "\nKeep these? [Y/edit] private-client-key-sentinel",
+            ]
+        )
+
+        def read(self, size: int) -> str:
+            try:
+                return next(self.chunks)
+            except StopIteration:
+                raise EOFError from None
+
+        def write(self, value: str) -> None:
+            pytest.fail("no replies to an exited child")
+
+        def isalive(self) -> bool:
+            return False
+
+        def close(self, force: bool) -> None:
+            assert force
+
+    child = Child()
+    monkeypatch.setitem(
+        sys.modules,
+        "winpty",
+        SimpleNamespace(
+            Backend=SimpleNamespace(ConPTY=1),
+            PtyProcess=SimpleNamespace(spawn=lambda *args, **kwargs: child),
+        ),
+    )
+    monkeypatch.setattr(
+        "guard_harness.native_channels.select.select", lambda *args: ([child.fileobj], [], [])
+    )
+    log = tmp_path / "dialogue.log"
+    with pytest.raises(LifecycleError, match="phase=rules, exit=1") as error:
+        native_channels.dialogue(
+            ["private-argv-sentinel"],
+            "private-account-sentinel",
+            env={},
+            windows=True,
+            log=log,
+        )
+    assert log.read_text().endswith("failure category: " + category + "\n")
+    assert "sentinel" not in log.read_text() + str(error.value)
+
+
+def test_conpty_exit_drain_has_a_bound_even_if_output_never_ends(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class Child:
+        fileobj = object()
+        exitstatus = 1
+        reads = 0
+
+        def read(self, size: int) -> str:
+            self.reads += 1
+            return "private-tail-sentinel"
+
+        def write(self, value: str) -> None:
+            pytest.fail("no replies")
+
+        def isalive(self) -> bool:
+            return False
+
+        def close(self, force: bool) -> None:
+            assert force
+
+    child = Child()
+    monkeypatch.setitem(
+        sys.modules,
+        "winpty",
+        SimpleNamespace(
+            Backend=SimpleNamespace(ConPTY=1),
+            PtyProcess=SimpleNamespace(spawn=lambda *args, **kwargs: child),
+        ),
+    )
+    monkeypatch.setattr(
+        "guard_harness.native_channels.select.select", lambda *args: ([child.fileobj], [], [])
+    )
+    ticks = iter(range(100))
+    monkeypatch.setattr("guard_harness.native_channels.time.monotonic", lambda: float(next(ticks)))
+    log = tmp_path / "dialogue.log"
+    with pytest.raises(LifecycleError, match="outcome=child-nonzero"):
+        native_channels.dialogue(["inert"], "inert", env={}, windows=True, timeout=60, log=log)
+    assert child.reads == 2
+    assert "sentinel" not in log.read_text()
+
+
+def test_specific_refusal_wins_over_init_wrapper_and_wrapped_source_context() -> None:
+    assert (
+        native_channels.paper_failure_category(
+            "private-sentinel exists; pass --force to replace it (the old client keys\r\n"
+            "stop working; the journal is kept)\r\nzunder-guard init stopped (exit 2); "
+            "nothing was started"
+        )
+        == "init-config-exists"
+    )
+    assert (
+        native_channels.paper_failure_category(
+            "could not replace private-path-sentinel (is Guard running?\r\n"
+            "stop it first): private-detail"
+        )
+        == "install-copy"
+    )
+
+
+def test_every_explicit_post_signature_and_peruser_inventory_throw_is_classified() -> None:
+    source = (ROOT / "loader/i.ps1").read_text()
+    start = source.index('    Write-Host "  signature:')
+    install = source[start : source.index("  } finally {", start)]
+    start = source.index("  if ($Uninstall) {")
+    uninstall = source[start : source.index("  # x64 build", start)]
+    messages = [
+        one or two
+        for one, two in re.findall(r"throw (?:'([^']*)'|\"([^\"]*)\")", install + uninstall)
+    ]
+    assert len(messages) == 14
+    for message in messages:
+        assert native_channels.paper_failure_category(message) != "unknown", message
+    # None of the loader's successful progress/next-step messages is a refusal.
+    for one, two in re.findall(r"Write-Host (?:'([^']*)'|\"([^\"]*)\")", install):
+        assert native_channels.paper_failure_category(one or two) == "unknown"

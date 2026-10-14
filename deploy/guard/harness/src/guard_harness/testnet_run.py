@@ -46,6 +46,54 @@ def _receipt(work: Path, receipt: dict[str, object]) -> None:
     pending.replace(work / "receipt.json")
 
 
+# verify-release-assets.sh's own fixed messages and its tools' fixed failure markers, in
+# the order checked; only the label is kept (rc.16 verify 38569322248, T2 attempt 1).
+AUTHENTICATE_FAILURES: tuple[tuple[str, str], ...] = (
+    (r"command timed out", "timeout"),
+    (r"usage: verify-release-assets\.sh", "usage"),
+    (r"unexpected release tag", "tag"),
+    (r"GITHUB_REPOSITORY is required", "repository"),
+    (r"release output must not exist", "output-exists"),
+    (r"cannot resolve release commit", "commit-unresolved"),
+    (r"ci has no successful completed push run for", "ci-run-missing"),
+    (r"release has no successful completed push run for", "release-run-missing"),
+    (r"invalid signed asset name", "asset-name"),
+    (r"signed subject count outside limit", "subject-count"),
+    (r"is missing or repeated in the signed checksums", "checksum-inventory"),
+    (r"SLSA verification failed", "slsa"),
+    (r": FAILED$|did NOT match", "checksum-mismatch"),
+    (r"SLSA provenance is missing", "provenance-missing"),
+    (r"invalid provenance subject|no provenance subjects", "provenance-subjects"),
+    (r"invalid signed image reference", "image-reference"),
+    (r"(?:^|[^0-9])HTTP (5[0-9]{2})(?:[^0-9]|$)", "github-http-5xx"),
+    (r"(?:^|[^0-9])HTTP 429(?:[^0-9]|$)", "github-http-429"),
+    (r"(?:^|[^0-9])HTTP (4[0-9]{2})(?:[^0-9]|$)", "github-http-4xx"),
+    (r"^Error: ", "sigstore-or-tool-error"),
+)
+AUTHENTICATE_LABELS = frozenset(
+    {label for _, label in AUTHENTICATE_FAILURES}
+    | {"release-archive", "budget", "unreadable-log", "unknown"}
+)
+
+
+def authenticate_failure(log: Path) -> str:
+    """A fixed label for why release authentication stopped; never the log's text."""
+    try:
+        if log.is_symlink() or not log.is_file() or log.stat().st_size > 4 * 1024 * 1024:
+            return "unreadable-log"
+        text = log.read_text(errors="replace")
+    except OSError:
+        return "unreadable-log"
+    if "Verified draft assets " in text:
+        return "release-archive"  # The script passed; the archive/manifest binding refused.
+    # The last failure marker decides: a 5xx that a later retry overcame stays above it.
+    for line in reversed(text.splitlines()[-200:]):
+        for pattern, label in AUTHENTICATE_FAILURES:
+            if re.search(pattern, line):
+                return label
+    return "unknown"
+
+
 def verified_asset(assets: Path, name: str, *, tag: str, commit: str) -> tuple[bytes, str]:
     """Called only after the real asset verifier succeeds in this invocation's fresh directory."""
     marker = json.loads(_read(assets / ".verified-release-source.json", 256))
@@ -167,19 +215,24 @@ def execute_release(
             if name in os.environ
         }
         env["GITHUB_REPOSITORY"] = REPOSITORY
-        # A saved marker or caller assertion never bypasses signature/provenance/source CI.
-        run(
-            ["bash", str(ROOT / "github/verify-release-assets.sh"), tag, str(work / "assets")],
-            env=env,
-            log=work / "assets.log",
-            timeout=600,
-            secrets=[env.get("GH_TOKEN", ""), env.get("GITHUB_TOKEN", "")],
-            stdin=b"",
-        )
-        digest, manifest_digest = signed_binary(
-            work / "assets", work / "subject", tag=tag, commit=commit
-        )
+        try:
+            # A saved marker or caller assertion never bypasses signature/provenance/source CI.
+            run(
+                ["bash", str(ROOT / "github/verify-release-assets.sh"), tag, str(work / "assets")],
+                env=env,
+                log=work / "assets.log",
+                timeout=600,
+                secrets=[env.get("GH_TOKEN", ""), env.get("GITHUB_TOKEN", "")],
+                stdin=b"",
+            )
+            digest, manifest_digest = signed_binary(
+                work / "assets", work / "subject", tag=tag, commit=commit
+            )
+        except (Exception, KeyboardInterrupt):
+            receipt["authenticate_failure"] = authenticate_failure(work / "assets.log")
+            raise
         if deadline - time.monotonic() < SCAN_TIMEOUT + ENTRY_REMAINING:
+            receipt["authenticate_failure"] = "budget"
             raise ProcessError("complete scan and cleanup budget expired before custody")
         receipt.update(binary_sha256=digest, manifest_sha256=manifest_digest, stage="foreground")
         _receipt(work, receipt)
@@ -217,6 +270,13 @@ def execute_release(
                 marker=service_marker,
                 observe_phase=observe_startup,
             )
+            if owner.opt_policy:
+                # Only the fixed decision note and the receipt digest, never metadata or output.
+                receipt.update(
+                    opt_policy=owner.opt_policy.get("opt_policy"),
+                    linux_opt_receipt_sha256=owner.opt_policy.get("linux_opt_receipt_sha256"),
+                )
+                _receipt(work, receipt)
         receipt["stage"] = "journey"
         _receipt(work, receipt)
         reads = TestnetReads()
