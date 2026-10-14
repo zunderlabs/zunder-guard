@@ -10,7 +10,7 @@ from typing import Any
 from guard_harness.channel_evidence import admit
 from guard_harness.docker_run import _version
 from guard_harness.install_evidence import read
-from guard_harness.lifecycle_coverage import LIFECYCLE_COVERAGE
+from guard_harness.lifecycle_coverage import LIFECYCLE_COVERAGE, WINDOWS_TESTNET_SCOPE
 from guard_harness.native_paper import LifecycleError
 from guard_harness.native_release import Release
 from guard_harness.release_state import validate_build
@@ -176,15 +176,9 @@ def predicate(
             )
             if row == "I4":
                 paper = paper - {"crash-recovery"} | {"manual-crash-restart"}
-                from guard_harness.windows_policy import REFUSAL_TOKEN, REMOVAL_TOKEN
-                from guard_harness.windows_policy import admit as admit_policy
-
-                testnet.update({REFUSAL_TOKEN, REMOVAL_TOKEN})
-                admit_policy(
-                    current,
-                    directory / "testnet/windows-policy",
-                    read(directory / "testnet/testnet.receipt.json"),
-                )
+                # Guard 1.0 Windows testnet is exactly the per-user scope; the SCM
+                # service and its crash-policy step are 1.0.1 (decision of 15 Oct 2026).
+                testnet = set(peruser)
             for mode, name, required in (
                 ("paper", "paper/paper.receipt.json", paper),
                 ("testnet", "testnet/testnet.receipt.json", testnet),
@@ -214,6 +208,12 @@ def predicate(
                     previous=previous,
                     target=target,
                 )
+                # The lifecycle receipt is the per-user measurement itself, never a relabel.
+                lifecycle = read(directory / "testnet/testnet.receipt.json")
+                if lifecycle.pop("scope", None) != WINDOWS_TESTNET_SCOPE or lifecycle != read(
+                    directory / "testnet/per-user/receipt.json"
+                ):
+                    raise LifecycleError("Windows testnet receipt must be the per-user scope")
                 observed.add("per-user:credential-manager")
             if scenario == "fresh":
                 observed.add(

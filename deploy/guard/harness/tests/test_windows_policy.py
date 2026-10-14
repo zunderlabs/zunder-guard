@@ -281,7 +281,9 @@ def test_scm_install_waits_for_policy_step(
     monkeypatch.setattr("guard_harness.native_testnet.platform.system", lambda: "Windows")
     monkeypatch.setenv("ProgramData", str(tmp_path / "data"))
     current = release(tmp_path / "assets")
-    controller = NativeTestnet(current, current, tmp_path / "work", "inert-account", "pwsh.exe")
+    controller = NativeTestnet(
+        current, current, tmp_path / "work", "inert-account", "pwsh.exe", windows_service=True
+    )
     calls: list[str] = []
 
     def prepare(subject: Release, work: Path, env: Any) -> dict[str, object]:
@@ -295,9 +297,10 @@ def test_scm_install_waits_for_policy_step(
         calls.append("install")
         raise LifecycleError("stop before real installer or venue")
 
-    def per_user(driver: NativeTestnet, work: Path, key: bytes) -> None:
+    def per_user(driver: NativeTestnet, work: Path, key: bytes) -> dict[str, object]:
         calls.append("per-user")  # W6: per-user custody is measured first, independently.
         driver.key = b""
+        return {}
 
     monkeypatch.setattr(policy, "prepare", prepare)
     monkeypatch.setattr("guard_harness.native_testnet.per_user", per_user)
@@ -376,7 +379,7 @@ def test_windows_per_user_journal_completes_before_policy_and_scm(
     monkeypatch.setenv("ProgramData", str(tmp_path / "data"))
     current = release(tmp_path / "assets")
     controller = native.NativeTestnet(
-        current, current, tmp_path / "work", "inert-account", shell, "fresh"
+        current, current, tmp_path / "work", "inert-account", shell, "fresh", windows_service=True
     )
     monkeypatch.setattr(native, "flat_scan", lambda *args: None)
     installed: list[Release] = []

@@ -323,7 +323,7 @@ The packaging's contract (`deploy/guard/README.md`, "The CLI contract"). Every r
 | `health [--listen L \| --url U]` | Exit 0 when `GET /healthz` answers 200 (`0.0.0.0` and `[::]` mean loopback), 1 when it does not (as container health checks expect); 2 only for a malformed `--url`. |
 | `status [--listen L \| --url U] [--json]` | The running Guard's `/guard/status` for a person, one fact a line: mode, kill switch, risk state, equity, the fee and its approval, alerts. `--json`: Guard's answer with the automation fields ("Automation" below). Exit 2 when no Guard answers. |
 | `licence set (KEY \| --stdin) [--listen L \| --url U]`; `licence show [--json]` | Checks a licence key for the configured account and network and writes it into the config (refused, config unchanged, otherwise), then waits for a running Guard to report it; `--stdin` reads the key as one line from standard input instead of the argument (out of the process list and shell history); `show` describes the key in the config (`--json`: the licence object below, no Guard needed). |
-| `service …` | The protected OS service on macOS (LaunchDaemon) and Windows (SCM): admission, credential, licence, pairing, removal ("Automation" below). |
+| `service …` | The protected OS service on macOS (LaunchDaemon) and Windows (SCM, from 1.0.1): admission, credential, licence, pairing, removal ("Automation" below). |
 | `journal-init`, `journal-resume` `--mode M --note N`; `journal-show --mode M` | The risk journal: start one (a person's decision), clear a drawdown halt after a review, print it. `--note` (who decided and why) is recorded. |
 | `mcp …` | The agent kit's MCP server over standard input and output (`docs/guard-mcp.md`), the same code and flags as `zunder-guard-mcp`, so users install one program. |
 | `kill --reason R` | Writes the kill file. |
@@ -351,7 +351,7 @@ The commands and fields installers, harnesses and the E2E suites use, pinned by 
 
 **Testnet licences.** On testnet (sending there, or paper reading a testnet account) Guard accepts licence keys signed by the production key or by the staging issuer's key (`TESTNET_LICENCE_PUBLIC_KEY_HEX` in `crates/zunder-guard-core/src/licence.rs`, the staging issuer's key since 11 Oct 2026); on mainnet, and for a config that names no network, only the production key (`LicenceIssuers`). Nothing at run time changes the keys; tests build their own set behind the `test-hooks` feature. `init --licence`, `licence set`, renewal and the running Guard all apply the same rule.
 
-**The service lifecycle.** The `service` subcommands manage the protected sending installation on macOS (a root LaunchDaemon, credential in the System Keychain) and Windows (an SCM service under a virtual service account, credential DPAPI-encrypted for it). Each takes the installation's binding (public JSON written by `prepare`): `/Library/Application Support/Zunder Guard/bindings/active.json` on macOS, `%ProgramData%\ZunderGuard\guard\binding.json` on Windows.
+**The service lifecycle.** The `service` subcommands manage the protected sending installation on macOS (a root LaunchDaemon, credential in the System Keychain) and Windows (an SCM service under a virtual service account, credential DPAPI-encrypted for it; the Windows service mode arrives in 1.0.1, "Windows" below). Each takes the installation's binding (public JSON written by `prepare`): `/Library/Application Support/Zunder Guard/bindings/active.json` on macOS, `%ProgramData%\ZunderGuard\guard\binding.json` on Windows.
 
 | Subcommand | Does |
 |---|---|
@@ -369,7 +369,7 @@ Install, start, stop, status and uninstall of the service itself belong to the p
 
 - **Linux (systemd, `install.sh`):** `sudo sh install.sh --uninstall`, with the installer of the installed release. It stops and disables `zunder-guard.service`, removes its unit and the installer's drop-in, reloads systemd, and removes the binary and the three notices; a binary installed elsewhere needs the original `--prefix DIR`. The separately installed native testnet or mainnet service: `--service-instance testnet` or `--service-instance mainnet` (its fixed prefix; the default service is left alone). A foreground installation: stop Guard, then `sh install.sh --uninstall --no-service --prefix DIR`, which removes only the binary and notices. Kept: config, licences, client pairings, journals, consent settings, the credential files and the `zunder-guard` user. The key is a systemd credential, not an OS-store item, so no `service` subcommand is involved; once it is no longer needed: `sudo rm -f /etc/credstore.encrypted/zunder-guard.hl-api-wallet-key /etc/zunder-guard/hl-api-wallet-key`. The uninstall never downloads anything, never sets up and never reads a credential, and refuses symlinked targets, units outside the installer's location, and removing files of a service it could not stop. Container installations are uninstalled by their supervisor, which removes its services and helpers but keeps the named volume (configuration, pairings, journals), the encrypted credential and `/etc/zunder-guard-container` for recovery (`deploy/guard/container/README.md`).
 - **macOS (LaunchDaemon):** the testnet service: `sudo sh install.sh --uninstall --service-instance testnet`, with the installer of the installed release. It unloads the daemon, removes its plist and the releases no other installation references (each checked by hash), and keeps config, journals and the Keychain item; it refuses while `/usr/local/bin/zunder-guard` is a binary it did not install, and needs `/usr/bin/python3` (the Command Line Tools). It also refuses when `/usr/local/bin` or `/usr/local/share` can be written by anyone but root, as on Intel Macs with Homebrew (which owns `/usr/local/bin`): then remove the convenience copy and its notices first, `sudo rm /usr/local/bin/zunder-guard && sudo rm -r /usr/local/share/licenses/zunder-guard`, and run the uninstall again (a safe removal in that case comes in 1.0.1). Other macOS services (and when that refusal applies): `sudo launchctl bootout system/<label>` (`com.zunderlabs.guard.<credential_id>`, mainnet `com.zunderlabs.guard.mainnet`), `sudo rm /Library/LaunchDaemons/<label>.plist`, then, unloaded, `sudo <guard> service remove-credential --binding '/Library/Application Support/Zunder Guard/bindings/active.json'`. A paper install from `curl … | sh` has no service: stop Guard and remove the binary. Homebrew (paper): `brew services stop zunder-guard`, `brew uninstall zunder-guard`.
-- **Windows (SCM):** the installation's helper, `-Action Stop` then `-Action Uninstall -Id guard -ConfirmAccount 0x…` (`deploy/guard/windows/README.md`), unregisters the owned service; then `zunder-guard.exe service remove-credential --binding "%ProgramData%\ZunderGuard\guard\binding.json"`. Per-user paper and testnet: `& ([scriptblock]::Create((irm https://zunderlabs.com/i.ps1))) -Uninstall` (or the installed `i.ps1 -Uninstall`) removes exactly the files its install recorded and refuses anything unknown or linked; the home `%LOCALAPPDATA%\zunder-guard` and the Credential Manager entry `init` made (generic credential of service `zunder-guard`) are kept, to be deleted by hand once no longer needed.
+- **Windows (SCM, from 1.0.1; Guard 1.0 on Windows is the per-user install):** the installation's helper, `-Action Stop` then `-Action Uninstall -Id guard -ConfirmAccount 0x…` (`deploy/guard/windows/README.md`), unregisters the owned service; then `zunder-guard.exe service remove-credential --binding "%ProgramData%\ZunderGuard\guard\binding.json"`. Per-user paper and testnet: `& ([scriptblock]::Create((irm https://zunderlabs.com/i.ps1))) -Uninstall` (or the installed `i.ps1 -Uninstall`) removes exactly the files its install recorded and refuses anything unknown or linked; the home `%LOCALAPPDATA%\zunder-guard` and the Credential Manager entry `init` made (generic credential of service `zunder-guard`) are kept, to be deleted by hand once no longer needed.
 
 Environment: `ZUNDER_GUARD_HOME`, `ZUNDER_GUARD_RULES`, `ZUNDER_GUARD_ACCOUNT`, `ZUNDER_GUARD_NETWORK` (the mode), `ZUNDER_GUARD_LISTEN`, `ZUNDER_GUARD_IP_SHARE` (`init` and `run`), `ZUNDER_GUARD_KEY_FILE`, `ZUNDER_GUARD_CONTAINER`, and `ZUNDER_MAINNET_CONFIRM` (the person's mainnet confirmation, the same variable as Zunder's runner).
 
@@ -396,15 +396,16 @@ Without a terminal it refuses unless `--non-interactive` is given: the answers t
 
 ## Windows
 
-Guard 1.0 runs natively on Windows (x86_64). The per-user installation runs paper and testnet;
-its `init` and `run` refuse mainnet. **Mainnet runs on Windows only as the protected machine
-service**: installed from an elevated PowerShell with
+Guard 1.0 runs natively on Windows (x86_64) as the per-user installation, for paper and
+testnet (Windows Server 2022 and 2025, PowerShell 5.1 and 7); its `init` and `run` refuse
+mainnet. **The Windows service mode arrives in 1.0.1** (decision of 15 Oct 2026). It is
+the only Windows route to mainnet: installed from an elevated PowerShell with
 `i.ps1 -Network mainnet`, an SCM service under a dedicated virtual service account, the API
 wallet key in a machine-protected credential (DPAPI for that account, exact access controls)
 that the broker hands to Guard on standard input at every start, as the systemd credential does
 on Linux; `service …` in "Automation" above. The person still confirms the account, the equity
-cap and the first `journal-init --mode mainnet`. The route ships, and the website lists it, only
-once its independent review and native release checks pass.
+cap and the first `journal-init --mode mainnet`. The website lists it only once its independent
+review and native release checks pass.
 
 - **Home** `%LOCALAPPDATA%\zunder-guard` (journals, config, kill file), unless
   `ZUNDER_GUARD_HOME` says otherwise.
@@ -416,8 +417,8 @@ once its independent review and native release checks pass.
   granted; read only when the ACL allows no one but the user, the owner, SYSTEM and
   Administrators.
 - **Stopping**: Ctrl-C, Ctrl-Break, closing the console, logoff and shutdown, as SIGTERM and
-  SIGINT on Unix. The per-user installation runs in the foreground; the machine service is
-  started and stopped by SCM.
+  SIGINT on Unix. The per-user installation runs in the foreground; the machine service (1.0.1)
+  is started and stopped by SCM.
 - **Installing**: `deploy/guard/README.md`, "Windows" (`i.ps1`, winget).
 
 ## Paper, testnet, mainnet

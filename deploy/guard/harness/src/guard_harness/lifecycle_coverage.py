@@ -17,6 +17,8 @@ MODES = frozenset(
         "cleanup",
     }
 )
+# The only Windows testnet receipt scope Guard 1.0 admits.
+WINDOWS_TESTNET_SCOPE = "windows-per-user"
 LIFECYCLE_COVERAGE: Mapping[str, frozenset[str]] = {
     "I1": MODES
     | {
@@ -28,9 +30,10 @@ LIFECYCLE_COVERAGE: Mapping[str, frozenset[str]] = {
     },
     "I2": MODES | {"crash-recovery", "D1:curl-pipe"},
     "I3": MODES | {"crash-recovery", "supervisor-reload", "D1:curl-pipe", "D3:homebrew"},
+    # Guard 1.0 Windows is the per-user install; the SCM service's crash recovery is
+    # 1.0.1 work (decision of 15 Oct 2026).
     "I4": MODES
     | {
-        "crash-recovery",
         "manual-crash-restart",
         "D2:irm-iex",
         "windows2022-ps51",

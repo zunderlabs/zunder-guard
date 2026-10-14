@@ -1,5 +1,7 @@
 # Windows mainnet installation candidate
 
+Guard 1.0 on Windows is the per-user installation for paper and testnet. This machine service, the only Windows route to mainnet, arrives in Guard 1.0.1 (decisions 15 Oct 2026); its native SCM checks are not part of the 1.0 gate.
+
 This machine-service source includes an additive protected Testnet candidate for a future signed release; signed v1.0.1 draft assets remain immutable. It is not yet a native-tested released installer. Do not replace already signed/versioned assets. Publication requires independent code review, Windows 5.1/7 tests, the native service checks and released-image install/upgrade proof. Pre-login reboot is a separate gate.
 
 Open an elevated, trusted Windows PowerShell console explicitly, then run the verified published loader:

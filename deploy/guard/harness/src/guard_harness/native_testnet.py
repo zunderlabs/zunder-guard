@@ -1,4 +1,8 @@
-"""Released Keychain/SCM testnet lifecycle. Read-only HTTP only; never /exchange."""
+"""Released Keychain and Windows per-user testnet lifecycle. Read-only HTTP; never /exchange.
+
+Guard 1.0 ships Windows per-user only (decision of 15 Oct 2026). The SCM service
+route and its hosted crash-policy step stay here for 1.0.1, off unless `windows_service`.
+"""
 
 import argparse
 import hashlib
@@ -9,8 +13,10 @@ import re
 import subprocess
 import sys
 import time
+from collections.abc import Callable
 from pathlib import Path
 
+from guard_harness.lifecycle_coverage import WINDOWS_TESTNET_SCOPE
 from guard_harness.native_paper import LifecycleError, Paper
 from guard_harness.native_release import Release, staged_loader
 from guard_harness.paper_bot import LocalGuard, PaperError
@@ -19,6 +25,9 @@ from guard_harness.source_installer import Candidate, prepare, verify_file
 from guard_harness.testnet_run import ROOT
 from guard_harness.testnet_scan import TestnetReads, flat_scan
 from guard_harness.windows_diagnostics import observe as windows_observe
+
+# The Windows service (SCM) mode arrives in 1.0.1; 1.0 measures only per-user custody.
+WINDOWS_SERVICE = False
 
 
 class NativeTestnet:
@@ -32,6 +41,8 @@ class NativeTestnet:
         scenario: str = "upgrade",
         source: Candidate | None = None,
         source_path: Path | None = None,
+        *,
+        windows_service: bool | None = None,
     ) -> None:
         self.current, self.previous, self.work, self.account = current, previous, work, account
         self.shell = shell
@@ -39,6 +50,9 @@ class NativeTestnet:
             raise LifecycleError("native lifecycle scenario refused")
         self.scenario = scenario
         self.mac = platform.system() == "Darwin"
+        self.windows_service = WINDOWS_SERVICE if windows_service is None else windows_service
+        if self.mac and self.windows_service:
+            raise LifecycleError("Windows service route refused on macOS")
         if source is not None and (
             not self.mac
             or scenario != "fresh"
@@ -69,7 +83,14 @@ class NativeTestnet:
             self.binding = self.base / self.id / "binding.json"
             self.transaction = self.base / "management" / f"{self.id}.json"
 
-    def command(self, words: list[str], *, key: bool = False, sensitive: bool = False) -> str:
+    def command(
+        self,
+        words: list[str],
+        *,
+        key: bool = False,
+        sensitive: bool = False,
+        failure_classifier: Callable[[str], str] | None = None,
+    ) -> str:
         self.sequence += 1
         return run(
             words,
@@ -79,6 +100,7 @@ class NativeTestnet:
             stdin=self.key * 2 if key else b"",
             sensitive_output=sensitive,
             secrets=[self.key.decode().strip()],
+            failure_classifier=failure_classifier,
         ).output.strip()
 
     def ps(self, words: list[str]) -> list[str]:
@@ -230,7 +252,7 @@ class NativeTestnet:
                 ]
             self.command(words, key=fresh, sensitive=True)
         else:
-            with windows_observe(self.work, "scm-install"):
+            with windows_observe(self.work, "scm-install", installer=True) as classifier:
                 self.command(
                     self.ps(
                         [
@@ -255,6 +277,7 @@ class NativeTestnet:
                     ),
                     key=fresh,
                     sensitive=True,
+                    failure_classifier=classifier,
                 )
             if not fresh:
                 # Loader authenticates and retains the new helper but never upgrades itself.
@@ -433,7 +456,11 @@ class NativeTestnet:
             if not self.mac:
                 # Independent per-user custody must still be measured when SCM admission refuses.
                 with windows_observe(self.work, "per-user-lifecycle"):
-                    per_user(self, self.work / "per-user", key)
+                    measured = per_user(self, self.work / "per-user", key)
+                if not self.windows_service:
+                    # 1.0: the per-user receipt is the whole Windows testnet scope. No
+                    # crash-policy removal, no SCM install (1.0.1).
+                    return {**measured, "scope": WINDOWS_TESTNET_SCOPE}
                 self.key = key  # Per-user cleanup clears its copy; SCM has a separate admission.
                 from guard_harness.windows_policy import prepare as prepare_windows_policy
 
@@ -581,7 +608,7 @@ def candidate_user_setup(native: NativeTestnet, paper: Paper, work: Path, rules:
     )
 
 
-def per_user(native: NativeTestnet, work: Path, key: bytes) -> None:
+def per_user(native: NativeTestnet, work: Path, key: bytes) -> dict[str, object]:
     """Ordinary Windows Credential Manager setup and stored-key startup, no orders."""
     work.mkdir(mode=0o700)
     paper = Paper(
@@ -708,38 +735,33 @@ def per_user(native: NativeTestnet, work: Path, key: bytes) -> None:
         )
         if paper.binary.exists():
             raise LifecycleError("released per-user uninstall retained executable")
-        (work / "receipt.json").write_text(
-            json.dumps(
-                {
-                    "result": "passed",
-                    "schema": 1,
-                    "mode": "testnet",
-                    "scenario": native.scenario,
-                    "tag": native.current.tag,
-                    "commit": native.current.commit,
-                    "manifest_sha256": hashlib.sha256(
-                        native.current.asset("release-manifest.json")
-                    ).hexdigest(),
-                    "observed_releases": paper.observed,
-                    "decision_journal_sha256": journal_digest,
-                    "no_exchange": True,
-                    "coverage": [
-                        "credential-manager",
-                        "candidate-loader-stdin"
-                        if native.scenario == "fresh"
-                        else "previous-release-init",
-                        "stored-key-runtime",
-                        "read-only-health",
-                        "restart",
-                        "fresh-candidate" if native.scenario == "fresh" else "upgrade",
-                        "reinstall",
-                        "uninstall",
-                        "no-exchange",
-                    ],
-                }
-            )
-            + "\n"
-        )
+        receipt: dict[str, object] = {
+            "result": "passed",
+            "schema": 1,
+            "mode": "testnet",
+            "scenario": native.scenario,
+            "tag": native.current.tag,
+            "commit": native.current.commit,
+            "manifest_sha256": hashlib.sha256(
+                native.current.asset("release-manifest.json")
+            ).hexdigest(),
+            "observed_releases": paper.observed,
+            "decision_journal_sha256": journal_digest,
+            "no_exchange": True,
+            "coverage": [
+                "credential-manager",
+                "candidate-loader-stdin" if native.scenario == "fresh" else "previous-release-init",
+                "stored-key-runtime",
+                "read-only-health",
+                "restart",
+                "fresh-candidate" if native.scenario == "fresh" else "upgrade",
+                "reinstall",
+                "uninstall",
+                "no-exchange",
+            ],
+        }
+        (work / "receipt.json").write_text(json.dumps(receipt) + "\n")
+        return receipt
     finally:
         native.key = b""
         native.env.pop("ZUNDER_GUARD_HOME", None)
