@@ -14,7 +14,7 @@
 # What it does, in order, refusing at the first thing that does not check out:
 #   1. downloads the release archive, SHA256SUMS and its Sigstore bundle;
 #   2. verifies the bundle with cosign against this repository's release workflow and tag
-#      (fetching a pinned cosign, checked by its pinned SHA-256, if none is installed);
+#      (fetching a pinned cosign, checked by its pinned SHA-256, unless the installed version matches);
 #   3. checks the archive against the signed checksums; only then extracts and installs it;
 #   4. runs `zunder-guard init`, which shows the rules and asks for the account and the mode;
 #   5. for testnet or mainnet asks for the API wallet key with hidden input, has the binary check
@@ -30,7 +30,7 @@ REPO="zunderlabs/zunder-guard"
 ISSUER="https://token.actions.githubusercontent.com"
 IDENTITY="https://github.com/$REPO/.github/workflows/release.yml@refs/tags/$VERSION"
 BASE_URL="${ZUNDER_GUARD_BASE_URL:-https://github.com/$REPO/releases/download/$VERSION}"
-# cosign used when none is installed: github.com/sigstore/cosign releases, SHA-256 from that
+# cosign used unless the installed version matches: github.com/sigstore/cosign releases, SHA-256 from that
 # release's cosign_checksums.txt. Bump deliberately (deploy/guard/test/resolve-pins.sh); the
 # same pins are in loader/i.sh.
 COSIGN_VERSION="v3.1.3"
@@ -589,10 +589,18 @@ fetch SHA256SUMS.sigstore.json "$BASE_URL/SHA256SUMS.sigstore.json"
 fetch "$ARCHIVE" "$BASE_URL/$ARCHIVE"
 
 # The loader passes the cosign it already used (and verified, if it fetched one).
+pinned_cosign() {
+  [ -n "$1" ] || return 1
+  reported=$("$1" version </dev/null 2>/dev/null) || return 1
+  printf '%s\n' "$reported" | awk -v pinned="$COSIGN_VERSION" '
+    { sub(/\r$/, "") }
+    $1 == "GitVersion:" { count++; if (NF != 2 || $2 != pinned) bad=1 }
+    END { exit (count != 1 || bad) }'
+}
 COSIGN=${ZUNDER_GUARD_COSIGN:-}
-if [ -z "$COSIGN" ] || [ ! -x "$COSIGN" ]; then COSIGN=$(command -v cosign 2>/dev/null || true); fi
-if [ -z "$COSIGN" ]; then
-  say "cosign is not installed: fetching cosign $COSIGN_VERSION and checking its pinned SHA-256"
+[ -n "$COSIGN" ] || COSIGN=$(command -v cosign 2>/dev/null || true)
+if ! pinned_cosign "$COSIGN"; then
+  say "cosign $COSIGN_VERSION is required: fetching it and checking its pinned SHA-256"
   fetch cosign "$COSIGN_URL/cosign-$OS-$ARCH"
   [ "$(sha256 "$TMP/cosign")" = "$COSIGN_SHA256" ] || die "the cosign download does not match its pinned SHA-256; refusing"
   chmod 0755 "$TMP/cosign"
@@ -773,7 +781,7 @@ if [ "$OS" = darwin ] && { [ "$NETWORK" = mainnet ] || [ "$NETWORK" = testnet ];
   fi
   fetch install-macos-service.sh "$BASE_URL/install-macos-service.sh"
   fetch uninstall-macos-testnet.py "$BASE_URL/uninstall-macos-testnet.py"
-  # Always use the exact pinned verifier, even if a different cosign verified
+  # Always use the exact pinned verifier, even if a local cosign verified
   # the unprivileged download. It is checked again after root-private copying.
   fetch macos-service-cosign "$COSIGN_URL/cosign-darwin-$ARCH"
   [ "$(sha256 "$TMP/macos-service-cosign")" = "$COSIGN_SHA256" ] || die "macOS service verifier checksum mismatch"

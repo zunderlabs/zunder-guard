@@ -25,6 +25,7 @@ import urllib.error
 from pathlib import Path, PurePosixPath
 from typing import Any
 
+from guard_harness import linux_policy
 from guard_harness.bounded_http_read import bounded_read
 from guard_harness.cli import PAIR_SCHEMA, STATUS_SCHEMA, decode_json
 from guard_harness.journal_diagnostics import error_category, valid_fee_approval
@@ -35,7 +36,7 @@ from guard_harness.linux_lifecycle import (
     authenticated_file,
     require,
 )
-from guard_harness.linux_testnet_service import TestnetService
+from guard_harness.linux_testnet_service import TestnetService, opt_metadata
 from guard_harness.paper_bot import LocalGuard, PaperError
 from guard_harness.runner import RunError, run
 from guard_harness.source_installer import component_metadata, verify_file
@@ -66,6 +67,7 @@ LIFECYCLE_OPERATIONS = frozenset(
         "live-uninstall-pid",
         "live-uninstall-state",
         "old-pid",
+        "opt-policy",
         "owned-fragment",
         "owned-volume",
         "pair-start",
@@ -288,6 +290,8 @@ class TestnetLifecycle:
         source_component: bool = False,
         installer_harness_commit: str = "",
         source_installer_sha256: str = "",
+        opt_policy_installer: Path | None = None,
+        opt_policy_installer_sha256: str = "",
     ) -> None:
         self.operation = "admission"
         self.source_metadata = component_metadata(
@@ -301,6 +305,8 @@ class TestnetLifecycle:
         require(route in {"native", "container"}, "protected route refused")
         require(inputs.account_network == "testnet", "Testnet read network required")
         self.inputs, self.route = inputs, route
+        self.opt_policy_installer = opt_policy_installer
+        self.opt_policy_installer_sha256 = opt_policy_installer_sha256
         self.binary_sha256, self.previous_binary_sha256 = binary_sha256, previous_binary_sha256
         self.image, self.previous_image = image, previous_image
         for digest in (binary_sha256, previous_binary_sha256):
@@ -799,6 +805,7 @@ class TestnetLifecycle:
                         "schema": 1,
                         "diagnostic": True,
                         "gate_eligible": False,
+                        **({"service_host_opt": opt_metadata()} if self.route == "native" else {}),
                         **state,
                         **getattr(self, "source_metadata", {}),
                     },
@@ -811,6 +818,18 @@ class TestnetLifecycle:
             pass
         finally:
             self.operation = operation
+
+    def prepare_opt_policy(self) -> dict[str, object]:
+        if self.route != "native" or not linux_policy.eligible():
+            return {}
+        self.flat()
+        self.operation = "opt-policy"
+        return linux_policy.prepare(
+            self.inputs,
+            self.opt_policy_installer,
+            self.opt_policy_installer_sha256,
+            self.binary_sha256,
+        )
 
     def before(self, key: bytes) -> None:
         self.operation = "before-reboot"
@@ -840,6 +859,7 @@ class TestnetLifecycle:
                 "container volume already exists; no adoption",
             )
         self.private.mkdir(mode=0o700, parents=True)
+        policy = self.prepare_opt_policy()
         installer, digest, version = self.inputs.initial
         self.install(installer, digest, key, initial=True)
         self.healthy(
@@ -932,6 +952,7 @@ class TestnetLifecycle:
                 "boot_id": Path("/proc/sys/kernel/random/boot_id").read_text().strip(),
                 "installer_sha256": self.inputs.installer_sha256,
                 "previous_installer_sha256": self.inputs.previous_installer_sha256,
+                **policy,
             }
         )
 
@@ -1159,6 +1180,10 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ("installer", "previous-installer", "output"):
         parser.add_argument("--" + name, type=Path, required=True)
+    parser.add_argument("--opt-policy-installer", type=Path)
+    parser.add_argument("--opt-policy-installer-sha256", default="")
+    parser.add_argument("--release-commit", default="")
+    parser.add_argument("--manifest-sha256", default="")
     for name in (
         "installer-sha256",
         "previous-installer-sha256",
@@ -1195,6 +1220,8 @@ def main() -> None:
             "source_component",
             "installer_harness_commit",
             "source_installer_sha256",
+            "opt_policy_installer",
+            "opt_policy_installer_sha256",
         )
     }
     source = component_metadata(

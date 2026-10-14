@@ -322,17 +322,30 @@ function Install-ZgMainnet($Rules,$Account,$ConfirmAccount,$EquityCap,$Licence,$
   } finally { if ($stage -and [IO.Directory]::Exists($stage)) { [IO.Directory]::Delete($stage,$true) } }
 }
 
+function Test-ZgCosignVersion([string]$Verifier,[string]$Version) {
+  if (-not $Verifier) { return $false }
+  $oldPreference = $ErrorActionPreference
+  try {
+    $ErrorActionPreference = 'Continue' # PS5.1 wraps native stderr
+    $lines = @(& $Verifier version 2>$null)
+    if ($LASTEXITCODE -ne 0) { return $false }
+    $reported = @($lines | Where-Object { [string]$_ -match '^\s*GitVersion:' })
+    return ($reported.Count -eq 1 -and
+      [string]$reported[0] -cmatch '^\s*GitVersion:\s*(\S+)\s*$' -and
+      $Matches[1] -ceq $Version)
+  } catch { return $false }
+  finally { $ErrorActionPreference = $oldPreference }
+}
 function Install-ZunderGuard {
   param($Rules, $Account, $Licence, $Network, $NonInteractive, $InstallOnly, $Force, $InstallDir, $Id, $ConfirmAccount, $EquityCap, $ManagedService, $KeyStdin)
   $ErrorActionPreference = 'Stop'
   $ProgressPreference = 'SilentlyContinue'
   $V = '@VERSION@'
   $Repo = 'zunderlabs/zunder-guard'
-  $Issuer = 'https://token.actions.githubusercontent.com'
   $Identity = "https://github.com/$Repo/.github/workflows/release.yml@refs/tags/$V"
   $Base = "https://github.com/$Repo/releases/download/$V"
   if ($env:ZUNDER_GUARD_BASE_URL) { $Base = $env:ZUNDER_GUARD_BASE_URL }
-  # cosign used when none is installed: github.com/sigstore/cosign, SHA-256 from that release's
+  # cosign used unless the installed version matches: github.com/sigstore/cosign, SHA-256 from that release's
   # cosign_checksums.txt (deploy/guard/test/resolve-pins.sh). The same version as loader/i.sh.
   $CosignVersion = 'v3.1.3'
   $CosignSha256 = '9fe59be0eca1271873ce019061335eb1ac419b7059202e797828467ddabe33be'
@@ -435,20 +448,16 @@ function Install-ZunderGuard {
       $Found = Get-Command cosign -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
       if ($Found) { $Cosign = $Found.Source }
     }
-    if (-not $Cosign) {
-      Write-Host "cosign is not installed: fetching cosign $CosignVersion and checking its pinned SHA-256"
+    if (-not (Test-ZgCosignVersion $Cosign $CosignVersion)) {
+      Write-Host "cosign $CosignVersion is required: fetching it and checking its pinned SHA-256"
       $Cosign = Get-Asset 'cosign-windows-amd64.exe' "https://github.com/sigstore/cosign/releases/download/$CosignVersion"
       if ((Get-Sha256 $Cosign) -ne $CosignSha256) { throw 'the cosign download does not match its pinned SHA-256; refusing' }
     }
-    # cosign reports on stderr; Windows PowerShell 5.1 would turn that into a terminating error.
-    $Previous = $ErrorActionPreference
-    $ErrorActionPreference = 'Continue'
-    $Log = & $Cosign verify-blob --bundle $Bundle --certificate-identity $Identity --certificate-oidc-issuer $Issuer $Sums 2>&1
-    $Code = $LASTEXITCODE
-    $ErrorActionPreference = $Previous
+    # Stream verifier diagnostics through the same PS5.1-safe boundary as the
+    # service path. A trust-root/network failure is not evidence of another signer.
+    $Code = Invoke-ZgReleaseVerifier $Cosign $Bundle $Sums $Identity
     if ($Code -ne 0) {
-      $Log | ForEach-Object { Write-Host $_ }
-      throw "signature check FAILED: SHA256SUMS was not signed by $Repo's release workflow for $V; refusing"
+      throw "signature check FAILED: SHA256SUMS could not be verified against $Repo's release workflow for $V; refusing"
     }
     Write-Host "  signature: SHA256SUMS signed by $Repo, release workflow, tag $V (Sigstore)"
     $Expected = $null

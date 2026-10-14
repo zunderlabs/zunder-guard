@@ -437,20 +437,14 @@ class NativeTestnet:
             self.audit()
             active = False
             if self.mac:
-                uninstaller = self.work / "uninstall-current.sh"
-                uninstaller.write_bytes(self.current.asset("install.sh"))
-                self.command(
-                    [
-                        "sudo",
-                        "sh",
-                        str(uninstaller),
-                        "--uninstall",
-                        "--service-instance",
-                        "testnet",
-                        "--non-interactive",
-                    ],
-                    sensitive=True,
+                from guard_harness.native_uninstall import execute, prepare_foreground
+
+                foreground = prepare_foreground(self.current, self.work, self.env)
+                (self.work / "foreground-cleanup.log").write_text(
+                    f"foreground cleanup: {foreground}\n"
                 )
+                self.sequence += 1
+                execute(self.current, self.work, self.env, self.work / f"step-{self.sequence}.log")
                 if self.plist.exists():
                     raise LifecycleError("launchd registration survived removal")
             else:
@@ -482,6 +476,7 @@ class NativeTestnet:
                 "observed_releases": self.observed,
                 "decision_journal_sha256": self.journal_digest,
                 "no_exchange": True,
+                **({"foreground_cleanup": foreground} if self.mac else {}),
                 "coverage": [
                     *(
                         ["windows-crash-policy-refusal", "windows-crash-policy-removed"]

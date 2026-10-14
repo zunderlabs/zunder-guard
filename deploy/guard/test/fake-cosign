@@ -6,6 +6,10 @@
 # so the tests still show that a tampered file or another release's signature is refused.
 # It is never shipped: package.sh and render.sh do not include it.
 set -eu
+if [ "${1:-}" = version ]; then
+  printf 'GitVersion:    v3.1.3\n'
+  exit 0
+fi
 [ "${1:-}" = verify-blob ] || { echo "fake cosign: only verify-blob" >&2; exit 2; }
 shift
 bundle="" identity="" issuer="" file=""

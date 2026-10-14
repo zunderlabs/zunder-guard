@@ -20,8 +20,17 @@ main() {
   get() { curl -fsSL --proto '=https,file' --retry 3 -o "$T/$1" "$2" || no "download failed: $2"; }
   sum() { { sha256sum "$1" 2>/dev/null || shasum -a 256 "$1"; } | cut -d' ' -f1; }
   for f in install.sh SHA256SUMS SHA256SUMS.sigstore.json; do get "$f" "$U/$f"; done
-  S=$(command -v cosign || true)
-  if [ -z "$S" ]; then
+  pinned_cosign() {
+    [ -n "$1" ] || return 1
+    reported=$("$1" version </dev/null 2>/dev/null) || return 1
+    printf '%s\n' "$reported" | awk -v pinned="$C" '
+      { sub(/\r$/, "") }
+      $1 == "GitVersion:" { count++; if (NF != 2 || $2 != pinned) bad=1 }
+      END { exit (count != 1 || bad) }'
+  }
+  S=${ZUNDER_GUARD_COSIGN:-}
+  [ -n "$S" ] || S=$(command -v cosign || true)
+  if ! pinned_cosign "$S"; then
     get cosign "https://github.com/sigstore/cosign/releases/download/$C/cosign-$P"
     [ "$(sum "$T/cosign")" = "$H" ] || no "cosign does not match its pinned SHA-256"
     chmod 0755 "$T/cosign" && S=$T/cosign

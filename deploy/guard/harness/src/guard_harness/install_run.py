@@ -11,6 +11,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+from guard_harness.linux_testnet_service import opt_metadata
 from guard_harness.native_release import Release, diagnostic_mode
 from guard_harness.source_installer import prepare, verify_file
 from guard_harness.testnet_process import ProcessError
@@ -25,6 +26,9 @@ EVIDENCE_FILES = (
     "status.log",
     "service-journal.log",
     "testnet-service-install.log",
+    "install-service-state.json",
+    "linux-opt-refusal.receipt.json",
+    "linux-opt-normalized.receipt.json",
 )
 
 
@@ -195,6 +199,9 @@ def main() -> None:
         raise ProcessError("loader snapshot differs from signed release")
     old_installer = previous.assets / "install.sh"
     previous.asset("install.sh")
+    opt_policy_digest = (
+        hashlib.sha256(current.asset("install.sh")).hexdigest() if args.row == "I2" else ""
+    )
     rules = json.loads((ROOT / "rules/vectors.json").read_bytes())["valid"][0]["canonical"]
     common = [
         "--version",
@@ -247,6 +254,7 @@ def main() -> None:
                     "scenario": args.scenario,
                     "commit": current.commit,
                     "harness_commit": harness_commit,
+                    **({"runner_opt": opt_metadata()} if args.row in {"I1", "I2"} else {}),
                     **(source.record() if source is not None else {}),
                 }
             )
@@ -341,7 +349,18 @@ def main() -> None:
             check=True,
             env=env,
         )
-        base = ["sudo", "env", "PYTHONPATH=" + str(ROOT / "harness/src"), sys.executable, "-m"]
+        base = [
+            "sudo",
+            "env",
+            "PYTHONPATH=" + str(ROOT / "harness/src"),
+            *[
+                name + "=" + os.environ[name]
+                for name in ("GITHUB_ACTIONS", "RUNNER_ENVIRONMENT")
+                if name in os.environ
+            ],
+            sys.executable,
+            "-m",
+        ]
         flags = [
             "--installer",
             str(loader),
@@ -386,6 +405,14 @@ def main() -> None:
             args.account,
             "--output",
             str(I2_PRIVATE / marker / "testnet" / args.scenario),
+            "--opt-policy-installer",
+            str(current.assets / "install.sh"),
+            "--opt-policy-installer-sha256",
+            opt_policy_digest,
+            "--release-commit",
+            current.commit,
+            "--manifest-sha256",
+            hashlib.sha256(current.asset("release-manifest.json")).hexdigest(),
         ]
     if source is None and args.row in {"I1", "I2"} and args.scenario in {"fresh", "both"}:
         (args.output / "channels").mkdir()
