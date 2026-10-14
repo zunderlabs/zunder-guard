@@ -28,7 +28,7 @@ from guard_harness.native_paper import LifecycleError
     ],
 )
 def test_conpty_failure_exposes_only_fixed_progress(
-    monkeypatch: pytest.MonkeyPatch, case: str, expected: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, case: str, expected: str
 ) -> None:
     class Child:
         fileobj = object()
@@ -73,10 +73,16 @@ def test_conpty_failure_exposes_only_fixed_progress(
     monkeypatch.setattr("guard_harness.native_channels.time.monotonic", lambda: next(ticks))
     with pytest.raises(LifecycleError) as error:
         native_channels.dialogue(
-            ["private-argv-sentinel"], "private-account-sentinel", env={}, windows=True, timeout=1
+            ["private-argv-sentinel"],
+            "private-account-sentinel",
+            env={},
+            windows=True,
+            timeout=1,
+            log=tmp_path / "dialogue.log",
         )
     assert expected in str(error.value)
     assert "sentinel" not in str(error.value)
+    assert "sentinel" not in (tmp_path / "dialogue.log").read_text()
     assert child.closed
     assert child.replies == ([] if case == "private" else ["\r\n"])
 
@@ -358,3 +364,113 @@ def test_windows_literal_channel_refuses_existing_actual_default_home(
             current, tmp_path / "work", account="fixture-account", shell="powershell.exe"
         )
     assert retained.read_text() == "existing customer state must be retained"
+
+
+@pytest.mark.parametrize(
+    "text,category",
+    [
+        ("signature check FAILED: private-argv-sentinel", "signature-verification"),
+        ("setting trusted material: getting trusted root private-sentinel", "verifier-trust-root"),
+        ("download failed: private-url-sentinel", "download"),
+        ("the rules code is refused: private-rules-sentinel", "rules-refused"),
+        ("init is interactive: run it on a terminal", "console-required"),
+        ("private-unrecognized-sentinel", "unknown"),
+    ],
+)
+def test_pre_rules_failure_keeps_fixed_artifact_category(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, text: str, category: str
+) -> None:
+    class Child:
+        fileobj = object()
+        exitstatus = 1
+
+        def read(self, size: int) -> str:
+            return "\x1b[31;1m" + text + "\x1b[0m"
+
+        def write(self, value: str) -> None:
+            pytest.fail("a verifier failure must never receive a wizard reply")
+
+        def isalive(self) -> bool:
+            return False
+
+        def close(self, force: bool) -> None:
+            assert force
+
+    child = Child()
+    monkeypatch.setitem(
+        sys.modules,
+        "winpty",
+        SimpleNamespace(
+            Backend=SimpleNamespace(ConPTY=1),
+            PtyProcess=SimpleNamespace(spawn=lambda *args, **kwargs: child),
+        ),
+    )
+    monkeypatch.setattr(
+        "guard_harness.native_channels.select.select", lambda *args: ([child.fileobj], [], [])
+    )
+    log = tmp_path / "dialogue.log"
+    with pytest.raises(LifecycleError, match="outcome=child-nonzero, phase=rules, exit=1"):
+        native_channels.dialogue(
+            ["private-argv-sentinel"], "private-account-sentinel", env={}, windows=True, log=log
+        )
+    assert log.read_text() == (
+        "[paper terminal output withheld]\n"
+        "outcome: child-nonzero\nnext phase: rules\nexit status: 1\n"
+        + "failure category: "
+        + category
+        + "\n"
+    )
+
+
+@pytest.mark.parametrize("mode_prompt", [False, True])
+def test_conpty_drives_bare_and_website_paper_prompts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode_prompt: bool
+) -> None:
+    prompts = ["Keep these? [Y/edit]", "Hyperliquid account address"]
+    if mode_prompt:
+        prompts.append("Mode: paper")
+    prompts.append("Paper mode reads which network's account")
+
+    class Child:
+        fileobj = object()
+        exitstatus = 0
+        replies: list[str] = []
+
+        def read(self, size: int) -> str:
+            return prompts[len(self.replies)] + " private-output-sentinel"
+
+        def write(self, value: str) -> None:
+            self.replies.append(value)
+
+        def isalive(self) -> bool:
+            return len(self.replies) < len(prompts)
+
+        def close(self, force: bool) -> None:
+            assert force
+
+    child = Child()
+    monkeypatch.setitem(
+        sys.modules,
+        "winpty",
+        SimpleNamespace(
+            Backend=SimpleNamespace(ConPTY=1),
+            PtyProcess=SimpleNamespace(spawn=lambda *args, **kwargs: child),
+        ),
+    )
+    monkeypatch.setattr(
+        "guard_harness.native_channels.select.select", lambda *args: ([child.fileobj], [], [])
+    )
+    log = tmp_path / "dialogue.log"
+    native_channels.dialogue(
+        ["private-argv-sentinel"],
+        "private-account-sentinel",
+        env={},
+        windows=True,
+        mode_prompt=mode_prompt,
+        log=log,
+    )
+    assert child.replies == ["\r\n", "private-account-sentinel\r\n"] + (
+        ["paper\r\n"] if mode_prompt else []
+    ) + ["testnet\r\n"]
+    assert "outcome: passed" in log.read_text()
+    assert "sentinel" not in log.read_text()

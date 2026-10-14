@@ -132,6 +132,10 @@ ENTRY_CODES = frozenset(
         "venue_unreachable",
     }
 )
+# The exit tools' own pre-send refusals in tools.rs (close_position, cancel_order).
+CLEANUP_CODES = ENTRY_CODES | {"position_size_mismatch", "no_position", "no_change"}
+CLEANUP_TOOLS = frozenset({"close_position", "cancel_order"})
+CLEANUP_RESPONSES = 6  # One cancel, three closes and one orphan cancel fit, with room.
 ENTRY_OUTCOMES = frozenset(
     {
         "sent",
@@ -156,7 +160,9 @@ RESPONSE_STAGES = {
 }
 
 
-def entry_response(result: object, error: bool | None) -> dict[str, object]:
+def entry_response(
+    result: object, error: bool | None, *, codes: frozenset[str] = ENTRY_CODES
+) -> dict[str, object]:
     """Finite observations only, never mutation/ownership/flat evidence."""
     value = result if type(result) is dict else {}
     is_error = error if type(error) is bool else None
@@ -167,7 +173,7 @@ def entry_response(result: object, error: bool | None) -> dict[str, object]:
     if is_error is False and "error" not in value and value.get("outcome") == "paper_mode_not_sent":
         code = value.get("code")  # The shipped paper reply is the one top-level-code schema.
     outcome = value.get("outcome")
-    code = code if type(code) is str and code in ENTRY_CODES else "unknown"
+    code = code if type(code) is str and code in codes else "unknown"
     http_status: int | None = None
     # GuardError::Http's exact public Display, never response bodies or free text.
     if code == "guard_http_error" and is_error is True and type(detail) is dict:
@@ -489,6 +495,7 @@ class OwnershipStore:
         }
         self.attempt: dict[str, object] | None = None
         self.response_record: dict[str, object] | None = None
+        self.cleanup_records: list[dict[str, object]] = []
 
     def begin(self, entry: Entry, started_ms: int) -> None:
         entry.validate()
@@ -532,6 +539,30 @@ class OwnershipStore:
         assert self.response_record is not None
         self.response_record.update(stage=stage, origin=RESPONSE_STAGES[stage])
         _write(self.work / "entry-response.json", self.response_record, exclusive=False)
+
+    def cleanup_response(self, tool: str, result: object, error: bool | None) -> None:
+        """Fsync each exit tool's finite outcome; never ownership, mutation or flat credit.
+
+        rc.15 T1 (verify 38486755221) kept only "cleanup incomplete": the refused close
+        and its code were lost. `result=None` records a call whose answer never came.
+        """
+        _need(self.attempt is not None and tool in CLEANUP_TOOLS)
+        _need(len(self.cleanup_records) < CLEANUP_RESPONSES)
+        self.cleanup_records.append(
+            {"tool": tool, **entry_response(result, error, codes=CLEANUP_CODES)}
+        )
+        _write(
+            self.work / "cleanup-responses.json",
+            {
+                "schema": 1,
+                "attempt_id": self.identity["attempt_id"],
+                "binary_sha256": self.identity["binary_sha256"],
+                "version": self.identity["version"],
+                "gate_eligible": False,
+                "responses": self.cleanup_records,
+            },
+            exclusive=False,
+        )
 
     def capture(self, events: Sequence[dict[str, Any]], entry: Entry, started_ms: int) -> None:
         attempt = self.attempt

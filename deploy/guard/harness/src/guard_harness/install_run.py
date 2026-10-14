@@ -11,6 +11,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+from guard_harness.linux_testnet_service import opt_metadata
 from guard_harness.native_release import Release, diagnostic_mode
 from guard_harness.source_installer import prepare, verify_file
 from guard_harness.testnet_process import ProcessError
@@ -25,6 +26,7 @@ EVIDENCE_FILES = (
     "status.log",
     "service-journal.log",
     "testnet-service-install.log",
+    "install-service-state.json",
 )
 
 
@@ -247,6 +249,7 @@ def main() -> None:
                     "scenario": args.scenario,
                     "commit": current.commit,
                     "harness_commit": harness_commit,
+                    **({"runner_opt": opt_metadata()} if args.row in {"I1", "I2"} else {}),
                     **(source.record() if source is not None else {}),
                 }
             )
