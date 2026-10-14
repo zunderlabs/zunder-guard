@@ -6,14 +6,42 @@ set -euo pipefail
 TAG=$1 OUT=$2
 [[ $TAG =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-rc\.[1-9][0-9]*)?$ ]] || { echo "unexpected release tag" >&2; exit 1; }
 : "${GITHUB_REPOSITORY:?GITHUB_REPOSITORY is required}"
+# BEGIN gh_retry
+# GitHub answers an occasional 5xx or 429 (rc.16 verify 38569322248, T2: HTTP 500 on a
+# release asset). Only those GitHub answers are retried, at most three attempts, and only
+# for gh; no verification below is ever retried. A failed attempt's output is
+# never passed on, and every downloaded byte is still checked against the signed
+# checksums, signatures and provenance below.
+gh_retry() {
+  local attempt status out err
+  out=$(mktemp)
+  err=$(mktemp)
+  for attempt in 1 2 3; do
+    if gh "$@" >"$out" 2>"$err"; then
+      cat "$out"
+      rm -f "$out" "$err"
+      return 0
+    else
+      status=$?
+    fi
+    cat "$err" >&2
+    if [ "$attempt" -lt 3 ] && grep -Eq '(^|[^0-9])HTTP (5[0-9]{2}|429)([^0-9]|$)' "$err"; then
+      sleep "$((attempt * ${GH_RETRY_PAUSE:-15}))"
+      continue
+    fi
+    rm -f "$out" "$err"
+    return "$status"
+  done
+}
+# END gh_retry
 if [ -e "$OUT" ]; then
   echo "release output must not exist" >&2
   exit 1
 fi
-COMMIT=$(gh api "repos/$GITHUB_REPOSITORY/commits/$TAG" --jq .sha)
+COMMIT=$(gh_retry api "repos/$GITHUB_REPOSITORY/commits/$TAG" --jq .sha)
 [[ $COMMIT =~ ^[0-9a-f]{40}$ ]] || { echo "cannot resolve release commit" >&2; exit 1; }
 for workflow in ci release; do
-  runs=$(gh api --method GET "repos/$GITHUB_REPOSITORY/actions/workflows/$workflow.yml/runs" \
+  runs=$(gh_retry api --method GET "repos/$GITHUB_REPOSITORY/actions/workflows/$workflow.yml/runs" \
     -f head_sha="$COMMIT" -f event=push -f status=success -f per_page=100)
   # release must be the tag run; CI must be the main-branch run of the same source.
   branch=main
@@ -26,7 +54,7 @@ for workflow in ci release; do
   fi
 done
 mkdir -p "$OUT"
-gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir "$OUT" \
+gh_retry release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir "$OUT" --clobber \
   --pattern SHA256SUMS --pattern SHA256SUMS.sigstore.json --pattern "zunder-guard-$TAG.intoto.jsonl"
 cd "$OUT"
 IDENTITY="https://github.com/$GITHUB_REPOSITORY/.github/workflows/release.yml@refs/tags/$TAG"
@@ -44,7 +72,7 @@ if ! { [ "${#ASSET_PATTERNS[@]}" -gt 0 ] && [ "${#ASSET_PATTERNS[@]}" -le 512 ];
   echo "signed subject count outside limit" >&2
   exit 1
 fi
-gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir . "${ASSET_PATTERNS[@]}"
+gh_retry release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir . --clobber "${ASSET_PATTERNS[@]}"
 # All checksummed assets must be present. --ignore-missing could hide omissions.
 sha256sum -c SHA256SUMS
 for asset in install-windows-service.ps1 install-macos-service.sh uninstall-macos-testnet.py install-container.py container-supervisor.py container-operations.py \

@@ -41,6 +41,14 @@ def amount(value: object) -> Decimal:
     return result
 
 
+class InventoryChanged(ScanError):
+    """The DEX inventory only grew during a scan; carries the end list for the restart check."""
+
+    def __init__(self, message: str, dexes: list[str]) -> None:
+        super().__init__(message)
+        self.dexes = dexes
+
+
 def inventory(value: object) -> list[str]:
     if not isinstance(value, list) or not value or value[0] is not None or len(value) > 512:
         raise ScanError("complete bounded DEX inventory required")
@@ -70,45 +78,65 @@ def flat_scan(
     started_at = datetime.now(UTC).isoformat()
     if read({"type": "userAbstraction", "user": account}) != "disabled":
         raise ScanError("standard testnet account required")
-    before = read({"type": "perpDexs"})
-    dexes = inventory(before)
-    observations: list[dict[str, object]] = []
-    for dex in dexes:
-        fields = {"user": account, **({"dex": dex} if dex else {})}
-        state = read({"type": "clearinghouseState", **fields})
-        orders = read({"type": "frontendOpenOrders", **fields})
-        if not isinstance(state, dict) or not isinstance(orders, list):
-            raise ScanError("unreadable holdings")
-        positions, summary = state.get("assetPositions"), state.get("marginSummary")
-        if not isinstance(positions, list) or not isinstance(summary, dict):
-            raise ScanError("unreadable holdings")
-        for item in positions:
-            position = item.get("position") if isinstance(item, dict) else None
-            if (
-                not isinstance(position, dict)
-                or not isinstance(position.get("coin"), str)
-                or not position["coin"]
-            ):
-                raise ScanError("unreadable position")
-            if amount(position.get("szi")) != 0:
-                raise ScanError("account is not flat; unrelated state is never repaired")
-        equity = amount(summary.get("accountValue"))
-        if orders:
-            raise ScanError("account has open orders; unrelated state is never repaired")
-        if not dex and equity < minimum_equity:
-            raise ScanError("refill the E2E testnet account")
-        observations.append(
-            {
-                "dex": dex,
-                "positions": 0,
-                "open_orders": 0,
-                "clearinghouse_sha256": digest(state),
-                "frontend_open_orders_sha256": digest(orders),
-            }
-        )
-    after = read({"type": "perpDexs"})
-    if inventory(after) != dexes:
-        raise ScanError("DEX inventory changed during scan")
+
+    def scan_once() -> tuple[object, object, list[str], list[dict[str, object]]]:
+        before = read({"type": "perpDexs"})
+        dexes = inventory(before)
+        observations: list[dict[str, object]] = []
+        for dex in dexes:
+            fields = {"user": account, **({"dex": dex} if dex else {})}
+            state = read({"type": "clearinghouseState", **fields})
+            orders = read({"type": "frontendOpenOrders", **fields})
+            if not isinstance(state, dict) or not isinstance(orders, list):
+                raise ScanError("unreadable holdings")
+            positions, summary = state.get("assetPositions"), state.get("marginSummary")
+            if not isinstance(positions, list) or not isinstance(summary, dict):
+                raise ScanError("unreadable holdings")
+            for item in positions:
+                position = item.get("position") if isinstance(item, dict) else None
+                if (
+                    not isinstance(position, dict)
+                    or not isinstance(position.get("coin"), str)
+                    or not position["coin"]
+                ):
+                    raise ScanError("unreadable position")
+                if amount(position.get("szi")) != 0:
+                    raise ScanError("account is not flat; unrelated state is never repaired")
+            equity = amount(summary.get("accountValue"))
+            if orders:
+                raise ScanError("account has open orders; unrelated state is never repaired")
+            if not dex and equity < minimum_equity:
+                raise ScanError("refill the E2E testnet account")
+            observations.append(
+                {
+                    "dex": dex,
+                    "positions": 0,
+                    "open_orders": 0,
+                    "clearinghouse_sha256": digest(state),
+                    "frontend_open_orders_sha256": digest(orders),
+                }
+            )
+        after = read({"type": "perpDexs"})
+        if inventory(after) != dexes:
+            if not set(dexes) <= set(inventory(after)):
+                raise ScanError("DEX inventory changed during scan")
+            raise InventoryChanged("DEX inventory changed during scan", inventory(after))
+        return before, after, dexes, observations
+
+    # Testnet DEXes come and go (rc.16, 14 Oct: one appeared and one was removed during scans).
+    # Only an added DEX restarts the whole scan, once, inside the same phase deadline: the second
+    # pass must cover every DEX seen at any point of the first (its end list), so a DEX that
+    # vanished from the list is never left unchecked. Each completed scan covers one unchanged
+    # inventory; nothing partial is accepted.
+    try:
+        before, after, dexes, observations = scan_once()
+    except InventoryChanged as changed:
+        # Every DEX seen at any point of the first pass (its end list contains its start list)
+        # must be scanned by the second pass; one added and removed again refuses.
+        seen = changed.dexes
+        before, after, dexes, observations = scan_once()
+        if not set(seen) <= set(dexes):
+            raise ScanError("DEX inventory changed during scan") from None
     return {
         "started_at": started_at,
         "finished_at": datetime.now(UTC).isoformat(),

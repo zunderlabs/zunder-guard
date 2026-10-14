@@ -753,6 +753,8 @@ def test_systemd_diagnostic_uses_existing_root_custody_and_exports_early_finite_
         "runtime/ownership.json",
         "runtime/collection-failure.json",
         "runtime/cleanup-responses.json",
+        "runtime/linux-opt-refusal.receipt.json",
+        "runtime/linux-opt-normalized.receipt.json",
     }
     export = runs[exported]
     assert set(export.split("for FILE in ", 1)[1].split("; do", 1)[0].split()) == expected

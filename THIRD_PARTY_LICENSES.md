@@ -149,7 +149,7 @@ are the files each crate ships, grouped where they are identical.
 | rustc-hash | 2.1.3 | Apache-2.0 OR MIT | https://github.com/rust-lang/rustc-hash |
 | rustc_version | 0.4.1 | MIT OR Apache-2.0 | https://github.com/djc/rustc-version-rs |
 | rustix | 1.1.5 | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT | https://github.com/bytecodealliance/rustix |
-| rustls | 0.23.45 | Apache-2.0 OR ISC OR MIT | https://github.com/rustls/rustls |
+| rustls | 0.23.46 | Apache-2.0 OR ISC OR MIT | https://github.com/rustls/rustls |
 | rustls-native-certs | 0.8.4 | Apache-2.0 OR ISC OR MIT | https://github.com/rustls/rustls-native-certs |
 | rustls-pki-types | 1.15.1 | MIT OR Apache-2.0 | https://github.com/rustls/pki-types |
 | rustls-webpki | 0.103.15 | ISC | https://github.com/rustls/webpki |
@@ -778,7 +778,7 @@ DEALINGS IN THE SOFTWARE.
 
 ### LICENSE-APACHE
 
-Used by: arrayvec 0.7.8, atomic-waker 1.1.2, autocfg 1.5.1, base64 0.22.1, base64 0.23.1, bitflags 1.3.2, bitflags 2.13.2, bumpalo 3.20.3, cc 1.6.0, cfg-if 1.0.5, core-foundation 0.10.1, core-foundation-sys 0.8.7, curve25519-dalek-derive 0.1.1, displaydoc 0.2.7, equivalent 1.0.2, errno 0.3.14, ff 0.14.0, find-msvc-tools 0.1.14, form_urlencoded 1.2.2, group 0.14.0, hashbrown 0.17.1, heck 0.5.0, httparse 1.10.1, hyper-rustls 0.27.10, idna 1.1.0, idna_adapter 1.2.2, indexmap 2.14.2, js-sys 0.3.106, linux-raw-sys 0.12.1, log 0.4.34, num-traits 0.2.19, once_cell 1.21.4, openssl-probe 0.2.1, percent-encoding 2.3.2, rustc_version 0.4.1, rustix 1.1.5, rustls 0.23.45, rustls-native-certs 0.8.4, security-framework 3.7.0, security-framework-sys 2.17.0, signal-hook 0.4.5, signal-hook-registry 1.4.8, smallvec 1.16.2, socket2 0.6.5, stable_deref_trait 1.2.1, tungstenite 0.30.0, url 2.5.8, version_check 0.9.5, wasi 0.11.1+wasi-snapshot-preview1, wasip2 1.0.4+wasi-0.2.12, wasm-bindgen 0.2.129, wasm-bindgen-futures 0.4.79, wasm-bindgen-macro 0.2.129, wasm-bindgen-macro-support 0.2.129, wasm-bindgen-shared 0.2.129, web-sys 0.3.106, win32job 2.0.3, wit-bindgen 0.57.1.
+Used by: arrayvec 0.7.8, atomic-waker 1.1.2, autocfg 1.5.1, base64 0.22.1, base64 0.23.1, bitflags 1.3.2, bitflags 2.13.2, bumpalo 3.20.3, cc 1.6.0, cfg-if 1.0.5, core-foundation 0.10.1, core-foundation-sys 0.8.7, curve25519-dalek-derive 0.1.1, displaydoc 0.2.7, equivalent 1.0.2, errno 0.3.14, ff 0.14.0, find-msvc-tools 0.1.14, form_urlencoded 1.2.2, group 0.14.0, hashbrown 0.17.1, heck 0.5.0, httparse 1.10.1, hyper-rustls 0.27.10, idna 1.1.0, idna_adapter 1.2.2, indexmap 2.14.2, js-sys 0.3.106, linux-raw-sys 0.12.1, log 0.4.34, num-traits 0.2.19, once_cell 1.21.4, openssl-probe 0.2.1, percent-encoding 2.3.2, rustc_version 0.4.1, rustix 1.1.5, rustls 0.23.46, rustls-native-certs 0.8.4, security-framework 3.7.0, security-framework-sys 2.17.0, signal-hook 0.4.5, signal-hook-registry 1.4.8, smallvec 1.16.2, socket2 0.6.5, stable_deref_trait 1.2.1, tungstenite 0.30.0, url 2.5.8, version_check 0.9.5, wasi 0.11.1+wasi-snapshot-preview1, wasip2 1.0.4+wasi-0.2.12, wasm-bindgen 0.2.129, wasm-bindgen-futures 0.4.79, wasm-bindgen-macro 0.2.129, wasm-bindgen-macro-support 0.2.129, wasm-bindgen-shared 0.2.129, web-sys 0.3.106, win32job 2.0.3, wit-bindgen 0.57.1.
 
 ````text
 Apache License
@@ -4496,7 +4496,7 @@ THE SOFTWARE.
 
 ### LICENSE-MIT
 
-Used by: hyper-rustls 0.27.10, rustls 0.23.45, rustls-native-certs 0.8.4.
+Used by: hyper-rustls 0.27.10, rustls 0.23.46, rustls-native-certs 0.8.4.
 
 ````text
 Copyright (c) 2016 Joseph Birr-Pixton <jpixton@gmail.com>
@@ -4528,7 +4528,7 @@ DEALINGS IN THE SOFTWARE.
 
 ### LICENSE-ISC
 
-Used by: hyper-rustls 0.27.10, rustls 0.23.45, rustls-native-certs 0.8.4.
+Used by: hyper-rustls 0.27.10, rustls 0.23.46, rustls-native-certs 0.8.4.
 
 ````text
 ISC License (ISC)

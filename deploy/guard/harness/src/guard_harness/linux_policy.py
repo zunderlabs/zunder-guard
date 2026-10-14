@@ -93,6 +93,34 @@ def write(path: Path, value: dict[str, Any]) -> None:
 def prepare(
     inputs: Inputs, installer: Path | None, digest: str, binary_sha256: str
 ) -> dict[str, object]:
+    return measure(
+        installer,
+        digest,
+        binary_sha256,
+        output=inputs.output,
+        account=inputs.account,
+        rules=inputs.rules,
+        version=inputs.version,
+        commit=inputs.release_commit,
+        manifest_sha256=inputs.manifest_sha256,
+        scenario=inputs.scenario,
+    )
+
+
+def measure(
+    installer: Path | None,
+    digest: str,
+    binary_sha256: str,
+    *,
+    output: Path,
+    account: str,
+    rules: str,
+    version: str,
+    commit: str,
+    manifest_sha256: str,
+    scenario: str,
+) -> dict[str, object]:
+    """The decisions.md 14 Oct step for any root service row (I1, I2, I6, T2)."""
     if not hosted():
         return {}
     before = opt_metadata()
@@ -103,19 +131,19 @@ def prepare(
     assert installer is not None
     authenticated_file(installer, digest)
     require(
-        re.fullmatch(r"[0-9a-f]{40}", inputs.release_commit) is not None
-        and re.fullmatch(r"[0-9a-f]{64}", inputs.manifest_sha256) is not None,
+        re.fullmatch(r"[0-9a-f]{40}", commit) is not None
+        and re.fullmatch(r"[0-9a-f]{64}", manifest_sha256) is not None,
         "authenticated released /opt policy identity required",
     )
     identity = dict(
         schema=1,
         result="passed",
-        tag=inputs.version,
-        commit=inputs.release_commit,
-        manifest_sha256=inputs.manifest_sha256,
+        tag=version,
+        commit=commit,
+        manifest_sha256=manifest_sha256,
         installer_sha256=digest,
         binary_sha256=binary_sha256,
-        scenario=inputs.scenario,
+        scenario=scenario,
         scope=SCOPE,
     )
     try:
@@ -127,10 +155,10 @@ def prepare(
                 "--network",
                 "testnet",
                 "--account",
-                inputs.account,
+                account,
                 "--key-stdin",
                 "--rules",
-                inputs.rules,
+                rules,
                 "--equity-cap",
                 "40",
                 "--ip-share",
@@ -157,7 +185,7 @@ def prepare(
         "released installer did not emit the exact native-software-permissions refusal",
     )
     require(opt_metadata() == before, "runner /opt changed during refusal probe")
-    refusal_path, normalized_path = (inputs.output / name for name in RECEIPTS)
+    refusal_path, normalized_path = (output / name for name in RECEIPTS)
     write(
         refusal_path,
         dict(

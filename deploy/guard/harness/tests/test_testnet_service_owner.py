@@ -7,10 +7,20 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
+import test_linux_policy as opt
+from test_install_evidence import release
 
+from guard_harness import linux_policy
 from guard_harness import testnet_service_owner as service
 from guard_harness.runner import RunResult
 from guard_harness.testnet_process import ProcessError
+
+
+@pytest.fixture(autouse=True)
+def not_a_hosted_opt(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A GitHub-hosted runner running these tests has /opt 0777 (5de60a9d): never let the
+    # real machine switch the /opt step on; its own tests below patch it on.
+    monkeypatch.setattr(linux_policy, "eligible", lambda: False)
 
 
 def test_service_pairs_as_owner_and_mcp_home_stays_private(
@@ -113,6 +123,7 @@ def test_service_pairs_as_owner_and_mcp_home_stays_private(
         "runtime-create",
         "staged-loader",
         "key-frame",
+        "opt-policy",
         "service-setup",
         "installed-binary",
         "service-stop",
@@ -318,3 +329,79 @@ def _framing_constructor(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, framed
         )
     assert key.tell() <= 257
     assert phases[-1] in {"key-frame", "service-setup"}
+
+
+def _hosted_opt_owner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, refusal: bytes | None = None
+) -> tuple[Any, dict[str, Any], list[str], list[str]]:
+    current = release(tmp_path / "assets")
+    work = tmp_path / "work"
+    _, state, calls = opt.setup(monkeypatch, current, work)
+    work.rmdir()  # The policy fixture's Inputs made it; the owner requires a fresh workspace.
+    if refusal is not None:
+        monkeypatch.setattr(
+            "guard_harness.linux_policy.subprocess.run",
+            lambda *a, **k: opt.completed(stderr=refusal),
+        )
+    monkeypatch.setattr(linux_policy, "eligible", lambda: True)
+    phases: list[str] = []
+    binary = tmp_path / "binary"
+    binary.write_bytes(b"authenticated fixture")
+
+    def loader(release: Any, *, windows: bool, output: Path) -> Path:
+        output.write_bytes(b"signed fixture")
+        return output
+
+    def setup(self: Any, key: bytes) -> dict[str, str]:
+        # The protected service setup only ever sees a normalised /opt.
+        calls.append("setup")
+        assert state["metadata"] == opt.metadata("0755")
+        raise RuntimeError("setup fixture reached")
+
+    monkeypatch.setattr(service, "staged_loader", loader)
+    monkeypatch.setattr("guard_harness.linux_testnet_service.TestnetService.setup", setup)
+    monkeypatch.setattr(service.ServiceOwner, "_control", lambda *a: pytest.fail("no control"))
+    with pytest.raises((RuntimeError, ProcessError)):
+        service.ServiceOwner(
+            binary,
+            sha256=hashlib.sha256(binary.read_bytes()).hexdigest(),
+            work=work,
+            account="0x" + "1" * 40,
+            api_wallet="0x" + "2" * 40,
+            port=18547,
+            key_stdin=io.BytesIO(b"a" * 64 + b"\n"),
+            assets=current.assets,
+            tag=current.tag,
+            commit=current.commit,
+            marker="c" * 32,
+            observe_phase=phases.append,
+        )
+    return current, state, calls, phases
+
+
+def test_hosted_world_writable_opt_is_measured_then_normalised_before_t2_setup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # rc.16 verify 38569322248, T2 attempt 2: install.sh refused the runner's 0777 /opt.
+    current, state, calls, phases = _hosted_opt_owner(tmp_path, monkeypatch)
+    assert calls == ["probe", "normalize", "setup"]
+    assert phases[-2:] == ["opt-policy", "service-setup"]
+    assert state["metadata"] == opt.metadata("0755")
+    refusal, normalized = (
+        json.loads((tmp_path / "work" / name).read_bytes()) for name in linux_policy.RECEIPTS
+    )
+    assert refusal["coverage"] == ["linux-opt-refusal"] and refusal["scenario"] == "t2"
+    assert refusal["tag"] == current.tag and refusal["commit"] == current.commit
+    assert refusal["installer_sha256"] == hashlib.sha256(current.asset("install.sh")).hexdigest()
+    assert normalized["opt_policy"] == "runner /opt normalised by harness"
+
+
+def test_any_other_t2_opt_refusal_stops_before_setup_and_leaves_opt_alone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, state, calls, phases = _hosted_opt_owner(
+        tmp_path, monkeypatch, refusal=b"install.sh: managed software directory is not root-owned\n"
+    )
+    assert "setup" not in calls and "normalize" not in calls
+    assert phases[-1] == "opt-policy" and state["metadata"] == opt.metadata("0777")
+    assert not any((tmp_path / "work" / name).exists() for name in linux_policy.RECEIPTS)

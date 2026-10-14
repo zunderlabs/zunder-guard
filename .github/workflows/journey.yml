@@ -217,6 +217,7 @@ jobs:
           name: T1-early-failure-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
             ${{ runner.temp }}/guard-release/T1/receipt.json
+            ${{ runner.temp }}/guard-release/T1/assets.log
             ${{ runner.temp }}/guard-release/T1/runtime/entry-attempt.json
             ${{ runner.temp }}/guard-release/T1/runtime/entry-response.json
             ${{ runner.temp }}/guard-release/T1/runtime/ownership.json
@@ -333,7 +334,7 @@ jobs:
           MARKER=$(python -c 'import secrets; print(secrets.token_hex(16))')
           printf '%s' "$MARKER" | sudo tee /etc/zunder-native-disposable >/dev/null
           sudo chmod 600 /etc/zunder-native-disposable
-          printf '%s\n' "$WALLET_INPUT" | env -u WALLET_INPUT sudo --preserve-env=GH_TOKEN,PATH \
+          printf '%s\n' "$WALLET_INPUT" | env -u WALLET_INPUT sudo --preserve-env=GH_TOKEN,PATH,GITHUB_ACTIONS,RUNNER_ENVIRONMENT \
             "$(command -v python)" -m guard_harness.testnet_run --service-marker "$MARKER" \
             --tag "$TAG" --commit "$SOURCE" --account "$E2E_ACCOUNT" --api-wallet "$API_WALLET" \
             --deadline "$JOURNEY_DEADLINE" --work "$ROOT_PARENT/T2"
@@ -346,7 +347,7 @@ jobs:
           ROOT_WORK="/root/guard-release-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT/T2"
           install -d -m 700 "$RUNNER_TEMP/guard-release/T2"
           FILES=()
-          for FILE in assets/release-manifest.json receipt.json assets.log runtime/init.log runtime/testnet-service-install.log runtime/service-stop.log runtime/service-start.log runtime/pair.log runtime/process.log runtime/mcp.log runtime/entry-attempt.json runtime/entry-response.json runtime/ownership.json runtime/collection-failure.json runtime/cleanup-responses.json T2.predicate.json; do
+          for FILE in assets/release-manifest.json receipt.json assets.log runtime/init.log runtime/testnet-service-install.log runtime/service-stop.log runtime/service-start.log runtime/pair.log runtime/process.log runtime/mcp.log runtime/entry-attempt.json runtime/entry-response.json runtime/ownership.json runtime/collection-failure.json runtime/cleanup-responses.json runtime/linux-opt-refusal.receipt.json runtime/linux-opt-normalized.receipt.json T2.predicate.json; do
             if sudo test -f "$ROOT_WORK/$FILE" && ! sudo test -L "$ROOT_WORK/$FILE"; then
               FILES+=("$FILE")
             fi
@@ -369,6 +370,7 @@ jobs:
           name: T2-early-failure-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
             ${{ runner.temp }}/guard-release/T2/receipt.json
+            ${{ runner.temp }}/guard-release/T2/assets.log
             ${{ runner.temp }}/guard-release/T2/runtime/testnet-service-install.log
             ${{ runner.temp }}/guard-release/T2/runtime/service-stop.log
             ${{ runner.temp }}/guard-release/T2/runtime/service-start.log
@@ -377,6 +379,8 @@ jobs:
             ${{ runner.temp }}/guard-release/T2/runtime/ownership.json
             ${{ runner.temp }}/guard-release/T2/runtime/collection-failure.json
             ${{ runner.temp }}/guard-release/T2/runtime/cleanup-responses.json
+            ${{ runner.temp }}/guard-release/T2/runtime/linux-opt-refusal.receipt.json
+            ${{ runner.temp }}/guard-release/T2/runtime/linux-opt-normalized.receipt.json
           if-no-files-found: warn
           retention-days: 7
       - name: Independent keyless C6 flat scan after failure
@@ -406,6 +410,8 @@ jobs:
             ${{ runner.temp }}/guard-release/T2/runtime/ownership.json
             ${{ runner.temp }}/guard-release/T2/runtime/collection-failure.json
             ${{ runner.temp }}/guard-release/T2/runtime/cleanup-responses.json
+            ${{ runner.temp }}/guard-release/T2/runtime/linux-opt-refusal.receipt.json
+            ${{ runner.temp }}/guard-release/T2/runtime/linux-opt-normalized.receipt.json
             ${{ runner.temp }}/guard-release/T2/T2.predicate.json
             ${{ steps.evidence.outputs.bundle-path }}
           if-no-files-found: warn

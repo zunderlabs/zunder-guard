@@ -9,6 +9,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import BinaryIO
 
+from guard_harness import linux_policy
 from guard_harness.cli import PAIR_SCHEMA, Pair, decode_json
 from guard_harness.linux_lifecycle import ROOT_PATH
 from guard_harness.linux_testnet_service import TestnetService
@@ -21,6 +22,7 @@ STARTUP_PHASES = frozenset(
         "runtime-create",
         "staged-loader",
         "key-frame",
+        "opt-policy",
         "service-setup",
         "installed-binary",
         "service-stop",
@@ -59,6 +61,7 @@ class ServiceOwner(Foreground):
         work.mkdir(mode=0o700)
         self.work, self.account, self.sha256 = work, account, sha256
         observe_phase("staged-loader")
+        self.opt_policy: dict[str, object] = {}
         installer = staged_loader(
             Release(tag, commit, assets), windows=False, output=work / "i-staging"
         )
@@ -72,6 +75,27 @@ class ServiceOwner(Foreground):
             key = key[2:]
         _need(len(key) == 64 and all(byte in b"0123456789abcdefABCDEF" for byte in key))
         key += b"\n"
+        # decisions.md 14 Oct: a hosted runner's world-writable /opt makes the released
+        # installer refuse every root service (rc.16 verify 38569322248, T2 attempt 2,
+        # native-software-permissions). Measure that exact refusal, then normalise /opt
+        # only, with both receipts in this workspace; any other /opt is left alone.
+        observe_phase("opt-policy")
+        if linux_policy.eligible():
+            release = Release(tag, commit, assets)
+            manifest = hashlib.sha256(release.asset("release-manifest.json")).hexdigest()
+            self.opt_policy = linux_policy.measure(
+                assets / "install.sh",
+                hashlib.sha256(release.asset("install.sh")).hexdigest(),
+                sha256,
+                output=work,
+                account=account,
+                rules="zr1_eyJ2IjoxfQ",
+                version=tag,
+                commit=commit,
+                manifest_sha256=manifest,
+                scenario="t2",
+            )
+            _need(self.opt_policy.get("opt_policy") == linux_policy.NORMALIZED_NOTE)
         observe_phase("service-setup")
         installed = TestnetService(
             installer,
