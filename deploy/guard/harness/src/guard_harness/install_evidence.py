@@ -7,6 +7,7 @@ import re
 from pathlib import Path
 from typing import Any
 
+from guard_harness import linux_policy
 from guard_harness.channel_evidence import admit
 from guard_harness.docker_run import _version
 from guard_harness.lifecycle_coverage import LIFECYCLE_COVERAGE
@@ -309,6 +310,15 @@ def predicate(
                     raise EvidenceError(
                         "encrypted systemd Testnet custody and no-exchange journal required"
                     )
+                if row in {"I1", "I2"} and mode == "testnet":
+                    directory = evidence / mode / scenario
+                    if any(
+                        key in value for key in ("opt_policy", "linux_opt_receipt_sha256")
+                    ) or any(
+                        (directory / name).exists() or (directory / name).is_symlink()
+                        for name in linux_policy.RECEIPTS
+                    ):
+                        linux_policy.admit(current, "linux-" + architecture, directory, value)
                 if route == "native":
                     target = "linux-" + architecture
                     if (

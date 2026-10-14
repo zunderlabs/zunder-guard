@@ -508,6 +508,7 @@ def test_foreground_diagnostic_workflow_preserves_custody_deadline_and_private_e
             "runtime/entry-attempt.json",
             "runtime/ownership.json",
             "runtime/collection-failure.json",
+            "runtime/cleanup-responses.json",
             "runtime/entry-response.json",
         }
         assert {path.split("/T1/")[1] for path in paths if "/T1/" in path} == expected
@@ -751,6 +752,7 @@ def test_systemd_diagnostic_uses_existing_root_custody_and_exports_early_finite_
         "runtime/entry-response.json",
         "runtime/ownership.json",
         "runtime/collection-failure.json",
+        "runtime/cleanup-responses.json",
     }
     export = runs[exported]
     assert set(export.split("for FILE in ", 1)[1].split("; do", 1)[0].split()) == expected

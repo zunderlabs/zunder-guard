@@ -206,6 +206,7 @@ jobs:
             ${{ runner.temp }}/guard-release/T1/runtime/mcp.log
             ${{ runner.temp }}/guard-release/T1/runtime/entry-attempt.json
             ${{ runner.temp }}/guard-release/T1/runtime/ownership.json
+            ${{ runner.temp }}/guard-release/T1/runtime/cleanup-responses.json
             ${{ runner.temp }}/guard-release/T1/runtime/entry-response.json
             ${{ runner.temp }}/guard-release/T1/runtime/collection-failure.json
           if-no-files-found: warn
@@ -230,6 +231,7 @@ jobs:
             ${{ runner.temp }}/guard-release/T1/runtime/mcp.log
             ${{ runner.temp }}/guard-release/T1/runtime/entry-attempt.json
             ${{ runner.temp }}/guard-release/T1/runtime/ownership.json
+            ${{ runner.temp }}/guard-release/T1/runtime/cleanup-responses.json
             ${{ runner.temp }}/guard-release/T1/runtime/entry-response.json
             ${{ runner.temp }}/guard-release/T1/runtime/collection-failure.json
           if-no-files-found: warn
@@ -313,7 +315,7 @@ jobs:
           ROOT_WORK="/root/guard-release-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT/T2"
           install -d -m 700 "$RUNNER_TEMP/guard-release/T2"
           FILES=()
-          for FILE in receipt.json assets.log runtime/init.log runtime/testnet-service-install.log runtime/service-stop.log runtime/service-start.log runtime/pair.log runtime/process.log runtime/mcp.log runtime/entry-attempt.json runtime/entry-response.json runtime/ownership.json runtime/collection-failure.json; do
+          for FILE in receipt.json assets.log runtime/init.log runtime/testnet-service-install.log runtime/service-stop.log runtime/service-start.log runtime/pair.log runtime/process.log runtime/mcp.log runtime/entry-attempt.json runtime/entry-response.json runtime/ownership.json runtime/collection-failure.json runtime/cleanup-responses.json; do
             if sudo test -f "$ROOT_WORK/$FILE" && ! sudo test -L "$ROOT_WORK/$FILE"; then
               FILES+=("$FILE")
             fi
@@ -355,6 +357,7 @@ jobs:
             ${{ runner.temp }}/guard-release/T2/runtime/mcp.log
             ${{ runner.temp }}/guard-release/T2/runtime/entry-attempt.json
             ${{ runner.temp }}/guard-release/T2/runtime/ownership.json
+            ${{ runner.temp }}/guard-release/T2/runtime/cleanup-responses.json
             ${{ runner.temp }}/guard-release/T2/runtime/entry-response.json
             ${{ runner.temp }}/guard-release/T2/runtime/collection-failure.json
           if-no-files-found: warn
@@ -382,6 +385,7 @@ jobs:
             ${{ runner.temp }}/guard-release/T2/runtime/mcp.log
             ${{ runner.temp }}/guard-release/T2/runtime/entry-attempt.json
             ${{ runner.temp }}/guard-release/T2/runtime/ownership.json
+            ${{ runner.temp }}/guard-release/T2/runtime/cleanup-responses.json
             ${{ runner.temp }}/guard-release/T2/runtime/entry-response.json
             ${{ runner.temp }}/guard-release/T2/runtime/collection-failure.json
           if-no-files-found: warn
@@ -1028,12 +1032,19 @@ jobs:
                  '--binary-sha256',hashlib.sha256(release.binary('linux-amd64')).hexdigest()]
           if os.environ['MODE']=='container': words += ['--release-image',image]
           if os.environ['DIAGNOSTIC']=='true': words += ['--diagnostic']
+          failed=False
           try:
               subprocess.run(words,check=True)
+          except subprocess.CalledProcessError:
+              failed=True
+              raise
           finally:
               route='linux-container-native' if os.environ['MODE']=='container' else 'linux-systemd'
               target=base/'mainnet/M1'
               target.mkdir(parents=True,exist_ok=True)
+              if failed:
+                  from guard_harness.mainnet_diagnostics import guest_failure
+                  guest_failure(output,target/(route+'.failure.json'))
               receipt=output/'mainnet-refusal.json'
               if receipt.exists(): (target/(route+'.json')).write_bytes(receipt.read_bytes())
               archive=output/'guest-evidence.tar.gz'
@@ -1077,6 +1088,26 @@ jobs:
         run: |
           python -m pip install --require-hashes --only-binary=:all: -r deploy/guard/harness/requirements-runtime.lock
           python -m pip install --no-deps --no-build-isolation -e ./deploy/guard/harness
+      - name: Measure and remove hosted Windows crash policy before M1
+        if: ${{ matrix.variant == 'windows' }}
+        shell: bash
+        env:
+          TAG: ${{ inputs.tag }}
+          SOURCE: ${{ inputs.commit }}
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import os, pathlib
+          from guard_harness.native_release import Release
+          from guard_harness.windows_policy import prepare
+          base=pathlib.Path(os.environ['RUNNER_TEMP'])
+          release=Release(os.environ['TAG'],os.environ['SOURCE'],base/'subjects/candidate/assets')
+          work=base/'mainnet/windows-policy'
+          work.parent.mkdir(mode=0o700,exist_ok=True)
+          clean={name:value for name,value in os.environ.items()
+                 if not name.startswith('ZUNDER_') and 'WALLET' not in name and 'TOKEN' not in name}
+          prepare(release,work,clean)
+          PY
       - name: M1 actual hidden-terminal unapproved wallet refusal, no orders
         shell: bash
         env:
@@ -1097,6 +1128,7 @@ jobs:
           path: |
             ${{ runner.temp }}/mainnet/M1/*.json
             ${{ runner.temp }}/mainnet/M1/*.log
+            ${{ runner.temp }}/mainnet/windows-policy/*.receipt.json
           if-no-files-found: warn
           retention-days: 14
   mainnet-setup:

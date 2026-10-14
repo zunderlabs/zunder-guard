@@ -1026,6 +1026,10 @@ def test_initial_install_failure_retains_only_typed_unit_and_local_read_diagnost
     path = tmp_path / "install-service-state.json"
     state = json.loads(path.read_bytes())
     assert state["diagnostic"] is True and state["gate_eligible"] is False
+    if route == "native":
+        assert state["service_host_opt"] == linux_testnet_service.opt_metadata()
+    else:
+        assert "service_host_opt" not in state
     assert "PRIVATE" not in path.read_text() and "account" not in state
     assert path.stat().st_mode & 0o777 == 0o600
     assert state["active_state"] == ("unknown" if observer == "read-failed" else "activating")

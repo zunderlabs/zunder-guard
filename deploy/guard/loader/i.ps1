@@ -328,7 +328,6 @@ function Install-ZunderGuard {
   $ProgressPreference = 'SilentlyContinue'
   $V = '@VERSION@'
   $Repo = 'zunderlabs/zunder-guard'
-  $Issuer = 'https://token.actions.githubusercontent.com'
   $Identity = "https://github.com/$Repo/.github/workflows/release.yml@refs/tags/$V"
   $Base = "https://github.com/$Repo/releases/download/$V"
   if ($env:ZUNDER_GUARD_BASE_URL) { $Base = $env:ZUNDER_GUARD_BASE_URL }
@@ -440,15 +439,11 @@ function Install-ZunderGuard {
       $Cosign = Get-Asset 'cosign-windows-amd64.exe' "https://github.com/sigstore/cosign/releases/download/$CosignVersion"
       if ((Get-Sha256 $Cosign) -ne $CosignSha256) { throw 'the cosign download does not match its pinned SHA-256; refusing' }
     }
-    # cosign reports on stderr; Windows PowerShell 5.1 would turn that into a terminating error.
-    $Previous = $ErrorActionPreference
-    $ErrorActionPreference = 'Continue'
-    $Log = & $Cosign verify-blob --bundle $Bundle --certificate-identity $Identity --certificate-oidc-issuer $Issuer $Sums 2>&1
-    $Code = $LASTEXITCODE
-    $ErrorActionPreference = $Previous
+    # Stream verifier diagnostics through the same PS5.1-safe boundary as the
+    # service path. A trust-root/network failure is not evidence of another signer.
+    $Code = Invoke-ZgReleaseVerifier $Cosign $Bundle $Sums $Identity
     if ($Code -ne 0) {
-      $Log | ForEach-Object { Write-Host $_ }
-      throw "signature check FAILED: SHA256SUMS was not signed by $Repo's release workflow for $V; refusing"
+      throw "signature check FAILED: SHA256SUMS could not be verified against $Repo's release workflow for $V; refusing"
     }
     Write-Host "  signature: SHA256SUMS signed by $Repo, release workflow, tag $V (Sigstore)"
     $Expected = $null

@@ -47,6 +47,8 @@ jobs:
           case "$GITHUB_REF" in refs/heads/main|"refs/tags/$TAG") ;; *) exit 1 ;; esac
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with: {ref: '${{ inputs.commit }}', persist-credentials: false}
+      - name: Read-only staging wallet refill preflight
+        run: python3 -I -S deploy/guard/harness/src/guard_harness/wallet_preflight.py
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with: {python-version: '3.13'}
       - uses: slsa-framework/slsa-verifier/actions/installer@ea584f4502babc6f60d9bc799dbbb13c1caa9ee6 # v2.7.1
@@ -128,6 +130,10 @@ jobs:
         with:
           ref: ${{ inputs.commit }}
           persist-credentials: false
+      - name: Read-only staging wallet refill preflight
+        env:
+          E2E_TESTNET_ACCOUNT: ${{ vars.E2E_TESTNET_ACCOUNT }}
+        run: python3 -I -S deploy/guard/harness/src/guard_harness/wallet_preflight.py
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: '3.13'

@@ -7,11 +7,27 @@ helper consumes its key descriptor on stdin and returns only public service meta
 import json
 import os
 import re
+import stat
 from dataclasses import dataclass
 from pathlib import Path
 
 from guard_harness.linux_lifecycle import MARKER, ROOT_PATH, authenticated_file, require
 from guard_harness.runner import run
+
+
+def opt_metadata() -> dict[str, object]:
+    """Read only fixed /opt stat fields; never retain an exception or follow a symlink."""
+    try:
+        info = Path("/opt").lstat()
+    except OSError:
+        return {"uid": None, "gid": None, "mode": None, "directory": None, "symlink": None}
+    return {
+        "uid": info.st_uid,
+        "gid": info.st_gid,
+        "mode": format(stat.S_IMODE(info.st_mode), "04o"),
+        "directory": stat.S_ISDIR(info.st_mode),
+        "symlink": stat.S_ISLNK(info.st_mode),
+    }
 
 
 def container_install_failure_category(output: str) -> str:
@@ -70,6 +86,11 @@ def native_install_failure_category(output: str) -> str:
         "invalid protected testnet key frame": "native-key-frame",
         "the key was refused; nothing was stored": "native-key-refused",
         "systemd-creds could not encrypt the key": "native-credential-encryption",
+        "managed software path is not a real directory": "native-software-directory",
+        "managed software directory is not root-owned": "native-software-owner",
+        "managed software directory mode is invalid": "native-software-mode",
+        "managed software directory has unsafe permissions": "native-software-permissions",
+        "managed software parent is not publicly traversable": "native-software-parent-traversal",
         (
             "Guard did not become healthy; see the log above (journalctl -u zunder-guard-testnet)"
         ): "native-readiness",

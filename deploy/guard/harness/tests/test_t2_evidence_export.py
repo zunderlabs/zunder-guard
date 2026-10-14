@@ -104,6 +104,10 @@ def test_finite_failure_upload_precedes_slow_scan_without_custody(row: str) -> N
         "runtime/entry-attempt.json",
         "runtime/entry-response.json",
         "runtime/ownership.json",
+        # rc.15 T1 (verify 38486755221) lost both finite records: they explain failed
+        # collection and refused cleanup exits from the artifact alone.
+        "runtime/collection-failure.json",
+        "runtime/cleanup-responses.json",
     }
     if row == "T2":
         expected |= {
