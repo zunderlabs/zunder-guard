@@ -1,4 +1,5 @@
 import os
+import stat
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -201,6 +202,14 @@ def test_installer_timeout_cannot_export_partial_stage(
         ("missing protected testnet key frame", "native-key-frame"),
         ("systemd-creds could not encrypt the key", "native-credential-encryption"),
         ("the key was refused; nothing was stored", "native-key-refused"),
+        ("managed software path is not a real directory", "native-software-directory"),
+        ("managed software directory is not root-owned", "native-software-owner"),
+        ("managed software directory mode is invalid", "native-software-mode"),
+        ("managed software directory has unsafe permissions", "native-software-permissions"),
+        (
+            "managed software parent is not publicly traversable",
+            "native-software-parent-traversal",
+        ),
         (
             "Guard did not become healthy; see the log above (journalctl -u zunder-guard-testnet)",
             "native-readiness",
@@ -253,3 +262,60 @@ def test_unknown_new_readiness_predicate_is_not_exported() -> None:
         "account/risk/licence state. (predicate=private-token).\n"
     )
     assert linux_testnet_service.container_install_failure_category(output) == "unknown"
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "managed software path is not a real directory",
+        "managed software directory is not root-owned",
+        "managed software directory mode is invalid",
+        "managed software directory has unsafe permissions",
+        "managed software parent is not publicly traversable",
+    ],
+)
+@pytest.mark.parametrize("suffix", ["", "-private\n", "\nprivate\n"])
+def test_nonexact_software_refusal_is_unknown(message: str, suffix: str) -> None:
+    assert (
+        linux_testnet_service.native_install_failure_category("install.sh: " + message + suffix)
+        == "unknown"
+    )
+
+
+@pytest.mark.parametrize(
+    "uid,gid,mode",
+    [
+        (0, 0, stat.S_IFDIR | 0o755),
+        (1001, 1002, stat.S_IFDIR | 0o2775),
+        (0, 0, stat.S_IFLNK | 0o777),
+    ],
+)
+def test_opt_metadata_records_actual_owner_and_mode_without_following_or_mutating(
+    monkeypatch: pytest.MonkeyPatch, uid: int, gid: int, mode: int
+) -> None:
+    def lstat(path: Path) -> os.stat_result:
+        assert path == Path("/opt")
+        return os.stat_result((mode, 0, 0, 1, uid, gid, 0, 0, 0, 0))
+
+    monkeypatch.setattr(Path, "lstat", lstat)
+    assert linux_testnet_service.opt_metadata() == {
+        "uid": uid,
+        "gid": gid,
+        "mode": format(stat.S_IMODE(mode), "04o"),
+        "directory": stat.S_ISDIR(mode),
+        "symlink": stat.S_ISLNK(mode),
+    }
+
+
+def test_opt_stat_failure_keeps_only_unknown_fields(monkeypatch: pytest.MonkeyPatch) -> None:
+    def lstat(path: Path) -> os.stat_result:
+        raise OSError("private-provider-message")
+
+    monkeypatch.setattr(Path, "lstat", lstat)
+    assert linux_testnet_service.opt_metadata() == {
+        "uid": None,
+        "gid": None,
+        "mode": None,
+        "directory": None,
+        "symlink": None,
+    }

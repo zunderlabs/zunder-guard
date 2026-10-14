@@ -9,15 +9,36 @@ import select
 import socket
 import subprocess
 import time
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
 
 from guard_harness.cli import GuardCLI
 from guard_harness.native_paper import LifecycleError, healthy
 from guard_harness.native_release import Release, staged_loader
+from guard_harness.native_verifier import LoaderDownloads, verifier_probe
 from guard_harness.paper_bot import LocalGuard
 from guard_harness.paper_roundtrip import round_trip
 from guard_harness.runner import run
+
+
+def paper_failure_category(text: str) -> str:
+    """Fixed categories only: terminal text can contain private material."""
+    for category, pattern in (
+        (
+            "verifier-trust-root",
+            r"(?:getting trusted root|setting trusted material|tuf refresh failed)",
+        ),
+        ("signature-verification", r"signature\s+check\s+FAILED"),
+        ("checksum", r"checksum mismatch|pinned SHA-256; refusing"),
+        ("download", r"download failed"),
+        ("rules-refused", r"the rules code is refused|a rules string is zr1_"),
+        ("console-required", r"init is interactive: run it on a terminal"),
+        ("init-refused", r"zunder-guard init stopped"),
+    ):
+        if re.search(pattern, text, flags=re.IGNORECASE):
+            return category
+    return "unknown"
 
 
 def dialogue(
@@ -28,6 +49,7 @@ def dialogue(
     windows: bool,
     timeout: float = 1200,
     mode_prompt: bool = True,
+    log: Path | None = None,
 ) -> None:
     """Public paper replies only; unknown/private-key prompts always refuse."""
     replies = [
@@ -51,6 +73,14 @@ def dialogue(
         if pid == 0:
             os.execve(argv[0], argv, env)
     pending, index, status = "", 0, None
+    category = "unknown"
+    events = ["[paper terminal output withheld]"]
+    phases = {
+        "Keep these? [Y/edit]": "rules",
+        "Hyperliquid account address": "account",
+        "Mode: paper": "mode",
+        "Paper mode reads which network's account": "read-network",
+    }
     deadline = time.monotonic() + timeout
     try:
         while time.monotonic() < deadline:
@@ -72,8 +102,12 @@ def dialogue(
                     chunk = ""
                 pending += chunk
                 if len(pending) > 1048576 or "API wallet" in pending:
+                    category = "output-or-private-prompt"
                     raise LifecycleError("paper channel output/private prompt refused")
                 pending = re.sub(r"\x1b\[[0-9;?]*[a-zA-Z]", "", pending)
+                observed = paper_failure_category(pending)
+                if observed != "unknown":
+                    category = observed
                 while index < len(replies) and replies[index][0] in pending:
                     prompt, reply = replies[index]
                     pending = pending.split(prompt, 1)[1]
@@ -81,6 +115,7 @@ def dialogue(
                         os.write(descriptor, (reply + "\n").encode())
                     else:
                         child.write(reply + "\r\n")
+                    events.append("reply phase: " + phases[prompt])
                     index += 1
             if child is None:
                 finished, raw = os.waitpid(pid, os.WNOHANG)
@@ -98,31 +133,35 @@ def dialogue(
                 if status != 0
                 else "incomplete-dialogue"
             )
-            phases = {
-                "Keep these? [Y/edit]": "rules",
-                "Hyperliquid account address": "account",
-                "Mode: paper": "mode",
-                "Paper mode reads which network's account": "read-network",
-            }
             phase = phases[replies[index][0]] if index < len(replies) else "setup-exit"
             # Never include the terminal transcript, account, argv or private suffix.
             exit_status = (
                 str(status) if type(status) is int and -255 <= status <= 255 else "unknown"
             )
+            events += [
+                "outcome: " + outcome,
+                "next phase: " + phase,
+                "exit status: " + exit_status,
+            ]
             raise LifecycleError(
                 "literal paper loader did not finish complete interactive setup "
                 f"(outcome={outcome}, phase={phase}, exit={exit_status})"
             )
+        events.append("outcome: passed")
     finally:
-        if child is not None:
-            child.close(force=True)
-        else:
-            if status is None:
-                import signal
+        try:
+            if child is not None:
+                child.close(force=True)
+            else:
+                if status is None:
+                    import signal
 
-                os.killpg(pid, signal.SIGKILL)
-                os.waitpid(pid, 0)
-            os.close(descriptor)
+                    os.killpg(pid, signal.SIGKILL)
+                    os.waitpid(pid, 0)
+                os.close(descriptor)
+        finally:
+            if log is not None:
+                log.write_text("\n".join([*events, "failure category: " + category]) + "\n")
 
 
 def destinations(windows: bool, env: dict[str, str]) -> tuple[Path, ...]:
@@ -277,9 +316,40 @@ def execute(release: Release, work: Path, *, account: str, shell: str) -> dict[s
                     if windows
                     else ["/bin/sh", "-c", literal]
                 )
-                dialogue(
-                    argv, account, env=clean, windows=windows, mode_prompt=form == "manifest-bare"
-                )
+                log = directory / "dialogue.log"
+                downloads = LoaderDownloads(release, clean) if windows else None
+                try:
+                    with downloads if downloads is not None else nullcontext():
+                        dialogue(
+                            argv,
+                            account,
+                            env=clean,
+                            windows=windows,
+                            mode_prompt=form == "manifest-bare",
+                            log=log,
+                        )
+                except LifecycleError:
+                    # Only a fixed signature category admits verifier output;
+                    # wizard/private output continues to be withheld entirely.
+                    try:
+                        if (
+                            downloads is not None
+                            and log.is_file()
+                            and "failure category: signature-verification"
+                            in log.read_text().splitlines()
+                        ):
+                            verifier_probe(
+                                release,
+                                downloads,
+                                directory,
+                                clean=clean,
+                                full=dict(os.environ),
+                                shell=shell,
+                                account=account,
+                            )
+                    except OSError:
+                        pass  # Diagnostic I/O must never replace the loader's refusal.
+                    raise
         installed = [path for path in candidates if path.is_file() and not path.is_symlink()]
         if len(installed) != 1:
             raise LifecycleError("documented user installer destination differs")

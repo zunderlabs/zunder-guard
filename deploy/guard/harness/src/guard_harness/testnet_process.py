@@ -385,6 +385,7 @@ class Foreground:
                 persist_ownership=store.capture,
                 persist_response=store.response,
                 persist_collection_failure=lambda value: retain_failure(self.work, value),
+                persist_cleanup_response=store.cleanup_response,
                 capture_entry=capture_entry,
                 warm_info=warm_info,
                 observe_phase=observe_phase,

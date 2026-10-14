@@ -709,3 +709,148 @@ def test_guard_http_template_is_pinned_to_authored_rust_display() -> None:
     tools = (root / "tools.rs").read_text()
     assert 'GuardError::Http(_) => "guard_http_error"' in tools
     assert "other => other.to_string()" in tools
+
+
+# MCP close_position's shipped pre-send refusal when the position is gone, as in rc.15 T1
+# (verify 38486755221): Guard's own close (cloid 0x7a69…) flattened at 00:09:40.044,
+# after two usdSends at 00:09:28 and 00:09:33, and the harness close found nothing.
+GONE = {
+    "ok": False,
+    "error": {"code": "position_size_mismatch", "reason": "PRIVATE-REASON"},
+    "expected_size": "0.0002",
+    "position_size": "0",
+    "sent": False,
+}
+
+
+def flattened_by_guard(scenario: Scenario) -> None:
+    original = scenario.tool
+
+    def tool(name: Any, arguments: Any = None) -> Any:
+        if name != "close_position":
+            return original(name, arguments)
+        scenario.calls.append(name)
+        # Guard's own flatten: no MCP close decision, the position and stop gone.
+        scenario.fields = copy.deepcopy(scenario.closed[3])
+        return {**GONE, "quoted_text": "PRIVATE-ACCOUNT-KEY-SIGNATURE"}, True
+
+    scenario.tool = tool  # type: ignore[method-assign]
+
+
+def test_refused_cleanup_close_retains_its_finite_code_and_phase(tmp_path: Path) -> None:
+    scenario = Scenario()
+    client, entry = scenario.opening[1:3]
+    store = OwnershipStore(
+        tmp_path, account="0x" + "2" * 40, client=client, source="a" * 64, version="1.0.0-rc.15"
+    )
+    flattened_by_guard(scenario)
+    phases: list[str] = []
+    result = scenario.execute(
+        record_attempt=store.begin,
+        persist_ownership=store.capture,
+        persist_response=store.response,
+        persist_cleanup_response=store.cleanup_response,
+        observe_phase=phases.append,
+    )
+    assert result.failure == "cleanup_incomplete_keep_guard_running"
+    assert not result.guard_stopped and not scenario.stopped
+    assert scenario.calls.count("close_position") == 1  # Never retried.
+    assert phases[-2:] == ["cleanup-mutation", "cleanup-mutation-response"]
+    text = (tmp_path / "cleanup-responses.json").read_text()
+    assert "PRIVATE" not in text and "0x" + "2" * 40 not in text
+    record = json.loads(text)
+    assert record["gate_eligible"] is False and record["version"] == "1.0.0-rc.15"
+    assert record["responses"] == [
+        {
+            "tool": "close_position",
+            "response_available": True,
+            "isError": True,
+            "ok": False,
+            "sent": False,
+            "code": "position_size_mismatch",
+            "http_status": None,
+            "outcome": "unknown",
+            "category": "refused_before_send",
+        }
+    ]
+    assert (tmp_path / "cleanup-responses.json").stat().st_mode & 0o777 == 0o600
+
+
+def test_unanswered_cleanup_close_is_recorded_and_the_original_error_escapes(
+    tmp_path: Path,
+) -> None:
+    scenario = Scenario("close-timeout")
+    client, entry = scenario.opening[1:3]
+    store = OwnershipStore(
+        tmp_path, account="0x" + "2" * 40, client=client, source="a" * 64, version="1.0.0-rc.15"
+    )
+    phases: list[str] = []
+    result = scenario.execute(
+        record_attempt=store.begin,
+        persist_cleanup_response=store.cleanup_response,
+        observe_phase=phases.append,
+    )
+    assert result.failure == "cleanup_incomplete_keep_guard_running"
+    assert phases[-1] == "cleanup-call-unconfirmed"
+    text = (tmp_path / "cleanup-responses.json").read_text()
+    assert "secret" not in text
+    (response,) = json.loads(text)["responses"]
+    assert response["tool"] == "close_position" and response["response_available"] is False
+    assert response["sent"] is None and response["category"] == "unknown"
+
+
+def test_successful_cleanup_records_each_exit_and_still_passes(tmp_path: Path) -> None:
+    scenario = Scenario()
+    client, entry = scenario.opening[1:3]
+    store = OwnershipStore(
+        tmp_path, account="0x" + "2" * 40, client=client, source="a" * 64, version="1.0.0-rc.15"
+    )
+    phases: list[str] = []
+    result = scenario.execute(
+        record_attempt=store.begin,
+        persist_cleanup_response=store.cleanup_response,
+        observe_phase=phases.append,
+    )
+    assert result.passed and phases[-1] == "final-scan"
+    (response,) = json.loads((tmp_path / "cleanup-responses.json").read_text())["responses"]
+    assert response["tool"] == "close_position" and response["sent"] is True
+
+
+@pytest.mark.parametrize("failure", ["io", "interrupt"])
+def test_cleanup_record_failure_never_changes_the_cleanup(failure: str) -> None:
+    scenario = Scenario()
+
+    def persist(*_: object) -> None:
+        raise OSError("disk") if failure == "io" else KeyboardInterrupt
+
+    result = scenario.execute(persist_cleanup_response=persist)
+    assert result.passed and scenario.calls.count("close_position") == 1
+
+
+def test_cleanup_records_refuse_unknown_tools_unknown_codes_and_overflow(tmp_path: Path) -> None:
+    scenario = Scenario()
+    client, entry = scenario.opening[1:3]
+    store = OwnershipStore(
+        tmp_path, account="0x" + "2" * 40, client=client, source="a" * 64, version="1.0.0-rc.15"
+    )
+    with pytest.raises(RuntimeError):
+        store.cleanup_response("close_position", {"sent": True}, False)  # No attempt yet.
+    store.begin(entry, 1000)
+    with pytest.raises(RuntimeError):
+        store.cleanup_response("place_order", {"sent": True}, False)
+    unknown = {"ok": False, "sent": False, "error": {"code": "PRIVATE-CODE", "reason": "x"}}
+    store.cleanup_response("cancel_order", unknown, True)
+    for _ in range(5):
+        store.cleanup_response("close_position", {"sent": True}, False)
+    with pytest.raises(RuntimeError):
+        store.cleanup_response("close_position", {"sent": True}, False)
+    responses = json.loads((tmp_path / "cleanup-responses.json").read_text())["responses"]
+    assert len(responses) == 6 and responses[0]["code"] == "unknown"
+    assert "PRIVATE" not in (tmp_path / "cleanup-responses.json").read_text()
+
+
+def test_cleanup_codes_are_the_exit_tools_shipped_refusals() -> None:
+    root = Path(__file__).resolve().parents[4] / "crates/zunder-guard-mcp/src"
+    tools = (root / "tools.rs").read_text()
+    for code in ("position_size_mismatch", "no_position", "no_change"):
+        assert f'"{code}",' in tools

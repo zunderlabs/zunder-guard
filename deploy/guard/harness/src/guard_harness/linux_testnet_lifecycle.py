@@ -35,7 +35,7 @@ from guard_harness.linux_lifecycle import (
     authenticated_file,
     require,
 )
-from guard_harness.linux_testnet_service import TestnetService
+from guard_harness.linux_testnet_service import TestnetService, opt_metadata
 from guard_harness.paper_bot import LocalGuard, PaperError
 from guard_harness.runner import RunError, run
 from guard_harness.source_installer import component_metadata, verify_file
@@ -799,6 +799,7 @@ class TestnetLifecycle:
                         "schema": 1,
                         "diagnostic": True,
                         "gate_eligible": False,
+                        **({"service_host_opt": opt_metadata()} if self.route == "native" else {}),
                         **state,
                         **getattr(self, "source_metadata", {}),
                     },
