@@ -271,6 +271,8 @@ def test_explicit_diagnostic_runs_authenticated_old_release_with_current_bound_h
     identity_path.write_text(json.dumps(identity))
     monkeypatch.setenv("GITHUB_SHA", harness)
     monkeypatch.setenv("DIAGNOSTIC", "true")
+    metadata = {"uid": 1001, "gid": 1001, "mode": "0775", "directory": True, "symlink": False}
+    monkeypatch.setattr(install_run, "opt_metadata", lambda: metadata)
     install_run.main()
     lifecycle = [(argv, kwargs) for argv, kwargs in calls if "-m" in argv]
     assert len(lifecycle) == 2
@@ -289,6 +291,7 @@ def test_explicit_diagnostic_runs_authenticated_old_release_with_current_bound_h
         "scenario": "upgrade",
         "commit": COMMIT,
         "harness_commit": harness,
+        **({"runner_opt": metadata} if row in {"I1", "I2"} else {}),
     }
     assert KEY not in json.dumps(marker)
     # Formal admission refuses at the identity boundary, before attempting
@@ -530,10 +533,13 @@ def test_private_export_allowlist_redacts_logs_without_touching_custody(tmp_path
 @pytest.mark.parametrize(
     "attack", ["symlink", "hardlink", "oversize", "directory", "identifier", "escaped-identifier"]
 )
-def test_private_export_refuses_unsafe_allowlisted_file(tmp_path: Path, attack: str) -> None:
+@pytest.mark.parametrize("name", ["testnet-lifecycle.json", "install-service-state.json"])
+def test_private_export_refuses_unsafe_allowlisted_file(
+    tmp_path: Path, attack: str, name: str
+) -> None:
     source = tmp_path / "private"
     source.mkdir(mode=0o700)
-    target = source / "testnet-lifecycle.json"
+    target = source / name
     if attack == "symlink":
         hidden = tmp_path / "hidden"
         hidden.write_text("private")
@@ -562,6 +568,12 @@ def test_i2_failure_exports_readable_safe_diagnostics_and_preserves_failure(
     source = tmp_path / "root-private"
     source.mkdir(mode=0o700)
     (source / "testnet-service-install.log").write_text("[sensitive command output withheld]\n")
+    receipt = {
+        "diagnostic": True,
+        "gate_eligible": False,
+        "service_host_opt": {"uid": 1001, "gid": 1001, "mode": "0775"},
+    }
+    (source / "install-service-state.json").write_text(json.dumps(receipt))
     destination = tmp_path / "runner-evidence"
     calls: list[list[str]] = []
 
@@ -587,7 +599,10 @@ def test_i2_failure_exports_readable_safe_diagnostics_and_preserves_failure(
     assert (destination / "testnet-service-install.log").read_text().startswith("[sensitive")
     assert (destination / "testnet-service-install.log").stat().st_uid == os.geteuid()
     assert source.stat().st_mode & 0o777 == 0o700
-    assert not list(destination.rglob("*.json"))
+    exported = destination / "install-service-state.json"
+    assert json.loads(exported.read_bytes()) == receipt
+    assert exported.stat().st_mode & 0o777 == 0o600
+    assert not (destination / "testnet-lifecycle.json").exists()
 
 
 def test_raw_nonhex_credentials_are_withheld(tmp_path: Path) -> None:
@@ -617,3 +632,29 @@ def test_secondary_export_refusal_preserves_primary_child_failure(
             destination=tmp_path / "public",
             env={},
         )
+
+
+@pytest.mark.parametrize("row", ["I1", "I2"])
+def test_runner_opt_receipt_survives_lifecycle_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, row: str
+) -> None:
+    subjects, _ = prepared(tmp_path, monkeypatch, row)
+    path = subjects / "input.json"
+    identity = json.loads(path.read_bytes())
+    identity["diagnostic"] = True
+    path.write_text(json.dumps(identity))
+    monkeypatch.setenv("DIAGNOSTIC", "true")
+    metadata = {"uid": 1001, "gid": 1001, "mode": "0775", "directory": True, "symlink": False}
+    monkeypatch.setattr(install_run, "opt_metadata", lambda: metadata)
+
+    def failed(*args: Any, **kwargs: Any) -> None:
+        raise ProcessError("install lifecycle child failed (exit 1)")
+
+    monkeypatch.setattr(install_run, "i2_child" if row == "I2" else "child", failed)
+    with pytest.raises(ProcessError, match="exit 1"):
+        install_run.main()
+    receipt = json.loads((tmp_path / "evidence/diagnostic-only.json").read_bytes())
+    assert receipt["runner_opt"] == metadata
+    assert receipt["status"] == "diagnostic_only"
+    assert KEY not in json.dumps(receipt)
+    assert not (tmp_path / "evidence/testnet-lifecycle.json").exists()

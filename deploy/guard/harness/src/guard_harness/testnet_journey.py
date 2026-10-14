@@ -81,8 +81,44 @@ JOURNEY_PHASES = frozenset(
         "ownership-storage-failed",
         "ownership-captured",
         "venue-collection",
+        "cleanup-mutation",
+        "cleanup-mutation-response",
+        "cleanup-call-unconfirmed",
+        "final-scan",
     }
 )
+
+
+class RecordedExits:
+    """The cleanup's MCP exits, each finite outcome kept before cleanup judges it."""
+
+    def __init__(
+        self,
+        mcp: Any,
+        persist: Callable[[str, object, bool | None], None],
+        observe_phase: Callable[[str], None],
+    ) -> None:
+        self.mcp, self.persist, self.observe_phase = mcp, persist, observe_phase
+
+    def tool(
+        self, name: Any, arguments: dict[str, Any] | None = None
+    ) -> tuple[dict[str, Any], bool]:
+        self.observe_phase("cleanup-mutation")
+        try:
+            result, error = self.mcp.tool(name, arguments)
+        except (Exception, KeyboardInterrupt):
+            self.observe_phase("cleanup-call-unconfirmed")
+            try:
+                self.persist(name, None, None)
+            except (Exception, KeyboardInterrupt):
+                pass  # The exact escaping exception decides; a record never masks it.
+            raise
+        self.observe_phase("cleanup-mutation-response")
+        try:
+            self.persist(name, result, error)
+        except (Exception, KeyboardInterrupt):
+            pass  # Diagnostics never change what cleanup does with the answer.
+        return result, error
 
 
 def admit_preview(
@@ -195,6 +231,7 @@ def execute(
     persist_ownership: Callable[[list[dict[str, Any]], Entry, int], None] = lambda *_: None,
     persist_response: Callable[[object, bool | None, str], None] = lambda *_: None,
     persist_collection_failure: Callable[[dict[str, object]], None] = lambda _: None,
+    persist_cleanup_response: Callable[[str, object, bool | None], None] = lambda *_: None,
     capture_entry: Callable[[Ownership, int, int], None] = lambda *_: None,
     warm_info: Callable[[str], tuple[object, Callable[[], None]]] | None = None,
     observe_phase: Callable[[str], None] = lambda _: None,
@@ -397,12 +434,13 @@ def execute(
             begin_cleanup()  # Owned cleanup shares the absolute entry-work deadline.
 
             def final_scan() -> dict[str, object]:
+                observe_phase("final-scan")
                 begin_final_scan()
                 return flat_scan(read, account)
 
             cleaned = cleanup(
                 lambda: observe(cleaning=True),
-                mcp,
+                RecordedExits(mcp, persist_cleanup_response, observe_phase),
                 final_scan,
                 check_work=check_owned_work,
                 timeout=1280,

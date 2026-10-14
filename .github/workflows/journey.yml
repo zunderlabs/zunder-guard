@@ -220,6 +220,8 @@ jobs:
             ${{ runner.temp }}/guard-release/T1/runtime/entry-attempt.json
             ${{ runner.temp }}/guard-release/T1/runtime/entry-response.json
             ${{ runner.temp }}/guard-release/T1/runtime/ownership.json
+            ${{ runner.temp }}/guard-release/T1/runtime/collection-failure.json
+            ${{ runner.temp }}/guard-release/T1/runtime/cleanup-responses.json
           if-no-files-found: warn
           retention-days: 7
       - name: Independent keyless C6 flat scan after failure
@@ -244,6 +246,8 @@ jobs:
             ${{ runner.temp }}/guard-release/T1/runtime/entry-attempt.json
             ${{ runner.temp }}/guard-release/T1/runtime/entry-response.json
             ${{ runner.temp }}/guard-release/T1/runtime/ownership.json
+            ${{ runner.temp }}/guard-release/T1/runtime/collection-failure.json
+            ${{ runner.temp }}/guard-release/T1/runtime/cleanup-responses.json
             ${{ runner.temp }}/guard-release/T1/T1.predicate.json
             ${{ steps.evidence.outputs.bundle-path }}
           if-no-files-found: warn
@@ -342,7 +346,7 @@ jobs:
           ROOT_WORK="/root/guard-release-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT/T2"
           install -d -m 700 "$RUNNER_TEMP/guard-release/T2"
           FILES=()
-          for FILE in assets/release-manifest.json receipt.json assets.log runtime/init.log runtime/testnet-service-install.log runtime/service-stop.log runtime/service-start.log runtime/pair.log runtime/process.log runtime/mcp.log runtime/entry-attempt.json runtime/entry-response.json runtime/ownership.json T2.predicate.json; do
+          for FILE in assets/release-manifest.json receipt.json assets.log runtime/init.log runtime/testnet-service-install.log runtime/service-stop.log runtime/service-start.log runtime/pair.log runtime/process.log runtime/mcp.log runtime/entry-attempt.json runtime/entry-response.json runtime/ownership.json runtime/collection-failure.json runtime/cleanup-responses.json T2.predicate.json; do
             if sudo test -f "$ROOT_WORK/$FILE" && ! sudo test -L "$ROOT_WORK/$FILE"; then
               FILES+=("$FILE")
             fi
@@ -371,6 +375,8 @@ jobs:
             ${{ runner.temp }}/guard-release/T2/runtime/entry-attempt.json
             ${{ runner.temp }}/guard-release/T2/runtime/entry-response.json
             ${{ runner.temp }}/guard-release/T2/runtime/ownership.json
+            ${{ runner.temp }}/guard-release/T2/runtime/collection-failure.json
+            ${{ runner.temp }}/guard-release/T2/runtime/cleanup-responses.json
           if-no-files-found: warn
           retention-days: 7
       - name: Independent keyless C6 flat scan after failure
@@ -398,6 +404,8 @@ jobs:
             ${{ runner.temp }}/guard-release/T2/runtime/entry-attempt.json
             ${{ runner.temp }}/guard-release/T2/runtime/entry-response.json
             ${{ runner.temp }}/guard-release/T2/runtime/ownership.json
+            ${{ runner.temp }}/guard-release/T2/runtime/collection-failure.json
+            ${{ runner.temp }}/guard-release/T2/runtime/cleanup-responses.json
             ${{ runner.temp }}/guard-release/T2/T2.predicate.json
             ${{ steps.evidence.outputs.bundle-path }}
           if-no-files-found: warn
@@ -965,6 +973,10 @@ jobs:
           [ "$WORKFLOW_SHA" = "$GITHUB_SHA" ]
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with: {ref: '${{ github.sha }}', persist-credentials: false}
+      - name: Read-only staging wallet refill preflight
+        env:
+          E2E_TESTNET_ACCOUNT: ${{ vars.E2E_TESTNET_ACCOUNT }}
+        run: python3 -I -S deploy/guard/harness/src/guard_harness/wallet_preflight.py
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with: {python-version: '3.13'}
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6

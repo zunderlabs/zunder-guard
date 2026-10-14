@@ -14,16 +14,54 @@ import subprocess
 from pathlib import Path
 
 
+FIXED_REFUSALS = frozenset(
+    {
+        "Testnet uninstall requires root",
+        "owned Testnet release inventory missing",
+        "owned LaunchDaemon label differs",
+        "owned LaunchDaemon executable differs",
+        "LaunchDaemon absence could not be confirmed",
+        "offline owned Testnet LaunchDaemon uninstall only",
+        "uninstall path is not plain root-owned protected state",
+        "owned Testnet binding executable differs",
+        "another protected route has an incomplete binding inventory",
+        "another protected route has an unknown binding entry",
+        "another protected route has an unexpected release reference",
+        "unknown installed release entry; uninstall refused",
+        "installed release executable identity changed",
+        "foreground executable is not one regular file",
+        "foreground executable belongs to another installation",
+        "foreground release notices differ",
+        "installed release entry is not one regular file",
+        "foreground notice is not a regular file",
+        "foreground release notice identity differs",
+    }
+)
+
+
+class UninstallRefused(RuntimeError):
+    """A fixed refusal that is safe to retain without paths or private state."""
+
+
+def refusal_message(error: Exception) -> str:
+    prefix = "Owned macOS Testnet uninstall refused"
+    if type(error) is UninstallRefused and str(error) in FIXED_REFUSALS:
+        return prefix + ": " + str(error) + "; retain state for review"
+    return prefix + "; retain state for review"
+
+
 def trusted(path: Path) -> None:
     for component in (path, *path.parents):
         stat = component.lstat()
         if component.is_symlink() or stat.st_uid != 0 or stat.st_mode & 0o022:
-            raise RuntimeError("uninstall path is not plain root-owned protected state")
+            raise UninstallRefused(
+                "uninstall path is not plain root-owned protected state"
+            )
 
 
 def remove(base: Path, plist: Path, generic: Path, notices: Path) -> None:
     if os.geteuid() != 0:
-        raise RuntimeError("Testnet uninstall requires root")
+        raise UninstallRefused("Testnet uninstall requires root")
     trusted(base)
     helper = base / "management/uninstall-testnet.py"
     trusted(helper)
@@ -40,21 +78,25 @@ def remove(base: Path, plist: Path, generic: Path, notices: Path) -> None:
             or release.parent != base / "releases"
             or not re.fullmatch(r"[0-9a-f]{64}", release.name)
         ):
-            raise RuntimeError("owned Testnet binding executable differs")
+            raise UninstallRefused("owned Testnet binding executable differs")
         releases.add(release)
     if not releases:
-        raise RuntimeError("owned Testnet release inventory missing")
+        raise UninstallRefused("owned Testnet release inventory missing")
     retained: set[Path] = set()
     other_bindings = base / "bindings"
     others = []
     if other_bindings.exists() or other_bindings.is_symlink():
         trusted(other_bindings)
         if not other_bindings.is_dir():
-            raise RuntimeError("another protected route has an incomplete binding inventory")
+            raise UninstallRefused(
+                "another protected route has an incomplete binding inventory"
+            )
         others = list(other_bindings.iterdir())
     for other in others:
         if other.suffix != ".json" or not other.is_file():
-            raise RuntimeError("another protected route has an unknown binding entry")
+            raise UninstallRefused(
+                "another protected route has an unknown binding entry"
+            )
         trusted(other)
         executable = Path(json.loads(other.read_bytes())["executable"])
         if (
@@ -62,7 +104,9 @@ def remove(base: Path, plist: Path, generic: Path, notices: Path) -> None:
             or executable.parent.parent != base / "releases"
             or not re.fullmatch(r"[0-9a-f]{64}", executable.parent.name)
         ):
-            raise RuntimeError("another protected route has an unexpected release reference")
+            raise UninstallRefused(
+                "another protected route has an unexpected release reference"
+            )
         retained.add(executable.parent)
     names = {"zunder-guard", "LICENSE", "NOTICE", "THIRD_PARTY_LICENSES.md"}
     for release in releases:
@@ -71,17 +115,22 @@ def remove(base: Path, plist: Path, generic: Path, notices: Path) -> None:
         trusted(release)
         entries = list(release.iterdir())
         if {path.name for path in entries} != names:
-            raise RuntimeError("unknown installed release entry; uninstall refused")
+            raise UninstallRefused("unknown installed release entry; uninstall refused")
         for path in entries:
             trusted(path)
             if not path.is_file() or path.stat().st_nlink != 1:
-                raise RuntimeError("installed release entry is not one regular file")
-        if hashlib.sha256((release / "zunder-guard").read_bytes()).hexdigest() != release.name:
-            raise RuntimeError("installed release executable identity changed")
+                raise UninstallRefused(
+                    "installed release entry is not one regular file"
+                )
+        if (
+            hashlib.sha256((release / "zunder-guard").read_bytes()).hexdigest()
+            != release.name
+        ):
+            raise UninstallRefused("installed release executable identity changed")
     trusted(plist)
     registration = plistlib.loads(plist.read_bytes())
     if registration.get("Label") != "com.zunderlabs.guard.testnet-native":
-        raise RuntimeError("owned LaunchDaemon label differs")
+        raise UninstallRefused("owned LaunchDaemon label differs")
     active = bindings / "active.json"
     trusted(active)
     active_executable = Path(json.loads(active.read_bytes())["executable"])
@@ -90,25 +139,30 @@ def remove(base: Path, plist: Path, generic: Path, notices: Path) -> None:
         words != [str(active_executable), "service", "run", "--binding", str(active)]
         or active_executable.parent not in releases
     ):
-        raise RuntimeError("owned LaunchDaemon executable differs")
+        raise UninstallRefused("owned LaunchDaemon executable differs")
     generic_owned = False
     if generic.exists():
         trusted(generic)
         if not generic.is_file() or generic.stat().st_nlink != 1:
-            raise RuntimeError("foreground executable is not one regular file")
+            raise UninstallRefused("foreground executable is not one regular file")
         digest = hashlib.sha256(generic.read_bytes()).hexdigest()
         generic_owned = digest in {p.name for p in releases}
         if not generic_owned:
-            raise RuntimeError("foreground executable belongs to another installation")
+            raise UninstallRefused(
+                "foreground executable belongs to another installation"
+            )
         trusted(notices)
         if {p.name for p in notices.iterdir()} != names - {"zunder-guard"}:
-            raise RuntimeError("foreground release notices differ")
+            raise UninstallRefused("foreground release notices differ")
         for path in notices.iterdir():
             trusted(path)
             if not path.is_file() or path.stat().st_nlink != 1:
-                raise RuntimeError("foreground notice is not a regular file")
-            if path.read_bytes() != (base / "releases" / digest / path.name).read_bytes():
-                raise RuntimeError("foreground release notice identity differs")
+                raise UninstallRefused("foreground notice is not a regular file")
+            if (
+                path.read_bytes()
+                != (base / "releases" / digest / path.name).read_bytes()
+            ):
+                raise UninstallRefused("foreground release notice identity differs")
     subprocess.run(
         ["/bin/launchctl", "bootout", "system/com.zunderlabs.guard.testnet-native"],
         capture_output=True,
@@ -122,7 +176,7 @@ def remove(base: Path, plist: Path, generic: Path, notices: Path) -> None:
         timeout=30,
     )
     if probe.returncode != 113:
-        raise RuntimeError("LaunchDaemon absence could not be confirmed")
+        raise UninstallRefused("LaunchDaemon absence could not be confirmed")
     plist.unlink()
     for release in releases - retained:
         if release.exists():
@@ -142,7 +196,7 @@ def remove(base: Path, plist: Path, generic: Path, notices: Path) -> None:
 
 def main() -> None:
     if sys.argv[1:] != ["--network", "testnet"] or sys.platform != "darwin":
-        raise RuntimeError("offline owned Testnet LaunchDaemon uninstall only")
+        raise UninstallRefused("offline owned Testnet LaunchDaemon uninstall only")
     remove(
         Path("/Library/Application Support/Zunder Guard"),
         Path("/Library/LaunchDaemons/com.zunderlabs.guard.testnet-native.plist"),
@@ -154,5 +208,11 @@ def main() -> None:
 if __name__ == "__main__":
     try:
         main()
-    except (OSError, ValueError, KeyError, RuntimeError, subprocess.SubprocessError):
-        raise SystemExit("Owned macOS Testnet uninstall refused; retain state for review") from None
+    except (
+        OSError,
+        ValueError,
+        KeyError,
+        RuntimeError,
+        subprocess.SubprocessError,
+    ) as error:
+        raise SystemExit(refusal_message(error)) from None
