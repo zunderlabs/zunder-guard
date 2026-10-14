@@ -25,6 +25,16 @@ from guard_harness.runner import RunResult
 from guard_harness.testnet_scan import SCAN_TIMEOUT, ScanError
 
 
+@pytest.fixture(autouse=True)
+def no_hosted_opt_policy(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The hosted /opt step reads the real machine; these unit tests never depend on it.
+
+    On a GitHub-hosted runner /opt is 0777, so the step switched itself on inside unrelated
+    lifecycle tests (public ci on rc.16). Tests of the step itself patch it back on.
+    """
+    monkeypatch.setattr("guard_harness.linux_policy.eligible", lambda: False)
+
+
 def journal(home: Path, events: list[dict[str, Any]]) -> None:
     previous = ""
     lines = []
