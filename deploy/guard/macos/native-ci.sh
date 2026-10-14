@@ -102,6 +102,33 @@ acl_created=1
 "$base/a/broker" service check --binding "$base/a.json"
 # Production backend must refuse a foreign executable before credential read.
 if "$base/deny/broker" service check --binding "$base/a.json" >/dev/null 2>&1; then echo 'foreign executable accepted' >&2; exit 1; fi
+wait_unloaded() {
+  local attempt status
+  for ((attempt=0; attempt<30; attempt++)); do
+    if launchctl print "system/$label" >/dev/null 2>&1; then
+      status=0
+    else
+      status=$?
+    fi
+    [[ $status != 113 ]] || return 0
+    [[ $status == 0 ]] || { echo "launchctl print failed with exit $status" >&2; return "$status"; }
+    if [[ $attempt -lt 29 ]]; then sleep 1; fi
+  done
+  echo 'launchd service did not unload before deadline' >&2; return 1
+}
+bootstrap() {
+  local attempt status
+  for ((attempt=0; attempt<3; attempt++)); do
+    wait_unloaded || return $?
+    if launchctl bootstrap system "$plist"; then
+      return 0
+    else
+      status=$?
+    fi
+    [[ $status == 5 && $attempt -lt 2 ]] || return "$status"
+    sleep 1
+  done
+}
 launch() {
   version=$1
   cat > "$plist" <<PLIST
@@ -112,7 +139,7 @@ launch() {
 <key>StandardOutPath</key><string>$base/broker.log</string><key>StandardErrorPath</key><string>$base/broker.log</string></dict></plist>
 PLIST
   chmod 0644 "$plist"; plutil -lint "$plist" >/dev/null
-  launchctl bootstrap system "$plist"
+  bootstrap
 }
 wait_starts() {
   expected=$1
@@ -157,6 +184,7 @@ if fixture_process_alive "$old_child"; then
   echo 'old fixture child survived broker crash' >&2; exit 1
 fi
 launchctl bootout "system/$label"
+wait_unloaded
 assert_no_children
 # Rejected next release must leave the old creator/item available.
 cp "$base/b.json" "$base/b-invalid.json"
@@ -169,6 +197,7 @@ if "$base/a/broker" service migrate-credential --binding "$base/a.json" --next-b
 "$base/a/broker" service check --binding "$base/a.json"
 launch b; wait_starts 4
 launchctl bootout "system/$label"
+wait_unloaded
 assert_no_children
 shasum -a 256 "$base/state/guard.toml" "$base/state/risk-mainnet.jsonl" > "$evidence/state-after.txt"
 cmp "$evidence/state-before.txt" "$evidence/state-after.txt"

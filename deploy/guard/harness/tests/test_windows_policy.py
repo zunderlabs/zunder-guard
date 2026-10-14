@@ -358,3 +358,92 @@ def test_windows_child_environment_keeps_machine_service_roots(
         assert env["PROGRAMFILES"] == "inert-program-files"
         assert "WALLET_FRAME" not in env and "UNRELATED_TOKEN" not in env
         assert all(env[name] == value for name, value in windows_locations.items())
+
+
+@pytest.mark.parametrize("shell", ["pwsh.exe", "powershell.exe"])
+@pytest.mark.parametrize("missing_pwd", [False, True])
+def test_windows_per_user_journal_completes_before_policy_and_scm(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, shell: str, missing_pwd: bool
+) -> None:
+    from test_native_journal import journal
+
+    from guard_harness import native_testnet as native
+    from guard_harness.native_paper import Paper
+
+    monkeypatch.setattr("guard_harness.native_testnet.platform.system", lambda: "Windows")
+    # Python exposes uppercase names on Windows; model its case-insensitive lookup.
+    monkeypatch.setenv("PROGRAMDATA", str(tmp_path / "data"))
+    monkeypatch.setenv("ProgramData", str(tmp_path / "data"))
+    current = release(tmp_path / "assets")
+    controller = native.NativeTestnet(
+        current, current, tmp_path / "work", "inert-account", shell, "fresh"
+    )
+    monkeypatch.setattr(native, "flat_scan", lambda *args: None)
+    installed: list[Release] = []
+
+    def install(paper: Paper, subject: Release, **kwargs: object) -> None:
+        installed.append(subject)
+        paper.binary.parent.mkdir(parents=True, exist_ok=True)
+        paper.binary.write_bytes(subject.binary("windows-amd64"))
+        paper.home.mkdir(exist_ok=True)
+        (paper.home / "decisions.jsonl").write_bytes(journal())
+
+    def command(words: list[str], **kwargs: object) -> str:
+        assert "-Uninstall" in words  # Setup below is inert; only real flow uninstall remains.
+        (controller.work / "per-user/bin/zunder-guard.exe").unlink()
+        return ""
+
+    class Runtime:
+        def __init__(self, words: list[str], **kwargs: object) -> None:
+            assert "--key-stdin" not in words  # Stored-key runtime, never private argv.
+
+        def poll(self) -> None:
+            return None
+
+        def terminate(self) -> None:
+            pass
+
+        def wait(self, *, timeout: float) -> int:
+            return 0
+
+    def prepare(subject: Release, work: Path, env: Any) -> dict[str, object]:
+        assert len(installed) == 3  # Initial runtime, repeat install and reinstall all audited.
+        receipt = json.loads((controller.work / "per-user/receipt.json").read_bytes())
+        assert receipt["result"] == "passed" and receipt["no_exchange"] is True
+        assert receipt["decision_journal_sha256"] == hashlib.sha256(journal()).hexdigest()
+        raise LifecycleError("stop before actual policy mutation or SCM custody")
+
+    monkeypatch.setattr(Paper, "install", install)
+    monkeypatch.setattr(native, "candidate_user_setup", lambda *args: None)
+    monkeypatch.setattr(controller, "command", command)
+    monkeypatch.setattr("guard_harness.native_testnet.subprocess.Popen", Runtime)
+    monkeypatch.setattr(
+        "guard_harness.native_testnet.LocalGuard.request",
+        lambda *args: dict(
+            last_sync_ms=1, version=current.tag[1:], mode="testnet", account="inert-account"
+        ),
+    )
+    monkeypatch.setattr(policy, "prepare", prepare)
+    if missing_pwd:
+
+        def missing_audit(*args: object, **kwargs: object) -> str:
+            raise ModuleNotFoundError("private sentinel detail", name="pwd")
+
+        monkeypatch.setattr("guard_harness.native_journal.audit", missing_audit)
+        with pytest.raises(ModuleNotFoundError):
+            controller.execute(b"inert frame never used for custody")
+        assert len(installed) == 1  # The diagnostic's exact artifact boundary.
+        assert not (controller.work / "per-user/receipt.json").exists()
+        assert not (controller.work / "windows-policy").exists()
+        assert (controller.work / "windows-per-user-journal-audit-failure.log").read_text() == (
+            "Windows lifecycle failure step: per-user-journal-audit\n"
+            "failure reason: posix-pwd-unavailable\n"
+        )
+    else:
+        with pytest.raises(LifecycleError, match="stop before actual policy"):
+            controller.execute(b"inert frame never used for custody")
+        assert not (controller.work / "windows-per-user-journal-audit-failure.log").exists()
+        assert (controller.work / "windows-crash-policy-prepare-failure.log").read_text() == (
+            "Windows lifecycle failure step: crash-policy-prepare\nfailure reason: unknown\n"
+        )
+    assert controller.key == b""

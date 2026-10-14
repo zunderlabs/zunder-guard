@@ -18,6 +18,7 @@ from guard_harness.runner import run
 from guard_harness.source_installer import Candidate, prepare, verify_file
 from guard_harness.testnet_run import ROOT
 from guard_harness.testnet_scan import TestnetReads, flat_scan
+from guard_harness.windows_diagnostics import observe as windows_observe
 
 
 class NativeTestnet:
@@ -229,31 +230,32 @@ class NativeTestnet:
                 ]
             self.command(words, key=fresh, sensitive=True)
         else:
-            self.command(
-                self.ps(
-                    [
-                        "-File",
-                        str(loader),
-                        "-Network",
-                        "testnet",
-                        "-ManagedService",
-                        "-NonInteractive",
-                        "-KeyStdin",
-                        "-Id",
-                        self.id,
-                        "-Rules",
-                        rules,
-                        "-Account",
-                        self.account,
-                        "-ConfirmAccount",
-                        self.account,
-                        "-EquityCap",
-                        "100",
-                    ]
-                ),
-                key=fresh,
-                sensitive=True,
-            )
+            with windows_observe(self.work, "scm-install"):
+                self.command(
+                    self.ps(
+                        [
+                            "-File",
+                            str(loader),
+                            "-Network",
+                            "testnet",
+                            "-ManagedService",
+                            "-NonInteractive",
+                            "-KeyStdin",
+                            "-Id",
+                            self.id,
+                            "-Rules",
+                            rules,
+                            "-Account",
+                            self.account,
+                            "-ConfirmAccount",
+                            self.account,
+                            "-EquityCap",
+                            "100",
+                        ]
+                    ),
+                    key=fresh,
+                    sensitive=True,
+                )
             if not fresh:
                 # Loader authenticates and retains the new helper but never upgrades itself.
                 candidates = list(
@@ -300,15 +302,54 @@ class NativeTestnet:
         ):
             raise LifecycleError("native credential custody/readback not admitted")
 
+    def launchctl_status(self, *words: str) -> int:
+        """Keep status evidence without retaining launchd's private service details."""
+        self.sequence += 1
+        log = self.work / f"step-{self.sequence}.log"
+        try:
+            result = subprocess.run(
+                ["sudo", "launchctl", *words],
+                env=self.env,
+                capture_output=True,
+                timeout=10,
+                check=False,
+                stdin=subprocess.DEVNULL,
+            )
+        except (OSError, subprocess.SubprocessError):
+            log.write_text("[launchctl output withheld]\ncommand outcome: unavailable\n")
+            raise LifecycleError("native launchctl command unavailable or timed out") from None
+        log.write_text(f"[launchctl output withheld]\nexit status: {result.returncode}\n")
+        return result.returncode
+
+    def wait_unloaded(self) -> None:
+        # bootout is asynchronous: only 113 proves this exact registration is absent.
+        for attempt in range(30):
+            status = self.launchctl_status("print", self.label)
+            if status == 113:
+                return
+            if status != 0:
+                raise LifecycleError(f"native launchctl print failed with exit {status}")
+            if attempt < 29:
+                time.sleep(1)
+        raise LifecycleError("native launchd service did not unload before deadline")
+
     def start(self) -> None:
         if self.mac:
-            self.command(["sudo", "launchctl", "bootstrap", "system", str(self.plist)])
+            for attempt in range(3):
+                self.wait_unloaded()
+                status = self.launchctl_status("bootstrap", "system", str(self.plist))
+                if status == 0:
+                    return
+                if status != 5 or attempt == 2:
+                    raise LifecycleError(f"native launchctl bootstrap failed with exit {status}")
+                time.sleep(1)
         else:
             self.action("Start", "-Startup", "Manual")
 
     def stop(self) -> None:
         if self.mac:
             self.command(["sudo", "launchctl", "bootout", self.label])
+            self.wait_unloaded()
         else:
             self.action("Stop")
 
@@ -391,13 +432,15 @@ class NativeTestnet:
             windows_policy: dict[str, object] = {}
             if not self.mac:
                 # Independent per-user custody must still be measured when SCM admission refuses.
-                per_user(self, self.work / "per-user", key)
+                with windows_observe(self.work, "per-user-lifecycle"):
+                    per_user(self, self.work / "per-user", key)
                 self.key = key  # Per-user cleanup clears its copy; SCM has a separate admission.
                 from guard_harness.windows_policy import prepare as prepare_windows_policy
 
-                windows_policy = prepare_windows_policy(
-                    self.current, self.work / "windows-policy", self.env
-                )
+                with windows_observe(self.work, "crash-policy-prepare"):
+                    windows_policy = prepare_windows_policy(
+                        self.current, self.work / "windows-policy", self.env
+                    )
             initial = self.current if self.scenario == "fresh" else self.previous
             self.install(initial, fresh=True)
             if self.mac:
@@ -612,41 +655,45 @@ def per_user(native: NativeTestnet, work: Path, key: bytes) -> None:
                     stderr=output,
                 )
                 try:
-                    guard = LocalGuard("http://127.0.0.1:18548")
-                    deadline = time.monotonic() + 120
-                    while time.monotonic() < deadline:
-                        if process.poll() is not None:
-                            raise LifecycleError("stored-key per-user runtime exited")
-                        try:
-                            status = guard.request("/guard/status")
-                            if (
-                                status.get("last_sync_ms")
-                                and status.get("version") == release.tag[1:]
-                            ):
+                    with windows_observe(native.work, "per-user-readiness"):
+                        guard = LocalGuard("http://127.0.0.1:18548")
+                        deadline = time.monotonic() + 120
+                        while time.monotonic() < deadline:
+                            if process.poll() is not None:
+                                raise LifecycleError("stored-key per-user runtime exited")
+                            try:
+                                status = guard.request("/guard/status")
                                 if (
-                                    status.get("mode") != "testnet"
-                                    or status.get("account", "").lower() != native.account.lower()
+                                    status.get("last_sync_ms")
+                                    and status.get("version") == release.tag[1:]
                                 ):
-                                    raise LifecycleError("per-user testnet identity mismatch")
-                                break
-                        except PaperError:
-                            pass
-                        time.sleep(1)
-                    else:
-                        raise LifecycleError("per-user testnet readiness deadline")
+                                    if (
+                                        status.get("mode") != "testnet"
+                                        or status.get("account", "").lower()
+                                        != native.account.lower()
+                                    ):
+                                        raise LifecycleError("per-user testnet identity mismatch")
+                                    break
+                            except PaperError:
+                                pass
+                            time.sleep(1)
+                        else:
+                            raise LifecycleError("per-user testnet readiness deadline")
                 finally:
-                    process.terminate()
-                    try:
-                        process.wait(timeout=40)
-                    except subprocess.TimeoutExpired:
-                        process.kill()
-                        process.wait(timeout=10)
-            from guard_harness.native_journal import audit
+                    with windows_observe(native.work, "per-user-shutdown"):
+                        process.terminate()
+                        try:
+                            process.wait(timeout=40)
+                        except subprocess.TimeoutExpired:
+                            process.kill()
+                            process.wait(timeout=10)
+            with windows_observe(native.work, "per-user-journal-audit"):
+                from guard_harness.native_journal import audit
 
-            journal_digest = audit(
-                (paper.home / "decisions.jsonl").read_bytes(),
-                emergency_present=any((paper.home / "emergency").rglob("*")),
-            )
+                journal_digest = audit(
+                    (paper.home / "decisions.jsonl").read_bytes(),
+                    emergency_present=any((paper.home / "emergency").rglob("*")),
+                )
         native.command(
             native.ps(
                 [

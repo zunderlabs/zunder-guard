@@ -24,6 +24,93 @@ def run(script, directory):
 
 
 class MacShellTests(unittest.TestCase):
+    def launchd_reload(self, prints, bootstraps):
+        # Run the actual launch/absence/retry functions with inert launchctl.
+        block = fragment(NATIVE, 'wait_unloaded() {', 'wait_starts() {')
+        with tempfile.TemporaryDirectory() as directory:
+            setup = '''label=com.example.fixture; plist=fixture.plist; base=$PWD
+print_index=0; bootstrap_index=0
+print_codes=(PRINT_CODES); bootstrap_codes=(BOOTSTRAP_CODES)
+sleep() { printf 'sleep %s\\n' "$*" >> calls; }
+chmod() { :; }
+plutil() { :; }
+launchctl() {
+  printf '%s\\n' "$*" >> calls
+  if [[ $1 == print ]]; then
+    [[ $2 == system/com.example.fixture ]] || return 88
+    status=${print_codes[$print_index]:-99}; print_index=$((print_index + 1))
+  elif [[ $1 == bootstrap ]]; then
+    [[ $2 == system && $3 == fixture.plist ]] || return 88
+    status=${bootstrap_codes[$bootstrap_index]:-99}; bootstrap_index=$((bootstrap_index + 1))
+  else return 88; fi
+  return "$status"
+}
+'''.replace('PRINT_CODES', ' '.join(map(str, prints))).replace('BOOTSTRAP_CODES', ' '.join(map(str, bootstraps)))
+            result = run(setup + block + '\nlaunch a\nprintf reached\n', directory)
+            calls = Path(directory, 'calls').read_text().splitlines()
+            return result, calls
+
+    def test_launch_waits_until_previous_registration_disappears(self):
+        result, calls = self.launchd_reload([0, 0, 113], [0])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, 'reached')
+        self.assertEqual(calls, ['print system/com.example.fixture', 'sleep 1',
+                                 'print system/com.example.fixture', 'sleep 1',
+                                 'print system/com.example.fixture', 'bootstrap system fixture.plist'])
+
+    def test_launch_retries_only_eio_with_new_absence_probe(self):
+        result, calls = self.launchd_reload([113, 0, 113, 113], [5, 5, 0])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, 'reached')
+        self.assertEqual(calls, ['print system/com.example.fixture', 'bootstrap system fixture.plist',
+                                 'sleep 1', 'print system/com.example.fixture', 'sleep 1',
+                                 'print system/com.example.fixture', 'bootstrap system fixture.plist',
+                                 'sleep 1', 'print system/com.example.fixture', 'bootstrap system fixture.plist'])
+
+    def test_launch_caps_bootstrap_attempts_and_never_retries_other_errors(self):
+        for statuses, expected, sleeps in [([0], 0, 0), ([5, 5, 5], 5, 2), ([78], 78, 0), ([5, 1], 1, 1)]:
+            with self.subTest(statuses=statuses):
+                result, calls = self.launchd_reload([113] * len(statuses), statuses)
+                self.assertEqual(result.returncode, expected, result.stderr)
+                self.assertEqual(sum(call.startswith('bootstrap ') for call in calls), len(statuses))
+                self.assertEqual(calls.count('sleep 1'), sleeps)
+                self.assertEqual(result.stdout, 'reached' if expected == 0 else '')
+
+    def test_launch_refuses_unknown_probe_errors_and_bounds_unload_wait(self):
+        for statuses, expected in [([5], 5), ([1], 1), ([0] * 30, 1)]:
+            with self.subTest(statuses=statuses):
+                result, calls = self.launchd_reload(statuses, [])
+                self.assertEqual(result.returncode, expected, result.stderr)
+                self.assertEqual(sum(call.startswith('print ') for call in calls), len(statuses))
+                self.assertEqual(calls.count('sleep 1'), len(statuses) - 1)
+                self.assertFalse(any(call.startswith('bootstrap ') for call in calls))
+                self.assertEqual(result.stdout, '')
+
+    def test_native_stops_wait_for_unload_before_child_checks(self):
+        helpers = fragment(NATIVE, 'wait_unloaded() {', 'bootstrap() {')
+        for end in ('# Rejected next release', 'shasum -a 256 "$base/state/guard.toml"'):
+            # Take each real stop site, including the final stop after launch b.
+            start = NATIVE.rindex('\nlaunchctl bootout "system/$label"\n', 0, NATIVE.index(end, NATIVE.index('launch a; wait_starts 1')))
+            block = fragment(NATIVE[start:], '\nlaunchctl bootout', end)
+            with self.subTest(end=end), tempfile.TemporaryDirectory() as directory:
+                setup = '''label=com.example.fixture; prints=0
+sleep() { :; }
+launchctl() {
+  printf '%s\\n' "$*" >> calls
+  if [[ $1 == bootout ]]; then return 0; fi
+  [[ $1 == print ]] || return 88
+  prints=$((prints + 1))
+  if [[ $prints == 2 ]]; then return 113; fi
+  return 0
+}
+assert_no_children() { [[ $prints == 2 ]]; printf 'children\\n' >> calls; }
+'''
+                result = run(setup + helpers + block, directory)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(Path(directory, 'calls').read_text().splitlines(),
+                                 ['bootout system/com.example.fixture',
+                                  'print system/com.example.fixture', 'print system/com.example.fixture', 'children'])
+
     def test_installer_renders_only_valid_plist_and_continues(self):
         block = fragment(INSTALL, 'cat >"$plist_next" <<PLIST', 'chown root:wheel "$plist_next"')
         with tempfile.TemporaryDirectory() as directory:
