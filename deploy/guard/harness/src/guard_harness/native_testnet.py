@@ -9,6 +9,7 @@ import re
 import subprocess
 import sys
 import time
+from collections.abc import Callable
 from pathlib import Path
 
 from guard_harness.native_paper import LifecycleError, Paper
@@ -69,7 +70,14 @@ class NativeTestnet:
             self.binding = self.base / self.id / "binding.json"
             self.transaction = self.base / "management" / f"{self.id}.json"
 
-    def command(self, words: list[str], *, key: bool = False, sensitive: bool = False) -> str:
+    def command(
+        self,
+        words: list[str],
+        *,
+        key: bool = False,
+        sensitive: bool = False,
+        failure_classifier: Callable[[str], str] | None = None,
+    ) -> str:
         self.sequence += 1
         return run(
             words,
@@ -79,6 +87,7 @@ class NativeTestnet:
             stdin=self.key * 2 if key else b"",
             sensitive_output=sensitive,
             secrets=[self.key.decode().strip()],
+            failure_classifier=failure_classifier,
         ).output.strip()
 
     def ps(self, words: list[str]) -> list[str]:
@@ -230,7 +239,7 @@ class NativeTestnet:
                 ]
             self.command(words, key=fresh, sensitive=True)
         else:
-            with windows_observe(self.work, "scm-install"):
+            with windows_observe(self.work, "scm-install", installer=True) as classifier:
                 self.command(
                     self.ps(
                         [
@@ -255,6 +264,7 @@ class NativeTestnet:
                     ),
                     key=fresh,
                     sensitive=True,
+                    failure_classifier=classifier,
                 )
             if not fresh:
                 # Loader authenticates and retains the new helper but never upgrades itself.

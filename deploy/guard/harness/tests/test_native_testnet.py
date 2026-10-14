@@ -167,3 +167,83 @@ def test_windows_start_stop_do_not_use_launchctl(
     controller.stop()
     assert calls == [("Start", "-Startup", "Manual"), ("Stop",)]
     assert sleeps == []
+
+
+@pytest.mark.parametrize("shell", ["powershell.exe", "pwsh.exe"])
+@pytest.mark.parametrize("scenario", ["fresh", "upgrade"])
+@pytest.mark.parametrize("failure", ["helper", "stdout-only", "unknown", "timeout", "success"])
+def test_windows_scm_install_retains_only_the_installer_literal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, shell: str, scenario: str, failure: str
+) -> None:
+    import guard_harness.native_testnet as native
+    from guard_harness.runner import RunError
+    from guard_harness.windows_diagnostics import INSTALLER_WRAPPER
+
+    monkeypatch.setattr("guard_harness.native_testnet.platform.system", lambda: "Windows")
+    monkeypatch.setenv("ProgramData", str(tmp_path / "program-data"))
+    current = Release("v1.0.0-rc.16", "a" * 40, tmp_path / "current")
+    previous = Release("v1.0.0-rc.15", "b" * 40, tmp_path / "previous")
+    controller = NativeTestnet(
+        current, previous, tmp_path / "work", "fixture-account", shell, scenario
+    )
+    controller.work.mkdir()
+    controller.key = b"private fixture frame\n"
+    monkeypatch.setattr(native, "staged_loader", lambda *args, **kwargs: None)
+    monkeypatch.setattr(Release, "asset", lambda *args: b"inert offline loader")
+    identities: list[Release] = []
+    monkeypatch.setattr(controller, "identity", identities.append)
+    binary = tmp_path / "installed.exe"
+    monkeypatch.setattr(controller, "installed", lambda: binary)
+    message = "SCM operation failed; transaction remains pending."
+    calls = 0
+
+    def execute(words: list[str], **kwargs: object) -> subprocess.CompletedProcess[bytes]:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            assert failure == "success" and words == [
+                str(binary),
+                "service",
+                "check",
+                "--binding",
+                str(controller.binding),
+                "--json",
+            ]
+            assert kwargs["input"] == b""
+            return subprocess.CompletedProcess(
+                words, 0, b'{"ok":true,"mode":"testnet","account":"fixture-account"}', b""
+            )
+        assert words[0] == shell and "-ManagedService" in words and "-KeyStdin" in words
+        assert words[words.index("-Network") + 1] == "testnet"
+        assert kwargs["input"] == controller.key * 2  # Init and provision get separate frames.
+        assert kwargs["env"] is controller.env  # Diagnostics do not change environment or custody.
+        assert kwargs["capture_output"] is True
+        if failure == "timeout":
+            raise subprocess.TimeoutExpired(words, 600, output=b"private timeout sentinel")
+        stdout = b"private stdout sentinel\n" + controller.key
+        stderr = b"private stderr sentinel\n"
+        if failure == "helper":
+            stderr += ("fixture\\install-windows-service.ps1 : " + message + "\n").encode()
+            stderr += (INSTALLER_WRAPPER + "\n").encode()
+        if failure == "stdout-only":
+            stdout += message.encode()  # Private stdout never supplies the failure classifier.
+        return subprocess.CompletedProcess(words, 0 if failure == "success" else 1, stdout, stderr)
+
+    monkeypatch.setattr("guard_harness.runner.subprocess.run", execute)
+    initial = current if scenario == "fresh" else previous
+    if failure == "success":
+        controller.install(initial, fresh=True)
+    else:
+        with pytest.raises(RunError):
+            controller.install(initial, fresh=True)
+        body = (controller.work / "windows-scm-install-failure.log").read_text()
+        assert body == (
+            "Windows lifecycle failure step: scm-install\nfailure reason: command-failed\n"
+            f"installer refusal: {message if failure == 'helper' else 'unknown'}\n"
+        )
+    assert calls == (2 if failure == "success" else 1)
+    assert identities == ([initial] if failure == "success" else [])
+    logs = "\n".join(path.read_text() for path in controller.work.glob("*.log"))
+    assert "private" not in logs and "fixture\\" not in logs
+    assert not list(controller.work.glob("*.json"))
+    assert (controller.work / "windows-scm-install-failure.log").exists() is (failure != "success")

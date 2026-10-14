@@ -334,6 +334,8 @@ jobs:
     permissions:
       contents: read
       actions: read
+      # staged_state verifies the signed GHCR image here as in staging (public today; read-only).
+      packages: read
       id-token: write
       attestations: write
     steps:
