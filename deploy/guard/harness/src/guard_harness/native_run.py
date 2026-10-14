@@ -16,6 +16,18 @@ from guard_harness.source_installer import prepare, verify_file
 from guard_harness.testnet_process import ProcessError
 from guard_harness.testnet_scan import TestnetReads, flat_scan
 
+WINDOWS_LOCATIONS = frozenset(
+    {
+        "APPDATA",
+        "PROGRAMFILES(X86)",
+        "PROGRAMW6432",
+        "WINDIR",
+        "COMSPEC",
+        "PATHEXT",
+        "PSMODULEPATH",
+    }
+)
+
 
 def execute(*, subjects: Path, output: Path, scenario: str, account: str, shell: str) -> None:
     diagnostic = diagnostic_mode()
@@ -80,6 +92,10 @@ def execute(*, subjects: Path, output: Path, scenario: str, account: str, shell:
             "INSTALL_MATRIX_PROFILE",
             "DIAGNOSTIC",
         }
+        # PowerShell needs these to run a downloaded .exe and to load its own modules
+        # (rc.16: "Cannot run a document in the middle of a pipeline" without PATHEXT).
+        # Windows reports environment names in upper case.
+        or (sys.platform == "win32" and name.upper() in WINDOWS_LOCATIONS)
         or (
             source is not None
             and name

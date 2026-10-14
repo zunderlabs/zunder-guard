@@ -338,6 +338,11 @@ def test_windows_child_environment_keeps_machine_service_roots(
     monkeypatch.setattr(native_run, "flat_scan", lambda *args: None)
     monkeypatch.setenv("PROGRAMDATA", "inert-program-data")
     monkeypatch.setenv("PROGRAMFILES", "inert-program-files")
+    # rc.16: without PATHEXT PowerShell refused to run the downloaded cosign.exe.
+    windows_locations = {name: f"inert-{name.lower()}" for name in native_run.WINDOWS_LOCATIONS}
+    for name, value in windows_locations.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.setattr("guard_harness.native_run.sys.platform", "win32")
     with patch("guard_harness.native_run.subprocess.run") as children:
         native_run.execute(
             subjects=subjects,
@@ -352,3 +357,4 @@ def test_windows_child_environment_keeps_machine_service_roots(
         assert env["PROGRAMDATA"] == "inert-program-data"
         assert env["PROGRAMFILES"] == "inert-program-files"
         assert "WALLET_FRAME" not in env and "UNRELATED_TOKEN" not in env
+        assert all(env[name] == value for name, value in windows_locations.items())
