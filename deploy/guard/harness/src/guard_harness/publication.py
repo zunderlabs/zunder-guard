@@ -40,12 +40,15 @@ def prepare(
     expected: str | None,
     journeys: Mapping[str, JourneyBundle],
     logs: Path,
+    expected_run_id: str | None = None,
+    expected_run_attempt: str | None = None,
 ) -> Publication:
     """Snapshot, authenticate, then bind the same bytes into one publication body.
 
     `previous` is the retained authenticated build head; `expected` is the durable
     channel head. They differ when promoting a new build over an older canonical
-    release. Neither comes from an unauthenticated incoming predicate.
+    release. Neither comes from an unauthenticated incoming predicate. A gated state
+    (signed by `verify.yml`) needs the gate's exact run and attempt.
     """
     if expected is not None and not re.fullmatch(r"[0-9a-f]{64}", expected):
         raise AttestationError("expected channel head must be a SHA256 digest")
@@ -103,6 +106,8 @@ def prepare(
                 workflow=workflow,
                 previous=previous,
                 logs=logs,
+                expected_run_id=expected_run_id,
+                expected_run_attempt=expected_run_attempt,
             )
         else:
             if journeys:

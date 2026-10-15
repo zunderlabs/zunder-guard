@@ -12,20 +12,28 @@ from guard_harness.attestation import AttestationError
 from guard_harness.journey_evidence import JourneyBundle, authenticate_journeys
 from guard_harness.lifecycle_coverage import CHANNEL_COVERAGE
 from guard_harness.release_state import GATE_JOURNEYS, canonical_bytes, validate_state
+from guard_harness.run_attempts import latest
 from guard_harness.state_verifier import authenticate_state
 from guard_harness.testnet_run import ROOT
 
 
 def bundles(evidence: Path, *, run_id: str, attempt: str) -> dict[str, JourneyBundle]:
+    """Each row's bundle from its latest attempt <= `attempt` of this one run.
+
+    Decision of 15 Oct 2026: a rerun of failed jobs keeps the passed rows' earlier
+    attempts, so rows may differ in attempt. Superseded lower attempts are ignored,
+    never merged or used as a fallback. The reference names the selected attempt,
+    which the row's signature must then carry exactly.
+    """
     if not re.fullmatch(r"[1-9][0-9]*", run_id) or not re.fullmatch(r"[1-9][0-9]*", attempt):
         raise ValueError("exact workflow run and attempt required")
     result: dict[str, JourneyBundle] = {}
     for row in sorted(GATE_JOURNEYS):
-        directory = evidence / f"{row}-{run_id}-{attempt}"
+        selected = latest(evidence, row, run_id, attempt)
         # Artifact paths are extracted by the pinned Actions downloader. The
         # official verifier, not artifact names or unsigned predicates, admits them.
         candidates: dict[bytes, Path] = {}
-        for path in directory.rglob("*.json"):
+        for path in selected.path.rglob("*.json"):
             if path.is_symlink() or path.stat().st_size > 2 * 1024 * 1024:
                 raise AttestationError("unsafe journey bundle file")
             raw = path.read_bytes()
@@ -43,9 +51,28 @@ def bundles(evidence: Path, *, run_id: str, attempt: str) -> dict[str, JourneyBu
             raise AttestationError(f"{row} requires exactly one captured signed journey bundle")
         result[row] = JourneyBundle(
             next(iter(candidates.values())),
-            f"https://github.com/zunderlabs/zunder-guard/actions/runs/{run_id}/attempts/{attempt}",
+            "https://github.com/zunderlabs/zunder-guard/actions/runs/"
+            f"{run_id}/attempts/{selected.attempt}",
         )
     return result
+
+
+def staged_chain(evidence: Path, work: Path, *, run_id: str, attempt: str) -> str:
+    """Copy the latest staged chain <= `attempt` into `work`; return its attempt."""
+    selected = latest(evidence, "state-chain", run_id, attempt)
+    for name in ("staged.predicate.json", "staged.sigstore.json"):
+        source = selected.path / name
+        if source.is_symlink() or not source.is_file():
+            raise AttestationError("staged chain file must be a regular file")
+        with source.open("rb") as stream:
+            data = stream.read(2 * 1024 * 1024 + 1)
+        if not 0 < len(data) <= 2 * 1024 * 1024:
+            raise AttestationError("staged chain file size refused")
+        target = work / name
+        if target.is_symlink():
+            raise AttestationError("staged chain target refused")
+        target.write_bytes(data)
+    return selected.attempt
 
 
 def successor(
@@ -93,6 +120,7 @@ def execute(
     *, work: Path, evidence: Path, tag: str, commit: str, run_id: str, attempt: str
 ) -> None:
     manifest = work / "assets/release-manifest.json"
+    staged_attempt = staged_chain(evidence, work, run_id=run_id, attempt=attempt)
     verified = authenticate_state(
         manifest,
         work / "staged.predicate.json",
@@ -106,7 +134,7 @@ def execute(
         verified_journeys=frozenset(),
         log=work / "gate-logs/staged.log",
         expected_run_id=run_id,
-        expected_run_attempt=attempt,
+        expected_run_attempt=staged_attempt,
     )
     journeys = bundles(evidence, run_id=run_id, attempt=attempt)
     coverage: dict[str, frozenset[str]] = {}
@@ -117,7 +145,7 @@ def execute(
         tag=tag,
         logs=work / "gate-logs",
         expected_run_id=run_id,
-        expected_run_attempt=attempt,
+        latest_run_attempt=attempt,
         coverage_out=coverage,
     )
     state = successor(

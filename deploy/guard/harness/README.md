@@ -94,6 +94,13 @@ Mainnet setup/refusal aggregates require every route and case, and the signing a
 the live testnet path. Lifecycle references must match the authenticated bundle reference map.
 The manifest and bundle inputs are captured before verification. This consumer is ready for
 workflow integration; its mocked-verifier tests are not hosted release acceptance evidence.
+All rows come from the gate's own run, but rows may come from different attempts of it (a rerun
+of failed jobs keeps the passed rows' artifacts): `guard_harness.run_attempts.latest` selects
+each producer's `<row>-<run>-<k>` artifact with the highest `k` at or before the consumer's
+attempt, ignores superseded lower attempts, refuses another run id or a malformed name, and the
+row's signature must then carry exactly attempt `k`. The staged chain and the in-run consumers
+of other jobs' artifacts (M1, M3, the SDK jobs) select the same way. The gated state itself is
+bound to the gate job's exact attempt.
 
 Real paper-binary check (in addition to local contract fixtures): set
 `GUARD_TEST_BINARY` to the built/installed Guard and `GUARD_PAPER_READ_ACCOUNT`

@@ -64,13 +64,24 @@ def verify_predicate(
     log: Path,
     expected_run_id: str | None = None,
     expected_run_attempt: str | None = None,
+    latest_run_attempt: str | None = None,
 ) -> VerifiedPredicate:
     """Authenticate signer, issuer, hosted runner, source commit and predicate type.
 
     gh also checks the subject's digest against the file. This function does not
     accept a claimed predicate from an unverified bundle or a caller-provided JSON.
+    `expected_run_attempt` binds one exact attempt. `latest_run_attempt` instead admits
+    any attempt up to it within `expected_run_id`, for a consumer that does not know
+    which earlier attempt of its own run produced the bundle; never both.
     """
-    expected = expected_invocation(expected_run_id, expected_run_attempt)
+    if latest_run_attempt is not None:
+        if expected_run_attempt is not None:
+            raise AttestationError("exact and latest expected attempts are exclusive")
+        ceiling = expected_invocation(expected_run_id, latest_run_attempt)
+        expected = None
+    else:
+        ceiling = None
+        expected = expected_invocation(expected_run_id, expected_run_attempt)
     if workflow not in WORKFLOWS:
         raise AttestationError("untrusted signer workflow")
     if not re.fullmatch(r"[0-9a-f]{40}", commit):
@@ -132,5 +143,9 @@ def verify_predicate(
     if expected is not None and (run_id, attempt) != expected:
         raise AttestationError(
             "authenticated workflow run or attempt differs from expected invocation"
+        )
+    if ceiling is not None and (run_id != ceiling[0] or int(attempt) > int(ceiling[1])):
+        raise AttestationError(
+            "authenticated workflow run differs or its attempt follows the expected one"
         )
     return VerifiedPredicate(predicate, workflow, commit, uri, run_id, attempt)

@@ -112,11 +112,15 @@ def _check(predicate: dict[str, Any], journey: str, commit: str, digest: str) ->
         raise AttestationError("Linux reboot rows require actual guest evidence")
 
 
-def journey_invocation(bundles: Mapping[str, JourneyBundle]) -> tuple[str, str]:
-    identities = {invocation_run(evidence.reference) for evidence in bundles.values()}
-    if len(identities) != 1:
-        raise AttestationError("journey references must identify one exact run and attempt")
-    return next(iter(identities))
+def journey_attempts(bundles: Mapping[str, JourneyBundle]) -> tuple[str, dict[str, str]]:
+    """One workflow run; each row's own attempt (rows may come from different attempts)."""
+    identities = {
+        journey: invocation_run(evidence.reference) for journey, evidence in bundles.items()
+    }
+    runs = {run_id for run_id, _ in identities.values()}
+    if len(runs) != 1:
+        raise AttestationError("journey references must identify one exact workflow run")
+    return next(iter(runs)), {journey: attempt for journey, (_, attempt) in identities.items()}
 
 
 def authenticate_journeys(
@@ -127,7 +131,7 @@ def authenticate_journeys(
     tag: str,
     logs: Path,
     expected_run_id: str | None = None,
-    expected_run_attempt: str | None = None,
+    latest_run_attempt: str | None = None,
     coverage_out: dict[str, frozenset[str]] | None = None,
 ) -> frozenset[str]:
     """Return a complete set only after each bundle passes the official verifier.
@@ -135,12 +139,17 @@ def authenticate_journeys(
     The attestation subject is the immutable manifest, not an arbitrary job artifact.
     Expected signer workflows and minimum tiers are derived from the journey ID.
     Fixture attestations cannot count as E2E. M4 cannot appear in this automated gate.
+    Every row belongs to one workflow run; each row's signature must carry exactly the
+    attempt its reference names, which may not follow `latest_run_attempt` (decision
+    of 15 Oct 2026: each row's latest attempt within the run).
     """
     if set(bundles) != GATE_JOURNEYS:
         raise AttestationError("gate requires exactly the complete automated journey set")
-    run_id, attempt = journey_invocation(bundles)
-    expected = expected_invocation(expected_run_id, expected_run_attempt)
-    if expected is not None and (run_id, attempt) != expected:
+    run_id, attempts = journey_attempts(bundles)
+    expected = expected_invocation(expected_run_id, latest_run_attempt)
+    if expected is not None and (
+        run_id != expected[0] or any(int(k) > int(expected[1]) for k in attempts.values())
+    ):
         raise AttestationError("journey references identify a different requested run or attempt")
     manifest_bytes = manifest.read_bytes()
     digest = hashlib.sha256(manifest_bytes).hexdigest()
@@ -168,7 +177,7 @@ def authenticate_journeys(
                 predicate_type=PREDICATE_TYPE,
                 log=logs / f"{journey}.log",
                 expected_run_id=run_id,
-                expected_run_attempt=attempt,
+                expected_run_attempt=attempts[journey],
             )
             _check(verified.predicate, journey, commit, digest)
             authenticated_coverage[journey] = frozenset(verified.predicate["coverage"])
@@ -193,7 +202,17 @@ def authenticate_gate(
     expected_run_id: str | None = None,
     expected_run_attempt: str | None = None,
 ) -> VerifiedState:
-    """Authenticate journey evidence and lifecycle against the same captured bytes."""
+    """Authenticate journey evidence and lifecycle against the same captured bytes.
+
+    A `verify.yml` (staged or gated) state is bound to the gate's exact run and attempt,
+    which every journey row's attempt must not follow. Promotion is a separate
+    invocation; its rows still share one run and carry their own signed attempts.
+    """
+    if (
+        workflow == "verify.yml"
+        and expected_invocation(expected_run_id, expected_run_attempt) is None
+    ):
+        raise AttestationError("gated state requires the gate's exact run and attempt")
     with TemporaryDirectory(prefix="guard-gate-") as directory:
         subject = Path(directory) / "release-manifest.json"
         subject.write_bytes(manifest.read_bytes())
@@ -205,9 +224,8 @@ def authenticate_gate(
             tag=tag,
             logs=logs,
             expected_run_id=expected_run_id,
-            expected_run_attempt=expected_run_attempt,
+            latest_run_attempt=expected_run_attempt,
         )
-        run_id, attempt = journey_invocation(journey_bundles)
         state = authenticate_state(
             subject,
             served,
@@ -222,8 +240,8 @@ def authenticate_gate(
             log=logs / "lifecycle.log",
             # Promotion is a separate invocation; verify staged/gated belongs to
             # the same verified caller run as its journey attestations.
-            expected_run_id=run_id if workflow == "verify.yml" else None,
-            expected_run_attempt=attempt if workflow == "verify.yml" else None,
+            expected_run_id=expected_run_id if workflow == "verify.yml" else None,
+            expected_run_attempt=expected_run_attempt if workflow == "verify.yml" else None,
         )
     references = {journey: evidence.reference for journey, evidence in journey_bundles.items()}
     if state.predicate["evidence"] != references:

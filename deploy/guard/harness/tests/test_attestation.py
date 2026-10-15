@@ -195,3 +195,70 @@ def test_expected_invocation_must_be_complete_canonical_pair(
     )
     with pytest.raises(attestation.AttestationError, match="paired canonical positive IDs"):
         verify(tmp_path, run_id=run_id, attempt=attempt)
+
+
+def verify_latest(
+    tmp_path: Path, *, run_id: str | None, latest: str, attempt: str | None = None
+) -> attestation.VerifiedPredicate:
+    return attestation.verify_predicate(
+        tmp_path / "manifest.json",
+        tmp_path / "bundle.json",
+        workflow="verify.yml",
+        commit="a" * 40,
+        tag="v1.0.0",
+        predicate_type=TYPE,
+        log=tmp_path / "verification.log",
+        expected_run_id=run_id,
+        expected_run_attempt=attempt,
+        latest_run_attempt=latest,
+    )
+
+
+@pytest.mark.parametrize("signed", ["1", "2", "3"])
+def test_latest_attempt_admits_any_earlier_attempt_of_the_same_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, signed: str
+) -> None:
+    uri = f"https://github.com/zunderlabs/zunder-guard/actions/runs/123/attempts/{signed}"
+    install_verifier(monkeypatch, tmp_path, authenticated(uri))
+    value = verify_latest(tmp_path, run_id="123", latest="3")
+    assert (value.run_id, value.run_attempt) == ("123", signed)
+
+
+@pytest.mark.parametrize(
+    "uri",
+    [
+        "https://github.com/zunderlabs/zunder-guard/actions/runs/123/attempts/4",
+        "https://github.com/zunderlabs/zunder-guard/actions/runs/123/attempts/10",
+        "https://github.com/zunderlabs/zunder-guard/actions/runs/124/attempts/1",
+    ],
+)
+def test_latest_attempt_refuses_later_attempt_or_other_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, uri: str
+) -> None:
+    install_verifier(monkeypatch, tmp_path, authenticated(uri))
+    with pytest.raises(attestation.AttestationError, match="attempt follows the expected"):
+        verify_latest(tmp_path, run_id="123", latest="3")
+
+
+@pytest.mark.parametrize(
+    "run_id,latest,attempt,message",
+    [
+        ("123", "3", "2", "exclusive"),
+        (None, "3", None, "paired canonical"),
+        ("123", "03", None, "paired canonical"),
+        ("123", "0", None, "paired canonical"),
+    ],
+)
+def test_latest_attempt_requires_a_run_and_excludes_an_exact_attempt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    run_id: str | None,
+    latest: str,
+    attempt: str | None,
+    message: str,
+) -> None:
+    monkeypatch.setattr(
+        attestation, "run", lambda *args, **kwargs: pytest.fail("must validate first")
+    )
+    with pytest.raises(attestation.AttestationError, match=message):
+        verify_latest(tmp_path, run_id=run_id, latest=latest, attempt=attempt)

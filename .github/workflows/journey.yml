@@ -695,8 +695,12 @@ jobs:
         python -m pip install --no-deps --no-build-isolation -e ./deploy/guard/harness
     - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
       with:
-        name: signing-subjects-${{ github.run_id }}-${{ github.run_attempt }}
-        path: ${{ runner.temp }}/sdk/assets
+        pattern: signing-subjects-${{ github.run_id }}-*
+        path: ${{ runner.temp }}/sdk/subjects-attempts
+    - name: Select the latest signing subjects at or before this attempt
+      run: python -m guard_harness.run_attempts --directory "$RUNNER_TEMP/sdk/subjects-attempts"
+        --prefix signing-subjects --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT"
+        --move-to "$RUNNER_TEMP/sdk/assets"
     - name: Install the pinned SDK toolchain in fresh job-private homes
       env:
         RUSTUP_HOME: ${{ runner.temp }}/sdk-rustup
@@ -820,35 +824,52 @@ jobs:
         > "$RUNNER_TEMP/M3/assets.log" 2>&1
 
         '
+    # Every attempt of this run, one directory per artifact; the latest attempt at or
+    # before this one is selected per producer below, never by download order.
     - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
       with:
-        pattern: signing-*-${{ github.run_id }}-${{ github.run_attempt }}
-        path: ${{ runner.temp }}/M3/evidence
-        merge-multiple: true
+        pattern: signing-*-${{ github.run_id }}-*
+        path: ${{ runner.temp }}/M3/signing-attempts
     - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
       with:
-        name: T1-${{ github.run_id }}-${{ github.run_attempt }}
-        path: ${{ runner.temp }}/M3/T1
+        pattern: T1-${{ github.run_id }}-*
+        path: ${{ runner.temp }}/M3/T1-attempts
     - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
       with:
-        name: T2-${{ github.run_id }}-${{ github.run_attempt }}
-        path: ${{ runner.temp }}/M3/T2
+        pattern: T2-${{ github.run_id }}-*
+        path: ${{ runner.temp }}/M3/T2-attempts
     - name: Authenticate all three SDK platforms and both live testnet journeys
       env:
         GH_TOKEN: ${{ github.token }}
         TAG: ${{ inputs.tag }}
         SOURCE: ${{ inputs.commit }}
-      run: "set -euo pipefail\npython - <<'PY_M3'\nimport json, os\nfrom pathlib import\
-        \ Path\nroot = Path(os.environ['RUNNER_TEMP']) / 'M3'\nfor row in ('T1', 'T2'):\n\
-        \    bundles = {}\n    for path in (root / row).rglob('*.json'):\n       \
-        \ value = json.loads(path.read_bytes())\n        if isinstance(value, dict)\
-        \ and 'dsseEnvelope' in value and 'verificationMaterial' in value:\n     \
-        \       bundles[path.read_bytes()] = path\n    if len(bundles) != 1:\n   \
-        \     raise SystemExit('Expected one authenticated testnet bundle')\n    (root\
-        \ / 'evidence' / (row + '.sigstore.json')).write_bytes(next(iter(bundles)))\n\
-        PY_M3\npython -m guard_harness.mainnet_evidence --row M3 --tag \"$TAG\" --commit\
-        \ \"$SOURCE\" --assets \"$RUNNER_TEMP/M3/assets\" --evidence \"$RUNNER_TEMP/M3/evidence\"\
-        \ --output \"$RUNNER_TEMP/M3/proof\"\n"
+      run: |
+        set -euo pipefail
+        python - <<'PY_M3'
+        import json, os
+        from pathlib import Path
+        from guard_harness.run_attempts import latest
+        root = Path(os.environ['RUNNER_TEMP']) / 'M3'
+        run, attempt = os.environ['GITHUB_RUN_ID'], os.environ['GITHUB_RUN_ATTEMPT']
+        evidence = root / 'evidence'
+        evidence.mkdir()
+        for platform in ('linux', 'macos', 'windows'):
+            name = 'signing-' + platform
+            source = latest(root / 'signing-attempts', name, run, attempt).path / (name + '.sigstore.json')
+            if source.is_symlink() or not source.is_file():
+                raise SystemExit('Expected one signing bundle per platform')
+            (evidence / (name + '.sigstore.json')).write_bytes(source.read_bytes())
+        for row in ('T1', 'T2'):
+            bundles = {}
+            for path in latest(root / (row + '-attempts'), row, run, attempt).path.rglob('*.json'):
+                value = json.loads(path.read_bytes())
+                if isinstance(value, dict) and 'dsseEnvelope' in value and 'verificationMaterial' in value:
+                    bundles[path.read_bytes()] = path
+            if len(bundles) != 1:
+                raise SystemExit('Expected one authenticated testnet bundle')
+            (evidence / (row + '.sigstore.json')).write_bytes(next(iter(bundles)))
+        PY_M3
+        python -m guard_harness.mainnet_evidence --row M3 --tag "$TAG" --commit "$SOURCE" --assets "$RUNNER_TEMP/M3/assets" --evidence "$RUNNER_TEMP/M3/evidence" --output "$RUNNER_TEMP/M3/proof"
     - uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6
       id: evidence
       with:

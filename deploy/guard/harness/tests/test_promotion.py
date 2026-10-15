@@ -14,7 +14,9 @@ from guard_harness.release_state import GATE_JOURNEYS, predicate_digest
 from guard_harness.state_verifier import VerifiedState
 
 
-def complete(tag: str = "v1.0.0") -> tuple[VerifiedState, dict[str, Any]]:
+def complete(
+    tag: str = "v1.0.0", attempts: dict[str, str] | None = None
+) -> tuple[VerifiedState, dict[str, Any]]:
     raw = build_bytes(tag)
     build = json.loads(raw)
     genesis = staged_state.genesis(raw, commit=COMMIT, issued_at="2026-10-11T04:00:00Z")
@@ -22,12 +24,29 @@ def complete(tag: str = "v1.0.0") -> tuple[VerifiedState, dict[str, Any]]:
         genesis,
         build,
         {
-            row: "https://github.com/zunderlabs/zunder-guard/actions/runs/1/attempts/1"
+            row: "https://github.com/zunderlabs/zunder-guard/actions/runs/1/attempts/"
+            + (attempts or {}).get(row, "1")
             for row in GATE_JOURNEYS
         },
         coverage=dict(JOURNEY_COVERAGE),
     )
     return VerifiedState(gated, hashlib.sha256(raw).hexdigest()), build
+
+
+def test_verification_run_admits_per_row_attempts_of_one_run_only() -> None:
+    # Decision of 15 Oct 2026: references name each row's own attempt in one run.
+    previous, _ = complete(attempts={"P2": "2", "I1": "3"})
+    assert promotion.verification_run(previous.predicate) == "1"
+    other = dict(previous.predicate["evidence"])
+    other["P2"] = "https://github.com/zunderlabs/zunder-guard/actions/runs/2/attempts/2"
+    with pytest.raises(AttestationError, match="one exact verification run"):
+        promotion.verification_run({"evidence": other})
+    other["P2"] = "https://example.com/runs/1/attempts/2"
+    with pytest.raises(AttestationError, match="public HTTPS"):
+        promotion.verification_run({"evidence": other})
+    for evidence in ({}, None, {"P2": 1}):
+        with pytest.raises(AttestationError):
+            promotion.verification_run({"evidence": evidence})
 
 
 def test_promotion_is_revision_three_and_preserves_all_admitted_evidence() -> None:

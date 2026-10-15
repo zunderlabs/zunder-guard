@@ -62,6 +62,7 @@ def successor(previous: VerifiedState, build: dict[str, Any], *, stage: str) -> 
 def gate(
     release: Release, evidence: Path, *, run_id: str, attempt: str, logs: Path
 ) -> VerifiedState:
+    """`attempt` is the gate job's own attempt; its rows and staging may be earlier."""
     chain = evidence / f"complete-gate-{run_id}-{attempt}"
     staged = authenticate_state(
         release.assets / "release-manifest.json",
@@ -72,8 +73,10 @@ def gate(
         commit=release.commit,
         tag=release.tag,
         workflow="verify.yml",
+        # Staging may have passed in an earlier attempt of the gate's run; the gated
+        # successor (exact attempt below) binds this predecessor by digest.
         expected_run_id=run_id,
-        expected_run_attempt=attempt,
+        latest_run_attempt=attempt,
         previous=None,
         verified_journeys=frozenset(),
         log=logs / "staged.log",

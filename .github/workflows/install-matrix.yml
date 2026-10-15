@@ -1244,7 +1244,8 @@ jobs:
         with: {pattern: 'install-matrix-M1-*', path: '${{ runner.temp }}/M1-routes'}
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         if: matrix.row == 'M1'
-        with: {name: 'I7-${{ github.run_id }}-${{ github.run_attempt }}', path: '${{ runner.temp }}/aws'}
+        # Every attempt of this run; the latest one at or before this attempt is selected below.
+        with: {pattern: 'I7-${{ github.run_id }}-*', path: '${{ runner.temp }}/aws-attempts'}
       - run: |
           python -m pip install --require-hashes --only-binary=:all: -r deploy/guard/harness/requirements-runtime.lock
           python -m pip install --no-deps --no-build-isolation -e ./deploy/guard/harness
@@ -1259,12 +1260,16 @@ jobs:
           [ "$GITHUB_SHA" = "$SOURCE" ]
           python - <<'PY'
           import os, pathlib, shutil
+          from guard_harness.run_attempts import latest
           base=pathlib.Path(os.environ['RUNNER_TEMP'])
           row=os.environ['ROW']
           target=base/'observations'/row
           target.mkdir(parents=True,exist_ok=True)
-          sources=((base/'macos').glob('**/mainnet/M2/*') if row=='M2' else
-                   list((base/'M1-routes').rglob('*')) + list((base/'aws').glob('**/mainnet/M1/*')))
+          if row=='M2':
+              sources=list((base/'macos').glob('**/mainnet/M2/*'))
+          else:
+              aws=latest(base/'aws-attempts','I7',os.environ['GITHUB_RUN_ID'],os.environ['GITHUB_RUN_ATTEMPT']).path
+              sources=list((base/'M1-routes').rglob('*')) + list(aws.glob('**/mainnet/M1/*'))
           for source in sources:
               if source.is_file() and source.suffix in ('.json','.log'):
                   destination=target/source.name

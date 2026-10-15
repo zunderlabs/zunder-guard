@@ -11,8 +11,9 @@ import os
 from pathlib import Path
 from typing import Any
 
-from guard_harness.attestation import AttestationError, verify_predicate
+from guard_harness.attestation import AttestationError, invocation_run, verify_predicate
 from guard_harness.release_state import GATE_JOURNEYS, canonical_bytes, predicate_digest
+from guard_harness.run_attempts import attempts
 from guard_harness.runner import RunError, run
 
 
@@ -47,14 +48,36 @@ def reconstruct(
     promoted: dict[str, Any],
     manifest: Path,
     run_id: str,
-    attempt: str,
-) -> None:
+) -> str:
+    """Rebuild the gate's evidence directory; return the gate's authenticated attempt.
+
+    Each journey row is bound to the exact attempt its promoted reference names (rows
+    may differ in attempt within the one run). The gated state is bound to the run;
+    its signed attempt is the gate's attempt and may not precede any row. The staged
+    state may come from any attempt up to the gate's.
+    """
     digest = hashlib.sha256(manifest.read_bytes()).hexdigest()
     statements = candidates(state_records)
+    references = promoted.get("evidence")
+    if not isinstance(references, dict) or set(references) != GATE_JOURNEYS:
+        raise AttestationError("promoted state must reference the complete journey set")
+    row_attempts: dict[str, str] = {}
+    for row, reference in references.items():
+        if not isinstance(reference, str):
+            raise AttestationError("promoted journey reference refused")
+        reference_run, row_attempts[row] = invocation_run(reference)
+        if reference_run != run_id:
+            raise AttestationError("promoted journey references identify another run")
 
     def authenticated(
-        matches: list[tuple[bytes, dict[str, Any]]], *, workflow: str, kind: str, label: str
-    ) -> tuple[bytes, dict[str, Any]]:
+        matches: list[tuple[bytes, dict[str, Any]]],
+        *,
+        workflow: str,
+        kind: str,
+        label: str,
+        attempt: str | None = None,
+        latest: str | None = None,
+    ) -> tuple[bytes, dict[str, Any], str]:
         directory = root.parent / "archive-candidates" / label
         directory.mkdir(mode=0o700, parents=True, exist_ok=False)
         for index, (bundle, predicate) in enumerate(sorted(matches, key=lambda item: item[0])):
@@ -68,17 +91,19 @@ def reconstruct(
                     commit=promoted["commit"],
                     tag=promoted["tag"],
                     predicate_type=f"https://zunderlabs.com/guard/{kind}/v1",
-                    expected_run_id=run_id,
+                    # Without an attempt (the gated state) only the run is bound here.
+                    expected_run_id=run_id if attempt is not None or latest is not None else None,
                     expected_run_attempt=attempt,
+                    latest_run_attempt=latest,
                     log=directory / f"{index}.log",
                 )
             except (AttestationError, RunError):
                 continue
-            if verified.predicate == predicate:
-                return bundle, predicate
+            if verified.run_id == run_id and verified.predicate == predicate:
+                return bundle, predicate, verified.run_attempt
         raise AttestationError("exact workflow run and attempt missing from attestation store")
 
-    def select(expected: str, label: str) -> tuple[bytes, dict[str, Any]]:
+    def select(expected: str, label: str) -> list[tuple[bytes, dict[str, Any]]]:
         matches = [
             (bundle, statement["predicate"])
             for bundle, statement in statements
@@ -87,10 +112,23 @@ def reconstruct(
         ]
         if not matches:
             raise AttestationError("exact lifecycle predecessor missing from attestation store")
-        return authenticated(matches, workflow="verify.yml", kind="release-state", label=label)
+        return matches
 
-    gated_bundle, gated = select(promoted["previous"], "gated")
-    staged_bundle, staged = select(gated["previous"], "staged")
+    gated_bundle, gated, attempt = authenticated(
+        select(promoted["previous"], "gated"),
+        workflow="verify.yml",
+        kind="release-state",
+        label="gated",
+    )
+    if any(int(k) > int(attempt) for k in row_attempts.values()):
+        raise AttestationError("journey reference follows the gate's attempt")
+    staged_bundle, staged, _ = authenticated(
+        select(gated["previous"], "staged"),
+        workflow="verify.yml",
+        kind="release-state",
+        label="staged",
+        latest=attempt,
+    )
     chain = root / f"complete-gate-{run_id}-{attempt}"
     chain.mkdir(parents=True, exist_ok=False)
     for stage, predicate, bundle in (
@@ -111,22 +149,33 @@ def reconstruct(
         ]
         if not matches:
             raise AttestationError("complete journey evidence missing from attestation store")
-        directory = root / f"{row}-{run_id}-{attempt}"
+        directory = root / f"{row}-{run_id}-{row_attempts[row]}"
         directory.mkdir()
-        bundle, _ = authenticated(
+        bundle, _, _ = authenticated(
             matches,
             workflow="install-matrix.yml"
             if row.startswith("I") or row in {"M1", "M2"}
             else "journey.yml",
             kind="journey",
             label=row,
+            attempt=row_attempts[row],
         )
         (directory / "bundle.json").write_bytes(bundle)
+    return attempt
+
+
+def gate_attempt(evidence: Path, run_id: str) -> str:
+    """The gate attempt `reconstruct` recorded: exactly one complete gate of the run."""
+    found = attempts(evidence, "complete-gate", run_id)
+    if len(found) != 1:
+        raise AttestationError("recovered evidence must hold exactly one complete gate")
+    return str(next(iter(found)))
 
 
 def recover(
-    root: Path, *, manifest: Path, promoted: dict[str, Any], run_id: str, attempt: str, logs: Path
-) -> None:
+    root: Path, *, manifest: Path, promoted: dict[str, Any], run_id: str, logs: Path
+) -> str:
+    """Rebuild the evidence directory from the attestation store; return the gate attempt."""
     sources: list[Path] = []
     for name, predicate in (("state", "release-state"), ("journeys", "journey")):
         directory = root.parent / ("attestation-store-" + name)
@@ -155,12 +204,11 @@ def recover(
         if len(files) != 1:
             raise AttestationError("expected exactly one immutable subject attestation archive")
         sources.append(files[0])
-    reconstruct(
+    return reconstruct(
         root,
         sources[0],
         sources[1],
         promoted=promoted,
         manifest=manifest,
         run_id=run_id,
-        attempt=attempt,
     )

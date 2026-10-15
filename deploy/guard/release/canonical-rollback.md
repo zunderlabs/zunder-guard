@@ -31,9 +31,11 @@ subsequent action; never blindly replay a publication or restore request.
 
 Use `promote.yml`'s **rollback** dispatch mode. Select the original stable tag as the workflow
 ref so the workflow source remains the released commit. Supply the original `tag`, full
-`commit`, verification `run_id` and `attempt`, and the original promotion's `source_run` and
-`source_attempt`. A reusable promotion shares its caller's run ID and attempt; a standalone
-promotion has its own. Do not rerun the promotion or `prepare` phase.
+`commit`, verification `run_id` and `attempt` (the gate job's attempt, recorded in the signed
+snapshot as `verify_attempt`), and the original promotion's `source_run` and `source_attempt`.
+A reusable promotion shares its caller's run ID; its own attempt can follow the gate's when
+failed jobs were rerun. A standalone promotion has its own run and attempt. Do not rerun the
+promotion or `prepare` phase.
 
 ```sh
 gh workflow run promote.yml --repo zunderlabs/zunder-guard --ref "$TAG" \

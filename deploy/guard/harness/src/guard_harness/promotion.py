@@ -9,13 +9,13 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
-from guard_harness.attestation import AttestationError, verify_predicate
+from guard_harness.attestation import AttestationError, invocation_run, verify_predicate
 from guard_harness.channel_head import read as read_head
 from guard_harness.gate_state import bundles
 from guard_harness.homebrew_stage import Tap
 from guard_harness.journey_evidence import authenticate_gate
 from guard_harness.native_release import Release, authenticate
-from guard_harness.promotion_archive import recover
+from guard_harness.promotion_archive import gate_attempt, recover
 from guard_harness.promotion_channels import Channels, public_get
 from guard_harness.promotion_recovery import authenticate as authenticate_snapshot
 from guard_harness.promotion_recovery import snapshot as make_snapshot
@@ -39,6 +39,25 @@ def outputs(values: dict[str, str]) -> None:
                 stream.write(f"{key}={value}\n")
 
 
+def verification_run(state: dict[str, Any]) -> str:
+    """The one verification run of a gated or promoted state's journey references.
+
+    Each reference names its own row's attempt (decision of 15 Oct 2026); the gate's
+    own attempt is recovered from its authenticated signature, never from a reference.
+    """
+    references = state.get("evidence")
+    if not isinstance(references, dict) or not references:
+        raise AttestationError("prior gate must identify its verification run")
+    runs = set()
+    for reference in references.values():
+        if not isinstance(reference, str):
+            raise AttestationError("prior verification run reference refused")
+        runs.add(invocation_run(reference)[0])
+    if len(runs) != 1:
+        raise AttestationError("prior gate must identify one exact verification run")
+    return runs.pop()
+
+
 def prior(work: Path, digest: str | None, state: dict[str, Any] | None) -> Release | None:
     if digest is None or state is None or state.get("stage") == "withdrawn":
         return None
@@ -52,23 +71,13 @@ def prior(work: Path, digest: str | None, state: dict[str, Any] | None) -> Relea
     root = work / "prior"
     (root / "promoted.predicate.json").write_bytes(canonical_bytes(state))
     (root / "promoted.sigstore.json").write_bytes(response[0])
-    references = set(state.get("evidence", {}).values())
-    if len(references) != 1:
-        raise AttestationError("prior gate must identify one exact verification run and attempt")
-    match = re.fullmatch(
-        r"https://github.com/zunderlabs/zunder-guard/actions/runs/([1-9][0-9]*)/attempts/([1-9][0-9]*)",
-        references.pop(),
-    )
-    if match is None:
-        raise AttestationError("prior verification run reference refused")
-    run_id, attempt = match.groups()
+    run_id = verification_run(state)
     evidence = root / "evidence"
-    recover(
+    attempt = recover(
         evidence,
         manifest=release.assets / "release-manifest.json",
         promoted=state,
         run_id=run_id,
-        attempt=attempt,
         logs=root / "logs/archive",
     )
     previous = gate(release, evidence, run_id=run_id, attempt=attempt, logs=root / "logs/gate")
@@ -103,16 +112,10 @@ def admitted_canonical(work: Path) -> tuple[Release, Publication]:
     release = prior(work, digest, state)
     if release is None or state is None:
         raise AttestationError("no promoted stable canonical release")
-    reference = next(iter(state["evidence"].values()))
-    match = re.fullmatch(
-        r"https://github.com/zunderlabs/zunder-guard/actions/runs/([1-9][0-9]*)/attempts/([1-9][0-9]*)",
-        reference,
-    )
-    if match is None:
-        raise AttestationError("canonical verification run reference refused")
-    run_id, attempt = match.groups()
+    run_id = verification_run(state)
     root = work / "prior"
     evidence = root / "evidence"
+    attempt = gate_attempt(evidence, run_id)
     previous = gate(
         release, evidence, run_id=run_id, attempt=attempt, logs=root / "logs/readback-gate"
     )
@@ -162,13 +165,9 @@ def admitted_prior(args: argparse.Namespace, transaction: dict[str, Any]) -> Non
     root = args.work / "prior"
     release = Release(old["tag"], old["commit"], root / "assets")
     state = json.loads((root / "promoted.predicate.json").read_bytes())
-    references = set(state["evidence"].values())
-    if len(references) != 1:
-        raise AttestationError("captured prior gate invocation differs")
-    from guard_harness.attestation import invocation_run
-
-    run_id, attempt = invocation_run(references.pop())
+    run_id = verification_run(state)
     evidence = root / "evidence"
+    attempt = gate_attempt(evidence, run_id)
     previous = gate(
         release, evidence, run_id=run_id, attempt=attempt, logs=root / "logs/recovery-gate"
     )

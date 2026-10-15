@@ -451,8 +451,20 @@ sha256() {
   fi
 }
 
+# curl's --retry covers only timeouts and HTTP 408/429/5xx; a refused or reset connection, a TLS
+# failure or a cut-off body gets three more tries, 2, 4 and 8 s apart. A failed try's partial
+# file is deleted, so each try writes a fresh file and only a complete one is verified.
 fetch() {
-  curl -fsSL --proto '=https,file' --retry 3 -o "$TMP/$1" "$2" || die "download failed: $2"
+  fetch_try=1 fetch_pause=2
+  while :; do
+    rm -f "$TMP/$1"
+    curl -fsSL --proto '=https,file' --retry 3 -o "$TMP/$1" "$2" && return 0
+    rm -f "$TMP/$1"
+    [ "$fetch_try" -lt 4 ] || die "download failed: $2"
+    say "install.sh: download try $fetch_try of 4 failed; trying again in ${fetch_pause}s" >&2
+    sleep "$fetch_pause"
+    fetch_try=$((fetch_try + 1)) && fetch_pause=$((fetch_pause * 2))
+  done
 }
 
 # Container mode never installs/replaces a native Guard binary.

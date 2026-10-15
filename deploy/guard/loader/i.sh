@@ -17,7 +17,21 @@ main() {
   esac
   T=$(mktemp -d) && trap 'rm -rf "$T"' EXIT
   no() { echo "zunder-guard: $1; refusing, nothing was run" >&2 && exit 1; }
-  get() { curl -fsSL --proto '=https,file' --retry 3 -o "$T/$1" "$2" || no "download failed: $2"; }
+  # curl's --retry covers only timeouts and HTTP 408/429/5xx; a refused or reset connection, a
+  # TLS failure or a cut-off body gets three more tries, 2, 4 and 8 s apart. A failed try's
+  # partial file is deleted, so each try writes a fresh file and only a complete one is verified.
+  get() {
+    get_try=1 get_pause=2
+    while :; do
+      rm -f "$T/$1"
+      curl -fsSL --proto '=https,file' --retry 3 -o "$T/$1" "$2" && return 0
+      rm -f "$T/$1"
+      [ "$get_try" -lt 4 ] || no "download failed: $2"
+      echo "zunder-guard: download try $get_try of 4 failed; trying again in ${get_pause}s" >&2
+      sleep "$get_pause"
+      get_try=$((get_try + 1)) && get_pause=$((get_pause * 2))
+    done
+  }
   sum() { { sha256sum "$1" 2>/dev/null || shasum -a 256 "$1"; } | cut -d' ' -f1; }
   for f in install.sh SHA256SUMS SHA256SUMS.sigstore.json; do get "$f" "$U/$f"; done
   pinned_cosign() {

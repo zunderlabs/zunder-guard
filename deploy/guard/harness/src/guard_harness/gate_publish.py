@@ -52,6 +52,8 @@ def execute(
         expected=hashlib.sha256(canonical_bytes(previous.predicate)).hexdigest(),
         journeys=bundles(evidence, run_id=run_id, attempt=attempt),
         logs=work / "gate-publication-logs",
+        expected_run_id=run_id,
+        expected_run_attempt=attempt,
     )
     digest = publish(publication, token=token)
     _receipt(work, {"tag": tag, "commit": commit, "state_sha256": digest, "stage": "gated"})
