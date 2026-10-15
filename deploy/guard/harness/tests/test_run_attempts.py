@@ -102,6 +102,18 @@ def test_selected_artifact_must_be_a_real_directory(tmp_path: Path) -> None:
         latest(root, "P2", "123", "1")
 
 
+def test_flat_single_artifact_download_is_refused(tmp_path: Path) -> None:
+    # rc.19: download-artifact extracts a lone pattern match flat into the path, so the
+    # artifact's name (its attempt) is gone; selection must refuse, not guess.
+    root = make(tmp_path / "art")
+    (root / "release-manifest.json").write_text("{}")
+    with pytest.raises(AttemptError, match="one real directory per artifact"):
+        latest(root, "signing-subjects", "123", "1")
+    (root / "release-manifest.json").unlink()
+    make(root, "signing-subjects-123-1", "staged-state-123-1")
+    assert latest(root, "signing-subjects", "123", "1").attempt == "1"
+
+
 def test_download_directory_must_exist_and_not_be_a_link(tmp_path: Path) -> None:
     with pytest.raises(AttemptError, match="download directory"):
         latest(tmp_path / "missing", "P2", "123", "1")

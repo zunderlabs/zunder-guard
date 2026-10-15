@@ -49,9 +49,16 @@ def attempts(directory: Path, prefix: str, run_id: str) -> dict[int, Path]:
     _positive(run_id, "workflow run id")
     if directory.is_symlink() or not directory.is_dir():
         raise AttemptError("artifact download directory missing")
+    entries = sorted(directory.iterdir())
+    # download-artifact makes one directory per artifact only when it downloads more than
+    # one; a single match is extracted flat into the path and its name (the attempt) is
+    # lost. Consumers therefore download every artifact of the run; a top-level file
+    # means that layout did not hold, so nothing can be selected.
+    if any(entry.is_symlink() or not entry.is_dir() for entry in entries):
+        raise AttemptError("artifact download is not one real directory per artifact")
     found: dict[int, Path] = {}
     lead = prefix + "-"
-    for entry in sorted(directory.iterdir()):
+    for entry in entries:
         name = entry.name
         rest = name[len(lead) :]
         if not name.startswith(lead) or not rest or rest[0] not in "0123456789":

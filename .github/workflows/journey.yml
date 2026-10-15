@@ -693,9 +693,10 @@ jobs:
     - run: |
         python -m pip install --require-hashes --only-binary=:all: -r deploy/guard/harness/requirements-runtime.lock
         python -m pip install --no-deps --no-build-isolation -e ./deploy/guard/harness
+    # Every artifact of the run, one directory each (a pattern matching a single artifact
+    # would be extracted flat and lose its attempt); the helper selects the latest attempt.
     - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
       with:
-        pattern: signing-subjects-${{ github.run_id }}-*
         path: ${{ runner.temp }}/sdk/subjects-attempts
     - name: Select the latest signing subjects at or before this attempt
       run: python -m guard_harness.run_attempts --directory "$RUNNER_TEMP/sdk/subjects-attempts"
@@ -824,20 +825,12 @@ jobs:
         > "$RUNNER_TEMP/M3/assets.log" 2>&1
 
         '
-    # Every attempt of this run, one directory per artifact; the latest attempt at or
-    # before this one is selected per producer below, never by download order.
+    # Every artifact of the run, one directory each (a pattern matching a single artifact
+    # would be extracted flat and lose its attempt); the latest attempt at or before this
+    # one is selected per producer below, never by download order.
     - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
       with:
-        pattern: signing-*-${{ github.run_id }}-*
-        path: ${{ runner.temp }}/M3/signing-attempts
-    - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
-      with:
-        pattern: T1-${{ github.run_id }}-*
-        path: ${{ runner.temp }}/M3/T1-attempts
-    - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
-      with:
-        pattern: T2-${{ github.run_id }}-*
-        path: ${{ runner.temp }}/M3/T2-attempts
+        path: ${{ runner.temp }}/M3/attempts
     - name: Authenticate all three SDK platforms and both live testnet journeys
       env:
         GH_TOKEN: ${{ github.token }}
@@ -855,13 +848,13 @@ jobs:
         evidence.mkdir()
         for platform in ('linux', 'macos', 'windows'):
             name = 'signing-' + platform
-            source = latest(root / 'signing-attempts', name, run, attempt).path / (name + '.sigstore.json')
+            source = latest(root / 'attempts', name, run, attempt).path / (name + '.sigstore.json')
             if source.is_symlink() or not source.is_file():
                 raise SystemExit('Expected one signing bundle per platform')
             (evidence / (name + '.sigstore.json')).write_bytes(source.read_bytes())
         for row in ('T1', 'T2'):
             bundles = {}
-            for path in latest(root / (row + '-attempts'), row, run, attempt).path.rglob('*.json'):
+            for path in latest(root / 'attempts', row, run, attempt).path.rglob('*.json'):
                 value = json.loads(path.read_bytes())
                 if isinstance(value, dict) and 'dsseEnvelope' in value and 'verificationMaterial' in value:
                     bundles[path.read_bytes()] = path
