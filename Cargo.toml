@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/zunder-config", "crates/zunder-core", "crates/zunder-guard", "crates/zunder-guard-core", "crates/zunder-guard-mcp", "crates/zunder-hl-protocol", "crates/zunder-risk", "crates/zunder-venue", "crates/zunder-venue-types", "deploy/guard/rules", "tests/redteam"]
 
 [workspace.package]
-version = "1.0.0-rc.17"
+version = "1.0.0-rc.18"
 edition = "2024"
 rust-version = "1.97"
 publish = false

@@ -25,16 +25,32 @@ export function validInboxMessage(value: unknown, email: string, since: number):
     && typeof message['text'] === 'string' && typeof message['html'] === 'string';
 }
 
+/**
+ * The request call itself threw, so no HTTP response exists (connection reset, DNS, socket timeout).
+ * Same fixed message as `safe`; the class lets a read-only poll tell this apart from a response it
+ * must judge. Every response, whatever its status or body, comes back as a value instead.
+ */
+export class Unanswered extends Error {}
+
+async function unanswered(operation: () => Promise<APIResponse>, label: string): Promise<APIResponse> {
+  try {
+    return await operation();
+  } catch {
+    // As in `safe`: no original error, cause, headers or body.
+    throw new Unanswered(`${label} failed; sensitive HTTP diagnostics withheld`);
+  }
+}
+
 export function get(
   request: APIRequestContext, url: string,
   options: NonNullable<Parameters<APIRequestContext['get']>[1]>, label: string,
 ): Promise<APIResponse> {
-  return safe(() => request.get(url, { ...options, maxRedirects: 0 }), label);
+  return unanswered(() => request.get(url, { ...options, maxRedirects: 0 }), label);
 }
 
 export function post(
   request: APIRequestContext, url: string,
   options: NonNullable<Parameters<APIRequestContext['post']>[1]>, label: string,
 ): Promise<APIResponse> {
-  return safe(() => request.post(url, { ...options, maxRedirects: 0 }), label);
+  return unanswered(() => request.post(url, { ...options, maxRedirects: 0 }), label);
 }

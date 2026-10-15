@@ -361,6 +361,8 @@ def test_windows_child_environment_keeps_machine_service_roots(
         assert env["PROGRAMFILES"] == "inert-program-files"
         assert "WALLET_FRAME" not in env and "UNRELATED_TOKEN" not in env
         assert all(env[name] == value for name, value in windows_locations.items())
+        # Without a source candidate too: receipts record the harness commit (rc.17 M2).
+        assert env["GITHUB_SHA"] == current.commit
 
 
 @pytest.mark.parametrize("shell", ["pwsh.exe", "powershell.exe"])

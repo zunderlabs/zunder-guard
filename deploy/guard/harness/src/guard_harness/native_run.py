@@ -91,6 +91,9 @@ def execute(*, subjects: Path, output: Path, scenario: str, account: str, shell:
             "RUNNER_ENVIRONMENT",
             "INSTALL_MATRIX_PROFILE",
             "DIAGNOSTIC",
+            # The harness source identity every receipt records (rc.17: without it the
+            # upgrade's Homebrew M2 receipt had an empty harness_commit and M2 refused).
+            "GITHUB_SHA",
         }
         # PowerShell needs these to run a downloaded .exe and to load its own modules
         # (rc.16: "Cannot run a document in the middle of a pipeline" without PATHEXT).
@@ -101,7 +104,6 @@ def execute(*, subjects: Path, output: Path, scenario: str, account: str, shell:
             and name
             in {
                 "SOURCE_INSTALLER_DIAGNOSTIC",
-                "GITHUB_SHA",
                 "WORKFLOW_REF",
                 "CALLER_REF",
                 "CALLER_EVENT",

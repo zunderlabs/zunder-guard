@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Elastic-2.0
 import { createServer } from 'node:http';
 import { test, expect } from '@playwright/test';
-import { safe, get, validInboxMessage } from './safe.js';
+import { safe, get, validInboxMessage, Unanswered } from './safe.js';
 
 test('HTTP failure does not retain secret headers or bodies', async () => {
   const credential = 'fixture-private-header';
@@ -19,6 +19,8 @@ test('HTTP failure does not retain secret headers or bodies', async () => {
   expect(error.stack?.includes(credential) || error.stack?.includes(body)).toBe(false);
   expect(error.cause).toBeUndefined();
   expect(error.message).toContain('inbox failed');
+  // Only a request without a response is Unanswered; a failed body read is not.
+  expect(error instanceof Unanswered).toBe(false);
 });
 
 test('actual request failure does not print bearer headers', async ({ request }) => {
@@ -32,7 +34,9 @@ test('actual request failure does not print bearer headers', async ({ request })
   } catch (error) {
     failure = error;
   }
-  expect(failure instanceof Error).toBe(true);
+  expect(failure instanceof Unanswered).toBe(true);
+  expect(String(failure)).toBe('Error: loopback negative control failed; sensitive HTTP diagnostics withheld');
+  expect((failure as Error).cause).toBeUndefined();
   expect(String(failure).includes(credential)).toBe(false);
 });
 

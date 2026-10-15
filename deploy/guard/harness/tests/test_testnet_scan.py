@@ -1,6 +1,9 @@
 """Cleanup scan failures never return flat evidence or trigger repairs."""
 
+import email.message
+import http.client
 import json
+import urllib.error
 from decimal import Decimal
 from typing import Any
 from unittest.mock import MagicMock, Mock
@@ -404,3 +407,223 @@ def test_pacing_sleep_overshoot_never_transmits_past_deadline() -> None:
     with pytest.raises(ScanError, match="nothing sent"):
         read({"type": "perpDexs"})
     assert read.reservations == [] and opener.open.call_count == 0
+
+
+def http_error(code: int, retry_after: str | None = None) -> urllib.error.HTTPError:
+    headers = email.message.Message()
+    if retry_after is not None:
+        headers["Retry-After"] = retry_after
+    return urllib.error.HTTPError(
+        "https://api.hyperliquid-testnet.xyz/info", code, "withheld", headers, None
+    )
+
+
+class Scripted:
+    """A fake clock and opener; each try takes the next outcome (an exception or a body)."""
+
+    def __init__(self, outcomes: list[object], *, timeout: float = SCAN_TIMEOUT) -> None:
+        self.now = 0.0
+        self.sleeps: list[float] = []
+        self.sent_at: list[float] = []
+        self.outcomes = list(outcomes)
+        self.reads = VenueReads(clock=lambda: self.now, sleep=self.sleep, timeout=timeout)
+        self.opener = MagicMock()
+        self.opener.open.side_effect = self.open
+        self.reads.opener = self.opener
+
+    def sleep(self, seconds: float) -> None:
+        self.sleeps.append(seconds)
+        self.now += seconds
+
+    def open(self, request: Any, *, timeout: float) -> MagicMock:
+        assert timeout == 10 and json.loads(request.data)["type"]
+        self.sent_at.append(self.now)
+        outcome = self.outcomes.pop(0)
+        if isinstance(outcome, BaseException):
+            raise outcome
+        assert isinstance(outcome, bytes)
+        response = MagicMock()
+        response.__enter__.return_value.read.return_value = outcome
+        return response
+
+
+HOLDINGS = {"type": "clearinghouseState", "user": ACCOUNT}
+
+
+def test_a_429_then_success_returns_the_data() -> None:
+    scripted = Scripted([http_error(429), b"[null]"])
+    assert scripted.reads({"type": "perpDexs"}) == [None]
+    assert scripted.opener.open.call_count == 2
+    # 20-weight pacing (2 s) already covers the first 2 s backoff.
+    assert scripted.sleeps == pytest.approx([2, 2])
+
+
+def test_a_503_twice_then_success_returns_the_data() -> None:
+    scripted = Scripted([http_error(503), http_error(503), b'{"ok": 1}'])
+    assert scripted.reads(HOLDINGS) == {"ok": 1}
+    assert scripted.opener.open.call_count == 3
+    assert scripted.sleeps == pytest.approx([0.2, 2, 4])
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        TimeoutError("withheld"),
+        urllib.error.URLError(TimeoutError("withheld")),
+        urllib.error.URLError("bounded read failed"),
+        ConnectionResetError("withheld"),
+        http.client.RemoteDisconnected("withheld"),
+        http.client.IncompleteRead(b"partial"),
+        http_error(500),
+        http_error(599),
+    ],
+)
+def test_a_transient_failure_then_success_returns_the_data(error: BaseException) -> None:
+    scripted = Scripted([error, b"[null]"])
+    assert scripted.reads({"type": "perpDexs"}) == [None]
+    assert scripted.opener.open.call_count == 2
+
+
+def test_four_transient_failures_fail_after_exactly_four_paced_tries() -> None:
+    # 2-weight reads prepay 0.2 s, so the 2/4/8 s backoff sets each retry's pause.
+    scripted = Scripted([TimeoutError(), http_error(502), http_error(429), TimeoutError()])
+    with pytest.raises(ScanError, match="^testnet HTTP/JSON read failed$") as caught:
+        scripted.reads(HOLDINGS)
+    assert caught.value.__cause__ is None and caught.value.__suppress_context__
+    assert scripted.opener.open.call_count == 4
+    assert scripted.sleeps == pytest.approx([0.2, 2, 4, 8])
+    assert scripted.sent_at == pytest.approx([0.2, 2.2, 6.2, 14.2])
+    # Every retry is another reserved request against the same rolling budget.
+    assert scripted.reads.reservations == pytest.approx([(0.2, 2), (2.2, 2), (6.2, 2), (14.2, 2)])
+
+
+@pytest.mark.parametrize(
+    "outcome",
+    [
+        http_error(400),
+        http_error(403),
+        http_error(404),
+        b"{not json",
+        b"\xff\xfe",
+        ValueError("read refused"),
+        OSError("not a connection failure"),
+        http.client.BadStatusLine("withheld"),
+    ],
+)
+def test_a_non_transient_failure_is_never_retried(outcome: object) -> None:
+    scripted = Scripted([outcome, b"[null]"])
+    with pytest.raises(ScanError, match="^testnet HTTP/JSON read failed$"):
+        scripted.reads({"type": "perpDexs"})
+    assert scripted.opener.open.call_count == 1
+
+
+def test_an_oversized_body_is_never_retried() -> None:
+    scripted = Scripted([b" " * 1_048_577, b"[null]"])
+    with pytest.raises(ScanError, match="oversized"):
+        scripted.reads({"type": "perpDexs"})
+    assert scripted.opener.open.call_count == 1
+
+
+@pytest.mark.parametrize(
+    "payload", [{"type": "order"}, {"type": "perpDexs", "user": ACCOUNT}, {"type": "meta", "x": 1}]
+)
+def test_a_refused_request_is_never_sent_or_retried(payload: dict[str, Any]) -> None:
+    scripted = Scripted([TimeoutError()])
+    with pytest.raises(ScanError, match="unsupported|unexpected"):
+        scripted.reads(payload)
+    assert scripted.opener.open.call_count == 0 and scripted.sleeps == []
+
+
+def test_a_deadline_after_the_response_is_never_retried() -> None:
+    scripted = Scripted([b"[null]", b"[null]"], timeout=15)
+
+    def late(request: Any, *, timeout: float) -> MagicMock:
+        response = scripted.open(request, timeout=timeout)
+        scripted.now = 15.0
+        return response
+
+    scripted.opener.open.side_effect = late
+    with pytest.raises(ScanError, match="deadline exhausted after response"):
+        scripted.reads({"type": "perpDexs"})
+    assert scripted.opener.open.call_count == 1
+
+
+def test_a_retry_that_would_cross_the_deadline_is_never_sent() -> None:
+    # Deadline 15: tries at 2 s and 4 s; the third would start at 8 s and end past 15 s.
+    scripted = Scripted([TimeoutError(), TimeoutError(), b"[null]"], timeout=15)
+    with pytest.raises(ScanError, match="^scan deadline exhausted; no incomplete flat credit$"):
+        scripted.reads({"type": "perpDexs"})
+    assert scripted.opener.open.call_count == 2
+    assert scripted.sleeps == pytest.approx([2, 2])
+    assert len(scripted.reads.reservations) == 2
+
+
+def test_a_retry_overslept_past_the_deadline_is_never_sent() -> None:
+    scripted = Scripted([TimeoutError(), b"[null]"], timeout=15)
+
+    def oversleep(seconds: float) -> None:
+        scripted.sleep(seconds)
+        if len(scripted.sleeps) == 2:
+            scripted.now = 14.0
+
+    scripted.reads.sleep = oversleep
+    with pytest.raises(ScanError, match="after pacing; nothing sent"):
+        scripted.reads({"type": "perpDexs"})
+    assert scripted.opener.open.call_count == 1
+
+
+def test_a_failed_try_keeps_its_weight_in_the_rolling_minute() -> None:
+    # Four 120-weight fill reads at 12/24/36/48 s; the fifth fails at 60 s and its retry goes
+    # at 72 s (12 s prepaid). Counting the failed try, (12, 72] holds 600, so the next 2-weight
+    # read waits until the 24 s reservation leaves; without it, 480 would let it go at 72.2 s.
+    fills = {"type": "userFillsByTime", "user": ACCOUNT, "startTime": 1}
+    scripted = Scripted([b"[]"] * 4 + [TimeoutError(), b"[]", b"{}"])
+    for _ in range(5):
+        assert scripted.reads(fills) == []
+    assert scripted.sent_at == pytest.approx([12, 24, 36, 48, 60, 72])
+    assert scripted.reads.reservations == pytest.approx(
+        [(24, 120), (36, 120), (48, 120), (60, 120), (72, 120)]
+    )
+    assert scripted.reads(HOLDINGS) == {}
+    assert scripted.sent_at[-1] == pytest.approx(84.001)
+
+
+@pytest.mark.parametrize(
+    "retry_after,pause",
+    [("7", 7), (" 12 ", 12), ("1", 2), ("30", 30), ("31", 30), ("86400", 30)],
+)
+def test_a_numeric_retry_after_is_honoured_and_capped(retry_after: str, pause: float) -> None:
+    scripted = Scripted([http_error(429, retry_after), b"[null]"])
+    assert scripted.reads(HOLDINGS) == [None]
+    assert scripted.sleeps == pytest.approx([0.2, pause])
+
+
+@pytest.mark.parametrize("retry_after", ["Wed, 21 Oct 2026 07:28:00 GMT", "-5", "1.5", "", "x"])
+def test_a_non_numeric_retry_after_uses_the_base_backoff(retry_after: str) -> None:
+    scripted = Scripted([http_error(429, retry_after), b"[null]"])
+    assert scripted.reads(HOLDINGS) == [None]
+    assert scripted.sleeps == pytest.approx([0.2, 2])
+
+
+def test_retry_after_is_ignored_on_a_5xx() -> None:
+    scripted = Scripted([http_error(503, "25"), b"[null]"])
+    assert scripted.reads(HOLDINGS) == [None]
+    assert scripted.sleeps == pytest.approx([0.2, 2])
+
+
+def test_a_retry_after_that_crosses_the_deadline_is_never_sent() -> None:
+    scripted = Scripted([http_error(429, "30"), b"[null]"], timeout=20)
+    with pytest.raises(ScanError, match="^scan deadline exhausted; no incomplete flat credit$"):
+        scripted.reads({"type": "perpDexs"})
+    assert scripted.opener.open.call_count == 1
+    assert scripted.sleeps == pytest.approx([2])
+
+
+def test_a_retried_read_inside_the_flat_scan_never_restarts_it() -> None:
+    dexes = json.dumps([None, {"name": "fixture"}]).encode()
+    state = json.dumps({"assetPositions": [], "marginSummary": {"accountValue": "200"}}).encode()
+    scripted = Scripted([b'"disabled"', dexes, state, b"[]", state, TimeoutError(), b"[]", dexes])
+    report = flat_scan(scripted.reads, ACCOUNT)
+    assert report["dexes"] == ["", "fixture"]
+    # Seven reads, one of them retried once: eight tries, two inventory reads, no restart.
+    assert scripted.opener.open.call_count == 8 and scripted.outcomes == []

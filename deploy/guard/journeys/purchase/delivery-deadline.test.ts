@@ -2,7 +2,8 @@
 // SPDX-License-Identifier: Elastic-2.0
 import { readFile } from 'node:fs/promises';
 import { test, expect } from '@playwright/test';
-import { deliveryWaitMs, paidTestTimeoutMs, waitForDelivery, type PaymentNetwork } from './delivery-deadline.js';
+import { deliveryWaitMs, paidTestTimeoutMs, toleratedUnansweredPolls, waitForDelivery, type PaymentNetwork } from './delivery-deadline.js';
+import { Unanswered, safe } from './safe.js';
 
 for (const network of ['arbitrum', 'base'] as const) {
   test(`${network}: receipt precedes late finality and delivery, one payment only`, async () => {
@@ -47,6 +48,119 @@ test('a delivery response beyond the EVM bound is refused', async () => {
   expect(result).toBeNull();
 });
 
+// A request that got no HTTP response, as `get`/`post` report it: the fixed label only.
+const unanswered = (label: string) => new Unanswered(`${label} failed; sensitive HTTP diagnostics withheld`);
+
+test('one unanswered read counts as not yet and the next poll delivers', async () => {
+  let now = 0;
+  let polls = 0;
+  const result = await waitForDelivery('base', async () => {
+    polls++;
+    if (polls === 1) throw unanswered('paid inbox');
+    return 'synthetic-key';
+  }, () => now, async ms => { now += ms; });
+  expect(result).toBe('synthetic-key');
+  expect(polls).toBe(2);
+  expect(now).toBe(5000);
+});
+
+test('three unanswered polls in a row are tolerated', async () => {
+  let now = 0;
+  let polls = 0;
+  expect(toleratedUnansweredPolls).toBe(3);
+  const result = await waitForDelivery('arbitrum', async () => {
+    polls++;
+    if (polls <= 3) throw unanswered('paid order check');
+    return 'synthetic-key';
+  }, () => now, async ms => { now += ms; });
+  expect(result).toBe('synthetic-key');
+  expect(polls).toBe(4);
+});
+
+test('a fourth unanswered poll in a row fails with the fixed label', async () => {
+  let now = 0;
+  let polls = 0;
+  let failure: unknown;
+  try {
+    await waitForDelivery('base', async () => {
+      polls++;
+      throw unanswered('paid inbox');
+    }, () => now, async ms => { now += ms; });
+  } catch (error) {
+    failure = error;
+  }
+  expect(polls).toBe(4);
+  expect(failure instanceof Unanswered).toBe(true);
+  expect((failure as Error).message).toBe('paid inbox failed; sensitive HTTP diagnostics withheld');
+  expect((failure as Error).cause).toBeUndefined();
+});
+
+test('an answered poll resets the count of unanswered ones', async () => {
+  let now = 0;
+  let polls = 0;
+  // Pattern: 3 unanswered, 1 answered "not yet", 3 unanswered, then delivery.
+  const result = await waitForDelivery('base', async () => {
+    polls++;
+    if (polls === 4) return null;
+    if (polls <= 7) throw unanswered('paid order state');
+    return 'synthetic-key';
+  }, () => now, async ms => { now += ms; });
+  expect(result).toBe('synthetic-key');
+  expect(polls).toBe(8);
+});
+
+test('a response is judged at once: a failed status or JSON check is never retried', async () => {
+  for (const failure of [
+    // What `expect(...)` throws on a non-200 status: an ordinary error, not Unanswered.
+    () => { throw new Error('paid inbox list'); },
+    // Bad JSON goes through `safe`, which never reports Unanswered.
+    () => safe(async () => { throw new SyntaxError('fixture-body'); }, 'paid inbox JSON'),
+  ]) {
+    let now = 0;
+    let polls = 0;
+    let thrown: unknown;
+    try {
+      await waitForDelivery('base', async () => { polls++; await failure(); return null; },
+        () => now, async ms => { now += ms; });
+    } catch (error) {
+      thrown = error;
+    }
+    expect(polls).toBe(1);
+    expect(thrown instanceof Error && !(thrown instanceof Unanswered)).toBe(true);
+    expect(now).toBe(0);
+  }
+});
+
+test('unanswered polls do not extend the delivery bound', async () => {
+  let now = 0;
+  let polls = 0;
+  const network: PaymentNetwork = 'hyperliquid';
+  // Every fourth poll answers "not yet", so the tolerance never runs out; each read hangs 1 s.
+  const result = await waitForDelivery(network, async () => {
+    polls++;
+    now += 1000;
+    if (polls % 4 === 0) return null;
+    throw unanswered('paid inbox');
+  }, () => now, async ms => { now += ms; });
+  expect(result).toBeNull();
+  expect(now).toBe(deliveryWaitMs(network));
+  expect(polls).toBe(deliveryWaitMs(network) / 6000);
+});
+
+test('after an unanswered read, a delivery past the bound is still refused', async () => {
+  let now = 0;
+  let polls = 0;
+  const network: PaymentNetwork = 'base';
+  const result = await waitForDelivery(network, async () => {
+    polls++;
+    if (polls === 1) throw unanswered('paid inbox');
+    now = deliveryWaitMs(network);
+    return 'synthetic-late-key';
+  }, () => now, async ms => { now += ms; });
+  expect(result).toBeNull();
+  expect(polls).toBe(2);
+});
+
 // Pin the actual consumer: neither payer command belongs to the polling callback.
 test('paid consumer broadcasts before waiting and never invokes a payer inside delivery polling', async () => {
   const source = await readFile(new URL('./paid.test.ts', import.meta.url), 'utf8');
@@ -58,4 +172,7 @@ test('paid consumer broadcasts before waiting and never invokes a payer inside d
   }
   expect(polling).toContain('/api/licence/order/check');
   expect(polling).toContain('/api/licence/test/order/');
+  // Only the read-only helpers can report a request without a response; no other request call.
+  expect(polling).not.toContain('request.');
+  expect(polling).not.toContain('Unanswered');
 });

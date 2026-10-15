@@ -1,6 +1,7 @@
 """Read-only testnet cleanup scan; never accepts a key or repairs account state."""
 
 import hashlib
+import http.client
 import json
 import re
 import time
@@ -14,6 +15,10 @@ from typing import Any
 from guard_harness.bounded_http_read import ReadOpener
 
 SCAN_TIMEOUT = 1800
+# Pauses before the retries of one transiently failed read (at most three retries, four tries).
+RETRY_DELAYS = (2.0, 4.0, 8.0)
+# A numeric Retry-After on a 429 is honoured up to this many seconds.
+RETRY_AFTER_CAP = 30.0
 
 INFO = "https://api.hyperliquid-testnet.xyz/info"
 Read = Callable[[dict[str, Any]], object]
@@ -150,6 +155,24 @@ def flat_scan(
     }
 
 
+def transient(error: BaseException) -> bool:
+    """A timeout, a connection-level failure, 429 or 5xx; never a refusal or a bad body."""
+    if isinstance(error, urllib.error.HTTPError):
+        return error.code == 429 or 500 <= error.code <= 599
+    return isinstance(
+        error, urllib.error.URLError | ConnectionError | TimeoutError | http.client.IncompleteRead
+    )
+
+
+def backoff(error: BaseException, base: float) -> float:
+    """The pause before a retry: the base delay, or a 429's numeric Retry-After, capped."""
+    if isinstance(error, urllib.error.HTTPError) and error.code == 429:
+        value = error.headers.get("Retry-After") if error.headers is not None else None
+        if isinstance(value, str) and re.fullmatch(r"[0-9]{1,6}", value.strip()):
+            return max(base, min(float(value.strip()), RETRY_AFTER_CAP))
+    return base
+
+
 class NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(
         self, req: Any, fp: Any, code: int, msg: str, headers: Any, newurl: str
@@ -163,7 +186,8 @@ class TestnetReads:
     clearinghouseState, allMids and orderStatus reserve 2 weight; other ordinary reads
     reserve 20. A fill-history request reserves 120 (20 plus at most 2000/20 returned-item
     weight). Each request prepays its weight at 10/second, and rolling reservations keep
-    every minute at 600, even on failures and across phases. Sequential only. See:
+    every minute at 600, even on failures and across phases. Sequential only. A transient
+    failure is retried at most three times, each retry paced and weighted like any read. See:
     https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/rate-limits-and-user-limits
     """
 
@@ -221,7 +245,6 @@ class TestnetReads:
             or not re.fullmatch(r"0x[0-9a-fA-F]{40}", payload["user"])
         ):
             raise ScanError("explicit testnet account required")
-        now = self.clock()
         weight = (
             120
             if kind == "userFillsByTime"
@@ -229,7 +252,24 @@ class TestnetReads:
             if kind in ("clearinghouseState", "allMids", "orderStatus")
             else 20
         )
-        scheduled = max(now, self.next_read) + weight / 10
+        # A transient failure (timeout, dropped connection, 429 or 5xx) is retried a bounded
+        # number of times; each retry is another paced, weighted request inside the same
+        # deadline, and nothing else is ever retried.
+        delay, attempt = 0.0, 0
+        while True:
+            self._reserve(weight, delay=delay)
+            try:
+                return self._send(payload)
+            except (OSError, http.client.HTTPException, UnicodeDecodeError, ValueError) as error:
+                if attempt >= len(RETRY_DELAYS) or not transient(error):
+                    raise ScanError("testnet HTTP/JSON read failed") from None
+                delay = backoff(error, RETRY_DELAYS[attempt])
+                attempt += 1
+
+    def _reserve(self, weight: int, *, delay: float = 0.0) -> None:
+        """Wait for the request's paced, rolling-minute slot, at least `delay` from now."""
+        now = self.clock()
+        scheduled = max(max(now, self.next_read) + weight / 10, now + delay)
         active = [(at, cost) for at, cost in self.reservations if at > scheduled - 60]
         reserved = sum(cost for _, cost in active)
         for at, cost in active:
@@ -249,18 +289,17 @@ class TestnetReads:
             (at, cost) for at, cost in self.reservations if at > self.next_read - 60
         ]
         self.reservations.append((self.next_read, weight))
+
+    def _send(self, payload: dict[str, Any]) -> object:
         request = urllib.request.Request(
             INFO,
             data=json.dumps(payload).encode(),
             headers={"Content-Type": "application/json"},
         )
-        try:
-            with self.opener.open(request, timeout=10) as response:
-                raw = response.read(1_048_577)
-            if len(raw) > 1_048_576:
-                raise ScanError("oversized testnet response")
-            if self.clock() >= self.deadline:
-                raise ScanError("scan deadline exhausted after response; no flat credit")
-            return json.loads(raw)
-        except (OSError, UnicodeDecodeError, ValueError):
-            raise ScanError("testnet HTTP/JSON read failed") from None
+        with self.opener.open(request, timeout=10) as response:
+            raw = response.read(1_048_577)
+        if len(raw) > 1_048_576:
+            raise ScanError("oversized testnet response")
+        if self.clock() >= self.deadline:
+            raise ScanError("scan deadline exhausted after response; no flat credit")
+        return json.loads(raw)
