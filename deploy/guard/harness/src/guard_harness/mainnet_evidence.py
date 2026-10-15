@@ -3,10 +3,11 @@
 import argparse
 import hashlib
 import json
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
-from guard_harness.attestation import verify_predicate
+from guard_harness.attestation import expected_invocation, verify_predicate
 from guard_harness.journey_evidence import MAINNET_COVERAGE, PREDICATE_TYPE, _check
 from guard_harness.native_release import Release
 
@@ -188,7 +189,26 @@ def predicate(row: str, release: Release) -> dict[str, Any]:
     )
 
 
-def signing_row(release: Release, evidence: Path, logs: Path) -> dict[str, Any]:
+M3_PRODUCERS = (*(f"signing-{platform}" for platform in SIGNING_CHECKS), "T1", "T2")
+
+
+def signing_row(
+    release: Release,
+    evidence: Path,
+    logs: Path,
+    *,
+    run_id: str,
+    attempts: Mapping[str, str],
+) -> dict[str, Any]:
+    """M3 from the signing and T1/T2 bundles of this run, each at its selected attempt.
+
+    The caller selects each producer's latest attempt by artifact name; every bundle must
+    then be signed in exactly that attempt of `run_id`, never another run or attempt.
+    """
+    if not isinstance(attempts, Mapping) or set(attempts) != set(M3_PRODUCERS):
+        raise MatrixError("M3 needs the selected attempt of every signing and testnet producer")
+    for name in M3_PRODUCERS:
+        expected_invocation(run_id, attempts[name])
     subject = release.assets / "release-manifest.json"
     digest = hashlib.sha256(release.asset("release-manifest.json")).hexdigest()
     for platform, required in SIGNING_CHECKS.items():
@@ -200,6 +220,8 @@ def signing_row(release: Release, evidence: Path, logs: Path) -> dict[str, Any]:
             tag=release.tag,
             predicate_type="https://zunderlabs.com/guard/signing/v1",
             log=logs / f"signing-{platform}.log",
+            expected_run_id=run_id,
+            expected_run_attempt=attempts[f"signing-{platform}"],
         )
         value = verified.predicate
         if (
@@ -226,6 +248,8 @@ def signing_row(release: Release, evidence: Path, logs: Path) -> dict[str, Any]:
             tag=release.tag,
             predicate_type=PREDICATE_TYPE,
             log=logs / f"{row}.log",
+            expected_run_id=run_id,
+            expected_run_attempt=attempts[row],
         )
         _check(verified.predicate, row, release.commit, digest)
     return predicate("M3", release)
@@ -237,14 +261,26 @@ def main() -> None:
         parser.add_argument("--" + name, required=True)
     for name in ("assets", "evidence", "output"):
         parser.add_argument("--" + name, type=Path, required=True)
+    # M3 only: this workflow run and a JSON object of each producer's selected attempt.
+    parser.add_argument("--run-id")
+    parser.add_argument("--attempts", type=Path)
     args = parser.parse_args()
+    m3 = args.row == "M3"
+    if (args.run_id is not None) != m3 or (args.attempts is not None) != m3:
+        parser.error("--run-id and --attempts are required for M3 and refused otherwise")
     release = Release(args.tag, args.commit, args.assets)
     args.output.mkdir(mode=0o700, parents=True, exist_ok=True)
-    result = (
-        signing_row(release, args.evidence, args.output)
-        if args.row == "M3"
-        else native_row(args.row, release, args.evidence)
-    )
+    if args.row == "M3":
+        attempts: Any = json.loads(args.attempts.read_bytes())
+        if not isinstance(attempts, dict) or any(
+            not isinstance(value, str) for value in attempts.values()
+        ):
+            raise MatrixError("M3 attempts must be an object of attempt strings")
+        result = signing_row(
+            release, args.evidence, args.output, run_id=args.run_id, attempts=attempts
+        )
+    else:
+        result = native_row(args.row, release, args.evidence)
     (args.output / f"{args.row}.predicate.json").write_text(json.dumps(result) + "\n")
 
 

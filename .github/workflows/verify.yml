@@ -415,7 +415,7 @@ jobs:
             ${{ runner.temp }}/guard-gate/release/gate-logs/
             ${{ runner.temp }}/guard-gate/release/gate-publication-logs/
             ${{ runner.temp }}/guard-gate/release/assets.log
-          if-no-files-found: warn
+          if-no-files-found: error
           retention-days: 7
 
   promote:

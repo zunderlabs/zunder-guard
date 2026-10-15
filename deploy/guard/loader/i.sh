@@ -20,11 +20,13 @@ main() {
   # curl's --retry covers only timeouts and HTTP 408/429/5xx; a refused or reset connection, a
   # TLS failure or a cut-off body gets three more tries, 2, 4 and 8 s apart. A failed try's
   # partial file is deleted, so each try writes a fresh file and only a complete one is verified.
+  # Each curl try is bounded: 20 s to connect, and a transfer slower than 1 KiB/s for 60 s is
+  # cut, so a stalled server cannot hang it while a slow link still gets the ~140 MB cosign.
   get() {
     get_try=1 get_pause=2
     while :; do
       rm -f "$T/$1"
-      curl -fsSL --proto '=https,file' --retry 3 -o "$T/$1" "$2" && return 0
+      curl -fsSL --proto '=https,file' --connect-timeout 20 --speed-limit 1024 --speed-time 60 --retry 3 -o "$T/$1" "$2" && return 0
       rm -f "$T/$1"
       [ "$get_try" -lt 4 ] || no "download failed: $2"
       echo "zunder-guard: download try $get_try of 4 failed; trying again in ${get_pause}s" >&2

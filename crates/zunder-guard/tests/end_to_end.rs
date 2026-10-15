@@ -17,7 +17,7 @@ use std::{path::Path, sync::Arc};
 use futures_util::{SinkExt, StreamExt};
 use rust_decimal::{Decimal, dec};
 use serde_json::{Value, json};
-use support::{CloseScript, MemoryVenue};
+use support::{CloseScript, MemoryVenue, VenueClock};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use zunder_core::Timestamp;
 use zunder_guard::{
@@ -44,13 +44,13 @@ fn api_key() -> GuardKey {
 }
 const ACCOUNT: &str = "0x5e9ee1089755c3435139848e47e6635505d5a13a";
 
-struct Running {
+struct Running<C = SystemClock> {
     url: String,
-    venue_handle: Arc<Guard<MemoryVenue>>,
+    venue_handle: Arc<Guard<MemoryVenue, C>>,
     dir: TestDir,
 }
 
-impl Running {
+impl<C: Clock> Running<C> {
     fn venue(&self) -> &MemoryVenue {
         self.venue_handle.upstream()
     }
@@ -81,6 +81,24 @@ async fn start(paper: bool) -> Running {
 
 /// [`start`] with the config changed by `edit` first.
 async fn start_with(paper: bool, edit: impl FnOnce(&mut GuardConfig)) -> Running {
+    start_on(paper, edit, |_| SystemClock).await
+}
+
+/// [`start`] on the venue's clock, frozen once Guard serves: only the test
+/// moves Guard's time, so no deadline Guard keeps on it (the journal's 2 s
+/// sync among them) can pass because a slow runner's disk is slow.
+async fn start_frozen(paper: bool) -> Running<VenueClock> {
+    let running = start_on(paper, |_| {}, MemoryVenue::clock).await;
+    running.venue().clock().freeze();
+    running
+}
+
+/// [`start_with`], Guard on the clock `clock` gives for the venue.
+async fn start_on<C: Clock>(
+    paper: bool,
+    edit: impl FnOnce(&mut GuardConfig),
+    clock: impl FnOnce(&MemoryVenue) -> C,
+) -> Running<C> {
     let dir = TestDir::new(if paper { "e2e-paper" } else { "e2e" });
     let mut config = config(dir.path(), paper);
     edit(&mut config);
@@ -108,6 +126,7 @@ async fn start_with(paper: bool, edit: impl FnOnce(&mut GuardConfig)) -> Running
         "10000",
     );
     let venue = if paper { venue.read_only() } else { venue };
+    let clock = clock(&venue);
     let guard = Guard::new(
         Setup {
             config,
@@ -123,7 +142,7 @@ async fn start_with(paper: bool, edit: impl FnOnce(&mut GuardConfig)) -> Running
             },
         },
         venue,
-        SystemClock,
+        clock,
     )
     .unwrap();
     // Guard refuses nonces from before its start plus 5 s: let the clock
@@ -605,9 +624,12 @@ async fn info_passes_through_and_foreign_hosts_are_refused() {
 
 #[tokio::test]
 async fn an_entry_whose_stop_is_refused_is_closed_at_once() {
-    let guard = start(false).await;
+    // On a frozen clock: the journal's syncs take what the runner's disk
+    // takes (over 2 s once on a hosted Windows runner) without breaking it.
+    let guard = start_frozen(false).await;
     guard.venue().refuse_stops();
-    let reply = post(&guard.url, "/exchange", &ccxt_market_buy("0.1", now())).await;
+    let nonce = guard.venue().clock().now_ms() + 1;
+    let reply = post(&guard.url, "/exchange", &ccxt_market_buy("0.1", nonce)).await;
     assert_eq!(reply["status"], "ok", "{reply}");
     let received = guard.venue().received();
     // The leverage, the entry with its (refused) stop, then Guard's close.

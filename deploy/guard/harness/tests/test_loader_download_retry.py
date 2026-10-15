@@ -14,9 +14,11 @@ ARCHIVE = f"zunder-guard-v0.0.0-{SYSTEM}-{ARCH}.tar.gz"
 COSIGN = f"cosign-{SYSTEM}-{ARCH}"
 
 
-def flaky_fixture(tmp_path: Path, name: str, failures: int) -> tuple[Path, dict[str, str], Path]:
+def flaky_fixture(
+    tmp_path: Path, name: str, failures: int, refusal: str = ""
+) -> tuple[Path, dict[str, str], Path]:
     """The offline fixture, with `name` failing `failures` times after writing a partial file."""
-    release, env, prefix = shell_fixture(tmp_path)
+    release, env, prefix = shell_fixture(tmp_path, refusal)
     fake_verifier(tmp_path / "fakebin/cosign", "GitVersion: v2.4.1\n", 0)  # forces the pinned get
     fakebin = tmp_path / "fakebin"
     offline = fakebin / "curl-offline"
@@ -29,6 +31,8 @@ def flaky_fixture(tmp_path: Path, name: str, failures: int) -> tuple[Path, dict[
         "name = url.rsplit('/', 1)[-1]\n"
         "with open(os.environ['CURL_LOG'], 'a') as log:\n"
         "    log.write(name + (' stale' if target.exists() else ' fresh') + '\\n')\n"
+        "with open(os.environ['CURL_LOG'] + '.args', 'a') as log:\n"
+        "    log.write(' '.join(sys.argv[1:-3]) + '\\n')\n"
         "if name == os.environ['FLAKY_NAME']:\n"
         "    count = pathlib.Path(os.environ['CURL_LOG'] + '.failed')\n"
         "    done = int(count.read_text()) if count.exists() else 0\n"
@@ -95,6 +99,12 @@ def test_transient_failures_are_retried_with_a_fresh_file(
     assert tries[:4] == [name + " fresh"] * 4
     assert all(line.endswith(" fresh") for line in lines(tmp_path / "curl-log"))
     assert lines(tmp_path / "sleep-log") == ["2", "4", "8"]
+    # Every try is bounded, so a stalled server ends the try instead of hanging the loader.
+    bounded = (
+        "-fsSL --proto =https,file --connect-timeout 20"
+        " --speed-limit 1024 --speed-time 60 --retry 3"
+    )
+    assert set(lines(tmp_path / "curl-log.args")) == {bounded}
     assert "download failed" not in result.stderr
     assert result.stderr.count("of 4 failed; trying again in") == 3
     # The pinned cosign was fetched once successfully and still checked against its SHA-256.
@@ -123,3 +133,29 @@ def test_four_failed_tries_refuse_with_the_classified_message(
     else:
         expected = f"install.sh: download failed: {url}"
     assert result.stderr.splitlines()[-1] == expected, result.stderr
+
+
+TAMPERED = [
+    ("i", "installer-hash", "install.sh", "install.sh does not match the signed checksums"),
+    ("i", "download-hash", COSIGN, "cosign does not match its pinned SHA-256"),
+    ("install.sh", "archive-hash", ARCHIVE, f"checksum mismatch for {ARCHIVE}; refusing"),
+    ("install.sh", "download-hash", COSIGN, "cosign download does not match its pinned SHA-256"),
+]
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX loaders")
+@pytest.mark.parametrize("entry,refusal,name,message", TAMPERED)
+def test_a_complete_tampered_download_is_refused_after_one_fetch(
+    tmp_path: Path, entry: str, refusal: str, name: str, message: str
+) -> None:
+    # curl succeeds with every byte of a file that differs from what is pinned or signed:
+    # the retry loop covers transport failures only, never a verification failure.
+    release, env, prefix = flaky_fixture(tmp_path, name, 0, refusal)
+    result = run(release, entry, env, prefix)
+    assert result.returncode != 0
+    assert not (prefix / "zunder-guard").exists()
+    tries = [line for line in lines(tmp_path / "curl-log") if line.split()[0] == name]
+    assert tries == [name + " fresh"]
+    assert lines(tmp_path / "sleep-log") == []
+    assert "trying again" not in result.stderr
+    assert message in result.stderr.splitlines()[-1], result.stderr

@@ -210,6 +210,10 @@ struct State {
     /// While set, the socket sends no snapshots (`clearinghouseState`,
     /// `openOrders`, `allMids`), only prices, books and events.
     ws_snapshots_paused: bool,
+    /// The messages the socket has sent, and the ticks it has sent in full
+    /// ([`MemoryVenue::ws_sent`]).
+    ws_sent: u64,
+    ws_ticks: u64,
     /// The account's snapshots go out every this many ticks (0 or 1: every
     /// tick), as the venue's every 5 s against prices every second.
     ws_snapshot_every: u64,
@@ -1358,6 +1362,14 @@ impl MemoryVenue {
         self.state.lock().unwrap().ws_snapshots_paused = paused;
     }
 
+    /// How many messages the socket has sent in all, and how many of its
+    /// ticks it has sent in full: for a test to wait until Guard has taken
+    /// what went out before it moves the clock.
+    pub fn ws_sent(&self) -> (u64, u64) {
+        let state = self.state.lock().unwrap();
+        (state.ws_sent, state.ws_ticks)
+    }
+
     /// A deposit (`usdc` positive) or withdrawal (negative) booked now on
     /// the main dex's perp account, moving its value by that much; on the
     /// socket's `userNonFundingLedgerUpdates` too unless `quiet` (the HTTP
@@ -1613,6 +1625,7 @@ pub async fn serve_ws<C: zunder_guard::guard::Clock>(
                 let mut next_periodic: u64 = 0;
                 let mut ledger_sent = guard.upstream().state.lock().unwrap().ledger.len();
                 let user = guard.upstream().account.to_hex();
+                let sent = || guard.upstream().state.lock().unwrap().ws_sent += 1;
                 loop {
                     tokio::select! {
                         message = source.next() => {
@@ -1623,15 +1636,18 @@ pub async fn serve_ws<C: zunder_guard::guard::Clock>(
                                     subscriptions.push(value["subscription"].clone());
                                     let reply = json!({"channel": "subscriptionResponse", "data": value});
                                     if sink.send(Message::text(reply.to_string())).await.is_err() { return; }
+                                    sent();
                                 }
                                 Some("unsubscribe") => {
                                     subscriptions.retain(|s| *s != value["subscription"]);
                                     let reply = json!({"channel": "subscriptionResponse", "data": value});
                                     if sink.send(Message::text(reply.to_string())).await.is_err() { return; }
+                                    sent();
                                 }
                                 Some("ping") => {
                                     let pong = sink.send(Message::text(json!({"channel": "pong"}).to_string())).await;
                                     if pong.is_err() { return; }
+                                    sent();
                                 }
                                 _ => {}
                             }
@@ -1766,7 +1782,9 @@ pub async fn serve_ws<C: zunder_guard::guard::Clock>(
                             }
                             for message in out {
                                 if sink.send(Message::text(message.to_string())).await.is_err() { return; }
+                                sent();
                             }
+                            venue.state.lock().unwrap().ws_ticks += 1;
                         }
                     }
                 }

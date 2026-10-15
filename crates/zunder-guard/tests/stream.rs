@@ -1057,6 +1057,31 @@ async fn socket_delivers() {
     tokio::time::sleep(Duration::from_millis(300)).await;
 }
 
+/// Until Guard has taken every message the socket sent before this call,
+/// however slow the runner: a tick begun after the call is sent in full,
+/// then Guard's count of messages reaches what had gone out by then.
+async fn socket_drained<C: Clock>(running: &Running<C>) {
+    let venue = running.guard.upstream();
+    let (_, ticks) = venue.ws_sent();
+    tokio::time::timeout(Duration::from_secs(30), async {
+        // The tick under way (perhaps begun before the call), then one
+        // begun after it.
+        while venue.ws_sent().1 < ticks + 2 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let (sent, _) = venue.ws_sent();
+        while stream_status(&running.guard).await["state"]["messages"]
+            .as_u64()
+            .unwrap_or(0)
+            < sent
+        {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("Guard takes what the socket sent");
+}
+
 /// `ms` of the test clock in steps of 100 ms, each with a few milliseconds
 /// of real time for Guard's background tasks (the sync, the stream) to run
 /// at the time it reached.
@@ -1347,6 +1372,9 @@ async fn the_settle_window_counts_from_the_views_own_time() {
     venue.clear_positions();
     socket_delivers().await;
     venue.pause_ws_snapshots(true);
+    // A snapshot taken before the pause and still on its way would arrive
+    // after the clock moves, as if the venue trailed it by that much.
+    socket_drained(&running).await;
     // 6 s after the send: judged from the stream, whose snapshots were
     // taken about 1.7 s after it (the view's time is Guard's clock less the
     // snapshots' age).

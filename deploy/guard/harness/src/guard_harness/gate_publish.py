@@ -8,6 +8,7 @@ from pathlib import Path
 from guard_harness.gate_state import bundles
 from guard_harness.publication import prepare, publish
 from guard_harness.release_state import canonical_bytes
+from guard_harness.run_attempts import latest
 from guard_harness.state_verifier import authenticate_state
 from guard_harness.testnet_run import ROOT, _receipt
 
@@ -26,6 +27,9 @@ def execute(
     with snapshot.open("xb") as stream:
         snapshot.chmod(0o600)
         stream.write(captured)
+    # As in gate_state: the staged chain gate_state copied into `work` is the latest
+    # state-chain attempt <= the gate's, and its signature must carry exactly that one.
+    staged_attempt = latest(evidence, "state-chain", run_id, attempt).attempt
     previous = authenticate_state(
         work / "assets/release-manifest.json",
         work / "staged.predicate.json",
@@ -38,6 +42,8 @@ def execute(
         previous=None,
         verified_journeys=frozenset(),
         log=work / "gate-publication-logs/staged.log",
+        expected_run_id=run_id,
+        expected_run_attempt=staged_attempt,
     )
     publication = prepare(
         work / "assets",

@@ -581,3 +581,54 @@ def test_workflow_retains_pre_mutation_recovery_and_orders_independent_restores(
     assert "needs.promote.outputs.mutation_attempted != 'false'" in rollback
     assert "always() && steps.channels.outcome != 'success'" in rollback
     assert body.count("queue: max") == 3
+
+
+def test_rerun_consumers_name_the_promote_jobs_own_attempt() -> None:
+    """A failed-jobs rerun keeps a passed promote job's earlier attempt and its artifacts."""
+    import yaml
+
+    guard = Path(__file__).resolve().parents[2]
+    workflow = guard / "github/workflows/promote.yml"
+    if not workflow.exists():
+        workflow = guard.parents[1] / ".github/workflows/promote.yml"
+    jobs = yaml.safe_load(workflow.read_text())["jobs"]
+    promote = jobs["promote"]
+    assert promote["outputs"]["attempt"] == "${{ steps.attempt.outputs.attempt }}"
+    recorded = [i for i, step in enumerate(promote["steps"]) if step.get("id") == "attempt"]
+    assert recorded == [1]
+    assert promote["steps"][1]["run"] == 'echo "attempt=$GITHUB_RUN_ATTEMPT" >> "$GITHUB_OUTPUT"'
+    produced = {
+        step["with"]["name"]
+        for step in promote["steps"]
+        if "upload-artifact" in step.get("uses", "")
+    }
+    assert produced == {
+        prefix + "-${{ github.run_id }}-${{ github.run_attempt }}"
+        for prefix in ("promotion-recovery", "canonical-subjects", "promotion-transaction")
+    }
+
+    def downloads(job: dict[str, Any]) -> list[str]:
+        return [
+            step["with"]["name"]
+            for step in job["steps"]
+            if "download-artifact" in step.get("uses", "") and "name" in step["with"]
+        ]
+
+    assert downloads(jobs["canonical-smoke"]) == [
+        "canonical-subjects-${{ github.run_id }}-${{ needs.promote.outputs.attempt }}"
+    ]
+    rollback = jobs["rollback"]
+    assert rollback["env"] == {
+        "SOURCE_RUN": "${{ inputs.mode == 'rollback' && inputs.source_run || github.run_id }}",
+        "SOURCE_ATTEMPT": "${{ inputs.mode == 'rollback' && inputs.source_attempt"
+        " || needs.promote.outputs.attempt || github.run_attempt }}",
+    }
+    assert downloads(rollback) == [
+        "promotion-recovery-${{ env.SOURCE_RUN }}-${{ env.SOURCE_ATTEMPT }}",
+        "promotion-transaction-${{ env.SOURCE_RUN }}-${{ env.SOURCE_ATTEMPT }}",
+    ]
+    for step in rollback["steps"]:
+        assert not {"SOURCE_RUN", "SOURCE_ATTEMPT"} & set(step.get("env", {}))
+    bind = rollback["steps"][0]["run"]
+    assert '[ "$SOURCE_ATTEMPT" = "$SOURCE_ATTEMPT_INPUT" ]' in bind
+    assert '[ "$SOURCE_ATTEMPT" -le "$GITHUB_RUN_ATTEMPT" ]' in bind

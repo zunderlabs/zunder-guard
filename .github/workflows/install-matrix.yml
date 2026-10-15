@@ -979,7 +979,7 @@ jobs:
             ${{ runner.temp }}/I7/*.log
             ${{ runner.temp }}/I7/mainnet/M1/*.json
             ${{ runner.temp }}/I7/mainnet/M1/*.log
-          if-no-files-found: warn
+          if-no-files-found: error
           retention-days: 14
 
   linux-mainnet:
@@ -1067,7 +1067,7 @@ jobs:
           path: |
             ${{ runner.temp }}/mainnet/M1/*.json
             ${{ runner.temp }}/mainnet/M1/*.log
-          if-no-files-found: warn
+          if-no-files-found: error
           retention-days: 14
   native-mainnet:
     if: ${{ (inputs.profile != 'nightly') && (inputs.target == 'all' || inputs.target == 'native-mainnet') }}
@@ -1133,7 +1133,7 @@ jobs:
             ${{ runner.temp }}/mainnet/M1/*.json
             ${{ runner.temp }}/mainnet/M1/*.log
             ${{ runner.temp }}/mainnet/windows-policy/*.receipt.json
-          if-no-files-found: warn
+          if-no-files-found: error
           retention-days: 14
   mainnet-setup:
     if: ${{ (inputs.profile != 'nightly') && (inputs.target == 'all' || inputs.target == 'mainnet-setup') }}
@@ -1291,4 +1291,4 @@ jobs:
         run: cp "$BUNDLE" "$RUNNER_TEMP/$ROW/$ROW.sigstore.json"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: always()
-        with: {name: '${{ matrix.row }}-${{ github.run_id }}-${{ github.run_attempt }}', path: '${{ runner.temp }}/${{ matrix.row }}', if-no-files-found: warn}
+        with: {name: '${{ matrix.row }}-${{ github.run_id }}-${{ github.run_attempt }}', path: '${{ runner.temp }}/${{ matrix.row }}', if-no-files-found: error}

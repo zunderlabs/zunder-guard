@@ -35,7 +35,9 @@ ref so the workflow source remains the released commit. Supply the original `tag
 snapshot as `verify_attempt`), and the original promotion's `source_run` and `source_attempt`.
 A reusable promotion shares its caller's run ID; its own attempt can follow the gate's when
 failed jobs were rerun. A standalone promotion has its own run and attempt. Do not rerun the
-promotion or `prepare` phase.
+promotion or `prepare` phase. Within one run, canonical smoke and automatic recovery read the
+promote job's artifacts by that job's own `attempt` output, not by their own attempt: after a
+failed-jobs rerun a promote job that had passed keeps its earlier attempt and artifacts.
 
 ```sh
 gh workflow run promote.yml --repo zunderlabs/zunder-guard --ref "$TAG" \

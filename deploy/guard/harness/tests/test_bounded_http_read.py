@@ -73,6 +73,13 @@ def test_failed_or_oversized_child_never_exposes_body(
 
 
 def test_slow_dribble_is_killed_and_reaped_under_whole_response_deadline() -> None:
+    # The deadline covers the isolated child's start too. A hosted Windows runner can take
+    # longer than 0.3 s just to start Python (public CI run 38715930937), so it gets a
+    # longer deadline and kill margin. Both stay far below the 12 s dribble, so finishing
+    # in time still proves the read was cut off at the deadline, not by the response's end.
+    deadline, slack = (3.0, 2.0) if sys.platform == "win32" else (0.3, 0.7)
+    dribble = 600
+    assert deadline + slack < dribble * 0.02 / 2
     closed = threading.Event()
     connected = threading.Event()
 
@@ -82,7 +89,7 @@ def test_slow_dribble_is_killed_and_reaped_under_whole_response_deadline() -> No
             self.send_response(200)
             self.end_headers()
             try:
-                for _ in range(300):
+                for _ in range(dribble):
                     self.wfile.write(b" ")
                     self.wfile.flush()
                     time.sleep(0.02)
@@ -98,10 +105,12 @@ def test_slow_dribble_is_killed_and_reaped_under_whole_response_deadline() -> No
     try:
         began = time.monotonic()
         with pytest.raises(urllib.error.URLError, match="bounded read failed"):
-            bounded_read(f"http://127.0.0.1:{server.server_port}/guard/status", None, timeout=0.3)
-        assert time.monotonic() - began < 1
+            bounded_read(
+                f"http://127.0.0.1:{server.server_port}/guard/status", None, timeout=deadline
+            )
+        assert time.monotonic() - began < deadline + slack
         assert connected.is_set()
-        assert closed.wait(1)  # Reaped worker closed the response before any next request.
+        assert closed.wait(slack)  # Reaped worker closed the response before any next request.
     finally:
         server.shutdown()
         server.server_close()

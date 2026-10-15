@@ -208,7 +208,7 @@ jobs:
             ${{ runner.temp }}/guard-release/P8-click-diagnostics/approve-network-testnet/page.html
             ${{ runner.temp }}/guard-release/P8-click-diagnostics/approve-network-testnet/diagnostics.json
             ${{ steps.fee-evidence.outputs.bundle-path }}
-          if-no-files-found: warn
+          if-no-files-found: error
           retention-days: 7
       - name: Retain finite T1 failure evidence before cleanup scan
         if: ${{ failure() || cancelled() }}
@@ -251,7 +251,7 @@ jobs:
             ${{ runner.temp }}/guard-release/T1/runtime/cleanup-responses.json
             ${{ runner.temp }}/guard-release/T1/T1.predicate.json
             ${{ steps.evidence.outputs.bundle-path }}
-          if-no-files-found: warn
+          if-no-files-found: error
           retention-days: 7
 
   testnet-systemd:
@@ -414,7 +414,7 @@ jobs:
             ${{ runner.temp }}/guard-release/T2/runtime/linux-opt-normalized.receipt.json
             ${{ runner.temp }}/guard-release/T2/T2.predicate.json
             ${{ steps.evidence.outputs.bundle-path }}
-          if-no-files-found: warn
+          if-no-files-found: error
           retention-days: 7
 
   purchase:
@@ -605,7 +605,7 @@ jobs:
             ${{ runner.temp }}/quote-evidence/P*/renewal-payment/payment-receipt.json
             ${{ runner.temp }}/quote-evidence/P*/licensed/licence-receipt.json
             ${{ steps.evidence.outputs.bundle-path }}
-          if-no-files-found: warn
+          if-no-files-found: error
           retention-days: 7
 
   signing-subjects:
@@ -771,7 +771,7 @@ jobs:
           ${{ runner.temp }}/sdk/*.log
 
           ${{ runner.temp }}/sdk/proof/*.log'
-        if-no-files-found: warn
+        if-no-files-found: error
         retention-days: 7
     needs: signing-subjects
   signing-gate:
@@ -846,23 +846,30 @@ jobs:
         run, attempt = os.environ['GITHUB_RUN_ID'], os.environ['GITHUB_RUN_ATTEMPT']
         evidence = root / 'evidence'
         evidence.mkdir()
+        # Each bundle must be signed in exactly the attempt its artifact name selected.
+        selected = {}
         for platform in ('linux', 'macos', 'windows'):
             name = 'signing-' + platform
-            source = latest(root / 'attempts', name, run, attempt).path / (name + '.sigstore.json')
+            chosen = latest(root / 'attempts', name, run, attempt)
+            selected[name] = chosen.attempt
+            source = chosen.path / (name + '.sigstore.json')
             if source.is_symlink() or not source.is_file():
                 raise SystemExit('Expected one signing bundle per platform')
             (evidence / (name + '.sigstore.json')).write_bytes(source.read_bytes())
         for row in ('T1', 'T2'):
             bundles = {}
-            for path in latest(root / 'attempts', row, run, attempt).path.rglob('*.json'):
+            chosen = latest(root / 'attempts', row, run, attempt)
+            selected[row] = chosen.attempt
+            for path in chosen.path.rglob('*.json'):
                 value = json.loads(path.read_bytes())
                 if isinstance(value, dict) and 'dsseEnvelope' in value and 'verificationMaterial' in value:
                     bundles[path.read_bytes()] = path
             if len(bundles) != 1:
                 raise SystemExit('Expected one authenticated testnet bundle')
             (evidence / (row + '.sigstore.json')).write_bytes(next(iter(bundles)))
+        (root / 'attempts.json').write_text(json.dumps(selected, sort_keys=True))
         PY_M3
-        python -m guard_harness.mainnet_evidence --row M3 --tag "$TAG" --commit "$SOURCE" --assets "$RUNNER_TEMP/M3/assets" --evidence "$RUNNER_TEMP/M3/evidence" --output "$RUNNER_TEMP/M3/proof"
+        python -m guard_harness.mainnet_evidence --row M3 --tag "$TAG" --commit "$SOURCE" --assets "$RUNNER_TEMP/M3/assets" --evidence "$RUNNER_TEMP/M3/evidence" --output "$RUNNER_TEMP/M3/proof" --run-id "$GITHUB_RUN_ID" --attempts "$RUNNER_TEMP/M3/attempts.json"
     - uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6
       id: evidence
       with:
@@ -878,7 +885,7 @@ jobs:
           ${{ runner.temp }}/M3/proof/*
 
           ${{ steps.evidence.outputs.bundle-path }}'
-        if-no-files-found: warn
+        if-no-files-found: error
         retention-days: 7
 
   testnet-failure-alert:

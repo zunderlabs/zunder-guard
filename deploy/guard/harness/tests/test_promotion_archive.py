@@ -25,8 +25,9 @@ MIXED = {"P2": "2", "I3": "2", "I1": "3"}
 def official_verifier_fixture(monkeypatch: pytest.MonkeyPatch) -> None:
     """Stub verifier boundary only; unsigned fixture recovery grants no gate admission.
 
-    It applies the real verifier's invocation rules to the attempt a fixture bundle
-    claims to be signed in (`fixture_attempt`, default 1).
+    It applies the real verifier's invocation rules to the run and attempt a fixture
+    bundle claims to be signed in (`fixture_run` and `fixture_attempt`, default 1): it
+    returns that invocation and raises only when an expected run or attempt differs.
     """
 
     def verify(subject: Path, bundle: Path, **kwargs: Any) -> VerifiedPredicate:
@@ -34,8 +35,10 @@ def official_verifier_fixture(monkeypatch: pytest.MonkeyPatch) -> None:
         material = value["verificationMaterial"]
         if material.get("fixture_wrong_run"):
             raise AttestationError("fixture other invocation")
-        run_id, attempt = "1", material.get("fixture_attempt", "1")
-        assert kwargs["expected_run_id"] in {None, "1"}
+        run_id = material.get("fixture_run", "1")
+        attempt = material.get("fixture_attempt", "1")
+        if kwargs["expected_run_id"] is not None and kwargs["expected_run_id"] != run_id:
+            raise AttestationError("fixture signed in another workflow run")
         if kwargs["expected_run_attempt"] is not None:
             assert kwargs["latest_run_attempt"] is None
             if kwargs["expected_run_attempt"] != attempt:
@@ -70,11 +73,11 @@ def official_verifier_fixture(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(promotion_archive, "verify_predicate", verify)
 
 
-def record(predicate: dict[str, Any], kind: str, *, attempt: str = "1") -> bytes:
+def record(predicate: dict[str, Any], kind: str, *, attempt: str = "1", run: str = "1") -> bytes:
     statement = {"predicateType": f"https://zunderlabs.com/guard/{kind}/v1", "predicate": predicate}
     return canonical_bytes(
         {
-            "verificationMaterial": {"fixture_attempt": attempt},
+            "verificationMaterial": {"fixture_run": run, "fixture_attempt": attempt},
             "dsseEnvelope": {
                 "payload": base64.b64encode(canonical_bytes(statement)).decode(),
                 "signatures": [],
@@ -89,6 +92,7 @@ def fixture(
     attempts: dict[str, str] | None = None,
     gated_attempt: str = "1",
     staged_attempt: str = "1",
+    gated_run: str = "1",
 ) -> tuple[Path, Path, Path, dict[str, Any]]:
     gated, build = complete(attempts=attempts)
     manifest = tmp_path / "manifest"
@@ -99,7 +103,7 @@ def fixture(
     states.write_bytes(
         record(staged, "release-state", attempt=staged_attempt)
         + b"\n"
-        + record(gated.predicate, "release-state", attempt=gated_attempt)
+        + record(gated.predicate, "release-state", attempt=gated_attempt, run=gated_run)
         + b"\n"
     )
     journeys = tmp_path / "journey.jsonl"
@@ -152,6 +156,37 @@ def test_recovery_rebuilds_each_rows_own_attempt_and_the_gates_attempt(tmp_path:
 def test_recovery_refuses_a_gate_that_precedes_a_referenced_row(tmp_path: Path) -> None:
     manifest, states, journeys, promoted = fixture(tmp_path, attempts=MIXED, gated_attempt="2")
     with pytest.raises(AttestationError, match="follows the gate's attempt"):
+        reconstruct(
+            tmp_path / "evidence",
+            states,
+            journeys,
+            promoted=promoted,
+            manifest=manifest,
+            run_id="1",
+        )
+
+
+def test_recovery_refuses_a_gated_state_signed_in_another_run(tmp_path: Path) -> None:
+    # The gated state is authenticated without an expected run (its attempt is what is
+    # being learned), so only the post-check on the verified invocation binds its run.
+    manifest, states, journeys, promoted = fixture(tmp_path, gated_run="2")
+    with pytest.raises(AttestationError, match="exact workflow run and attempt"):
+        reconstruct(
+            tmp_path / "evidence",
+            states,
+            journeys,
+            promoted=promoted,
+            manifest=manifest,
+            run_id="1",
+        )
+
+
+def test_recovery_refuses_a_row_signed_in_another_run(tmp_path: Path) -> None:
+    manifest, states, journeys, promoted = fixture(tmp_path)
+    records = [json.loads(line) for line in journeys.read_bytes().splitlines()]
+    records[0]["verificationMaterial"]["fixture_run"] = "2"
+    journeys.write_bytes(b"\n".join(canonical_bytes(value) for value in records))
+    with pytest.raises(AttestationError, match="exact workflow run and attempt"):
         reconstruct(
             tmp_path / "evidence",
             states,

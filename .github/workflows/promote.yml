@@ -49,6 +49,9 @@ jobs:
       cancel-in-progress: false
       queue: max
     outputs:
+      # The attempt this job ran in. A failed-jobs rerun keeps a passed promote job's
+      # earlier attempt, so its artifacts are named by this, never by a consumer's own attempt.
+      attempt: ${{ steps.attempt.outputs.attempt }}
       manifest_sha256: ${{ steps.admission.outputs.manifest_sha256 }}
       mutation_attempted: ${{ steps.publication.outcome != '' && steps.publication.outcome != 'skipped' }}
     name: Authenticate complete gate and promote stable channels
@@ -76,6 +79,10 @@ jobs:
           [[ $VERIFY_RUN =~ ^[1-9][0-9]*$ && $VERIFY_ATTEMPT =~ ^[1-9][0-9]*$ ]]
           [ "$GITHUB_SHA" = "$SOURCE" ]
           case "$GITHUB_REF" in refs/heads/main|"refs/tags/$TAG") ;; *) exit 1 ;; esac
+      - name: Record this job's attempt before anything can fail
+        id: attempt
+        shell: bash
+        run: echo "attempt=$GITHUB_RUN_ATTEMPT" >> "$GITHUB_OUTPUT"
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with: {ref: '${{ inputs.commit }}', persist-credentials: false}
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
@@ -182,7 +189,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: promotion-transaction-${{ inputs.mode == 'rollback' && inputs.source_run || github.run_id }}-${{ inputs.mode == 'rollback' && inputs.source_attempt || github.run_attempt }}
+          name: promotion-transaction-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/promotion
           include-hidden-files: true
           if-no-files-found: warn
@@ -224,7 +231,8 @@ jobs:
           path: ${{ runner.temp }}/promotion-evidence
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: canonical-subjects-${{ github.run_id }}-${{ github.run_attempt }}
+          # The promote job's own attempt: it may precede this rerun job's attempt.
+          name: canonical-subjects-${{ github.run_id }}-${{ needs.promote.outputs.attempt }}
           path: ${{ runner.temp }}/canonical-subjects
       - name: Install actual canonical channel and observe paper allow, resize and veto
         shell: bash
@@ -272,6 +280,14 @@ jobs:
       packages: write
       id-token: write
       attestations: write
+    env:
+      # The original promotion this recovery binds. Rollback mode takes exactly the dispatched
+      # run and attempt. Automatic recovery takes the promote job's own attempt, which a
+      # failed-jobs rerun can leave below this job's; it falls back to this attempt only when
+      # promote recorded no outputs (its runner was lost), and such a job never passed, so it
+      # ran in this attempt. The recovery signature binds the exact attempt either way.
+      SOURCE_RUN: ${{ inputs.mode == 'rollback' && inputs.source_run || github.run_id }}
+      SOURCE_ATTEMPT: ${{ inputs.mode == 'rollback' && inputs.source_attempt || needs.promote.outputs.attempt || github.run_attempt }}
     steps:
       - name: Bind recovery to original stable source and exact artifact invocation
         shell: bash
@@ -281,8 +297,6 @@ jobs:
           MODE: ${{ inputs.mode }}
           SOURCE_RUN_INPUT: ${{ inputs.source_run }}
           SOURCE_ATTEMPT_INPUT: ${{ inputs.source_attempt }}
-          SOURCE_RUN: ${{ inputs.mode == 'rollback' && inputs.source_run || github.run_id }}
-          SOURCE_ATTEMPT: ${{ inputs.mode == 'rollback' && inputs.source_attempt || github.run_attempt }}
         run: |
           set -euo pipefail
           [ "$GITHUB_REPOSITORY" = zunderlabs/zunder-guard ]
@@ -291,6 +305,9 @@ jobs:
           [ "$MODE" = promote ] || [ "$MODE" = rollback ]
           if [ "$MODE" = rollback ]; then
             [[ $SOURCE_RUN_INPUT =~ ^[1-9][0-9]*$ && $SOURCE_ATTEMPT_INPUT =~ ^[1-9][0-9]*$ ]]
+            [ "$SOURCE_RUN" = "$SOURCE_RUN_INPUT" ] && [ "$SOURCE_ATTEMPT" = "$SOURCE_ATTEMPT_INPUT" ]
+          else
+            [ "$SOURCE_RUN" = "$GITHUB_RUN_ID" ] && [ "$SOURCE_ATTEMPT" -le "$GITHUB_RUN_ATTEMPT" ]
           fi
           [ "$GITHUB_SHA" = "$SOURCE" ]
           case "$GITHUB_REF" in refs/heads/main|"refs/tags/$TAG") ;; *) exit 1 ;; esac
@@ -307,9 +324,9 @@ jobs:
           python -m pip install --no-deps --no-build-isolation -e ./deploy/guard/harness
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: promotion-recovery-${{ inputs.mode == 'rollback' && inputs.source_run || github.run_id }}-${{ inputs.mode == 'rollback' && inputs.source_attempt || github.run_attempt }}
+          name: promotion-recovery-${{ env.SOURCE_RUN }}-${{ env.SOURCE_ATTEMPT }}
           github-token: ${{ github.token }}
-          run-id: ${{ inputs.mode == 'rollback' && inputs.source_run || github.run_id }}
+          run-id: ${{ env.SOURCE_RUN }}
           path: ${{ runner.temp }}/promotion
       - name: Mint fresh short-lived tap-only rollback token
         id: tap
@@ -338,8 +355,6 @@ jobs:
           SOURCE: ${{ inputs.commit }}
           VERIFY_RUN: ${{ inputs.run_id }}
           VERIFY_ATTEMPT: ${{ inputs.attempt }}
-          SOURCE_RUN: ${{ inputs.mode == 'rollback' && inputs.source_run || github.run_id }}
-          SOURCE_ATTEMPT: ${{ inputs.mode == 'rollback' && inputs.source_attempt || github.run_attempt }}
         shell: bash
         run: |
           set -euo pipefail
@@ -353,9 +368,9 @@ jobs:
         continue-on-error: true
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: promotion-transaction-${{ inputs.mode == 'rollback' && inputs.source_run || github.run_id }}-${{ inputs.mode == 'rollback' && inputs.source_attempt || github.run_attempt }}
+          name: promotion-transaction-${{ env.SOURCE_RUN }}-${{ env.SOURCE_ATTEMPT }}
           github-token: ${{ github.token }}
-          run-id: ${{ inputs.mode == 'rollback' && inputs.source_run || github.run_id }}
+          run-id: ${{ env.SOURCE_RUN }}
           path: ${{ runner.temp }}/promotion-late
       - name: Retain original promoted attestation only
         if: steps.late.outcome == 'success'
@@ -379,8 +394,6 @@ jobs:
           SOURCE: ${{ inputs.commit }}
           VERIFY_RUN: ${{ inputs.run_id }}
           VERIFY_ATTEMPT: ${{ inputs.attempt }}
-          SOURCE_RUN: ${{ inputs.mode == 'rollback' && inputs.source_run || github.run_id }}
-          SOURCE_ATTEMPT: ${{ inputs.mode == 'rollback' && inputs.source_attempt || github.run_attempt }}
         shell: bash
         run: |
           set -euo pipefail
@@ -406,8 +419,6 @@ jobs:
           SOURCE: ${{ inputs.commit }}
           VERIFY_RUN: ${{ inputs.run_id }}
           VERIFY_ATTEMPT: ${{ inputs.attempt }}
-          SOURCE_RUN: ${{ inputs.mode == 'rollback' && inputs.source_run || github.run_id }}
-          SOURCE_ATTEMPT: ${{ inputs.mode == 'rollback' && inputs.source_attempt || github.run_attempt }}
           BUNDLE: ${{ steps.withdrawn.outputs.bundle-path }}
         shell: bash
         run: |
