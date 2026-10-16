@@ -34,7 +34,8 @@ def outputs(values: dict[str, str]) -> None:
     if target:
         with Path(target).open("a") as stream:
             for key, value in values.items():
-                if not re.fullmatch(r"[a-z_]+", key) or "\n" in value:
+                # A step output name; digits included (v1.0.0 promote: "manifest_sha256").
+                if not re.fullmatch(r"[a-z][a-z0-9_]*", key) or "\n" in value or "\r" in value:
                     raise ValueError("workflow output refused")
                 stream.write(f"{key}={value}\n")
 

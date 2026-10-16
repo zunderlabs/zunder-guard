@@ -632,3 +632,40 @@ def test_rerun_consumers_name_the_promote_jobs_own_attempt() -> None:
     bind = rollback["steps"][0]["run"]
     assert '[ "$SOURCE_ATTEMPT" = "$SOURCE_ATTEMPT_INPUT" ]' in bind
     assert '[ "$SOURCE_ATTEMPT" -le "$GITHUB_RUN_ATTEMPT" ]' in bind
+
+
+@pytest.mark.parametrize("stale_reads, restored", [(2, True), (99, False)])
+def test_rollback_rereads_a_cached_github_latest_before_judging_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stale_reads: int, restored: bool
+) -> None:
+    # The unauthenticated latest read can lag the restore PATCH by about a minute.
+    (tmp_path / "transaction.json").write_text('{"canonical_before":null,"prior":null}')
+    client = promotion.channels(argparse.Namespace(work=tmp_path, tag="v1.0.0", commit=COMMIT), "")
+    reads = {"count": 0}
+    pauses: list[float] = []
+
+    def latest(url: str) -> tuple[bytes, dict[str, str]] | None:
+        reads["count"] += 1
+        # The first read precedes the PATCH; then the cache keeps the candidate for a while.
+        return (b'{"id":222}', {}) if reads["count"] <= 1 + stale_reads else None
+
+    def github(method: str, endpoint: str, body: object = None) -> dict[str, object]:
+        return {"id": 222, "tag_name": "v1.0.0"} if method == "GET" else {}
+
+    monkeypatch.setattr(promotion_channels, "image_digest", lambda tag: None)
+    monkeypatch.setattr(promotion_channels, "public_get", latest)
+    monkeypatch.setattr(client, "github", github)
+    monkeypatch.setattr(client, "pause", pauses.append)
+    failures = client.rollback(
+        {
+            "tap_before": "a" * 40,
+            "image_before": None,
+            "github_before": None,
+            "candidate_release_id": 222,
+        }
+    )
+    assert ("github-latest" in failures) is not restored
+    if restored:
+        assert pauses == [promotion_channels.LATEST_REREAD_PAUSE] * stale_reads
+    else:
+        assert len(pauses) == promotion_channels.LATEST_REREADS

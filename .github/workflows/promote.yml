@@ -211,10 +211,10 @@ jobs:
       matrix:
         include:
           - {channel: D1, runner: ubuntu-24.04, shell: sh}
-          - {channel: D1, runner: macos-14, shell: sh}
+          - {channel: D1, runner: macos-15, shell: sh}
           - {channel: D2, runner: windows-2025, shell: powershell.exe}
           - {channel: D2, runner: windows-2025, shell: pwsh.exe}
-          - {channel: D3, runner: macos-14, shell: sh}
+          - {channel: D3, runner: macos-15, shell: sh}
           - {channel: D4, runner: ubuntu-24.04, shell: sh}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

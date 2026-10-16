@@ -193,3 +193,40 @@ def test_uncertain_publication_never_accepts_a_different_head(
     monkeypatch.setattr(promotion, "read_head", lambda channel: ("b" * 64, None))
     with pytest.raises(AttestationError, match="response lost"):
         promotion.publish_once(proposal, token="fixture")
+
+
+def test_outputs_admit_every_step_output_promote_writes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # v1.0.0's first hosted promote refused "manifest_sha256" (digits) after authenticating.
+    target = tmp_path / "github-output"
+    monkeypatch.setenv("GITHUB_OUTPUT", str(target))
+    promotion.outputs({"manifest_sha256": "a" * 64})
+    promotion.outputs({"promoted_digest": "b" * 64})
+    promotion.outputs({"rollback_needed": "false"})
+    assert target.read_text().splitlines() == [
+        "manifest_sha256=" + "a" * 64,
+        "promoted_digest=" + "b" * 64,
+        "rollback_needed=false",
+    ]
+
+
+@pytest.mark.parametrize(
+    "key, value",
+    [
+        ("Manifest", "x"),
+        ("manifest-sha256", "x"),
+        ("1digest", "x"),
+        ("", "x"),
+        ("digest", "a\nb=c"),
+        ("digest", "a\rb"),
+    ],
+)
+def test_outputs_refuse_names_and_values_that_could_inject(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, key: str, value: str
+) -> None:
+    target = tmp_path / "github-output"
+    monkeypatch.setenv("GITHUB_OUTPUT", str(target))
+    with pytest.raises(ValueError, match="workflow output refused"):
+        promotion.outputs({key: value})
+    assert not target.exists() or target.read_text() == ""

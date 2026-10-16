@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import re
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -19,6 +20,11 @@ from guard_harness.runner import run
 
 IMAGE = "ghcr.io/zunderlabs/zunder-guard"
 REPOSITORY = "zunderlabs/zunder-guard"
+
+
+# Rollback re-reads GitHub latest this many times, this far apart, past its ~60 s cache.
+LATEST_REREADS = 9
+LATEST_REREAD_PAUSE = 10.0
 
 
 def public_get(url: str, *, headers: dict[str, str] | None = None) -> tuple[bytes, Any] | None:
@@ -75,6 +81,7 @@ class Channels:
     ) -> None:
         self.release, self.previous, self.work, self._tap = release, previous, work, tap
         self.sequence = 0
+        self.pause = time.sleep  # Tests replace it.
 
     @property
     def tap(self) -> Tap:
@@ -313,14 +320,21 @@ class Channels:
                 self.github(
                     "PATCH", f"releases/{snapshot['github_before']['id']}", {"make_latest": "true"}
                 )
-            observed = public_get(f"https://api.github.com/repos/{REPOSITORY}/releases/latest")
-            if snapshot["github_before"] is None:
-                if observed is not None:
+            # The unauthenticated read can be served from a cache for about a minute after the
+            # PATCH; re-read (bounded) until it shows the restored latest, then judge it.
+            restored = (
+                None if snapshot["github_before"] is None else snapshot["github_before"]["id"]
+            )
+            for _ in range(LATEST_REREADS):
+                observed = public_get(f"https://api.github.com/repos/{REPOSITORY}/releases/latest")
+                latest_id = None if observed is None else json.loads(observed[0]).get("id")
+                if latest_id == restored:
+                    break
+                self.pause(LATEST_REREAD_PAUSE)
+            if restored is None:
+                if latest_id is not None:
                     raise AttestationError("first GitHub latest remains available after withdrawal")
-            elif (
-                observed is None
-                or json.loads(observed[0]).get("id") != snapshot["github_before"]["id"]
-            ):
+            elif latest_id != restored:
                 raise AttestationError("prior GitHub latest was not restored")
         except Exception:
             failures.append("github-latest")
