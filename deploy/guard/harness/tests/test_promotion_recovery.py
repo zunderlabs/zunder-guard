@@ -199,14 +199,20 @@ def test_each_failed_channel_is_attempted_and_newer_github_latest_is_never_repla
         calls.append("image")
         raise AttestationError("registry unavailable")
 
-    def newest(url: str) -> tuple[bytes, dict[str, str]]:
-        calls.append("github")
-        return b'{"id":333}', {}
+    def newest(method: str, endpoint: str, body: Any = None) -> dict[str, Any]:
+        if method != "GET":
+            pytest.fail("newer latest must remain")
+        if endpoint == "releases/latest":
+            calls.append("github")
+            return {"id": 333}
+        return {"id": 222, "tag_name": "v1.0.0"}
 
     client.tap = cast(Any, SimpleNamespace(request=failed_tap))
     monkeypatch.setattr(promotion_channels, "image_digest", failed_image)
-    monkeypatch.setattr(promotion_channels, "public_get", newest)
-    monkeypatch.setattr(client, "github", lambda *a: pytest.fail("newer latest must remain"))
+    monkeypatch.setattr(
+        promotion_channels, "public_get", lambda url: pytest.fail("authenticated latest only")
+    )
+    monkeypatch.setattr(client, "github", newest)
     failures = client.rollback(
         {
             "tap_before": "a" * 40,
@@ -352,33 +358,69 @@ def test_recovery_after_prior_restore_is_not_skipped_by_withdrawal_preparation(
     assert state["stage"] == "withdrawn" and state["previous"] == predicate_digest(candidate)
 
 
+class ReadOnlyTap:
+    """The job's read token on the public tap; any write fails the test."""
+
+    head = "a" * 40
+    tokens: list[str] = []
+
+    def __init__(self, *, token: str, logs: Path) -> None:
+        if not token:
+            raise ValueError("tap credential required")
+        ReadOnlyTap.tokens.append(token)
+
+    def request(self, method: str, endpoint: str, body: Any = None) -> dict[str, Any]:
+        assert (method, endpoint) == ("GET", "git/ref/heads/main"), "tap mutation refused"
+        return {"object": {"sha": ReadOnlyTap.head}}
+
+
+@pytest.mark.parametrize(
+    ("head", "token", "tap_failed"),
+    [
+        ("a" * 40, "job-read-token", False),  # never moved: nothing to restore
+        ("b" * 40, "job-read-token", True),  # moved, and no credential to restore it
+        ("a" * 40, "", True),  # the head cannot even be read
+    ],
+)
 def test_missing_tap_token_never_blocks_other_channel_reconciliation(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, head: str, token: str, tap_failed: bool
 ) -> None:
     (tmp_path / "transaction.json").write_text('{"canonical_before":null,"prior":null}')
     client = promotion.channels(argparse.Namespace(work=tmp_path, tag="v1.0.0", commit=COMMIT), "")
     attempts: list[str] = []
+    ReadOnlyTap.head, ReadOnlyTap.tokens = head, []
+    monkeypatch.setattr(promotion_channels, "Tap", ReadOnlyTap)
+    if token:
+        monkeypatch.setenv("GH_TOKEN", token)
+    else:
+        monkeypatch.delenv("GH_TOKEN", raising=False)
 
     def image(tag: str) -> None:
         attempts.append("image")
         return None
 
-    def github(url: str) -> tuple[bytes, dict[str, str]]:
-        attempts.append("github")
-        return b'{"id":333}', {}
+    def github(method: str, endpoint: str, body: Any = None) -> dict[str, Any]:
+        if method != "GET":
+            pytest.fail("foreign latest mutation")
+        if endpoint == "releases/latest":
+            attempts.append("github")
+            return {"id": 333}
+        return {"id": 222, "tag_name": "v1.0.0"}
 
     monkeypatch.setattr(promotion_channels, "image_digest", image)
-    monkeypatch.setattr(promotion_channels, "public_get", github)
-    monkeypatch.setattr(client, "github", lambda *a: pytest.fail("foreign latest mutation"))
-    assert client.rollback(
+    monkeypatch.setattr(promotion_channels, "public_get", lambda url: pytest.fail("cached read"))
+    monkeypatch.setattr(client, "github", github)
+    failures = client.rollback(
         {
             "tap_before": "a" * 40,
             "image_before": None,
             "github_before": None,
             "candidate_release_id": 222,
         }
-    ) == ["tap", "github-latest"]
+    )
+    assert failures == (["tap"] if tap_failed else []) + ["github-latest"]
     assert attempts == ["image", "github"]
+    assert ReadOnlyTap.tokens == ([token] if token else [])
 
 
 @pytest.mark.parametrize("outage_route", ["head", "withdrawal-bundle", "withdrawal-proof"])
@@ -646,8 +688,9 @@ def test_rollback_rereads_a_cached_github_latest_before_judging_it(
 
     def latest(url: str) -> tuple[bytes, dict[str, str]] | None:
         reads["count"] += 1
-        # The first read precedes the PATCH; then the cache keeps the candidate for a while.
-        return (b'{"id":222}', {}) if reads["count"] <= 1 + stale_reads else None
+        # The pre-check is authenticated; after the PATCH the public cache keeps the
+        # candidate for a while.
+        return (b'{"id":222}', {}) if reads["count"] <= stale_reads else None
 
     def github(method: str, endpoint: str, body: object = None) -> dict[str, object]:
         return {"id": 222, "tag_name": "v1.0.0"} if method == "GET" else {}

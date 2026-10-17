@@ -35,6 +35,97 @@ pub(crate) const FLOW_FALL_WRITTEN: Decimal = Decimal::from_parts(1, 0, 0, false
 /// so far.
 pub type Horizon = BTreeMap<String, i64>;
 
+/// The id prefix of a flow that stands for a ledger entry the caller
+/// cannot account for (Guard: `zunder_guard_core::ledger::LedgerProblem`).
+/// The caller books 0 (its amount and direction are not trusted), no value,
+/// between the accounts (which it touched is not known), and an
+/// [`UnaccountedEntry`]: how long a gap it watched the account through, the
+/// rule for the entry's type, and a credit it can read. The change of the
+/// equity from the last view the engine took to the first view that shows
+/// it is judged by that rule ([`UnaccountedRule`], `Fold::measure_inner`):
+/// never a gain, a fall never lowers the drawdown peak, and what is taken
+/// as the entry's money in a UTC day stays below the loss the stops
+/// allowed at its first such entry ([`RebaseBudget`]).
+/// (`docs/guard.md#deposits-and-withdrawals`.)
+///
+/// An id namespace (a venue id never starts with it: Guard's are a
+/// transaction hash, `0x` and hex digits) plus [`Flow::unaccounted`], so
+/// that records of other flows keep their shape.
+pub const UNKNOWN_TYPE_ID_PREFIX: &str = "unknown-type:";
+
+/// The longest watched gap a flow may carry ([`UnaccountedEntry`]): 2
+/// minutes. A caller that sees the account less often than that is not
+/// watching it: the change around the entry is unwatched.
+pub const UNKNOWN_TYPE_GAP_MAX_MS: i64 = 2 * 60_000;
+
+/// How the change around a ledger entry the caller cannot account for is
+/// judged, by the entry's type. Ordered by strictness: in one span the
+/// strictest rule holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UnaccountedRule {
+    /// A type classified from real entries as money moved, not trading
+    /// (Guard: `hip3LiquidatorDeposit`, `hip3LiquidatorWithdraw`), that
+    /// Guard still cannot book. A readable credit is taken as money in
+    /// first; what is left is the entry's money (a deposit's or a
+    /// withdrawal's rules, the peak never lowered) when the caller watched
+    /// the account around it and it fits the stops' room and the day's
+    /// budget; else a fall counts as the loss it shows and a rise halts the
+    /// day.
+    Rebasable,
+    /// Any other type: a fall counts as the loss it shows, a rise halts the
+    /// day; never taken as money.
+    Strict,
+    /// A type the caller reads as carrying a credit in dollars (Guard:
+    /// `usdc` or `usdcValue` on a type it does not know): the day halts
+    /// whatever the change, and a fall counts as the loss it shows as well.
+    Halts,
+}
+
+/// What a flow standing for a ledger entry the caller cannot account for
+/// carries ([`UNKNOWN_TYPE_ID_PREFIX`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UnaccountedEntry {
+    /// How far, in venue time on every dex, the first view that shows it
+    /// may be from the last view the engine took for the caller to have
+    /// watched the account around it (Guard derives it from its sync
+    /// interval), in `1..=`[`UNKNOWN_TYPE_GAP_MAX_MS`]. Recorded with the
+    /// flow, so that a replay decides as the writer did whatever the
+    /// caller's settings are later.
+    pub watched_gap_ms: i64,
+    /// How its change is judged.
+    pub rule: UnaccountedRule,
+    /// A credit to the account the caller can read from it (0 if none),
+    /// only for [`UnaccountedRule::Rebasable`]: taken as money in before the
+    /// rest is judged, which can only make the stops stricter (a credit
+    /// misread as larger turns into a loss). A debit is never read.
+    #[serde(default, skip_serializing_if = "Decimal::is_zero")]
+    pub credit: Decimal,
+}
+
+/// What a UTC day's re-bases for entries the caller cannot account for
+/// have used: all of them together stay below `room`, the loss the stops
+/// allowed when the day's first one came (`Fold::measure_inner`). Both are
+/// shares of the day's start (or of the equity cap where smaller), as the
+/// engine measures a day's loss, so that a known deposit or withdrawal,
+/// which moves the day's start, moves what they stand for with it: after a
+/// withdrawal of nine tenths, a day's budget is a tenth of the dollars it
+/// was. Reset by a new UTC day and by a review (a record without one). On
+/// every record of an engine that takes flows from version 4 on.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RebaseBudget {
+    /// The UTC day it is for.
+    pub day: i64,
+    /// The loss that would have halted or stopped the engine at the day's
+    /// first re-base, as a share of that day's start (or the cap).
+    pub room: Decimal,
+    /// The changes re-based that day so far, each as a share of the day's
+    /// start (or the cap) when it came, added up.
+    pub used: Decimal,
+}
+
 /// A deposit, a withdrawal or a transfer of the accounts the equity sums.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -57,6 +148,11 @@ pub struct Flow {
     /// they could not be read.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub value: Option<ValueRange>,
+    /// For a flow that stands for a ledger entry the caller cannot account
+    /// for ([`UNKNOWN_TYPE_ID_PREFIX`]), and only there: how its change is
+    /// judged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unaccounted: Option<UnaccountedEntry>,
 }
 
 /// Journal-compatible measured value. Only explicitly cash-exact singleton
@@ -69,6 +165,66 @@ pub struct ValueRange {
     pub hi: Decimal,
     #[serde(default)]
     pub cash_exact: bool,
+}
+
+impl Flow {
+    /// Whether it stands for a ledger entry the caller cannot account for
+    /// ([`UNKNOWN_TYPE_ID_PREFIX`]).
+    pub fn unknown_type(&self) -> bool {
+        self.id.starts_with(UNKNOWN_TYPE_ID_PREFIX)
+    }
+
+    /// Whether it is well formed: a flow for an entry the caller cannot
+    /// account for is a transfer of nothing between the accounts, without a
+    /// value, with a watched gap in bounds and a credit of 0 or more (more
+    /// only under [`UnaccountedRule::Rebasable`]); no other flow carries an
+    /// [`UnaccountedEntry`]. The writer refuses such a flow, and the reader
+    /// a record that lists one.
+    pub fn check(&self) -> Result<(), String> {
+        let Some(entry) = &self.unaccounted else {
+            return if self.unknown_type() {
+                Err(format!("the flow {} has no watched gap", self.id))
+            } else {
+                Ok(())
+            };
+        };
+        if !self.unknown_type() {
+            return Err(format!(
+                "the flow {} has a watched gap but stands for no entry the caller cannot account for",
+                self.id
+            ));
+        }
+        if !(1..=UNKNOWN_TYPE_GAP_MAX_MS).contains(&entry.watched_gap_ms) {
+            return Err(format!(
+                "the flow {} has a watched gap of {} ms, outside 1 to {UNKNOWN_TYPE_GAP_MAX_MS}",
+                self.id, entry.watched_gap_ms
+            ));
+        }
+        if entry.credit < Decimal::ZERO
+            || (!entry.credit.is_zero() && entry.rule != UnaccountedRule::Rebasable)
+        {
+            return Err(format!(
+                "the flow {} reads a credit of {} under the rule {:?}",
+                self.id, entry.credit, entry.rule
+            ));
+        }
+        if !self.amount.is_zero() || !self.between || self.value.is_some() {
+            return Err(format!(
+                "the flow {} stands for an entry the caller cannot account for, but books an amount, a dex or a value",
+                self.id
+            ));
+        }
+        Ok(())
+    }
+
+    /// Whether, in a span of flows whose value is unknown, it lets the
+    /// change across the span be taken as the money of an entry the caller
+    /// cannot account for: such an entry, or a transfer between two of the
+    /// accounts of nothing (which on its own moves no money and never
+    /// halts).
+    fn rebasable(&self) -> bool {
+        self.unknown_type() || (self.amount.is_zero() && self.between)
+    }
 }
 
 impl ValueRange {
@@ -118,6 +274,33 @@ pub struct WaivedStop {
     pub measured: bool,
     /// Why otherwise exact arithmetic could not be represented.
     pub reason: Option<String>,
+    /// What became of a ledger entry the caller cannot account for, when
+    /// it was not taken as its money ([`UNKNOWN_TYPE_ID_PREFIX`]).
+    pub unaccounted: Option<Unaccounted>,
+}
+
+/// Why the change around a ledger entry the caller cannot account for was
+/// not taken as its money ([`UNKNOWN_TYPE_ID_PREFIX`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Unaccounted {
+    /// The caller was not watching the account around it (the first view
+    /// that shows it further than its watched gap from the last view
+    /// taken), and the account rose or held: the day halted, as for any
+    /// flow whose value is unknown.
+    NotWatched,
+    /// A rise bigger than the day's room or budget allowed: the day halted,
+    /// as for any flow whose value is unknown.
+    RiseBeyondRoom,
+    /// A fall not taken as its money (its type not on the list, not
+    /// watched, or bigger than the room or the day's budget): it counts as
+    /// the loss it shows (the engine's own stops decide).
+    CountedAsLoss,
+    /// A rise beside a type whose change is never taken as money
+    /// ([`UnaccountedRule::Strict`]): the day halted.
+    RiseNotRebased,
+    /// A type the caller reads as carrying a credit in dollars
+    /// ([`UnaccountedRule::Halts`]): the day halted, a fall counted.
+    Halted,
 }
 
 /// Where a view stands to a flow: before it, showing it, or too close to
@@ -217,6 +400,19 @@ pub(crate) struct Fold {
     deferred_origin: Option<RiskEngine>,
     /// The stops waived so far.
     pub(crate) waived: Vec<WaivedStop>,
+    /// The venue's time of each dex in the last view the engine took (at
+    /// the start, the horizon it starts from; none for a journal that has
+    /// seen no view): how close a view showing an entry the caller cannot
+    /// account for is to it ([`UnaccountedEntry::watched_gap_ms`]). A view
+    /// left out does not move it. A replay starts it at its base's
+    /// horizon: a base is a record written while no flow was pending
+    /// (`risk_store::flow_book`), and a view is left out only beside a flow
+    /// not applied yet (one that may or may not show it, or a group that
+    /// cannot be applied yet), so that horizon is the last view taken.
+    taken: Option<Horizon>,
+    /// The day's budget for re-bases of entries the caller cannot account
+    /// for ([`RebaseBudget`]).
+    pub(crate) budget: Option<RebaseBudget>,
 }
 
 /// What [`Fold::view`] did with a view.
@@ -246,16 +442,23 @@ enum Measured {
 }
 
 impl Fold {
-    pub(crate) fn new(limits: RiskLimits, engine: RiskEngine, horizon: Horizon) -> Self {
+    pub(crate) fn new(
+        limits: RiskLimits,
+        engine: RiskEngine,
+        horizon: Horizon,
+        budget: Option<RebaseBudget>,
+    ) -> Self {
         Self {
             limits,
             engine,
-            horizon,
+            budget,
             flows: Vec::new(),
             placed: Vec::new(),
             views: 0,
             deferred_origin: None,
             waived: Vec::new(),
+            taken: (!horizon.is_empty()).then(|| horizon.clone()),
+            horizon,
         }
     }
 
@@ -304,7 +507,7 @@ impl Fold {
                 (a.time_ms, &a.id).cmp(&(b.time_ms, &b.id))
             });
             // A group that cannot be applied leaves the view out.
-            if self.group(&shows, view.equity, at)? {
+            if self.group(&shows, view, at)? {
                 for i in &shows {
                     self.placed[*i] = Some(index);
                 }
@@ -319,6 +522,7 @@ impl Fold {
             return Ok(Step::Left);
         }
         self.engine.observe(at, view.equity);
+        self.taken = Some(view.times.clone());
         Ok(Step::Taken { applied: shows })
     }
 
@@ -327,13 +531,15 @@ impl Fold {
     /// observed at `at`. `false` when the view is left out: the account is
     /// empty at it after a withdrawal, or no value of the account at the
     /// flows fits them.
-    fn group(&mut self, group: &[usize], shown: Decimal, at: Timestamp) -> Result<bool, String> {
+    fn group(&mut self, group: &[usize], view: &SeenView, at: Timestamp) -> Result<bool, String> {
         let flows: Vec<Flow> = group.iter().map(|i| self.flows[*i].clone()).collect();
         let mut trial = self.clone();
         if let Some(origin) = &self.deferred_origin {
             trial.engine = origin.clone();
         }
-        let measured = trial.measure(&flows, shown, at)?;
+        let watched = self.watched(&flows, &view.times);
+        let mut budget = self.budget.clone();
+        let measured = trial.measure(&flows, view.equity, at, watched, &mut budget)?;
         let (merged, undecided, applied, failure) = match measured {
             Measured::Applied(snapshot, report) => (snapshot, report, true, None),
             Measured::Deferred(snapshot, report) => (snapshot, report, false, None),
@@ -344,6 +550,7 @@ impl Fold {
         let merged = settle(&self.limits, &self.engine.snapshot(), &merged)?;
         if applied {
             self.deferred_origin = None;
+            self.budget = budget;
         } else if self.deferred_origin.is_none() {
             self.deferred_origin = Some(self.engine.clone());
         }
@@ -356,19 +563,117 @@ impl Fold {
         Ok(applied)
     }
 
+    /// Whether the caller watched the account around the entries it cannot
+    /// account for among `flows`, shown by a view whose dexes the venue
+    /// showed at `times`: every dex of it at most the smallest of their
+    /// watched gaps ([`UnaccountedEntry::watched_gap_ms`]) after the last view the
+    /// engine took (a dex that view did not have, or no view taken, is not
+    /// watched).
+    fn watched(&self, flows: &[Flow], times: &BTreeMap<String, i64>) -> bool {
+        let gap = flows
+            .iter()
+            .filter(|flow| flow.unknown_type())
+            .filter_map(|flow| flow.unaccounted.as_ref().map(|entry| entry.watched_gap_ms))
+            .min();
+        let (Some(gap), Some(taken)) = (gap, &self.taken) else {
+            return false;
+        };
+        !times.is_empty()
+            && times.iter().all(|(dex, time)| {
+                taken
+                    .get(dex)
+                    .is_some_and(|before| time.saturating_sub(*before) <= gap)
+            })
+    }
+
+    /// Whether a change of `change` around entries the caller cannot
+    /// account for, from `base` at `time`, may be taken as their money: a
+    /// loss its size would leave the engine active ([`within_room`]), and
+    /// the day's re-bases with it stay below the room the stops allowed at
+    /// the day's first one ([`RebaseBudget`]; started here when the day has
+    /// none). Uses the budget when it fits.
+    fn fits(
+        &self,
+        engine: &RiskEngine,
+        time: Timestamp,
+        base: Decimal,
+        change: Decimal,
+        budget: &mut Option<RebaseBudget>,
+    ) -> bool {
+        if !within_room(engine, time, base, change) {
+            return false;
+        }
+        let snapshot = engine.snapshot();
+        // Shares of the day's start (or the cap where smaller), as the
+        // engine measures a day's loss.
+        let against = self
+            .limits
+            .max_trading_equity_usd
+            .map_or(snapshot.day_start, |cap| snapshot.day_start.min(cap));
+        if against <= Decimal::ZERO {
+            return false;
+        }
+        let mut current = match budget {
+            Some(existing) if existing.day == snapshot.day => existing.clone(),
+            _ => match room(&self.limits, &snapshot, base)
+                .and_then(|room| room.checked_div(against))
+            {
+                Some(room) => RebaseBudget {
+                    day: snapshot.day,
+                    room,
+                    used: Decimal::ZERO,
+                },
+                None => return false,
+            },
+        };
+        let Some(used) = change
+            .abs()
+            .checked_div(against)
+            .and_then(|share| current.used.checked_add(share))
+        else {
+            return false;
+        };
+        if used >= current.room {
+            return false;
+        }
+        current.used = used;
+        *budget = Some(current);
+        true
+    }
+
     /// Judge exact chronological checkpoints. Unknown spans carry only
     /// known money movements; their right anchor normalizes existing loss
     /// rather than inferring new trading losses across missing history.
-    fn measure(&self, flows: &[Flow], shown: Decimal, at: Timestamp) -> Result<Measured, String> {
+    /// `watched`: the caller watched the account around the entries it
+    /// cannot account for among `flows` ([`Self::watched`]).
+    fn measure(
+        &self,
+        flows: &[Flow],
+        shown: Decimal,
+        at: Timestamp,
+        watched: bool,
+        budget: &mut Option<RebaseBudget>,
+    ) -> Result<Measured, String> {
         let mut proof = self.engine.clone();
-        match self.measure_inner(flows, shown, at, &mut proof) {
+        match self.measure_inner(flows, shown, at, watched, budget, &mut proof) {
             Ok(measured) => Ok(measured),
             Err(failure) => {
                 let (invariant, why) = match failure {
                     MeasurementFailure::Arithmetic(why) => (false, why),
                     MeasurementFailure::Invariant(why) => (true, why),
                 };
-                let Measured::Deferred(snapshot, mut report) = self.defer(&proof, true, at)? else {
+                // A group of entries the caller cannot account for, watched
+                // around them, only defers (entries stay blocked while it
+                // is pending): it never halts the day by itself. Any other
+                // group halts, as before. In practice no such group fails
+                // here: it is re-based only while the engine is active with
+                // room for the change (`within_room`), where the rebase's
+                // fraction is below the drawdown stop and its divisions are
+                // of positive, representable figures; the other outcomes
+                // only observe the view or normalise as any unknown span.
+                let halts = !(watched && flows.iter().all(Flow::rebasable));
+                let Measured::Deferred(snapshot, mut report) = self.defer(&proof, halts, at)?
+                else {
                     return Err("invalid deferred measurement result".to_owned());
                 };
                 if let Some(report) = &mut report {
@@ -390,10 +695,13 @@ impl Fold {
         flows: &[Flow],
         shown: Decimal,
         at: Timestamp,
+        watched: bool,
+        budget: &mut Option<RebaseBudget>,
         engine: &mut RiskEngine,
     ) -> Result<Measured, MeasurementFailure> {
         if flows.iter().all(|flow| {
             flow.amount.is_zero()
+                && !flow.unknown_type()
                 && flow
                     .value
                     .and_then(|value| value.trusted(flow.amount))
@@ -401,7 +709,11 @@ impl Fold {
         }) {
             return Ok(Measured::Applied(self.engine.snapshot(), None));
         }
+        // An unknown span halts the day, unless it is only entries the
+        // caller cannot account for (`UNKNOWN_TYPE_ID_PREFIX`).
         let mut unknown = false;
+        // What became of such entries, when not taken as their money.
+        let mut unaccounted: Option<Unaccounted> = None;
         // Keep the pre-empty checkpoint and its external withdrawal until
         // refill. An emptying transfer is not a trading loss to zero.
         let mut emptied: Option<(Decimal, Flow)> = None;
@@ -409,7 +721,7 @@ impl Fold {
         while index < flows.len() {
             let flow = &flows[index];
             let value = flow.value.and_then(|value| value.trusted(flow.amount));
-            if flow.amount.is_zero() && value.is_none() {
+            if flow.amount.is_zero() && value.is_none() && !flow.unknown_type() {
                 index += 1;
                 continue;
             }
@@ -429,6 +741,7 @@ impl Fold {
                             after
                                 .checked_sub(*from)
                                 .ok_or_else(|| "refill overflow".to_owned())?,
+                            false,
                         )
                         .ok_or_else(|| "exact refill cannot be rebased".to_owned())?;
                         emptied = None;
@@ -441,14 +754,20 @@ impl Fold {
                     } else if after.is_zero() {
                         emptied = Some((value, flow.clone()));
                     } else {
-                        move_flow(engine, &self.limits, flow.time_ms, value, flow.amount)
-                            .ok_or_else(|| "exact flow cannot be rebased".to_owned())?;
+                        move_flow(
+                            engine,
+                            &self.limits,
+                            flow.time_ms,
+                            value,
+                            flow.amount,
+                            false,
+                        )
+                        .ok_or_else(|| "exact flow cannot be rebased".to_owned())?;
                     }
                 }
                 index += 1;
                 continue;
             }
-            unknown = true;
             let begin = index;
             // A zero cash checkpoint cannot safely normalize a nonzero
             // loss base. Keep its money in the span until a positive anchor.
@@ -472,11 +791,102 @@ impl Fold {
             } else {
                 (shown, at)
             };
+            let span = &flows[begin..index];
+            if emptied.is_none()
+                && span.iter().all(Flow::rebasable)
+                && span.iter().any(Flow::unknown_type)
+            {
+                // Entries the caller cannot account for: the change from the
+                // last equity to the right anchor, observed at the first of
+                // them (a day rolls there), judged by the strictest rule
+                // among them.
+                let entries: Vec<&UnaccountedEntry> = span
+                    .iter()
+                    .filter_map(|flow| flow.unaccounted.as_ref())
+                    .collect();
+                let rule = entries
+                    .iter()
+                    .map(|entry| entry.rule)
+                    .max()
+                    .unwrap_or(UnaccountedRule::Halts);
+                let first = span[0].time_ms;
+                let first_at = Timestamp::from_millis(first);
+                let before = engine.snapshot().last;
+                engine.observe(first_at, before);
+                match rule {
+                    UnaccountedRule::Halts => {
+                        unaccounted.get_or_insert(Unaccounted::Halted);
+                        if right < before {
+                            // Counted as the loss it shows, and the day
+                            // halts (`unknown`).
+                            unknown = true;
+                            continue;
+                        }
+                    }
+                    UnaccountedRule::Strict => {
+                        if right <= before {
+                            if right < before {
+                                unaccounted.get_or_insert(Unaccounted::CountedAsLoss);
+                            }
+                            continue;
+                        }
+                        unaccounted.get_or_insert(Unaccounted::RiseNotRebased);
+                    }
+                    UnaccountedRule::Rebasable => {
+                        // A readable credit first, as money in (stricter
+                        // only: the rest is judged after it).
+                        let mut credit = Decimal::ZERO;
+                        for entry in &entries {
+                            credit = credit
+                                .checked_add(entry.credit)
+                                .ok_or_else(|| "unknown entry credit overflow".to_owned())?;
+                        }
+                        let mut base = before;
+                        if credit > Decimal::ZERO && before > Decimal::ZERO {
+                            move_flow(engine, &self.limits, first, before, credit, false)
+                                .ok_or_else(|| {
+                                    "an unknown entry's credit cannot be applied".to_owned()
+                                })?;
+                            base = before
+                                .checked_add(credit)
+                                .ok_or_else(|| "unknown entry credit overflow".to_owned())?;
+                        }
+                        let change = right
+                            .checked_sub(base)
+                            .ok_or_else(|| "unknown entry amount overflow".to_owned())?;
+                        if change.is_zero() {
+                            continue;
+                        }
+                        if watched && self.fits(engine, first_at, base, change, budget) {
+                            // Watched around them, within the room and the
+                            // day's budget: their money, the peak never
+                            // lowered.
+                            move_flow(engine, &self.limits, first, base, change, true)
+                                .ok_or_else(|| "an unknown entry cannot be rebased".to_owned())?;
+                            continue;
+                        }
+                        if change < Decimal::ZERO {
+                            // Not watched, or bigger than the room or the
+                            // budget: it counts as the loss it shows, so a
+                            // liquidation-sized loss halts or stops the
+                            // engine by its own rules.
+                            unaccounted.get_or_insert(Unaccounted::CountedAsLoss);
+                            continue;
+                        }
+                        unaccounted.get_or_insert(if watched {
+                            Unaccounted::RiseBeyondRoom
+                        } else {
+                            Unaccounted::NotWatched
+                        });
+                    }
+                }
+            }
+            unknown = true;
             let mut gap = Vec::new();
             if let Some((_, withdrawal)) = emptied.take() {
                 gap.push(withdrawal);
             }
-            gap.extend_from_slice(&flows[begin..index]);
+            gap.extend_from_slice(span);
             if right <= Decimal::ZERO {
                 return self
                     .defer(engine, unknown, at)
@@ -494,12 +904,13 @@ impl Fold {
         if unknown && !matches!(snapshot.state, RiskState::Stopped { .. }) {
             snapshot.state = RiskState::HaltedForDay { day: snapshot.day };
         }
-        let report = unknown.then_some(WaivedStop {
+        let report = (unknown || unaccounted.is_some()).then_some(WaivedStop {
             at,
             waived: Decimal::ZERO,
             kept: Decimal::ZERO,
             measured: false,
             reason: None,
+            unaccounted,
         });
         Ok(Measured::Applied(snapshot, report))
     }
@@ -530,6 +941,7 @@ impl Fold {
                 kept: Decimal::ZERO,
                 measured: false,
                 reason: None,
+                unaccounted: None,
             }),
         ))
     }
@@ -623,6 +1035,7 @@ impl Fold {
                         flow.time_ms,
                         from,
                         after.checked_sub(from)?,
+                        false,
                     )?;
                     emptied = None;
                 }
@@ -640,6 +1053,7 @@ impl Fold {
                         flow.time_ms,
                         balance,
                         flow.amount,
+                        false,
                     )?;
                 }
             }
@@ -662,15 +1076,62 @@ fn share(limits: &RiskLimits, peak: Decimal, equity: Decimal) -> Decimal {
         .unwrap_or(Decimal::ONE)
 }
 
+/// Whether a loss the size of `change` from `before`, counted as trading at
+/// `time`, would leave the engine active (it is active now, and neither the
+/// daily stop nor the drawdown stop would be reached): how big a change of
+/// the equity around a ledger entry the caller cannot account for may be
+/// taken as its money ([`UNKNOWN_TYPE_ID_PREFIX`]). The same bound for a
+/// rise as for a fall: an unknown credit may hide a trading loss up to its
+/// size. Never across nothing.
+pub(crate) fn within_room(
+    engine: &RiskEngine,
+    time: Timestamp,
+    before: Decimal,
+    change: Decimal,
+) -> bool {
+    if engine.state() != RiskState::Active {
+        return false;
+    }
+    let Some(after) = before.checked_sub(change.abs()) else {
+        return false;
+    };
+    if after <= Decimal::ZERO {
+        return false;
+    }
+    let mut trial = engine.clone();
+    trial.observe(time, after) == RiskState::Active
+}
+
+/// The loss, in dollars from `equity`, at which the engine with figures
+/// `snapshot` would halt the day or stop: the smaller of the daily stop's
+/// and the drawdown stop's (each against its base, or the equity cap where
+/// smaller, as the engine measures), not below 0. `None` on overflow.
+fn room(limits: &RiskLimits, snapshot: &RiskSnapshot, equity: Decimal) -> Option<Decimal> {
+    let cap = limits.max_trading_equity_usd;
+    let against = |base: Decimal| cap.map_or(base, |cap| base.min(cap));
+    let day = limits
+        .daily_loss_stop
+        .checked_mul(against(snapshot.day_start))?
+        .checked_sub(snapshot.day_start.checked_sub(equity)?)?;
+    let drawdown = limits
+        .drawdown_stop
+        .checked_mul(against(snapshot.peak))?
+        .checked_sub(snapshot.peak.checked_sub(equity)?)?;
+    Some(day.min(drawdown).max(Decimal::ZERO))
+}
+
 /// Move the engine's peak and day's start for a flow of `amount` at the
 /// equity `before` just before it, the engine having observed `before` at
-/// the flow's time. `None` when they cannot be moved.
+/// the flow's time. `None` when they cannot be moved. With `keep_peak`, a
+/// fall leaves the peak where it was (an entry the caller cannot account
+/// for: the fall counts toward the drawdown stop).
 fn move_flow(
     engine: &mut RiskEngine,
     limits: &RiskLimits,
     time_ms: i64,
     before: Decimal,
     amount: Decimal,
+    keep_peak: bool,
 ) -> Option<()> {
     if amount.is_zero() {
         return Some(());
@@ -678,7 +1139,11 @@ fn move_flow(
     let cap = limits.max_trading_equity_usd;
     let snapshot = engine.snapshot();
     let after = before.checked_add(amount)?;
-    let peak = rebase(snapshot.peak, before, after, cap)?.max(after);
+    let peak = if keep_peak && amount < Decimal::ZERO {
+        snapshot.peak.max(after)
+    } else {
+        rebase(snapshot.peak, before, after, cap)?.max(after)
+    };
     let mut day_start = rebase(snapshot.day_start, before, after, cap).or_else(|| {
         // A permanent stop can roll midnight with last equity zero. Its
         // daily loss fraction is then undefined; a verified positive cash
@@ -717,22 +1182,27 @@ pub(crate) struct Replayed {
     pub(crate) placed: Vec<Option<usize>>,
     /// The stops waived on the way.
     pub(crate) waived: Vec<WaivedStop>,
+    /// The day's re-base budget after it ([`RebaseBudget`]).
+    pub(crate) budget: Option<RebaseBudget>,
 }
 
-/// Fold `views` with `flows` from the engine state `base` and its horizon.
+/// Fold `views` with `flows` from the engine state `base` and its horizon
+/// and re-base budget.
 /// The writer and the reader of the journal both compute a `flowed`
 /// record's state with this and [`settle`].
 pub(crate) fn replay(
     limits: &RiskLimits,
     base: &RiskSnapshot,
     horizon: &Horizon,
+    budget: Option<&RebaseBudget>,
     views: &[SeenView],
     flows: &[Flow],
 ) -> Result<Replayed, String> {
     let engine = RiskEngine::restore(limits.clone(), base.clone())
         .map_err(|error| format!("the base: {error}"))?;
-    let mut fold = Fold::new(limits.clone(), engine, horizon.clone());
+    let mut fold = Fold::new(limits.clone(), engine, horizon.clone(), budget.cloned());
     for flow in flows {
+        flow.check()?;
         fold.add_flow(flow.clone());
     }
     for view in views {
@@ -743,6 +1213,7 @@ pub(crate) fn replay(
         horizon: fold.horizon,
         placed: fold.placed,
         waived: fold.waived,
+        budget: fold.budget,
     })
 }
 

@@ -9,8 +9,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use zunder_risk::{RiskLimits, RiskSnapshot, RiskState};
 
-use super::record::{JOURNAL_VERSION, JournalEvent, JournalRecord};
-use crate::flows::{self, Flow, Horizon, SeenView};
+use super::record::{FLOWS_VERSION, JournalEvent, JournalRecord, UNACCOUNTED_VERSION};
+use crate::flows::{self, Flow, Horizon, RebaseBudget, SeenView};
 
 /// Whether the engine can get from `before` to `after` in one record. A
 /// `flowed` record is checked further by [`check_flowed`].
@@ -19,16 +19,33 @@ pub(super) fn check_step(before: &JournalRecord, after: &JournalRecord) -> Resul
     if new.day < old.day {
         return Err(format!("the day went back from {} to {}", old.day, new.day));
     }
-    // The fields of an engine that takes flows, only in version 3.
+    // The fields of an engine that takes flows, only in version 3 and on.
     let flowed = matches!(after.event, JournalEvent::Flowed { .. });
-    if (after.version >= JOURNAL_VERSION) != after.horizon.is_some() {
-        return Err("a horizon in a record of version 3, and only there".into());
+    if (after.version >= FLOWS_VERSION) != after.horizon.is_some() {
+        return Err("a horizon in a record of version 3 or later, and only there".into());
     }
     if (flowed || after.view.is_some()) && after.horizon.is_none() {
         return Err("a flowed record or a view without a horizon".into());
     }
     if flowed && after.view.is_some() {
         return Err("a flowed record lists its views in the event".into());
+    }
+    // The re-base budget: from version 4 on, in an engine that takes flows;
+    // changed only by a `flowed` record (checked there), cleared by a review.
+    if after.budget.is_some() && (after.version < UNACCOUNTED_VERSION || after.horizon.is_none()) {
+        return Err(
+            "a re-base budget outside a version 4 record of an engine that takes flows".into(),
+        );
+    }
+    let budget_kept = match &after.event {
+        JournalEvent::Flowed { .. } => true,
+        JournalEvent::Initialised { .. } | JournalEvent::ResumedAfterReview { .. } => {
+            after.budget.is_none()
+        }
+        _ => after.horizon.is_none() || after.budget == before.budget,
+    };
+    if !budget_kept {
+        return Err("the re-base budget changed outside a flowed record".into());
     }
     if let Some(horizon) = &after.horizon {
         if let Some(previous) = &before.horizon
@@ -339,6 +356,7 @@ pub(super) fn check_flowed(
     limits: &RiskLimits,
     base: &RiskSnapshot,
     base_horizon: &Horizon,
+    base_budget: Option<&RebaseBudget>,
     before: &JournalRecord,
     after: &JournalRecord,
 ) -> Result<flows::Replayed, String> {
@@ -358,6 +376,18 @@ pub(super) fn check_flowed(
     if views.windows(2).any(|pair| pair[1].at < pair[0].at) {
         return Err("views out of order".into());
     }
+    // A flow for a ledger entry the caller cannot account for exists from
+    // version 4 on: a version 3 build replays it as another flow.
+    if after.version < UNACCOUNTED_VERSION
+        && flow_list
+            .iter()
+            .any(|flow| flow.unknown_type() || flow.unaccounted.is_some())
+    {
+        return Err(format!(
+            "a version {} record lists a flow for a ledger entry the caller cannot account for (version {UNACCOUNTED_VERSION} on)",
+            after.version
+        ));
+    }
     let mut latest = base_horizon.clone();
     for view in views {
         if flows::goes_back(&view.times, &latest) {
@@ -368,7 +398,7 @@ pub(super) fn check_flowed(
             *entry = (*entry).max(*time);
         }
     }
-    let replayed = flows::replay(limits, base, base_horizon, views, flow_list)?;
+    let replayed = flows::replay(limits, base, base_horizon, base_budget, views, flow_list)?;
     let settled = flows::settle(limits, &before.state, &replayed.snapshot)?;
     if settled != after.state {
         return Err(format!(
@@ -383,6 +413,12 @@ pub(super) fn check_flowed(
     }
     if after.horizon.as_ref() != Some(&horizon) {
         return Err("the horizon is not the one the flows give".into());
+    }
+    if after.budget != replayed.budget {
+        return Err(format!(
+            "the flows give the re-base budget {:?}, the record holds {:?}",
+            replayed.budget, after.budget
+        ));
     }
     Ok(replayed)
 }

@@ -16,7 +16,7 @@ from guard_harness.homebrew_stage import Tap, _sha
 from guard_harness.native_release import Release
 from guard_harness.promotion_registry import sentinel, withdraw_latest
 from guard_harness.publication import USER_AGENT, _NoRedirect
-from guard_harness.runner import run
+from guard_harness.runner import RunError, run
 
 IMAGE = "ghcr.io/zunderlabs/zunder-guard"
 REPOSITORY = "zunderlabs/zunder-guard"
@@ -41,6 +41,21 @@ def public_get(url: str, *, headers: dict[str, str] | None = None) -> tuple[byte
         raise AttestationError("public channel snapshot failed") from None
     except (OSError, urllib.error.URLError):
         raise AttestationError("public channel snapshot failed") from None
+
+
+def _not_found(log: Path) -> bool:
+    """Whether a failed `gh api` call's retained output is exactly GitHub's 404 answer."""
+    try:
+        text = log.read_text(encoding="utf-8")
+        body, end = json.JSONDecoder().raw_decode(text)
+    except (OSError, ValueError):
+        return False
+    return (
+        isinstance(body, dict)
+        and body.get("message") == "Not Found"
+        and body.get("status") == "404"
+        and text[end:] == "gh: Not Found (HTTP 404)\n"
+    )
 
 
 def image_snapshot(tag: str) -> tuple[str, bytes] | None:
@@ -113,6 +128,20 @@ class Channels:
         )
         return json.loads(result.output)
 
+    def github_latest(self) -> Any | None:
+        """GitHub latest through the authenticated API, never the ~60 s public cache.
+
+        gh api exits 1 on any HTTP error. Only GitHub's exact 404 answer (no latest
+        release) is None; every other failure stays a failure. A 404 also answers a
+        repository the token cannot read, so callers read a positive control first.
+        """
+        try:
+            return self.github("GET", "releases/latest")
+        except RunError:
+            if _not_found(self.work / f"github-{self.sequence}.log"):
+                return None
+            raise
+
     def snapshot(self) -> dict[str, Any]:
         head = self.tap.request("GET", "git/ref/heads/main")
         old = _sha(head["object"]["sha"])
@@ -139,8 +168,11 @@ class Channels:
             expected = build["distribution"]["docker"]["digest"]
         if latest != expected:
             raise AttestationError("OCI latest differs from prior authenticated canonical release")
-        response = public_get(f"https://api.github.com/repos/{REPOSITORY}/releases/latest")
-        github_latest = None if response is None else json.loads(response[0])
+        # The candidate read is the positive control that makes a latest 404 mean "none".
+        candidate = self.github("GET", "releases/tags/" + self.release.tag)
+        if candidate.get("tag_name") != self.release.tag or candidate.get("draft"):
+            raise AttestationError("candidate release is not the staged public release")
+        github_latest = self.github_latest()
         if self.previous is None:
             if github_latest is not None:
                 raise AttestationError(
@@ -155,9 +187,6 @@ class Channels:
             raise AttestationError(
                 "GitHub latest differs from prior authenticated canonical release"
             )
-        candidate = self.github("GET", "releases/tags/" + self.release.tag)
-        if candidate.get("tag_name") != self.release.tag or candidate.get("draft"):
-            raise AttestationError("candidate release is not the staged public release")
         return {
             "tap_before": old,
             "tap_tree_before": tree,
@@ -236,32 +265,46 @@ class Channels:
             raise AttestationError("GitHub latest promotion readback differs")
         self.save(snapshot)
 
+    def rollback_tap(self, snapshot: dict[str, Any]) -> None:
+        if self._tap is None:
+            # No tap credential, so no restoration; but a tap this promotion never moved
+            # needs none. Its live head, read with the job's token as prepare reads the
+            # public tap, must still be exactly the signed pre-mutation head; anything
+            # else, a failed read included, stays a tap failure.
+            reader = Tap(token=os.environ.get("GH_TOKEN", ""), logs=self.work / "logs/tap-read")
+            current = _sha(reader.request("GET", "git/ref/heads/main")["object"]["sha"])
+            if current != _sha(snapshot["tap_before"]):
+                raise AttestationError("tap moved and its rollback credential is unavailable")
+            return
+        current = _sha(self.tap.request("GET", "git/ref/heads/main")["object"]["sha"])
+        if current == snapshot["tap_before"]:
+            return
+        commit = self.tap.request("GET", f"git/commits/{current}")
+        parents = [item["sha"] for item in commit["parents"]]
+        promoted_tree = self.tap_tree(
+            snapshot["tap_tree_before"], self.release.asset("zunder-guard.rb")
+        )
+        already_restored = False
+        if commit["tree"]["sha"] == snapshot["tap_tree_before"] and len(parents) == 1:
+            parent = self.tap.request("GET", f"git/commits/{parents[0]}")
+            already_restored = [item["sha"] for item in parent["parents"]] == [
+                snapshot["tap_before"]
+            ] and parent["tree"]["sha"] == promoted_tree
+        if not already_restored and (
+            parents != [snapshot["tap_before"]] or commit["tree"]["sha"] != promoted_tree
+        ):
+            raise AttestationError("tap head changed outside this promotion")
+        if not already_restored:
+            self.tap_commit(
+                current,
+                snapshot["tap_tree_before"],
+                "Rollback zunder-guard " + self.release.tag,
+            )
+
     def rollback(self, snapshot: dict[str, Any]) -> list[str]:
         failures: list[str] = []
         try:
-            current = _sha(self.tap.request("GET", "git/ref/heads/main")["object"]["sha"])
-            if current != snapshot["tap_before"]:
-                commit = self.tap.request("GET", f"git/commits/{current}")
-                parents = [item["sha"] for item in commit["parents"]]
-                promoted_tree = self.tap_tree(
-                    snapshot["tap_tree_before"], self.release.asset("zunder-guard.rb")
-                )
-                already_restored = False
-                if commit["tree"]["sha"] == snapshot["tap_tree_before"] and len(parents) == 1:
-                    parent = self.tap.request("GET", f"git/commits/{parents[0]}")
-                    already_restored = [item["sha"] for item in parent["parents"]] == [
-                        snapshot["tap_before"]
-                    ] and parent["tree"]["sha"] == promoted_tree
-                if not already_restored and (
-                    parents != [snapshot["tap_before"]] or commit["tree"]["sha"] != promoted_tree
-                ):
-                    raise AttestationError("tap head changed outside this promotion")
-                if not already_restored:
-                    self.tap_commit(
-                        current,
-                        snapshot["tap_tree_before"],
-                        "Rollback zunder-guard " + self.release.tag,
-                    )
+            self.rollback_tap(snapshot)
         except Exception:
             failures.append("tap")
         try:
@@ -290,20 +333,21 @@ class Channels:
         except Exception:
             failures.append("image")
         try:
-            observed = public_get(f"https://api.github.com/repos/{REPOSITORY}/releases/latest")
-            latest_id = None if observed is None else json.loads(observed[0]).get("id")
-            allowed = {
-                None if snapshot["github_before"] is None else snapshot["github_before"]["id"],
-                snapshot["candidate_release_id"],
-            }
-            if latest_id not in allowed:
-                raise AttestationError("GitHub latest changed outside this promotion")
+            # Candidate first: the positive control for an authenticated latest 404.
             candidate = self.github("GET", f"releases/{snapshot['candidate_release_id']}")
             if (
                 candidate.get("id") != snapshot["candidate_release_id"]
                 or candidate.get("tag_name") != self.release.tag
             ):
                 raise AttestationError("captured GitHub release identity changed")
+            current_latest = self.github_latest()
+            latest_id = None if current_latest is None else current_latest.get("id")
+            allowed = {
+                None if snapshot["github_before"] is None else snapshot["github_before"]["id"],
+                snapshot["candidate_release_id"],
+            }
+            if latest_id not in allowed:
+                raise AttestationError("GitHub latest changed outside this promotion")
             if snapshot["github_before"] is not None:
                 old = self.github("GET", f"releases/{snapshot['github_before']['id']}")
                 if (

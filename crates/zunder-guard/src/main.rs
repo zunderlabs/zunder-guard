@@ -856,12 +856,22 @@ fn validate_service_init_args(args: &InitArgs) -> Result<()> {
 async fn run_init(paths: &Paths, args: InitArgs) -> Result<()> {
     validate_service_init_args(&args)?;
     let service_setup = args.service_setup.is_some();
+    // The service's runtime config gets the ACL its admission requires, not
+    // the installing person's owner-only file (which that admission refuses).
+    let mut config_access = init::ConfigAccess::OwnerOnly;
     if let Some(identity) = &args.service_setup {
         #[cfg(windows)]
-        zunder_guard::service::windows::validate_setup(&paths.home, &paths.config, identity)?;
+        {
+            let service_sid = zunder_guard::service::windows::validate_setup(
+                &paths.home,
+                &paths.config,
+                identity,
+            )?;
+            config_access = init::ConfigAccess::WindowsService { service_sid };
+        }
         #[cfg(not(windows))]
         {
-            let _ = identity;
+            let _ = (identity, &mut config_access);
             bail!("--service-setup is for Windows SCM staging only");
         }
     }
@@ -893,6 +903,7 @@ async fn run_init(paths: &Paths, args: InitArgs) -> Result<()> {
         }),
         licence: args.licence,
         licence_issuers: None,
+        config_access,
     };
     let base = paths
         .config
@@ -2192,11 +2203,8 @@ fn service_command(paths: &Paths, command: ServiceCommand) -> Result<()> {
                 );
             }
         }
-        ServiceCommand::Run { binding } => {
-            let path = fs::canonicalize(binding)?;
-            let binding = service::load_binding(&path)?;
-            service::run(&binding, &path)?;
-        }
+        // Admission happens inside: on Windows only after connecting to SCM.
+        ServiceCommand::Run { binding } => service::run(&binding)?,
         ServiceCommand::MigrateCredential {
             binding,
             next_binding,

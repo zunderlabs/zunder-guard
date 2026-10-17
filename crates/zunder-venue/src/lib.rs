@@ -23,7 +23,11 @@ pub mod hyperliquid;
 pub mod owner_only;
 pub mod risk_store;
 
-pub use flows::{FLOW_TIME_MARGIN_MS, Flow, Horizon, SeenView, ValueRange, WaivedStop, rebase};
+pub use flows::{
+    FLOW_TIME_MARGIN_MS, Flow, Horizon, RebaseBudget, SeenView, UNKNOWN_TYPE_GAP_MAX_MS,
+    UNKNOWN_TYPE_ID_PREFIX, Unaccounted, UnaccountedEntry, UnaccountedRule, ValueRange, WaivedStop,
+    rebase,
+};
 pub use risk_store::{
     EngineHandle, FLOW_READ_BACK_MS, FlattenOutcome, FlowOutcome, JOURNAL_FORMAT, JOURNAL_VERSION,
     JournalError, JournalEvent, JournalRecord, JournalScope, PersistentRisk, RiskObservation,

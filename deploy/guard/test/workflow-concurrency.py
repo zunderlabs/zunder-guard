@@ -19,6 +19,7 @@ spec.loader.exec_module(contract)
 
 def validate(paths):
     shared = []
+    account = set()
     required = set()
     sources = {}
     for path in paths:
@@ -42,8 +43,12 @@ def validate(paths):
                     if not isinstance(minutes, int) or str(seconds) != str(minutes * 60):
                         raise ValueError(f"{path}:{name}: deadline must match hosted timeout")
             custody = yaml.safe_dump({"workflow_env": document.get("env", {}), "job": job})
-            if any("secrets." + secret in custody for secret in
-                   ("E2E_TESTNET_API_WALLET_KEY", "E2E_TESTNET_OWNER_KEY")):
+            # toJSON(secrets) or secrets[...] would hide a custody leaf from the name check.
+            try:
+                names = contract.secret_names(custody)
+            except contract.OwnerError:
+                raise ValueError(f"{path}:{name}: secrets must be named as secrets.<NAME>") from None
+            if names & {"E2E_TESTNET_API_WALLET_KEY", "E2E_TESTNET_OWNER_KEY"}:
                 required.add((Path(path).name, name))
         sections = [("workflow", document)] + list(jobs.items())
         for name, section in sections:
@@ -55,6 +60,9 @@ def validate(paths):
                     raise ValueError(f"{path}:{name}: unsupported concurrency queue")
                 if concurrency["queue"] == "max" and concurrency.get("cancel-in-progress", False) is not False:
                     raise ValueError(f"{path}:{name}: queue max must never cancel active work")
+            if "guard-e2e-testnet" in str(concurrency.get("group")):
+                # Literal or standalone-only expression: every holder of the account group.
+                account.add((Path(path).name, name))
             if concurrency.get("group") == "guard-e2e-testnet":
                 if concurrency.get("queue") != "max" or concurrency.get("cancel-in-progress") is not False:
                     raise ValueError(f"{path}:{name}: shared account requires durable serial queue")
@@ -76,6 +84,10 @@ def validate(paths):
         covered.update(("journey.yml", job) for job in ("testnet-foreground", "testnet-systemd"))
         if required != covered or set(shared) != {("verify.yml", "workflow"), ("nightly.yml", "workflow")}:
             raise ValueError("complete run-wide C6 custody ownership required")
+        # W23: install-matrix's standalone account lock sits on exactly its custody jobs.
+        installs = {job for workflow, job in required if workflow == "install-matrix.yml"}
+        if account != set(shared) | {("install-matrix.yml", job) for job in installs}:
+            raise ValueError("account lock must cover exactly the install-matrix custody jobs")
     elif set(shared) != required:
         raise ValueError("complete shared-account lifecycle and trading locks required")
 

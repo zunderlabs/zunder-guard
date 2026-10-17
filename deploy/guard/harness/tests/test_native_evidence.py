@@ -6,9 +6,12 @@ from pathlib import Path
 import pytest
 from test_install_evidence import release, write
 from test_testnet_run import COMMIT
+from test_windows_policy import policy_fixture
 
 from guard_harness.channel_evidence import commands, required
-from guard_harness.lifecycle_coverage import LIFECYCLE_COVERAGE
+from guard_harness.lifecycle_coverage import LIFECYCLE_COVERAGE, windows_service_measured
+from guard_harness.lifecycle_coverage import WINDOWS_SERVICE_SCOPE as SERVICE_SCOPE
+from guard_harness.lifecycle_coverage import WINDOWS_SERVICE_SKIP as SERVICE_SKIP
 from guard_harness.lifecycle_coverage import WINDOWS_TESTNET_SCOPE as WINDOWS_SCOPE
 from guard_harness.native_evidence import PAPER, PERUSER, TESTNET, VARIANTS, predicate
 from guard_harness.native_paper import LifecycleError
@@ -95,10 +98,24 @@ def fixture(root: Path, row: str) -> Path:
                         else [],
                     ),
                 )
-            if row == "I4":
-                # Guard 1.0: the Windows testnet receipt is the per-user receipt, scoped.
+            if row == "I4" and windows_service_measured(scenario, previous.tag):
+                # The SCM service receipt after the per-user one, with the hosted
+                # crash-policy refusal and removal measured beside it.
+                from guard_harness.windows_policy import REFUSAL_TOKEN, REMOVAL_TOKEN
+
+                path = directory / "testnet/testnet.receipt.json"
+                value = json.loads(path.read_bytes())
+                value.update(policy_fixture(current, directory / "testnet/windows-policy"))
+                value["coverage"] += [REFUSAL_TOKEN, REMOVAL_TOKEN]
+                value["scope"] = SERVICE_SCOPE
+                write(path, value)
+            elif row == "I4":
+                # No released service to upgrade from: the per-user receipt, scoped.
                 value = json.loads((directory / "testnet/per-user/receipt.json").read_bytes())
-                write(directory / "testnet/testnet.receipt.json", dict(value, scope=WINDOWS_SCOPE))
+                write(
+                    directory / "testnet/testnet.receipt.json",
+                    dict(value, scope=WINDOWS_SCOPE, service_skipped=SERVICE_SKIP),
+                )
             if scenario == "fresh":
                 channel = "D1" if row == "I3" else "D2"
                 url = "https://zunderlabs.com/i-staging" + (".ps1" if row == "I4" else "")
@@ -159,11 +176,12 @@ def test_complete_exact_source_row(row: str, tmp_path: Path) -> None:
     assert value["coverage"] == sorted(LIFECYCLE_COVERAGE[row])
 
 
-def test_i4_admits_exactly_the_windows_per_user_scope() -> None:
-    # Guard 1.0 (decisions.md, 15 Oct 2026): no SCM service, so no crash recovery under it.
+def test_i4_admits_the_windows_per_user_scope_and_the_service() -> None:
+    # The SCM service's crash recovery is back in I4 with the service route (1.0.2).
     from guard_harness.lifecycle_coverage import MODES
 
     assert LIFECYCLE_COVERAGE["I4"] - MODES == {
+        "crash-recovery",
         "manual-crash-restart",
         "D2:irm-iex",
         "windows2022-ps51",
@@ -213,6 +231,8 @@ def test_d3_requires_fresh_homebrew_measurement(tmp_path: Path, mutation: str) -
         "partial",
         "missing-variant",
         "missing-scope",
+        "missing-skip",
+        "other-skip",
         "other-scope",
         "relabelled",
         "scm-tokens",
@@ -240,12 +260,16 @@ def test_no_credit_for_partial_or_diagnostic_receipts(mutation: str, tmp_path: P
             value["mode"] = "paper"
         elif mutation == "missing-scope":
             value.pop("scope")
+        elif mutation == "missing-skip":
+            value.pop("service_skipped")  # A silent skip earns nothing.
+        elif mutation == "other-skip":
+            value["service_skipped"] = "windows-service-skipped:runner-policy"
         elif mutation == "other-scope":
             value["scope"] = "windows-scm"
         elif mutation == "relabelled":
             value["decision_journal_sha256"] = "f" * 64  # Not the per-user measurement.
         elif mutation == "scm-tokens":
-            # The 1.0.1 service tokens are refused, not merely ignored, in the 1.0 scope.
+            # Service tokens are refused, not merely ignored, in the per-user scope.
             value["coverage"] += ["windows-crash-policy-refusal", "windows-crash-policy-removed"]
         elif mutation == "scm-receipt":
             # A machine-service receipt cannot stand in for the per-user scope.
@@ -254,6 +278,68 @@ def test_no_credit_for_partial_or_diagnostic_receipts(mutation: str, tmp_path: P
             value["coverage"].remove("stored-key-runtime")
         path.write_text(json.dumps(value))
     with pytest.raises((LifecycleError, FileNotFoundError, ValueError)):
+        predicate("I4", tmp_path, manifest, COMMIT, tmp_path / "subjects")
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "per-user-scope",
+        "skip-on-measured-service",
+        "missing-scope",
+        "no-policy-tokens",
+        "no-crash-recovery",
+        "policy-receipt-missing",
+        "policy-receipt-other",
+    ],
+)
+def test_no_service_credit_without_the_measured_scm_lifecycle(
+    mutation: str, tmp_path: Path
+) -> None:
+    manifest = fixture(tmp_path, "I4")
+    variant = tmp_path / "windows2025-ps7/fresh/testnet"
+    path = variant / "testnet.receipt.json"
+    value = json.loads(path.read_bytes())
+    if mutation == "per-user-scope":
+        # The fresh scenario measures the service: a per-user relabel earns nothing.
+        value = dict(json.loads((variant / "per-user/receipt.json").read_bytes()))
+        value["scope"] = WINDOWS_SCOPE
+        value["service_skipped"] = SERVICE_SKIP
+    elif mutation == "skip-on-measured-service":
+        value["service_skipped"] = SERVICE_SKIP
+    elif mutation == "missing-scope":
+        value.pop("scope")
+    elif mutation == "no-policy-tokens":
+        value["coverage"] = sorted(set(value["coverage"]) - {"windows-crash-policy-removed"})
+    elif mutation == "no-crash-recovery":
+        value["coverage"].remove("crash-recovery")
+    elif mutation == "policy-receipt-missing":
+        (variant / "windows-policy/removal.receipt.json").unlink()
+    else:
+        value["windows_policy_receipt_sha256"] = "0" * 64
+    write(path, value)
+    with pytest.raises((LifecycleError, FileNotFoundError, ValueError)):
+        predicate("I4", tmp_path, manifest, COMMIT, tmp_path / "subjects")
+
+
+def test_upgrade_from_a_release_with_the_service_must_measure_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Once the predecessor has a working service, its upgrade is measured under SCM too.
+    monkeypatch.setattr("guard_harness.lifecycle_coverage.WINDOWS_SERVICE_SINCE", "v0.9.0")
+    manifest = fixture(tmp_path, "I4")
+    upgrade = json.loads(
+        (tmp_path / "windows2022-ps51/upgrade/testnet/testnet.receipt.json").read_bytes()
+    )
+    assert upgrade["scope"] == SERVICE_SCOPE
+    assert predicate("I4", tmp_path, manifest, COMMIT, tmp_path / "subjects")["result"] == "passed"
+    # The per-user scope alone no longer earns that upgrade.
+    per_user = tmp_path / "windows2022-ps51/upgrade/testnet/per-user/receipt.json"
+    value = dict(
+        json.loads(per_user.read_bytes()), scope=WINDOWS_SCOPE, service_skipped=SERVICE_SKIP
+    )
+    write(tmp_path / "windows2022-ps51/upgrade/testnet/testnet.receipt.json", value)
+    with pytest.raises(LifecycleError):
         predicate("I4", tmp_path, manifest, COMMIT, tmp_path / "subjects")
 
 
@@ -650,20 +736,27 @@ def test_macos_ambiguous_journal_is_never_initialized_or_reset(
     assert journal.exists() or journal.is_symlink()
 
 
-@pytest.mark.parametrize("scenario", ["fresh", "upgrade"])
-def test_windows_default_is_per_user_scope_without_policy_or_scm(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, scenario: str
+@pytest.mark.parametrize("route", ["off", "upgrade-from-release-without-service"])
+def test_windows_per_user_scope_without_policy_or_scm(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, route: str
 ) -> None:
     import guard_harness.native_testnet as native
 
     monkeypatch.setenv("ProgramData", str(tmp_path / "program-data"))
     monkeypatch.setattr(platform, "system", lambda: "Windows")
     current = release(tmp_path / "current/assets")
-    previous = release(tmp_path / "previous/assets", old=True)
+    previous = release(tmp_path / "previous/assets", old=True)  # v0.9.0: before the service
     controller = native.NativeTestnet(
-        current, previous, tmp_path / "work", "fixture-account", "pwsh.exe", scenario
+        current,
+        previous,
+        tmp_path / "work",
+        "fixture-account",
+        "pwsh.exe",
+        "fresh" if route == "off" else "upgrade",
+        windows_service=False if route == "off" else None,
     )
-    assert native.WINDOWS_SERVICE is False and controller.windows_service is False
+    assert native.WINDOWS_SERVICE is True
+    assert controller.windows_service is (route != "off")
     frame = b"inert fixture frame never used for custody"
     measured: dict[str, object] = {"result": "passed", "coverage": ["credential-manager"]}
 
@@ -674,14 +767,15 @@ def test_windows_default_is_per_user_scope_without_policy_or_scm(
         return measured
 
     def refused(*args: object, **kwargs: object) -> None:
-        pytest.fail("Guard 1.0 Windows must not remove crash policy or touch the SCM")
+        pytest.fail("the per-user scope must not remove crash policy or touch the SCM")
 
     monkeypatch.setattr(native, "per_user", per_user)
     monkeypatch.setattr("guard_harness.windows_policy.prepare", refused)
     for name in ("install", "start", "stop", "crash", "action", "healthy", "audit"):
         monkeypatch.setattr(controller, name, refused)
     receipt = controller.execute(frame)
-    assert receipt == {**measured, "scope": "windows-per-user"}
+    skipped = {} if route == "off" else {"service_skipped": SERVICE_SKIP}
+    assert receipt == {**measured, "scope": "windows-per-user", **skipped}
     assert not (controller.work / "windows-policy").exists()
     assert controller.key == b""
 
@@ -697,6 +791,24 @@ def test_windows_service_route_is_refused_on_macos(
         native.NativeTestnet(
             current, current, tmp_path / "work", "fixture-account", "sh", windows_service=True
         )
+    # The default is the Windows route only on Windows: macOS keeps its own lifecycle.
+    default = native.NativeTestnet(current, current, tmp_path / "work", "fixture-account", "sh")
+    assert default.windows_service is False
+
+
+def test_windows_service_scenarios_follow_the_first_working_service() -> None:
+    from guard_harness.lifecycle_coverage import WINDOWS_SERVICE_SINCE, windows_service_measured
+
+    assert WINDOWS_SERVICE_SINCE == "v1.0.2"
+    for previous in ("v0.9.0", "v1.0.0", "v1.0.1", "v1.0.2-rc.1"):
+        assert windows_service_measured("fresh", previous) is True
+        assert windows_service_measured("upgrade", previous) is False
+    for previous in ("v1.0.2", "v1.0.3-rc.1", "v1.1.0"):
+        assert windows_service_measured("upgrade", previous) is True
+    with pytest.raises(ValueError):
+        windows_service_measured("reboot", "v1.0.2")
+    with pytest.raises(ValueError):
+        windows_service_measured("upgrade", "1.0.2")
 
 
 @pytest.mark.parametrize("scenario", ["fresh", "upgrade"])
@@ -707,17 +819,14 @@ def test_per_user_receipt_precedes_independent_scm_admission(
 
     monkeypatch.setenv("ProgramData", str(tmp_path / "program-data"))
     monkeypatch.setattr(platform, "system", lambda: "Windows")
+    # The fixture's v0.9.0 stands for a predecessor that has a working service.
+    monkeypatch.setattr("guard_harness.lifecycle_coverage.WINDOWS_SERVICE_SINCE", "v0.9.0")
     current = release(tmp_path / "current/assets")
     previous = release(tmp_path / "previous/assets", old=True)
     controller = native.NativeTestnet(
-        current,
-        previous,
-        tmp_path / "work",
-        "fixture-account",
-        "pwsh.exe",
-        scenario,
-        windows_service=True,  # The 1.0.1 SCM route, off by default in 1.0.
+        current, previous, tmp_path / "work", "fixture-account", "pwsh.exe", scenario
     )
+    assert controller.windows_service is True  # the default SCM route on Windows
     frame = b"inert fixture frame never used for custody"
     calls: list[str] = []
 

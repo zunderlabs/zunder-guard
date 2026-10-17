@@ -19,7 +19,7 @@ use super::{
     persistent::{PersistentRisk, ViewSync},
     record::{FlowFields, JournalEvent, JournalRecord},
 };
-use crate::flows::{self, Flow, Fold, Horizon, SeenView, Step, WaivedStop};
+use crate::flows::{self, Flow, Fold, Horizon, RebaseBudget, SeenView, Step, WaivedStop};
 
 /// How long views not on the journal are remembered for a flow reported
 /// late, at least (`docs/guard.md#deposits-and-withdrawals`).
@@ -88,6 +88,8 @@ pub(super) struct Base {
     /// horizon, or for a record written without one the time it was
     /// written at.
     pub(super) reach: Horizon,
+    /// Its re-base budget as recorded.
+    pub(super) budget: Option<RebaseBudget>,
     /// The number of the first view after it.
     pub(super) next_view: u64,
 }
@@ -111,6 +113,13 @@ pub(super) struct FlowBook {
     pub(super) bases: VecDeque<Base>,
     /// What became of flows since the caller last asked.
     pub(super) outcomes: Vec<(Flow, FlowOutcome)>,
+    /// The day's budget for re-bases of ledger entries the caller cannot
+    /// account for, as the engine stands ([`RebaseBudget`]).
+    pub(super) budget: Option<RebaseBudget>,
+    /// The flows for ledger entries the caller cannot account for that the
+    /// journal holds, and when each was first journaled, for the last two
+    /// days ([`PersistentRisk::unaccounted_entries`]).
+    pub(super) unaccounted: Vec<(Flow, Timestamp)>,
     /// Stops waived since the caller last asked, and the views
     /// they were waived at lately (a replay meets them again).
     pub(super) waived: Vec<WaivedStop>,
@@ -140,9 +149,28 @@ impl FlowBook {
     pub(super) fn add_base(&mut self, record: &JournalRecord) {
         // A pending group owns its immutable pre-group replay origin.
         // Displayed UTC rollovers and exact-prefix state latches cannot
-        // replace that origin with partly processed money.
+        // replace that origin with partly processed money. It is also why a
+        // base's horizon is the last view the engine took (a view is left
+        // out only beside a flow not applied yet), where a replay starts
+        // watching from (`flows::Fold`).
         if !self.pending() {
             self.push_base(record, reach(record));
+        }
+    }
+
+    /// Note the flows for entries the caller cannot account for that
+    /// `record` lists, first journaled at its time.
+    fn note_unaccounted(&mut self, record: &JournalRecord) {
+        if let JournalEvent::Flowed { flows: listed, .. } = &record.event {
+            for flow in listed.iter().filter(|flow| flow.unknown_type()) {
+                if !self
+                    .unaccounted
+                    .iter()
+                    .any(|(known, _)| known.id == flow.id)
+                {
+                    self.unaccounted.push((flow.clone(), record.at));
+                }
+            }
         }
     }
 
@@ -165,6 +193,7 @@ impl FlowBook {
             horizon: record.horizon.clone().unwrap_or_default(),
             reach,
             next_view: self.next_view,
+            budget: record.budget.clone(),
         });
     }
 
@@ -214,6 +243,8 @@ impl FlowBook {
         }
         self.known
             .retain(|known| known.place.is_none_or(|place| place >= oldest));
+        self.unaccounted
+            .retain(|(_, at)| now.saturating_sub(at.as_millis()) <= 2 * Timestamp::MS_PER_DAY);
     }
 
     /// Forget every view and base: what came before cannot be replayed.
@@ -221,20 +252,22 @@ impl FlowBook {
         self.views.clear();
         self.bases.clear();
         self.known.retain(|known| known.place.is_none());
+        self.budget = None;
     }
 
     /// The fold as the engine stands now, with every flow known.
     fn live_fold(&self, limits: &RiskLimits, engine: &RiskEngine) -> Result<Fold, String> {
         let base = self.pending().then(|| self.bases.back()).flatten();
-        let (start, horizon) = match base {
+        let (start, horizon, budget) = match base {
             Some(base) => (
                 RiskEngine::restore(limits.clone(), base.state.clone())
                     .map_err(|error| format!("pending origin: {error}"))?,
                 base.horizon.clone(),
+                base.budget.clone(),
             ),
-            None => (engine.clone(), self.horizon.clone()),
+            None => (engine.clone(), self.horizon.clone(), self.budget.clone()),
         };
-        let mut fold = Fold::new(limits.clone(), start, horizon);
+        let mut fold = Fold::new(limits.clone(), start, horizon, budget);
         for known in &self.known {
             fold.add_flow(known.flow.clone());
             let in_origin = known
@@ -288,6 +321,7 @@ impl FlowBook {
                         limits,
                         &base_record.state,
                         base_record.horizon.as_ref().unwrap_or(&empty),
+                        base_record.budget.as_ref(),
                         views,
                         listed,
                     )?;
@@ -342,6 +376,8 @@ impl FlowBook {
                 (_, None) => self.reset(),
             }
             after.insert(record.seq, self.next_view);
+            self.budget = record.budget.clone();
+            self.note_unaccounted(record);
             if record.horizon.is_some() || matches!(record.event, JournalEvent::Initialised { .. })
             {
                 self.add_base(record);
@@ -425,6 +461,18 @@ impl PersistentRisk {
         self.flows
             .as_ref()
             .is_some_and(|book| book.ids.contains(id))
+    }
+
+    /// The flows for ledger entries the caller cannot account for that the
+    /// journal holds from the last two days, and when each was first
+    /// journaled (the caller's clock): for a caller that refuses new
+    /// positions for the UTC day it saw one, to restore that after a
+    /// restart.
+    pub fn unaccounted_entries(&self) -> Vec<(Flow, Timestamp)> {
+        self.flows
+            .as_ref()
+            .map(|book| book.unaccounted.clone())
+            .unwrap_or_default()
     }
 
     /// From when to read the account's ledger at a start: the journal's
@@ -568,6 +616,7 @@ impl PersistentRisk {
             written: false,
         });
         book.horizon = fold.horizon;
+        book.budget = fold.budget;
         let settled = flows::settle(&limits, &before, &fold.engine.snapshot())
             .map_err(JournalError::Invalid)?;
         self.engine = RiskEngine::restore(limits.clone(), settled)
@@ -614,6 +663,7 @@ impl PersistentRisk {
             Vec<(usize, Option<u64>)>,
             Base,
             Vec<WaivedStop>,
+            Option<RebaseBudget>,
         ),
         JournalError,
     > {
@@ -643,8 +693,15 @@ impl PersistentRisk {
             .iter()
             .map(|index| book.known[*index].flow.clone())
             .collect();
-        let replayed = flows::replay(limits, &base.state, &base.horizon, &views, &flow_list)
-            .map_err(JournalError::Invalid)?;
+        let replayed = flows::replay(
+            limits,
+            &base.state,
+            &base.horizon,
+            base.budget.as_ref(),
+            &views,
+            &flow_list,
+        )
+        .map_err(JournalError::Invalid)?;
         let settled = flows::settle(limits, &self.journal.last.state, &replayed.snapshot)
             .map_err(JournalError::Invalid)?;
         let mut horizon = replayed.horizon;
@@ -667,7 +724,15 @@ impl PersistentRisk {
             views,
             flows: flow_list,
         };
-        Ok((event, settled, horizon, places, base, replayed.waived))
+        Ok((
+            event,
+            settled,
+            horizon,
+            places,
+            base,
+            replayed.waived,
+            replayed.budget,
+        ))
     }
 
     /// Write the `flowed` record of [`PersistentRisk::replay_from_base`]
@@ -676,9 +741,10 @@ impl PersistentRisk {
     /// recomputed state is the right one either way.
     fn write_flowed(&mut self, now: Timestamp) -> Result<(), JournalError> {
         self.check_intact()?;
-        let (event, settled, horizon, places, base, waived) = self.replay_from_base()?;
+        let (event, settled, horizon, places, base, waived, budget) = self.replay_from_base()?;
         if let Some(book) = &mut self.flows {
             book.note_waived(waived);
+            book.budget = budget.clone();
         }
         self.engine = RiskEngine::restore(self.journal.limits.clone(), settled.clone())
             .map_err(|error| JournalError::Invalid(error.to_string()))?;
@@ -698,8 +764,14 @@ impl PersistentRisk {
                 FlowFields {
                     horizon: Some(horizon),
                     view: None,
+                    budget,
                 },
-                Some((&base.state, &base.horizon, &base.reach)),
+                Some((
+                    &base.state,
+                    &base.horizon,
+                    &base.reach,
+                    base.budget.as_ref(),
+                )),
             )
             .inspect_err(|error| {
                 let reason = error.to_string();
@@ -712,6 +784,7 @@ impl PersistentRisk {
                     view.written = true;
                 }
             }
+            book.note_unaccounted(&self.journal.last);
             book.add_base(&self.journal.last);
         }
         Ok(())
@@ -775,7 +848,17 @@ impl PersistentRisk {
                 "this engine does not take flows".into(),
             ));
         };
-        if flow.amount.is_zero() && !flow.between {
+        // A malformed flow is never journaled (the reader would refuse the
+        // record): it counts as any change of equity.
+        if let Err(why) = flow.check() {
+            let outcome = FlowOutcome::Skipped(why);
+            book.outcomes.push((flow.clone(), outcome.clone()));
+            return Ok(outcome);
+        }
+        // An entry the caller cannot account for is booked as 0 but its
+        // change may re-base the stops' bases (`flows::UNKNOWN_TYPE_ID_PREFIX`):
+        // not nothing.
+        if flow.amount.is_zero() && !flow.between && !flow.unknown_type() {
             return Ok(FlowOutcome::Skipped("a flow of nothing".into()));
         }
         if book.ids.contains(&flow.id) {

@@ -22,6 +22,28 @@ NOTICES = ('LICENSE', 'NOTICE', 'THIRD_PARTY_LICENSES.md')
 class WindowsAclPolicy(unittest.TestCase):
     """Offline bit-contract check; real PowerShell selector execution is in its fixture."""
 
+    def test_service_can_open_the_shared_bases_and_nothing_more(self):
+        # The SCM service's virtual account re-checks the two shared anchors'
+        # owner and ACL at every start; without a read entry it cannot open
+        # them and its admission refuses before Guard starts.
+        lifecycle = (GUARD / 'windows/lifecycle.ps1.inc').read_text()
+        body = re.search(r'function Set-ZgBaseAcl \{\n(.*?)\n\}\n', lifecycle, re.S)
+        self.assertIsNotNone(body)
+        self.assertIn("foreach ($base in @($ZgData,$ZgBin))", body[1])
+        grants = re.findall(r'FileSystemAccessRule\]::new\((.*?)\)\)$', body[1], re.M)
+        self.assertEqual(len(grants), 1)
+        self.assertEqual(
+            grants[0],
+            "[Security.Principal.SecurityIdentifier]::new('S-1-5-11'),'ReadAndExecute',"
+            "[Security.AccessControl.InheritanceFlags]::None,'None','Allow'",
+        )
+        self.assertIn("$acl = New-ZgAcl $true ''", body[1])
+        ensure = re.search(r'function Ensure-ZgService \{\n(.*?)\n\}\n', lifecycle, re.S)
+        self.assertIsNotNone(ensure)
+        steps = ensure[1].splitlines()
+        self.assertLess(steps.index('  Set-ZgBaseAcl'), steps.index(
+            '  foreach ($path in @($ZgRoot,$ZgBinaryDir,$ZgExe)) { Set-ZgAcl $path $ZgSid }'))
+
     def test_programdata_exception_cannot_grant_destructive_or_anchor_rights(self):
         source = (GUARD / 'windows/bootstrap.ps1.inc').read_text()
         base = int(re.search(r'\$allowed = (0x[0-9a-f]+) #', source)[1], 16)

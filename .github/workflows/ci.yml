@@ -74,9 +74,9 @@ jobs:
         env:
           ZUNDER_FLOWS_TRACE: "1"
 
-  # Windows: clippy and the tests natively (owner-only ACLs, the Credential Manager, Ctrl-C),
-  # then the PowerShell installer against a release made from this build, under Windows
-  # PowerShell 5.1 and PowerShell 7 (deploy/guard/test/installer-windows.ps1).
+  # Windows: clippy natively, then the PowerShell installer against a release made from this
+  # build, under Windows PowerShell 5.1 and PowerShell 7 (deploy/guard/test/installer-windows.ps1).
+  # The native tests (owner-only ACLs, the Credential Manager, Ctrl-C) run in windows-tests.
   windows-main:
     runs-on: windows-2025
     timeout-minutes: 60
@@ -108,6 +108,34 @@ jobs:
         if: ${{ !cancelled() }}
         shell: pwsh
         run: ./deploy/guard/test/windows-mainnet-loader.ps1
+      # The loaders' real download loops against a loopback fixture (slow, stalled, cut,
+      # refused, 404, existing destination) and one public HTTPS file.
+      - name: Download retries and timeouts (PowerShell 5.1)
+        if: ${{ !cancelled() }}
+        shell: powershell
+        timeout-minutes: 10
+        run: ./deploy/guard/test/windows-download.ps1
+      - name: Download retries and timeouts (PowerShell 7)
+        if: ${{ !cancelled() }}
+        shell: pwsh
+        timeout-minutes: 10
+        run: ./deploy/guard/test/windows-download.ps1
+      # The gate's and promote's Sigstore trust-root fetch, proven on Windows Git Bash with
+      # a drive-letter RUNNER_TEMP before canonical-smoke first relies on it: the pair is
+      # written, then admitted by the harness's own check, and a second fetch is refused.
+      - name: Sigstore trust-root fetch under Git Bash
+        if: ${{ !cancelled() }}
+        shell: bash
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          case "$RUNNER_TEMP" in [A-Za-z]:\\*) ;; *) echo "expected a drive-letter RUNNER_TEMP: $RUNNER_TEMP" >&2; exit 1 ;; esac
+          bash deploy/guard/github/fetch-trusted-root.sh
+          PYTHONPATH=deploy/guard/harness/src python -c "from guard_harness.attestation import trusted_roots; roots = trusted_roots(); assert roots is not None; print(roots)"
+          if bash deploy/guard/github/fetch-trusted-root.sh 2>/dev/null; then
+            echo "a second fetch in the same job must be refused" >&2
+            exit 1
+          fi
       - run: rustup toolchain install
       - name: Cache Cargo sources and build output
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
@@ -121,56 +149,6 @@ jobs:
           restore-keys: |
             guard-cargo-v2-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('rust-toolchain.toml') }}-
       - run: cargo clippy --locked --all-targets -p zunder-venue -p zunder-venue-types -p zunder-guard-core -p zunder-guard-mcp -p zunder-guard-rules -p zunder-guard -p zunder-redteam -- -D warnings
-      # The full model runs 4,000 histories per property on Linux. Windows
-      # exercises 400 per property on its native filesystem, including the
-      # generator's asserted coverage of every path, plus every native unit test.
-      - name: Native Windows tests (400 flow histories per property)
-        shell: pwsh
-        env:
-          ZUNDER_FLOWS_CASES: "400"
-          # Each test still uses native durable I/O and its deliberate concurrency.
-          # Serialize test cases so unrelated journals do not contend for one disk.
-          RUST_TEST_THREADS: "1"
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $cargo = (Get-Command cargo -CommandType Application -ErrorAction Stop).Source
-          $arguments = @('test', '--no-fail-fast', '--locked', '-p', 'zunder-venue', '-p', 'zunder-venue-types', '-p', 'zunder-guard-core', '-p', 'zunder-guard-mcp', '-p', 'zunder-guard-rules', '-p', 'zunder-guard', '--', '--exact', '--skip', 'the_generator_reaches_every_path', '--skip', 'the_implementation_is_the_reference', '--skip', 'the_implementation_is_the_reference_when_told_in_time', '--skip', 'the_order_of_the_reports_does_not_matter')
-          $tests = Start-Process -FilePath $cargo -ArgumentList $arguments -NoNewWindow -PassThru
-          $finished = $false
-          try {
-            # Retain the process handle until its exit code has been collected.
-            $null = $tests.Handle
-            while (-not $tests.WaitForExit(30000)) {
-              Write-Host 'Native Windows tests are active; cumulative process counters:'
-              try {
-                Get-CimInstance -ClassName Win32_Process -OperationTimeoutSec 5 -Filter "Name = 'cargo.exe' OR Name LIKE 'flows_model%'" |
-                  Select-Object Name, ProcessId,
-                    @{Name='CpuSeconds';Expression={[math]::Round(([decimal]$_.KernelModeTime + [decimal]$_.UserModeTime) / 10000000, 1)}},
-                    ReadOperationCount, WriteOperationCount, WriteTransferCount |
-                  Format-Table -AutoSize
-              } catch {
-                Write-Warning 'Process counters are unavailable; the test exit code still determines this step.'
-              }
-            }
-            $tests.WaitForExit()
-            $testExit = $tests.ExitCode
-            $finished = $true
-          } finally {
-            try {
-              if (-not $finished -and -not $tests.HasExited) {
-                & "$env:SystemRoot\System32\taskkill.exe" /PID $tests.Id /T /F | Out-Host
-                if (-not $tests.WaitForExit(10000)) {
-                  Write-Warning 'The test child did not exit after termination; this step remains failed.'
-                }
-              }
-            } catch {
-              Write-Warning 'Test child cleanup failed; the original wrapper failure is retained.'
-            } finally {
-              $tests.Dispose()
-            }
-          }
-          if ($null -eq $testExit) { throw 'The test process supplied no exit code' }
-          exit $testExit
       - name: A local release from this build (the test double signs it)
         shell: bash
         run: |
@@ -197,6 +175,160 @@ jobs:
       - name: i.ps1 under PowerShell 7
         shell: pwsh
         run: deploy/guard/test/installer-windows.ps1 -Release $env:RELEASE_DIR -Cosign fakebin/cosign.cmd
+      - name: Windows ACL diagnostics on failure (empty files only)
+        if: failure()
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $root = Join-Path ([IO.Path]::GetTempPath()) ('guard-acl-' + [Guid]::NewGuid().ToString('N'))
+          $file = $null
+          function Show-Acl([string]$Path) {
+            $env:ZUNDER_ACL_PATH = $Path
+            $child = [Diagnostics.Process]::new()
+            $child.StartInfo.FileName = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
+            $child.StartInfo.Arguments = '-NoProfile -NonInteractive -Command "(Get-Acl -LiteralPath $env:ZUNDER_ACL_PATH).Sddl; try { ([Security.Principal.SecurityIdentifier]''LA'').Value } catch { '''' }"'
+            $child.StartInfo.UseShellExecute = $false
+            $child.StartInfo.RedirectStandardOutput = $true
+            $child.StartInfo.RedirectStandardError = $true
+            try {
+              $child.Start() | Out-Null
+              $stdout = $child.StandardOutput.ReadToEndAsync()
+              $stderr = $child.StandardError.ReadToEndAsync()
+              $child.WaitForExit()
+              [ordered]@{
+                stdout = $stdout.Result; stderr = $stderr.Result
+                stdout_length = $stdout.Result.Length; exit_code = $child.ExitCode
+              } | ConvertTo-Json -Compress
+            } finally { $child.Dispose() }
+            $acl = Get-Acl -LiteralPath $Path -ErrorAction Stop
+            $raw = [Security.AccessControl.RawSecurityDescriptor]::new($acl.GetSecurityDescriptorBinaryForm(), 0)
+            [ordered]@{
+              path = $Path; sddl = $acl.Sddl
+              owner = $acl.GetOwner([Security.Principal.SecurityIdentifier]).Value
+              protected = $acl.AreAccessRulesProtected
+              control_flags = $raw.ControlFlags.ToString()
+              dacl_null = ($null -eq $raw.DiscretionaryAcl)
+            } | ConvertTo-Json -Compress
+          }
+          try {
+            New-Item -ItemType Directory -Path $root | Out-Null
+            $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+            & "$env:SystemRoot\System32\icacls.exe" $root /inheritance:r /grant:r "*${sid}:(OI)(CI)F" /q
+            if ($LASTEXITCODE -ne 0) { throw 'Folder ACL command failed' }
+            Show-Acl $root
+            $path = Join-Path $root 'empty'
+            $sharing = [IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete
+            $file = [IO.FileStream]::new($path, [IO.FileMode]::CreateNew, [IO.FileAccess]::ReadWrite, $sharing)
+            Show-Acl $path
+            & "$env:SystemRoot\System32\icacls.exe" $path /inheritance:d /q
+            if ($LASTEXITCODE -ne 0) { throw 'File ACL command failed' }
+            Show-Acl $path
+          } finally {
+            if ($null -ne $file) { $file.Dispose() }
+            Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue
+            Remove-Item Env:ZUNDER_ACL_PATH -ErrorAction SilentlyContinue
+          }
+
+  # windows-main's native tests, split by test binary (deploy/guard/github/windows-test-shards.py):
+  # every shard selects the same six packages, so features resolve as in the single command;
+  # `rest` runs every target no other shard names. Same flow histories, serialization and wrapper.
+  windows-tests:
+    name: windows tests (${{ matrix.shard }})
+    runs-on: windows-2025
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [pilot, io, rest]
+    env:
+      TEST_SHARD: ${{ matrix.shard }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install
+      - name: Restore Cargo sources and build output
+        id: cache
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          # One cache for the shards: same packages, features and dependencies. Cargo revalidates
+          # fingerprints; fallback never crosses toolchains or jobs. `rest` saves it.
+          key: guard-cargo-v2-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            guard-cargo-v2-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('rust-toolchain.toml') }}-
+      - name: Plan this shard from the workspace's test targets
+        shell: bash
+        run: python deploy/guard/github/windows-test-shards.py plan "$TEST_SHARD" --out "$RUNNER_TEMP/windows-test-shard.json"
+      # Windows exercises 400 flow histories per property on its native filesystem (Linux
+      # runs 4,000), plus every native unit test.
+      - name: Native Windows tests (400 flow histories per property)
+        shell: pwsh
+        env:
+          ZUNDER_FLOWS_CASES: "400"
+          # Each test still uses native durable I/O and its deliberate concurrency.
+          # Serialize test cases so unrelated journals do not contend for one disk.
+          RUST_TEST_THREADS: "1"
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $cargo = (Get-Command cargo -CommandType Application -ErrorAction Stop).Source
+          $runs = Get-Content -Raw -LiteralPath (Join-Path $env:RUNNER_TEMP 'windows-test-shard.json') | ConvertFrom-Json -NoEnumerate
+          if ($runs.Count -lt 1) { throw 'No Cargo invocation to run' }
+          # Every invocation runs, as one --no-fail-fast command would; the first failure's code is kept.
+          $stepExit = 0
+          foreach ($arguments in $runs) {
+            Write-Host ('cargo ' + ($arguments -join ' '))
+            $testExit = $null
+            $tests = Start-Process -FilePath $cargo -ArgumentList $arguments -NoNewWindow -PassThru
+            $finished = $false
+            try {
+              # Retain the process handle until its exit code has been collected.
+              $null = $tests.Handle
+              while (-not $tests.WaitForExit(30000)) {
+                Write-Host 'Native Windows tests are active; cumulative process counters:'
+                try {
+                  Get-CimInstance -ClassName Win32_Process -OperationTimeoutSec 5 -Filter "Name = 'cargo.exe' OR Name LIKE 'flows_model%'" |
+                    Select-Object Name, ProcessId,
+                      @{Name='CpuSeconds';Expression={[math]::Round(([decimal]$_.KernelModeTime + [decimal]$_.UserModeTime) / 10000000, 1)}},
+                      ReadOperationCount, WriteOperationCount, WriteTransferCount |
+                    Format-Table -AutoSize
+                } catch {
+                  Write-Warning 'Process counters are unavailable; the test exit code still determines this step.'
+                }
+              }
+              $tests.WaitForExit()
+              $testExit = $tests.ExitCode
+              $finished = $true
+            } finally {
+              try {
+                if (-not $finished -and -not $tests.HasExited) {
+                  & "$env:SystemRoot\System32\taskkill.exe" /PID $tests.Id /T /F | Out-Host
+                  if (-not $tests.WaitForExit(10000)) {
+                    Write-Warning 'The test child did not exit after termination; this step remains failed.'
+                  }
+                }
+              } catch {
+                Write-Warning 'Test child cleanup failed; the original wrapper failure is retained.'
+              } finally {
+                $tests.Dispose()
+              }
+            }
+            if ($null -eq $testExit) { throw 'The test process supplied no exit code' }
+            if ($testExit -ne 0 -and $stepExit -eq 0) { $stepExit = $testExit }
+          }
+          exit $stepExit
+      - name: Save Cargo sources and build output
+        if: matrix.shard == 'rest' && steps.cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ steps.cache.outputs.cache-primary-key }}
       - name: Windows ACL diagnostics on failure (empty files only)
         if: failure()
         shell: powershell
@@ -386,7 +518,7 @@ jobs:
   windows:
     name: windows
     if: always()
-    needs: [windows-main, windows-flows]
+    needs: [windows-main, windows-tests, windows-flows]
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     env:
@@ -397,7 +529,7 @@ jobs:
         run: |
           import json, os
           results = json.loads(os.environ['REQUIRED_RESULTS'])
-          assert set(results) == {'windows-main', 'windows-flows'}, 'Unexpected dependency set'
+          assert set(results) == {'windows-main', 'windows-tests', 'windows-flows'}, 'Unexpected dependency set'
           assert all(job['result'] == 'success' for job in results.values()), 'A required CI dependency did not succeed'
 
   # Native proof runs on PR/main before any release tag. No secrets or publication.
@@ -599,6 +731,7 @@ jobs:
           python3 -B deploy/guard/test/release-policy.py
           python3 -B deploy/guard/test/macos-shell.py
           python3 -B deploy/guard/github/test_publish_loaders.py
+          python3 -B deploy/guard/github/test_registry_retry.py
       - name: Workflow security audit
         run: |
           python3 -m pip install zizmor==1.30.1
@@ -630,9 +763,13 @@ jobs:
         with:
           persist-credentials: false
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      # Bounded retries on HTTP 429, 5xx and timeouts; the images stay the Dockerfile's, pinned by
+      # digest (deploy/guard/github/registry-retry.sh).
+      - name: Fetch the pinned builder and runtime images into the builder
+        run: deploy/guard/github/registry-retry.sh warm deploy/guard/Dockerfile - build runtime
       - name: Build (not pushed) and smoke-test the image
         run: |
-          docker buildx build --load -f deploy/guard/Dockerfile -t zunder-guard:ci .
+          deploy/guard/github/registry-retry.sh run -- docker buildx build --load -f deploy/guard/Dockerfile -t zunder-guard:ci .
           docker run --rm zunder-guard:ci --version
           deploy/guard/test/image-smoke.sh zunder-guard:ci
 

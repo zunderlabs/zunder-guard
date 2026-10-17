@@ -98,6 +98,7 @@ fn flow(time_ms: i64, amount: Decimal, id: &str) -> Flow {
         dex: String::new(),
         between: false,
         value: None,
+        unaccounted: None,
     }
 }
 
@@ -1196,13 +1197,13 @@ fn the_reader_refuses_a_flowed_record_that_leaves_out_a_view_or_a_flow_or_starts
 }
 
 #[test]
-fn every_record_of_an_engine_with_flows_is_version_3_and_the_runner_writes_version_2() {
+fn every_record_of_an_engine_with_flows_is_version_4_and_the_runner_writes_version_2() {
     let dir = Dir::new("versions");
     journal_with_a_withdrawal(&dir);
     let records = PersistentRisk::read(&dir.journal()).unwrap();
     assert_eq!(records[0].version, 2);
     for record in &records[1..] {
-        assert_eq!(record.version, 3);
+        assert_eq!(record.version, 4);
         assert!(record.horizon.is_some());
     }
     assert!(

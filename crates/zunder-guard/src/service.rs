@@ -547,19 +547,89 @@ pub fn verify_child(binding: &ServiceBinding) -> Result<()> {
     }
 }
 
-pub fn run(binding: &ServiceBinding, binding_path: &Path) -> Result<()> {
+/// `service run --binding <path>`, the OS supervisor's entry point. On Windows
+/// the process connects to the SCM dispatcher first and admits the binding
+/// only afterwards, under a reported START_PENDING: SCM gives a service 30
+/// seconds to connect, and a refusal before connecting is reported as "did
+/// not respond" (error 1053) instead of a stopped service with its failure.
+pub fn run(binding_path: &Path) -> Result<()> {
     #[cfg(windows)]
     {
-        windows::run(binding, binding_path)
+        windows::run(binding_path)
     }
     #[cfg(target_os = "macos")]
     {
-        macos::run(binding, binding_path)
+        let path = fs::canonicalize(binding_path)?;
+        let binding = load_binding(&path)?;
+        macos::run(&binding, &path)
     }
     #[cfg(not(any(windows, target_os = "macos")))]
     {
-        let _ = (binding, binding_path);
+        let _ = binding_path;
         Err(refused("unsupported service platform"))
+    }
+}
+
+/// The SCM service name for a binding path, from the path alone (no file
+/// access): a binding lives at `<ProgramData>\ZunderGuard\<id>\binding.json`
+/// and its service is `ZunderGuard-<id>`. Used to connect to the dispatcher
+/// before any admission; admission then requires the binding's own service
+/// name to be exactly this one. `None` for any other shape.
+pub fn scm_service_name(binding_path: &Path) -> Option<String> {
+    if binding_path.file_name()? != "binding.json" {
+        return None;
+    }
+    let id = binding_path.parent()?.file_name()?.to_str()?;
+    let valid = !id.is_empty()
+        && id.len() <= 80
+        && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-');
+    valid.then(|| format!("ZunderGuard-{id}"))
+}
+
+#[cfg(test)]
+mod scm_name_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn path(parts: &[&str]) -> PathBuf {
+        parts.iter().collect()
+    }
+
+    #[test]
+    fn the_service_name_comes_from_the_path_alone() {
+        // No such files exist: deriving the name touches nothing on disk, so
+        // it can precede the SCM dispatcher connection.
+        let binding = path(&["no-such-root", "ZunderGuard", "guard", "binding.json"]);
+        assert!(!binding.exists());
+        assert_eq!(
+            scm_service_name(&binding).as_deref(),
+            Some("ZunderGuard-guard")
+        );
+        assert_eq!(
+            scm_service_name(&path(&["x", "testnet-journey", "binding.json"])).as_deref(),
+            Some("ZunderGuard-testnet-journey")
+        );
+        for refused in [
+            path(&["x", "guard", "binding.json.new"]),
+            path(&["x", "guard", "other.json"]),
+            path(&["binding.json"]),
+            path(&["x", "bad id", "binding.json"]),
+            path(&["x", "guard.", "binding.json"]),
+            path(&["x", &"a".repeat(81), "binding.json"]),
+        ] {
+            assert_eq!(scm_service_name(&refused), None, "{}", refused.display());
+        }
+    }
+
+    #[test]
+    fn the_derived_name_is_the_one_binding_validation_requires() {
+        // validate_shape() admits a Windows binding only when its service
+        // name is ZunderGuard-<credential_id>, and validate_paths() only when
+        // the binding sits at <root>\<credential_id>\binding.json.
+        for id in ["guard", "testnet-journey", "ci-0123abcd"] {
+            let derived = scm_service_name(&path(&["root", id, "binding.json"])).unwrap();
+            assert_eq!(derived, format!("ZunderGuard-{id}"));
+        }
     }
 }
 

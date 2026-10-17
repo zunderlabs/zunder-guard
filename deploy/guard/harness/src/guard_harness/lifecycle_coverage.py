@@ -1,5 +1,6 @@
 """Pinned measured acceptance for install rows and their documented distribution paths."""
 
+import re
 from collections.abc import Mapping
 
 MODES = frozenset(
@@ -17,8 +18,41 @@ MODES = frozenset(
         "cleanup",
     }
 )
-# The only Windows testnet receipt scope Guard 1.0 admits.
+# Windows testnet receipt scopes: the per-user install alone, or the machine (SCM) service
+# measured after it (its own receipt; the per-user receipt stays beside it).
 WINDOWS_TESTNET_SCOPE = "windows-per-user"
+WINDOWS_SERVICE_SCOPE = "windows-service"
+# The first release whose Windows SCM service starts. An upgrade from an older release has
+# no working service to upgrade: that scenario records WINDOWS_SERVICE_SKIP by name in its
+# receipt and measures the per-user scope; from this release on, every upgrade measures the
+# service too.
+WINDOWS_SERVICE_SINCE = "v1.0.2"
+WINDOWS_SERVICE_SKIP = "windows-service-skipped:previous-release-has-no-service"
+
+
+def release_version(tag: str) -> tuple[int, int, int, int, int]:
+    """The ordering key of a release tag `vX.Y.Z[-rc.N]`, shared by every harness check."""
+    match = re.fullmatch(r"v(\d+)\.(\d+)\.(\d+)(?:-rc\.([1-9]\d*))?", tag)
+    if match is None:
+        raise ValueError("release version required")
+    # A final version follows every RC with the same numeric version.
+    return int(match[1]), int(match[2]), int(match[3]), 0 if match[4] else 1, int(match[4] or 0)
+
+
+def windows_service_measured(scenario: str, previous_tag: str) -> bool:
+    """Whether a Windows scenario must measure the SCM service after the per-user install.
+
+    Fresh: always. Upgrade: exactly when the previous release has a working service
+    (`previous_tag >= WINDOWS_SERVICE_SINCE`); otherwise the scenario's receipt names the
+    skip (WINDOWS_SERVICE_SKIP) and admission requires that name.
+    """
+    if scenario == "fresh":
+        return True
+    if scenario != "upgrade":
+        raise ValueError("native lifecycle scenario refused")
+    return release_version(previous_tag) >= release_version(WINDOWS_SERVICE_SINCE)
+
+
 LIFECYCLE_COVERAGE: Mapping[str, frozenset[str]] = {
     "I1": MODES
     | {
@@ -30,10 +64,10 @@ LIFECYCLE_COVERAGE: Mapping[str, frozenset[str]] = {
     },
     "I2": MODES | {"crash-recovery", "D1:curl-pipe"},
     "I3": MODES | {"crash-recovery", "supervisor-reload", "D1:curl-pipe", "D3:homebrew"},
-    # Guard 1.0 Windows is the per-user install; the SCM service's crash recovery is
-    # 1.0.1 work (decision of 15 Oct 2026).
+    # Windows: the per-user install and, from 1.0.2, the SCM service with its crash recovery.
     "I4": MODES
     | {
+        "crash-recovery",
         "manual-crash-restart",
         "D2:irm-iex",
         "windows2022-ps51",

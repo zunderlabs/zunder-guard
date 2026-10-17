@@ -72,8 +72,10 @@
 //! An engine that takes flows ([`PersistentRisk::with_flows`], Zunder Guard;
 //! never the runner) keeps them out of its stops as
 //! `docs/guard.md#deposits-and-withdrawals` specifies, through the fold in [`crate::flows`].
-//! Its records are version 3: each carries the horizon (the latest venue
-//! time of any view, per dex), a record written for a view also the view,
+//! Its records are version 3 or later (4 since Guard 1.0.2, when a flow may
+//! stand for a ledger entry the caller cannot account for): each carries
+//! the horizon (the latest venue time of any view, per dex), a record
+//! written for a view also the view,
 //! and a falling last equity is written too once the last record is a
 //! minute old. A flow that changes the engine is a `flowed` record: an
 //! earlier record to start from (its base), every view since it and every

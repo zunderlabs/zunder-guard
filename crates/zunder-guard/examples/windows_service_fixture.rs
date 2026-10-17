@@ -29,6 +29,17 @@ fn main() -> anyhow::Result<()> {
             .cloned()
             .context("fixture argument value missing")
     };
+    let operation = args
+        .iter()
+        .position(|arg| arg == "service")
+        .and_then(|i| args.get(i + 1))
+        .map(String::as_str);
+    if operation == Some("run") && !args.iter().any(|arg| arg == "--supervised-stdin") {
+        // As in production: connect to SCM before any check that can refuse;
+        // the broker admits the binding (and the crash-dump policy) after.
+        windows::run(&PathBuf::from(value("--binding")?))?;
+        return Ok(());
+    }
     windows::enforce_no_core_dumps()?;
     if args.first().map(String::as_str) == Some("prepare-fixture") {
         if std::env::var("GITHUB_ACTIONS").as_deref() != Ok("true")
@@ -152,12 +163,7 @@ fn main() -> anyhow::Result<()> {
         log.sync_all()?;
         return Ok(());
     }
-    match args
-        .iter()
-        .position(|arg| arg == "service")
-        .and_then(|i| args.get(i + 1))
-        .map(String::as_str)
-    {
+    match operation {
         Some("provision") => {
             service::validate_provision(&binding)?;
             windows::provision(
@@ -166,7 +172,6 @@ fn main() -> anyhow::Result<()> {
                 false,
             )?;
         }
-        Some("run") => windows::run(&binding, &path)?,
         Some("check") => windows::check(&binding)?,
         Some("renew-fixture") => {
             windows::verify_service_identity(&binding)?;

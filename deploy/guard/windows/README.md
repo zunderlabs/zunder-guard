@@ -1,6 +1,6 @@
 # Windows mainnet installation candidate
 
-Guard 1.0 on Windows is the per-user installation for paper and testnet. This machine service, the only Windows route to mainnet, arrives in Guard 1.0.1 (decisions 15 Oct 2026); its native SCM checks are not part of the 1.0 gate.
+This machine service, the only Windows route to mainnet, ships in Guard 1.0.2; Guard 1.0 and 1.0.1 on Windows are the per-user installation for paper and testnet. 1.0.2 fixes the three defects that held the service back: `init` now writes the runtime `guard.toml` with the exact ACL service admission requires, the owner-only check maps SDDL aliases such as `SY` (installs run as SYSTEM), and `service run` connects to the SCM dispatcher before admitting its binding, so a refusal is a stopped service with its failure instead of error 1053. The installer also lets Authenticated Users read and list the two shared folders (`%ProgramData%\ZunderGuard`, `%ProgramFiles%\ZunderGuard`, this folder only), which the service re-checks at every start. If anything else later adds an entry to either folder, the service refuses to start (a stopped service, fail closed); running the installer again restores the folders. Its native SCM checks are part of the 1.0.2 gate (row I4).
 
 This machine-service source includes an additive protected Testnet candidate for a future signed release; signed v1.0.1 draft assets remain immutable. It is not yet a native-tested released installer. Do not replace already signed/versioned assets. Publication requires independent code review, Windows 5.1/7 tests, the native service checks and released-image install/upgrade proof. Pre-login reboot is a separate gate.
 
@@ -65,6 +65,8 @@ Stop disables boot startup before stopping. Uninstall unregisters only the exact
 ## Evidence boundaries
 
 `test/windows-mainnet-loader.ps1` runs real function state transitions with synthetic native boundaries and temporary files under Windows PowerShell 5.1/PowerShell 7. It distinguishes phase-interruption simulation from real power-loss/pre-login reboot evidence. Runtime SCM/DPAPI/Job/stop tests remain owned by the shared native service workflow. The Rust SVC-M1 configuration snapshot and SVC-M2 stop/recovery fixes are required dependencies. No test bypass, alternate verifier pin or plaintext credential route exists in the production entry point.
+
+`test/windows-download.ps1` runs the loaders' real download loops (`Get-ZgAsset` and the per-user `Get-Asset`) under Windows PowerShell 5.1 and PowerShell 7 against a loopback fixture (`test/download-fixture-server.py`: slow, stalled, cut and reset bodies, refused connections, 404s, an existing destination) and fetches one public HTTPS file with the unmodified functions. Only the test's own copy accepts `http://`, records its pauses and, for the stall cases, uses a shorter read timeout.
 
 ## Protected Testnet automation candidate
 

@@ -188,12 +188,52 @@ function Copy-ZgSecureFile([IO.Stream]$InputStream,[string]$Destination) {
 }
 function Get-ZgAsset([string]$Source,[string]$Name,[string]$Destination) {
   if ($Source.StartsWith('https://')) {
-    $client = [Net.WebClient]::new()
-    $inputStream = $null
-    try {
-      $inputStream = $client.OpenRead($Source.TrimEnd('/')+'/'+$Name)
-      Copy-ZgSecureFile $inputStream $Destination
-    } finally { if ($inputStream) { $inputStream.Dispose() }; $client.Dispose() }
+    # A refused or reset connection, a TLS or HTTP failure or a cut-off body gets three more
+    # tries, 2, 4 and 8 s apart. Each try is bounded: 20 s to connect and receive the headers,
+    # and a read that receives nothing for 60 s ends it; a slow but moving download (the
+    # ~140 MB verifier) is never capped. A body shorter than its announced length is a failed
+    # try. A try that created its file (CreateNew) and failed while copying deletes that
+    # file, so the next try writes a fresh one. An entry that already existed, or a refused
+    # path, is final: never retried, adopted or removed. A failed try aborts its request and
+    # closes an error response: .NET Framework allows two connections per host, and one
+    # still held would make a later try wait for it until its timeout.
+    $pause = 2
+    for ($attempt = 1; $attempt -le 4; $attempt++) {
+      $request = $null
+      $response = $null
+      $inputStream = $null
+      $step = 'open'
+      try {
+        $request = [Net.WebRequest]::Create($Source.TrimEnd('/')+'/'+$Name)
+        $request.Timeout = 20000
+        $request.ReadWriteTimeout = 60000
+        $response = $request.GetResponse()
+        $inputStream = $response.GetResponseStream()
+        $step = 'create'
+        $output = New-ZgSecureFile $Destination
+        $step = 'copy'
+        $received = -1
+        try { $inputStream.CopyTo($output); $output.Flush($true); $received = $output.Length } finally { $output.Dispose() }
+        if ($response.ContentLength -ge 0 -and $received -ne $response.ContentLength) { throw 'Release download ended before its announced length.' }
+        $step = 'done'
+      } catch {
+        $cause = $_.Exception
+        while ($cause) {
+          if ($cause -is [Net.WebException] -and $cause.Response) { $cause.Response.Close() }
+          $cause = $cause.InnerException
+        }
+        if ($request) { $request.Abort() }
+        if ($step -eq 'copy') { [IO.File]::Delete($Destination) }
+        if ($step -eq 'create' -or $attempt -ge 4) { throw }
+      } finally {
+        if ($inputStream) { $inputStream.Dispose() }
+        if ($response) { $response.Close() }
+      }
+      if ($step -eq 'done') { Assert-ZgPath $Destination; return }
+      Microsoft.PowerShell.Utility\Write-Host "Release download try $attempt of 4 failed; trying again in ${pause}s."
+      Microsoft.PowerShell.Utility\Start-Sleep -Seconds $pause
+      $pause *= 2
+    }
   } elseif ([IO.Directory]::Exists($Source)) {
     $inputStream = [IO.File]::OpenRead([IO.Path]::Combine($Source,$Name))
     try { Copy-ZgSecureFile $inputStream $Destination } finally { $inputStream.Dispose() }
@@ -382,6 +422,20 @@ function Install-ZgImage([string]$Directory) {
     if ([IO.File]::Exists($destination)) { [IO.File]::Replace($next,$destination,[NullString]::Value) } else { [IO.File]::Move($next,$destination) }
   }
 }
+# The service's virtual account re-admits its layout at every start, the two
+# shared anchors included: it must be able to open them and read their owner
+# and ACL. Authenticated Users may read and list this folder only, as stock
+# ProgramData and Program Files grant; nothing is inherited, nobody else writes.
+function Set-ZgBaseAcl {
+  foreach ($base in @($ZgData,$ZgBin)) {
+    $item = Microsoft.PowerShell.Management\Get-Item -LiteralPath $base -Force
+    if (-not $item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw 'Reparse or non-directory base refused.' }
+    $acl = New-ZgAcl $true ''
+    $acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new([Security.Principal.SecurityIdentifier]::new('S-1-5-11'),'ReadAndExecute',[Security.AccessControl.InheritanceFlags]::None,'None','Allow'))
+    Microsoft.PowerShell.Security\Set-Acl -LiteralPath $base -AclObject $acl
+    Assert-ZgPath $base
+  }
+}
 function Ensure-ZgService {
   $service = Get-ZgService
   if (-not $service) {
@@ -390,6 +444,7 @@ function Ensure-ZgService {
     $null = Get-ZgService
   }
   Disable-ZgService
+  Set-ZgBaseAcl
   foreach ($path in @($ZgRoot,$ZgBinaryDir,$ZgExe)) { Set-ZgAcl $path $ZgSid }
   Set-ZgAcl $ZgHome $ZgSid $true
   # Same per-executable WER exclusion as native service admission; never global policy.

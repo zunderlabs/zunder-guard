@@ -1,8 +1,11 @@
 import hashlib
 import importlib.util
 import json
+import os
 import plistlib
+import stat
 import subprocess
+from collections.abc import Callable
 from pathlib import Path
 from types import ModuleType
 from typing import Any
@@ -20,6 +23,30 @@ def module() -> ModuleType:
     value = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(value)
     return value
+
+
+def modeled_ownership(
+    mutable: dict[Path, tuple[int, int]] | None = None,
+) -> Callable[[int], os.stat_result]:
+    """The helper's owner/mode view of an open entry, as on a stock root-owned tree.
+
+    Without sudo the fixture belongs to the test user; every entry is modeled root-owned and
+    writable by root only, except the given directories (owner, mode), matched by inode so
+    that a renamed or replaced entry keeps or loses the model exactly as the real one would.
+    """
+    modeled = {}
+    for path, value in (mutable or {}).items():
+        info = os.lstat(path)
+        modeled[(info.st_dev, info.st_ino)] = value
+
+    def ownership(fd: int) -> os.stat_result:
+        info = os.fstat(fd)
+        owner, mode = modeled.get((info.st_dev, info.st_ino), (0, info.st_mode & ~0o022))
+        fields = list(info)
+        fields[4], fields[0] = owner, stat.S_IFMT(info.st_mode) | stat.S_IMODE(mode)
+        return os.stat_result(fields)
+
+    return ownership
 
 
 def fixture(
@@ -74,6 +101,7 @@ def fixture(
             raise RuntimeError("fixture symlink refused")
 
     monkeypatch.setattr(value, "trusted", trusted)
+    monkeypatch.setattr(value, "ownership", modeled_ownership())
     monkeypatch.setattr("os.geteuid", lambda: 0)
     monkeypatch.setattr("subprocess.run", command)
     return value, base, plist, generic, notices, release, calls

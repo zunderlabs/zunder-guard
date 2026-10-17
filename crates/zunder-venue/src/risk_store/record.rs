@@ -11,7 +11,7 @@ use zunder_risk::{RiskLimits, RiskSnapshot};
 
 #[cfg(doc)]
 use super::PersistentRisk;
-use crate::flows::{Flow, Horizon, SeenView};
+use crate::flows::{Flow, Horizon, RebaseBudget, SeenView};
 
 /// The `format` of every journal line.
 pub const JOURNAL_FORMAT: &str = "zunder-risk-journal";
@@ -22,10 +22,24 @@ pub const JOURNAL_FORMAT: &str = "zunder-risk-journal";
 /// withdrawals ([`PersistentRisk::with_flows`]: the horizon, the view, and
 /// [`JournalEvent::Flowed`]), the only records written as version 3: an
 /// engine without flows (the runner) writes version 2 as before, so an
-/// older build still reads its journal. Older journals are still read, and
-/// an older build refuses a newer record as too new rather than misreading
-/// it.
-pub const JOURNAL_VERSION: u32 = 3;
+/// older build still reads its journal. Version 4 (Guard 1.0.2) is version
+/// 3 whose flows may stand for ledger entries the caller cannot account
+/// for (`flows::UNKNOWN_TYPE_ID_PREFIX`, with `Flow::unaccounted`) and carry the
+/// day's re-base budget (`budget`), which a
+/// version 3 build would replay differently: the records of an engine that
+/// takes flows are written as version 4 since, and only they may list such
+/// a flow. Older journals are still read (a version 3 journal goes on as
+/// version 4), and an older build refuses a newer record as too new rather
+/// than misreading it.
+pub const JOURNAL_VERSION: u32 = 4;
+
+/// The first version whose records carry an engine's flow fields (the
+/// horizon, the view, `flowed` records).
+pub(super) const FLOWS_VERSION: u32 = 3;
+
+/// The first version whose `flowed` records may list a flow for a ledger
+/// entry the caller cannot account for.
+pub(super) const UNACCOUNTED_VERSION: u32 = 4;
 
 /// The version every record of an engine without flows is written as.
 pub(super) const RECORD_VERSION: u32 = 2;
@@ -102,6 +116,8 @@ struct Body<'a> {
     horizon: Option<&'a Horizon>,
     #[serde(skip_serializing_if = "Option::is_none")]
     view: Option<&'a SeenView>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    budget: Option<&'a RebaseBudget>,
     prev: &'a str,
 }
 
@@ -121,13 +137,19 @@ pub struct JournalRecord {
     /// The engine's state after the change.
     pub state: RiskSnapshot,
     /// For an engine that takes flows: for each dex, the latest venue time
-    /// of any view so far (version 3 only).
+    /// of any view so far (version 3 and later only).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub horizon: Option<Horizon>,
     /// For an engine that takes flows, a record written for a view: that
-    /// view (version 3 only).
+    /// view (version 3 and later only).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub view: Option<SeenView>,
+    /// For an engine that takes flows, from version 4 on: the day's budget
+    /// for re-bases of ledger entries it cannot account for
+    /// ([`RebaseBudget`]); changed only by a `flowed` record, cleared by a
+    /// review.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget: Option<RebaseBudget>,
     /// The previous record's checksum; empty for the first.
     pub prev: String,
 }
@@ -137,6 +159,7 @@ pub struct JournalRecord {
 pub(super) struct FlowFields {
     pub(super) horizon: Option<Horizon>,
     pub(super) view: Option<SeenView>,
+    pub(super) budget: Option<RebaseBudget>,
 }
 
 impl JournalRecord {
@@ -149,7 +172,11 @@ impl JournalRecord {
         prev: String,
         fields: FlowFields,
     ) -> Result<(Self, String), String> {
-        let FlowFields { horizon, view } = fields;
+        let FlowFields {
+            horizon,
+            view,
+            budget,
+        } = fields;
         let version = if horizon.is_some() {
             JOURNAL_VERSION
         } else {
@@ -164,6 +191,7 @@ impl JournalRecord {
             state: &state,
             horizon: horizon.as_ref(),
             view: view.as_ref(),
+            budget: budget.as_ref(),
             prev: &prev,
         })
         .map_err(|error| error.to_string())?;
@@ -182,6 +210,7 @@ impl JournalRecord {
             state,
             horizon,
             view,
+            budget,
             prev,
         };
         Ok((record, line))

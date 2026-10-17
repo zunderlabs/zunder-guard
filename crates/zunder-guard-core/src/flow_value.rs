@@ -46,6 +46,8 @@ pub fn valid_ledger(
         let delta = &row["delta"];
         // Every field the flow needs, the fee the account pays among them
         // (never taken as zero): as the flows applied to the account stops.
+        // An entry Guard cannot account for (a type it does not know among
+        // them) makes the window's money unknown.
         if crate::ledger::classify(row, user, dexes).is_err() {
             return false;
         }
@@ -337,19 +339,29 @@ mod tests {
 
     #[test]
     fn malformed_duplicate_or_unknown_ledger_cannot_be_exact() {
-        let row = json!({"time":100000,"hash":"flow","delta":{"type":"deposit","usdc":"50"}});
+        let row = json!({"time":100000,"hash":"0xf10","delta":{"type":"deposit","usdc":"50"}});
         assert!(valid(std::slice::from_ref(&row)));
         assert!(!valid(&[row.clone(), row.clone()]));
         let mut malformed = row.clone();
         malformed["delta"]["fee"] = json!("bad");
         assert!(!valid(&[malformed]));
+        // A type Guard does not know, with a USD amount or not, paid by the
+        // account or not: the window's money is unknown.
         let mut unknown = row;
         unknown["delta"]["type"] = json!("newCollateralMovement");
+        assert!(!valid(std::slice::from_ref(&unknown)));
+        if let Some(delta) = unknown["delta"].as_object_mut() {
+            delta.remove("usdc");
+            delta.insert("amount".into(), json!("50"));
+        }
         assert!(!valid(&[unknown]));
+        let paid = json!({"time":100000,"hash":"0x9a1d","delta":{"type":"newPayment","usdc":"50",
+            "user":SENDER,"destination":RECEIVER}});
+        assert!(!valid(&[paid]));
         // A transfer the account pays without its fee: the fee is part of
         // what moved, never zero. The receiver's side needs no fee, as for
         // the flows applied to the account stops (`ledger::classify`).
-        let transfer = json!({"time":100000,"hash":"t","delta":{"type":"internalTransfer","usdc":"50",
+        let transfer = json!({"time":100000,"hash":"0x7","delta":{"type":"internalTransfer","usdc":"50",
             "user":SENDER, "destination":RECEIVER,"fee":"1"}});
         assert!(valid(std::slice::from_ref(&transfer)));
         let mut feeless = transfer;
@@ -369,11 +381,11 @@ mod tests {
     #[test]
     fn dex_abstraction_reconstructs_each_dex_on_its_own_side() {
         let user = crate::sign::Address::from_hex(SENDER).unwrap();
-        let activation = json!({"time":100000,"hash":"act","delta":{"type":"activateDexAbstraction",
+        let activation = json!({"time":100000,"hash":"0xac7","delta":{"type":"activateDexAbstraction",
             "dex":"xyz","token":"USDC","amount":"1000"}});
         let anchor = |value: &str| json!({"time":120001,"marginSummary":{"accountValue":value},"assetPositions":[]});
         let both = [("", anchor("10000")), ("xyz", anchor("0"))];
-        let id = "act:100000:activateDexAbstraction";
+        let id = "0xac7:100000:activateDexAbstraction";
         let ledger = std::slice::from_ref(&activation);
         let all = std::collections::BTreeSet::from([String::new(), "xyz".to_owned()]);
         assert!(valid_ledger(ledger, user, &all));
@@ -394,12 +406,12 @@ mod tests {
         // The activation between a deposit of 500 to the main dex at 90,000
         // (the flow reconstructed) and the anchors (main 10,500, xyz 0):
         // main 10,500 - 500 - 1,000 = 9,000, xyz 0 + 1,000 = 1,000.
-        let deposit = json!({"time":90000,"hash":"dep","delta":{"type":"deposit","usdc":"500"}});
+        let deposit = json!({"time":90000,"hash":"0xde9","delta":{"type":"deposit","usdc":"500"}});
         let ledger = [deposit, activation];
         assert!(valid_ledger(&ledger, user, &all));
         let both = [("", anchor("10500")), ("xyz", anchor("0"))];
         assert_eq!(
-            reconstruct_dexes(&both, "dep:90000:deposit", 90000, &[], &[], &ledger, user),
+            reconstruct_dexes(&both, "0xde9:90000:deposit", 90000, &[], &[], &ledger, user),
             Some(vec![
                 ("".to_owned(), d("9000")),
                 ("xyz".to_owned(), d("1000"))
@@ -412,7 +424,7 @@ mod tests {
         // Mainnet shapes (`ledger::tests`): a charge in HYPE moves none of
         // the perp accounts' money; one in USDC, or without its token,
         // cannot be vouched for.
-        let row = |delta: Value| json!({"time":100000,"hash":"c","delta":delta});
+        let row = |delta: Value| json!({"time":100000,"hash":"0xc","delta":delta});
         for kind in [
             "accountActivationGas",
             "deployGasAuction",

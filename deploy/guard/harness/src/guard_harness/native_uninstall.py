@@ -1,6 +1,7 @@
 """Fixed macOS uninstall diagnostics and measured hosted foreground cleanup."""
 
 import os
+import re
 import stat
 from pathlib import Path
 
@@ -39,7 +40,13 @@ HELPER_REFUSALS = frozenset(
         "installed release entry is not one regular file",
         "foreground notice is not a regular file",
         "foreground release notice identity differs",
+        "foreground copy changed during removal",
     }
+)
+# The signed helper's own declaration (deploy/guard/macos/uninstall.py, CAPABILITIES).
+CAPABILITY = re.compile(
+    rb'^CAPABILITIES = frozenset\(\{[^}\n]*"writable-usr-local-foreground"[^}\n]*\}\)$',
+    re.MULTILINE,
 )
 UNKNOWN = "unknown macOS uninstall failure"
 LEGACY = "Owned macOS Testnet uninstall refused; retain state for review"
@@ -68,8 +75,10 @@ def prepare_foreground(
 ) -> str:
     """Remove our signed copy only for the hosted image's two mutable ancestors.
 
-    The service helper still refuses untrusted foreground paths. Do not chown
-    shared runner directories or credit this manual cleanup to product uninstall.
+    The 1.0 and 1.0.1 service helpers refuse these foreground paths, so for them the harness
+    removes the copy first. A release whose signed helper declares the capability removes it
+    itself: then nothing is touched here, and `assert_foreground_removed` checks afterwards.
+    Do not chown shared runner directories or credit this manual cleanup to product uninstall.
     """
     if not binary.exists() and not binary.is_symlink():
         return "absent"
@@ -84,12 +93,28 @@ def prepare_foreground(
             if component not in mutable or info.st_uid not in {0, os.getuid()}:
                 raise LifecycleError("unexpected hosted foreground ancestor ownership")
             needs_cleanup = True
-    if not needs_cleanup:
+    if not needs_cleanup or product_removes_foreground(release):
         return "product-uninstall"
     # This existing harness operation checks the exact signed binary and all
     # three notices, plain files and link counts before removing only those files.
     remove_macos_paper(release, binary, env=env, work=work)
     return "owned-manual-cleanup-runner-ancestors"
+
+
+def product_removes_foreground(release: Release) -> bool:
+    """Whether the signed helper this release installs removes the copy itself (1.0.2 on).
+
+    Read from the authenticated asset that install-service.sh installs, not from the tag.
+    """
+    return CAPABILITY.search(release.asset("uninstall-macos-testnet.py")) is not None
+
+
+def assert_foreground_removed(binary: Path = Path("/usr/local/bin/zunder-guard")) -> None:
+    """After a product uninstall: neither the copy nor its notice directory is left."""
+    notices = binary.parent.parent / "share/licenses/zunder-guard"
+    for path in (binary, notices):
+        if path.exists() or path.is_symlink():
+            raise LifecycleError("product uninstall left the foreground copy or its notices")
 
 
 def execute(release: Release, work: Path, env: dict[str, str], log: Path) -> None:

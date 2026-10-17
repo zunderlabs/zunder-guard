@@ -202,3 +202,25 @@ def test_actual_completion_step_refuses_incomplete_or_ambiguous_results(
     else:
         results["gate"] = {"result": "unknown"}
     assert not completion(rc, results)
+
+
+@pytest.mark.parametrize("rc,cancelled", itertools.product((False, True), (False, True)))
+@pytest.mark.parametrize("staging,journeys,installs", itertools.product(RESULTS, repeat=3))
+def test_wallet_restore_waits_for_every_trading_and_install_row(
+    rc: bool, cancelled: bool, staging: str, journeys: str, installs: str
+) -> None:
+    # W18: the merchant's transfers start only once journeys (P8, T1, T2, purchases) and the
+    # install rows have finished. A failed journey may have paid, so it still restores; a
+    # cancelled dependency or run is left for a person to reconcile.
+    assert admitted(
+        "wallet-restore",
+        {"staging": staging, "journeys": journeys, "install-matrix": installs},
+        rc=rc,
+        cancelled=cancelled,
+        ancestors=("skipped" if rc else "success",),
+    ) == (
+        not cancelled
+        and staging == "success"
+        and journeys in {"success", "failure"}
+        and installs in {"success", "failure", "skipped"}
+    )

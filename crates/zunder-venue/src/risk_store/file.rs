@@ -23,7 +23,7 @@ use super::{
     parse::parse,
     record::{FlowFields, JournalEvent, JournalRecord},
 };
-use crate::flows::Horizon;
+use crate::flows::{Horizon, RebaseBudget};
 
 /// The marker a failed write leaves next to the journal at `path`.
 pub fn broken_marker(path: &Path) -> PathBuf {
@@ -84,7 +84,7 @@ impl RiskJournal {
         event: JournalEvent,
         state: RiskSnapshot,
         fields: FlowFields,
-        base: Option<(&RiskSnapshot, &Horizon, &Horizon)>,
+        base: Option<(&RiskSnapshot, &Horizon, &Horizon, Option<&RebaseBudget>)>,
     ) -> Result<(), JournalError> {
         let seq = self.last.seq + 1;
         let refuse = |message: String| JournalError::Inconsistent {
@@ -109,7 +109,7 @@ impl RiskJournal {
             flows: listed,
         } = &record.event
         {
-            let (state, horizon, reached) =
+            let (state, horizon, reached, budget) =
                 base.ok_or_else(|| refuse("a flowed record without its base".into()))?;
             self.checks
                 .trail
@@ -119,8 +119,8 @@ impl RiskJournal {
                 .listings
                 .check(*base_seq, reached, listed)
                 .map_err(refuse)?;
-            let replayed =
-                check_flowed(&self.limits, state, horizon, &self.last, &record).map_err(refuse)?;
+            let replayed = check_flowed(&self.limits, state, horizon, budget, &self.last, &record)
+                .map_err(refuse)?;
             placed = Some(replayed.placed);
         }
         self.file

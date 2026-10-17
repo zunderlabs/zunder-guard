@@ -9,8 +9,7 @@ from typing import Any
 
 from guard_harness import linux_policy
 from guard_harness.channel_evidence import admit
-from guard_harness.docker_run import _version
-from guard_harness.lifecycle_coverage import LIFECYCLE_COVERAGE
+from guard_harness.lifecycle_coverage import LIFECYCLE_COVERAGE, release_version
 from guard_harness.native_release import Release
 from guard_harness.release_state import validate_build
 from guard_harness.testnet_run import ROOT
@@ -146,7 +145,7 @@ def predicate(
         raise EvidenceError("attestation manifest differs from authenticated C2")
     build = json.loads(build_bytes)
     validate_build(build, ROOT / "release/manifest.schema.json", expected_commit=commit)
-    if previous.commit == commit or _version(previous.tag) >= _version(current.tag):
+    if previous.commit == commit or release_version(previous.tag) >= release_version(current.tag):
         raise EvidenceError("distinct authenticated predecessor required")
     previous.asset("release-manifest.json")
     observed: set[str] = set()

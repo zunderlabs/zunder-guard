@@ -358,6 +358,7 @@ def publish_phase(args: argparse.Namespace, installer_token: str, tap_token: str
         prepare_sentinel(
             sentinel(state["manifest_sha256"], proposal.digest),
             original=build["distribution"]["docker"]["digest"],
+            log=args.work / "logs/sentinel-preflight-pull.log",
         )
     # Worker first: any later partial channel failure has a signed promoted head
     # that rollback can advance to withdrawal before restoring prior bytes.

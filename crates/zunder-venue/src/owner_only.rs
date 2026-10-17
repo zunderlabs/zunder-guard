@@ -155,8 +155,76 @@ const READ_ONLY_MASK: u32 = 0x0000_0001
     | 0x2000_0000
     | 0x8000_0000;
 
+/// The machine-independent SID aliases SDDL may print instead of a numeric SID
+/// (`sddl.h`; Windows prints the alias whenever one exists, so the current
+/// user SYSTEM appears as `SY`, never as `S-1-5-18`). Aliases relative to a
+/// machine or domain (`LA`, `LG`, `DA`, `DU`, ...) differ per machine and are
+/// not here: they stay unresolved and so never match a numeric SID (`LA` is
+/// resolved on the machine, see [`check_sddl`]).
+const WELL_KNOWN_ALIASES: &[(&str, &str)] = &[
+    ("AA", "S-1-5-32-579"),
+    ("AC", "S-1-15-2-1"),
+    ("AN", "S-1-5-7"),
+    ("AO", "S-1-5-32-548"),
+    ("AU", "S-1-5-11"),
+    ("BA", "S-1-5-32-544"),
+    ("BG", "S-1-5-32-546"),
+    ("BO", "S-1-5-32-551"),
+    ("BU", "S-1-5-32-545"),
+    ("CD", "S-1-5-32-574"),
+    ("CG", "S-1-3-1"),
+    ("CO", "S-1-3-0"),
+    ("CY", "S-1-5-32-569"),
+    ("ED", "S-1-5-9"),
+    ("ER", "S-1-5-32-573"),
+    ("HA", "S-1-5-32-578"),
+    ("HI", "S-1-16-12288"),
+    ("IS", "S-1-5-32-568"),
+    ("IU", "S-1-5-4"),
+    ("LS", "S-1-5-19"),
+    ("LU", "S-1-5-32-559"),
+    ("LW", "S-1-16-4096"),
+    ("ME", "S-1-16-8192"),
+    ("MP", "S-1-16-8448"),
+    ("MS", "S-1-5-32-577"),
+    ("MU", "S-1-5-32-558"),
+    ("NO", "S-1-5-32-556"),
+    ("NS", "S-1-5-20"),
+    ("NU", "S-1-5-2"),
+    ("OW", "S-1-3-4"),
+    ("PO", "S-1-5-32-550"),
+    ("PS", "S-1-5-10"),
+    ("PU", "S-1-5-32-547"),
+    ("RA", "S-1-5-32-575"),
+    ("RC", "S-1-5-12"),
+    ("RD", "S-1-5-32-555"),
+    ("RE", "S-1-5-32-552"),
+    ("RM", "S-1-5-32-580"),
+    ("RU", "S-1-5-32-554"),
+    ("SI", "S-1-16-16384"),
+    ("SO", "S-1-5-32-549"),
+    ("SS", "S-1-18-2"),
+    ("SU", "S-1-5-6"),
+    ("SY", "S-1-5-18"),
+    ("WD", "S-1-1-0"),
+    ("WR", "S-1-5-33"),
+];
+
+/// `sid` as a numeric SID when it is a well-known alias, unchanged otherwise.
+fn canonical_sid(sid: &str) -> &str {
+    WELL_KNOWN_ALIASES
+        .iter()
+        .find(|(alias, _)| sid.eq_ignore_ascii_case(alias))
+        .map_or(sid, |(_, numeric)| numeric)
+}
+
+/// Whether two SIDs, each an alias or numeric, name the same identity.
+fn same_sid(a: &str, b: &str) -> bool {
+    canonical_sid(a).eq_ignore_ascii_case(canonical_sid(b))
+}
+
 fn sid_in(sid: &str, set: &[&str]) -> bool {
-    set.iter().any(|known| sid.eq_ignore_ascii_case(known))
+    set.iter().any(|known| same_sid(sid, known))
 }
 
 /// One ACE's text between its brackets, split into its six fields. Refused
@@ -256,10 +324,12 @@ fn owner_and_dacl(sddl: &str) -> Result<(String, String), Openness> {
 }
 
 /// Check a file's security descriptor in SDDL against `user` (the current
-/// user's SID, `S-1-5-21-…`). `local_admin` is what the alias `LA` (this
-/// machine's built-in Administrator account) stands for, resolved on the
-/// machine; `LA` counts as the user only when it is exactly the user's SID.
-/// An allowlist:
+/// user's numeric SID: `S-1-5-21-…`, or `S-1-5-18` when running as SYSTEM).
+/// Windows prints a well-known SID as its alias (`SY`, `BA`, `OW`, ...), so
+/// every comparison maps aliases to their numeric SIDs first. `local_admin`
+/// is what the alias `LA` (this machine's built-in Administrator account)
+/// stands for, resolved on the machine; `LA` counts as the user only when it
+/// is exactly the user's SID. An allowlist:
 ///
 /// - the owner (`O:`) must be the user, SYSTEM or Administrators (an owner
 ///   can rewrite the ACL at will);
@@ -277,7 +347,7 @@ fn owner_and_dacl(sddl: &str) -> Result<(String, String), Openness> {
 pub fn check_sddl(sddl: &str, user: &str, local_admin: Option<&str>) -> Result<(), Openness> {
     let (owner, dacl) = owner_and_dacl(sddl)?;
     let is_user_sid = |sid: &str| {
-        sid.eq_ignore_ascii_case(user)
+        same_sid(sid, user)
             || (sid.eq_ignore_ascii_case("LA")
                 && local_admin.is_some_and(|la| la.eq_ignore_ascii_case(user)))
     };
@@ -846,6 +916,80 @@ mod tests {
         assert!(check_sddl("O:LAD:(A;;FA;;;LA)", USER, Some(admin)).is_err());
         let other_admin = "S-1-5-21-9-9-9-500";
         assert!(check_sddl("O:LAD:(A;;FA;;;LA)", admin, Some(other_admin)).is_err());
+    }
+
+    #[test]
+    fn system_as_the_user_matches_its_sddl_alias() {
+        // `owner_only::create` run as SYSTEM (an SSM or scheduled-task install):
+        // whoami prints S-1-5-18, the SDDL names it SY. Both are the user.
+        const SYSTEM: &str = "S-1-5-18";
+        assert_eq!(check_sddl("O:SYG:SYD:(A;ID;FA;;;SY)", SYSTEM, None), Ok(()));
+        assert_eq!(check_sddl("O:BAG:SYD:P(A;;FA;;;SY)", SYSTEM, None), Ok(()));
+        // OWNER RIGHTS while SYSTEM owns the file is the user, too.
+        assert_eq!(check_sddl("O:SYD:(A;;FA;;;OW)", SYSTEM, None), Ok(()));
+        // Numeric SIDs in the descriptor are the same identities as the aliases.
+        assert_eq!(
+            check_sddl("O:S-1-5-18D:(A;;FA;;;S-1-5-18)", SYSTEM, None),
+            Ok(())
+        );
+        let numeric_admins = format!("O:S-1-5-32-544D:(A;;FA;;;{USER})(A;;FA;;;S-1-5-32-544)");
+        assert_eq!(check_sddl(&numeric_admins, USER, None), Ok(()));
+        // Mapping never widens: anyone else is still refused for SYSTEM...
+        for other in ["BU", "AU", "WD", "LS", "NS", "S-1-5-19", USER] {
+            let sddl = format!("O:SYD:(A;;FA;;;SY)(A;;FR;;;{other})");
+            assert!(
+                matches!(check_sddl(&sddl, SYSTEM, None), Err(Openness::Readable(text)) if text.contains(other)),
+                "{other} reading a SYSTEM file was not Readable"
+            );
+        }
+        // ...and a file that only Administrators can read is not SYSTEM's.
+        assert_eq!(
+            check_sddl("O:BAD:P(A;;FA;;;BA)", SYSTEM, None),
+            Err(Openness::Readable(
+                "its ACL does not let you read it".into()
+            ))
+        );
+        // A user who is not SYSTEM does not become the user through SY.
+        assert!(check_sddl(&format!("O:{USER}D:(A;;FA;;;SY)"), USER, None).is_err());
+    }
+
+    #[test]
+    fn well_known_aliases_map_to_their_numeric_sids_and_nothing_else() {
+        // Values from Microsoft's well-known SID list (sddl.h).
+        for (alias, numeric) in [
+            ("SY", "S-1-5-18"),
+            ("BA", "S-1-5-32-544"),
+            ("OW", "S-1-3-4"),
+            ("LS", "S-1-5-19"),
+            ("NS", "S-1-5-20"),
+            ("WD", "S-1-1-0"),
+            ("AU", "S-1-5-11"),
+            ("BU", "S-1-5-32-545"),
+        ] {
+            assert_eq!(canonical_sid(alias), numeric);
+            assert_eq!(canonical_sid(&alias.to_ascii_lowercase()), numeric);
+            assert!(same_sid(alias, numeric) && same_sid(numeric, alias));
+        }
+        // Machine- and domain-relative aliases stay unresolved; numeric SIDs pass through.
+        for unresolved in ["LA", "LG", "DA", "DU", USER, "S-1-5-80-1-2-3-4-5", "XX", ""] {
+            assert_eq!(canonical_sid(unresolved), unresolved);
+        }
+        assert!(!same_sid("LA", "S-1-5-21-1-2-3-500"));
+        // Every alias is two capitals and every target a numeric SID, each once.
+        let mut aliases: Vec<_> = WELL_KNOWN_ALIASES.iter().map(|(a, _)| *a).collect();
+        let mut numerics: Vec<_> = WELL_KNOWN_ALIASES.iter().map(|(_, n)| *n).collect();
+        assert!(
+            aliases
+                .iter()
+                .all(|a| a.len() == 2 && a.bytes().all(|b| b.is_ascii_uppercase()))
+        );
+        assert!(numerics.iter().all(|n| n.starts_with("S-1-")));
+        aliases.sort_unstable();
+        aliases.dedup();
+        numerics.sort_unstable();
+        numerics.dedup();
+        assert_eq!(aliases.len(), WELL_KNOWN_ALIASES.len());
+        assert_eq!(numerics.len(), WELL_KNOWN_ALIASES.len());
     }
 
     #[test]

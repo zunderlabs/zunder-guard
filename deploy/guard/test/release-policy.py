@@ -141,6 +141,13 @@ args = sys.argv[1:]
 command = args[0]
 with open(os.environ['TEST_SLSA_LOG'], 'a') as log:
     log.write(json.dumps(args) + '\\n')
+transient = json.loads(os.environ.get('TEST_SLSA_TRANSIENT', '{}')).get(command)
+if transient:
+    with open(os.environ['TEST_SLSA_LOG']) as log:
+        calls = sum(json.loads(line)[0] == command for line in log)
+    if calls <= transient['times']:
+        sys.stderr.write('FAILED: SLSA verification failed: ' + transient['message'] + '\\n')
+        raise SystemExit(1)
 if os.environ.get('TEST_FAIL_SLSA') == command:
     raise SystemExit(1)
 statement = dict(predicate=dict(invocation=dict(configSource=dict(
@@ -159,6 +166,9 @@ if os.environ.get('TEST_FAIL_AFTER_SLSA') == command:
                         GITHUB_REPOSITORY='zunderlabs/zunder-guard', TEST_SHA=SHA,
                         TEST_ASSETS=str(self.assets), TEST_COSIGN_LOG=str(self.root / 'cosign.log'),
                         TEST_SLSA_LOG=str(self.root / 'slsa.log'))
+        # A job's pre-fetched Sigstore trust root lives in RUNNER_TEMP; tests opt in.
+        self.env.pop('RUNNER_TEMP', None)
+        self.env['SLSA_RETRY_PAUSE'] = '0'
 
     def checksums(self):
         files = sorted(p for p in self.assets.iterdir() if p.name not in {
@@ -309,6 +319,130 @@ if os.environ.get('TEST_FAIL_AFTER_SLSA') == command:
     def test_unavailable_verifier_refuses(self):
         (self.root / 'bin/slsa-verifier').write_text('#!/bin/sh\nexit 127\n')
         self.assertNotEqual(self.run_gate().returncode, 0)
+
+    def slsa_calls(self, command):
+        path = self.root / 'slsa.log'
+        lines = path.read_text().splitlines() if path.exists() else []
+        return sum(json.loads(line)[0] == command for line in lines)
+
+    def test_slsa_transport_failures_are_retried_at_most_three_times(self):
+        messages = [
+            'getting Rekor entry: giving up after 1 attempt(s)',
+            'Get "https://rekor.sigstore.dev/api/v1/log": context deadline exceeded',
+            'read tcp 10.0.0.1:443: read: connection reset by peer',
+            'unexpected status code 503 from registry',
+            'HTTP 502 Bad Gateway',
+        ]
+        for command in ['verify-artifact', 'verify-image']:
+            for message in messages:
+                for times, passes in [(2, True), (3, False)]:
+                    with self.subTest(command=command, message=message, times=times):
+                        for leftover in ['slsa.log', 'download']:
+                            path = self.root / leftover
+                            if path.is_dir():
+                                shutil.rmtree(path)
+                            elif path.exists():
+                                path.unlink()
+                        self.env['TEST_SLSA_TRANSIENT'] = json.dumps(
+                            {command: {'times': times, 'message': message}})
+                        result = self.run_gate()
+                        self.assertEqual(result.returncode == 0, passes, result.stderr)
+                        self.assertEqual(self.slsa_calls(command), 3)
+                        # Two retries announced; the third failure is final.
+                        self.assertEqual(result.stderr.count('transport failure on attempt'), 2)
+        del self.env['TEST_SLSA_TRANSIENT']
+
+    def test_slsa_verification_refusals_are_never_retried(self):
+        refusals = [
+            'expected source github.com/zunderlabs/zunder-guard, got github.com/other/repo',
+            'invalid signature when validating ASN.1 encoded signature',
+            'expected tag v1.0.0, got v0.9.0',
+            'status 404 manifest unknown',
+        ]
+        for command in ['verify-artifact', 'verify-image']:
+            for message in refusals:
+                with self.subTest(command=command, message=message):
+                    for leftover in ['slsa.log', 'download']:
+                        path = self.root / leftover
+                        if path.is_dir():
+                            shutil.rmtree(path)
+                        elif path.exists():
+                            path.unlink()
+                    self.env['TEST_SLSA_TRANSIENT'] = json.dumps(
+                        {command: {'times': 9, 'message': message}})
+                    self.assertNotEqual(self.run_gate().returncode, 0)
+                    self.assertEqual(self.slsa_calls(command), 1)
+        del self.env['TEST_SLSA_TRANSIENT']
+
+    def trust_roots(self):
+        temp = self.root / 'runner-temp'
+        temp.mkdir(exist_ok=True)
+        public = {'mediaType': 'application/vnd.dev.sigstore.trustedroot+json;version=0.1',
+                  'tlogs': [{'baseUrl': 'https://rekor.sigstore.dev'}]}
+        github = {'mediaType': 'application/vnd.dev.sigstore.trustedroot+json;version=0.1',
+                  'certificateAuthorities': [{'uri': 'fulcio.githubapp.com'}]}
+        (temp / 'trusted_root.jsonl').write_text(json.dumps(public) + '\n' + json.dumps(github) + '\n')
+        (temp / 'trusted_root.json').write_text(json.dumps(public, indent=1) + '\n')
+        self.env['RUNNER_TEMP'] = str(temp)
+        return temp
+
+    def cosign_calls(self):
+        path = self.root / 'cosign.log'
+        return path.read_text().splitlines() if path.exists() else []
+
+    def test_without_fetched_trust_root_cosign_fetches_its_own(self):
+        self.env['RUNNER_TEMP'] = str(self.root / 'empty-runner-temp')
+        result = self.run_gate()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = self.cosign_calls()
+        self.assertEqual([call.split()[0] for call in calls], ['verify-blob', 'verify'])
+        self.assertTrue(all('--trusted-root' not in call for call in calls))
+
+    def test_fetched_trust_root_is_passed_to_every_cosign_verification_once(self):
+        temp = self.trust_roots()
+        result = self.run_gate()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = self.cosign_calls()
+        self.assertEqual([call.split()[0] for call in calls], ['verify-blob', 'verify'])
+        for call in calls:
+            self.assertEqual(call.split().count('--trusted-root'), 1)
+            self.assertIn('--trusted-root ' + str(temp / 'trusted_root.json'), call)
+            self.assertIn('--certificate-identity https://github.com/zunderlabs/zunder-guard/'
+                          '.github/workflows/release.yml@refs/tags/v1.0.0', call)
+        # The explicit root changes the transport only; a failed check still refuses once.
+        for command in ['verify-blob', 'verify']:
+            with self.subTest(command=command):
+                shutil.rmtree(self.root / 'download')
+                (self.root / 'cosign.log').unlink()
+                self.env['TEST_FAIL_COSIGN'] = command
+                self.assertNotEqual(self.run_gate().returncode, 0)
+                self.assertEqual([c.split()[0] for c in self.cosign_calls()].count(command), 1)
+
+    def test_partial_or_unbound_trust_root_refuses_before_any_verifier(self):
+        cases = {
+            'gh-only': lambda temp: (temp / 'trusted_root.json').unlink(),
+            'cosign-only': lambda temp: (temp / 'trusted_root.jsonl').unlink(),
+            'unbound': lambda temp: (temp / 'trusted_root.json').write_text(
+                '{"mediaType": "application/vnd.dev.sigstore.trustedroot+json;version=0.1"}\n'),
+            'symlink': lambda temp: ((temp / 'trusted_root.json').rename(temp / 'real.json'),
+                                     (temp / 'trusted_root.json').symlink_to(temp / 'real.json')),
+            'malformed': lambda temp: (temp / 'trusted_root.jsonl').write_text('{not json\n'),
+            # Bound to a fetched line, but neither is a Sigstore TrustedRoot.
+            'wrong-type-bound': lambda temp: [(temp / name).write_text('{"mediaType": "application/json"}\n')
+                                              for name in ('trusted_root.jsonl', 'trusted_root.json')],
+            'oversized': lambda temp: (temp / 'trusted_root.jsonl').write_text(
+                (temp / 'trusted_root.jsonl').read_text() + ' ' * 1048576),
+        }
+        for name, damage in cases.items():
+            with self.subTest(case=name):
+                temp = self.trust_roots()
+                damage(temp)
+                result = self.run_gate()
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(self.cosign_calls(), [])
+                if (self.root / 'download').exists():
+                    shutil.rmtree(self.root / 'download')
+                shutil.rmtree(temp)
 
 
 class HomebrewPublication(unittest.TestCase):

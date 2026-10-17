@@ -8,9 +8,15 @@ from pathlib import Path
 from typing import Any
 
 from guard_harness.channel_evidence import admit
-from guard_harness.docker_run import _version
 from guard_harness.install_evidence import read
-from guard_harness.lifecycle_coverage import LIFECYCLE_COVERAGE, WINDOWS_TESTNET_SCOPE
+from guard_harness.lifecycle_coverage import (
+    LIFECYCLE_COVERAGE,
+    WINDOWS_SERVICE_SCOPE,
+    WINDOWS_SERVICE_SKIP,
+    WINDOWS_TESTNET_SCOPE,
+    release_version,
+    windows_service_measured,
+)
 from guard_harness.native_paper import LifecycleError
 from guard_harness.native_release import Release
 from guard_harness.release_state import validate_build
@@ -135,7 +141,7 @@ def predicate(
     previous.asset("release-manifest.json")
     if (
         previous.commit == commit
-        or _version(previous.tag) >= _version(current.tag)
+        or release_version(previous.tag) >= release_version(current.tag)
         or manifest.is_symlink()
         or manifest.read_bytes() != build_bytes
     ):
@@ -174,11 +180,18 @@ def predicate(
                     "candidate-loader-stdin" if scenario == "fresh" else "previous-release-init",
                 }
             )
+            service = row == "I4" and windows_service_measured(scenario, previous.tag)
             if row == "I4":
                 paper = paper - {"crash-recovery"} | {"manual-crash-restart"}
-                # Guard 1.0 Windows testnet is exactly the per-user scope; the SCM
-                # service and its crash-policy step are 1.0.1 (decision of 15 Oct 2026).
-                testnet = set(peruser)
+                if service:
+                    # The SCM service after the per-user install, with the hosted crash
+                    # policy measured as refused and then removed (separate tokens).
+                    from guard_harness.windows_policy import REFUSAL_TOKEN, REMOVAL_TOKEN
+
+                    testnet.update({REFUSAL_TOKEN, REMOVAL_TOKEN})
+                else:
+                    # No released service to upgrade from: exactly the per-user scope.
+                    testnet = set(peruser)
             for mode, name, required in (
                 ("paper", "paper/paper.receipt.json", paper),
                 ("testnet", "testnet/testnet.receipt.json", testnet),
@@ -208,12 +221,25 @@ def predicate(
                     previous=previous,
                     target=target,
                 )
-                # The lifecycle receipt is the per-user measurement itself, never a relabel.
                 lifecycle = read(directory / "testnet/testnet.receipt.json")
-                if lifecycle.pop("scope", None) != WINDOWS_TESTNET_SCOPE or lifecycle != read(
-                    directory / "testnet/per-user/receipt.json"
+                if service:
+                    # Fresh, or an upgrade from a release with a working service: measured.
+                    from guard_harness.windows_policy import admit as admit_policy
+
+                    if (
+                        lifecycle.get("scope") != WINDOWS_SERVICE_SCOPE
+                        or "service_skipped" in lifecycle
+                    ):
+                        raise LifecycleError("Windows testnet receipt must be the service scope")
+                    admit_policy(current, directory / "testnet/windows-policy", lifecycle)
+                elif (
+                    lifecycle.pop("service_skipped", None) != WINDOWS_SERVICE_SKIP
+                    or lifecycle.pop("scope", None) != WINDOWS_TESTNET_SCOPE
+                    or lifecycle != read(directory / "testnet/per-user/receipt.json")
                 ):
-                    raise LifecycleError("Windows testnet receipt must be the per-user scope")
+                    # Only an upgrade from a release without a service skips it, and names the
+                    # skip; the lifecycle receipt is then the per-user measurement, never a relabel.
+                    raise LifecycleError("Windows testnet receipt must name the skipped service")
                 observed.add("per-user:credential-manager")
             if scenario == "fresh":
                 observed.add(

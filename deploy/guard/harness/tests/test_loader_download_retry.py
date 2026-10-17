@@ -1,12 +1,14 @@
 """Bounded download retries in the loaders: real POSIX loaders, offline fakes, no network."""
 
 import os
+import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
 
 import pytest
-from test_loader_cosign import PIN, fake_verifier, shell_fixture
+from test_loader_cosign import PIN, ROOT, fake_verifier, shell_fixture
 
 SYSTEM = "darwin" if sys.platform == "darwin" else "linux"
 ARCH = "arm64" if os.uname().machine in ("arm64", "aarch64") else "amd64"
@@ -159,3 +161,190 @@ def test_a_complete_tampered_download_is_refused_after_one_fetch(
     assert lines(tmp_path / "sleep-log") == []
     assert "trying again" not in result.stderr
     assert message in result.stderr.splitlines()[-1], result.stderr
+
+
+def powershell_function(path: Path, name: str) -> str:
+    """The text of a PowerShell function, from its `function` line to its closing brace."""
+    source = path.read_text()
+    start = source.index(f"function {name}(")
+    indent = source[source.rindex("\n", 0, start) + 1 : start]
+    end = source.index("\n" + indent + "}\n", start)
+    return source[start : end + len(indent) + 3]
+
+
+def test_per_user_powershell_download_mirrors_the_posix_loop() -> None:
+    # Static: PowerShell is not installed on every machine that runs this suite; the
+    # executable twin below runs wherever powershell.exe or pwsh is.
+    body = powershell_function(ROOT / "loader/i.ps1", "Get-Asset")
+    assert "for ($Try = 1; $Try -le 4; $Try++)" in body
+    assert "$Pause = 2" in body and "$Pause *= 2" in body
+    # A fresh file before each try and no partial file after a failed one.
+    assert body.count("[IO.File]::Delete($To)") == 2
+    loop = body[body.index("for ($Try") :]
+    assert loop.index("[IO.File]::Delete($To)") < loop.index("Invoke-WebRequest")
+    assert 'Invoke-WebRequest -UseBasicParsing -Uri "$From/$Name" -OutFile $To @Bounds; break' in (
+        body
+    )
+    # Each try is bounded without capping the transfer; PowerShell 5.1 has no retry parameter.
+    assert "$Bounds = @{ TimeoutSec = 20 }" in body
+    assert "$Bounds.OperationTimeoutSeconds = 60" in body
+    assert body.count("Invoke-WebRequest -UseBasicParsing") == 1
+    # A failed try's error response is closed, so no later try waits for its connection.
+    catch = body[body.index("catch {", body.index("for ($Try")) :]
+    assert catch.index("$Cause.Response.Close()") < catch.index("Start-Sleep")
+    assert "if ($Cause -is [Net.WebException] -and $Cause.Response)" in catch
+    # The final message is the one from before retries existed.
+    assert (
+        'throw "download failed: $From/$Name ($Failure); refusing, nothing was installed"' in body
+    )
+    # Verification is untouched and runs once, after the download, outside the loop.
+    script = (ROOT / "loader/i.ps1").read_text()
+    assert "Get-Sha256" not in body and "Invoke-ZgReleaseVerifier" not in body
+    assert script.count("if ((Get-Sha256 $Cosign) -ne $CosignSha256)") == 1
+
+
+def test_machine_powershell_download_retries_only_its_own_file() -> None:
+    shared = powershell_function(ROOT / "windows/bootstrap.ps1.inc", "Get-ZgAsset")
+    for copy in ("loader/i.ps1", "windows/service.ps1"):
+        assert powershell_function(ROOT / copy, "Get-ZgAsset") == shared, copy
+    https = shared[: shared.index("} elseif ([IO.Directory]::Exists($Source))")]
+    assert "for ($attempt = 1; $attempt -le 4; $attempt++)" in https
+    assert "$pause = 2" in https and "$pause *= 2" in https
+    assert "Microsoft.PowerShell.Utility\\Start-Sleep -Seconds $pause" in https
+    # Bounded: 20 s to connect and receive the headers, 60 s without a byte ends a read.
+    assert "$request.Timeout = 20000" in https
+    assert "$request.ReadWriteTimeout = 60000" in https
+    assert "WebClient" not in https
+    # The file is created with CreateNew (New-ZgSecureFile) on every try; only a file this try
+    # created is deleted, and a refused existing entry or path is final.
+    assert https.count("New-ZgSecureFile $Destination") == 1
+    assert https.count("[IO.File]::Delete($Destination)") == 1
+    assert "if ($step -eq 'copy') { [IO.File]::Delete($Destination) }" in https
+    assert "if ($step -eq 'create' -or $attempt -ge 4) { throw }" in https
+    order = [https.index(f"$step = '{step}'") for step in ("open", "create", "copy", "done")]
+    assert order == sorted(order)
+    assert "if ($step -eq 'done') { Assert-ZgPath $Destination; return }" in https
+    # A short body is a failed try; a failed try aborts its request and closes an error
+    # response before the next one (two connections per host on .NET Framework).
+    assert "if ($response.ContentLength -ge 0 -and $received -ne $response.ContentLength)" in https
+    catch = https[https.index("} catch {") : https.index("} finally {\n")]
+    close = "if ($cause -is [Net.WebException] -and $cause.Response) { $cause.Response.Close() }"
+    assert close in catch
+    assert catch.index("$request.Abort()") < catch.index("throw")
+    assert "$request = $null" in https
+    # Diagnostics stay fixed categories: no path, URL or exception text in the retry line.
+    notice = re.search(r'Write-Host "(Release download try[^"]*)"', https)
+    assert notice is not None
+    assert notice[1] == "Release download try $attempt of 4 failed; trying again in ${pause}s."
+    # The offline branch is unchanged, and verification stays with the caller.
+    assert "Copy-ZgSecureFile $inputStream $Destination" in shared
+    assert "Confirm-ZgRelease" not in shared and "Get-ZgHash" not in shared
+
+
+@pytest.mark.parametrize("shell", ["powershell.exe", "pwsh.exe", "pwsh"])
+@pytest.mark.parametrize("failures", [3, 99])
+def test_per_user_powershell_download_runs_the_loop(
+    tmp_path: Path, shell: str, failures: int
+) -> None:
+    executable = shutil.which(shell)
+    if executable is None:
+        pytest.skip(f"{shell} is unavailable")
+
+    def quote(value: Path) -> str:
+        return "'" + str(value).replace("'", "''") + "'"
+
+    log, sleeps, stage = tmp_path / "tries", tmp_path / "sleeps", tmp_path / "stage"
+    loader = quote(ROOT / "loader/i.ps1")
+    command = f"""
+$ErrorActionPreference='Stop'
+$tokens=$null; $errors=$null
+$ast=[System.Management.Automation.Language.Parser]::ParseFile({loader},[ref]$tokens,[ref]$errors)
+if ($errors.Count) {{ throw 'loader parse failed' }}
+$definition=$ast.Find({{
+  param($node)
+  $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+    $node.Name -eq 'Get-Asset'
+}},$true)
+. ([scriptblock]::Create($definition.Extent.Text))
+$Tmp={quote(stage)}
+New-Item -ItemType Directory -Path $Tmp | Out-Null
+$global:Failed=0
+function Invoke-WebRequest {{
+  param([switch]$UseBasicParsing,[string]$Uri,[string]$OutFile,[int]$TimeoutSec,[int]$OperationTimeoutSeconds)
+  $state = if ([IO.File]::Exists($OutFile)) {{ 'stale' }} else {{ 'fresh' }}
+  [IO.File]::AppendAllText({quote(log)},"$Uri $state $TimeoutSec $OperationTimeoutSeconds`n")
+  if ($global:Failed -lt {failures}) {{
+    $global:Failed++
+    [IO.File]::WriteAllText($OutFile,'partial body of a reset connection')
+    throw 'connection reset fixture'
+  }}
+  [IO.File]::WriteAllText($OutFile,'complete body')
+}}
+function Start-Sleep {{
+  param([int]$Seconds)
+  [IO.File]::AppendAllText({quote(sleeps)},"$Seconds`n")
+}}
+try {{
+  $result = Get-Asset 'SHA256SUMS' 'https://release.invalid/v0.0.0'
+  Write-Host "RESULT:$result"
+  Write-Host ('BODY:' + [IO.File]::ReadAllText($result))
+}} catch {{ Write-Host "ERROR:$($_.Exception.Message)" }}
+"""
+    result = subprocess.run(
+        [executable, "-NoProfile", "-Command", command],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    output = result.stdout + result.stderr
+    assert result.returncode == 0, output
+    tries = lines(log)
+    assert len(tries) == 4, output
+    url = "https://release.invalid/v0.0.0/SHA256SUMS"
+    # Every try starts without the partial file and is bounded; the read bound only where
+    # the cmdlet offers it (PowerShell 7.4 or newer).
+    assert len(set(tries)) == 1 and tries[0] in {f"{url} fresh 20 60", f"{url} fresh 20 0"}
+    assert lines(sleeps) == ["2", "4", "8"]
+    assert output.count("of 4 failed; trying again in") == 3
+    target = stage / "SHA256SUMS"
+    if failures == 3:
+        assert f"RESULT:{target}" in output and "BODY:complete body" in output
+    else:
+        expected = (
+            f"ERROR:download failed: {url} (connection reset fixture);"
+            " refusing, nothing was installed"
+        )
+        assert expected in output
+        assert not target.exists()
+
+
+def test_windows_download_test_rewrites_still_match_the_loader_and_runs_on_both_shells() -> None:
+    # windows-download.ps1 rewrites its own copy of each function, each text exactly once;
+    # catch a loader edit that would break it here, before the Windows job.
+    test = (ROOT / "test/windows-download.ps1").read_text()
+    machine = powershell_function(ROOT / "loader/i.ps1", "Get-ZgAsset")
+    user = powershell_function(ROOT / "loader/i.ps1", "Get-Asset")
+    for old in (
+        "$Source.StartsWith('https://')",
+        "Microsoft.PowerShell.Utility\\Start-Sleep",
+        "$request.ReadWriteTimeout = 60000",
+    ):
+        assert machine.count(old) == 1, old
+        assert "'" + old.replace("'", "''") + "'" in test, old
+    for old in ("$From -like 'https://*'", "$Bounds.OperationTimeoutSeconds = 60"):
+        assert user.count(old) == 1, old
+        assert "'" + old.replace("'", "''") + "'" in test, old
+    # Production values are never rewritten outside the stall cases.
+    assert "$request.Timeout = 20000" not in test and "TimeoutSec = 20" not in test
+    # Private source keeps the workflows in deploy/guard/github/workflows; the export moves
+    # them to .github/workflows.
+    ci = ROOT / "github/workflows/ci.yml"
+    if not ci.is_file():
+        ci = ROOT.parents[1] / ".github/workflows/ci.yml"
+    workflow = ci.read_text()
+    job = workflow[workflow.index("\n  windows-main:") : workflow.index("\n  windows-tests:")]
+    steps = re.findall(r"shell: (\w+)\n(?:\s+timeout-minutes: \d+\n)?\s+run: (\S+)", job)
+    assert ("powershell", "./deploy/guard/test/windows-download.ps1") in steps
+    assert ("pwsh", "./deploy/guard/test/windows-download.ps1") in steps
+    assert (ROOT / "test/download-fixture-server.py").is_file()

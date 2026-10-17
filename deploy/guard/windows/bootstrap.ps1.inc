@@ -173,12 +173,52 @@ function Copy-ZgSecureFile([IO.Stream]$InputStream,[string]$Destination) {
 }
 function Get-ZgAsset([string]$Source,[string]$Name,[string]$Destination) {
   if ($Source.StartsWith('https://')) {
-    $client = [Net.WebClient]::new()
-    $inputStream = $null
-    try {
-      $inputStream = $client.OpenRead($Source.TrimEnd('/')+'/'+$Name)
-      Copy-ZgSecureFile $inputStream $Destination
-    } finally { if ($inputStream) { $inputStream.Dispose() }; $client.Dispose() }
+    # A refused or reset connection, a TLS or HTTP failure or a cut-off body gets three more
+    # tries, 2, 4 and 8 s apart. Each try is bounded: 20 s to connect and receive the headers,
+    # and a read that receives nothing for 60 s ends it; a slow but moving download (the
+    # ~140 MB verifier) is never capped. A body shorter than its announced length is a failed
+    # try. A try that created its file (CreateNew) and failed while copying deletes that
+    # file, so the next try writes a fresh one. An entry that already existed, or a refused
+    # path, is final: never retried, adopted or removed. A failed try aborts its request and
+    # closes an error response: .NET Framework allows two connections per host, and one
+    # still held would make a later try wait for it until its timeout.
+    $pause = 2
+    for ($attempt = 1; $attempt -le 4; $attempt++) {
+      $request = $null
+      $response = $null
+      $inputStream = $null
+      $step = 'open'
+      try {
+        $request = [Net.WebRequest]::Create($Source.TrimEnd('/')+'/'+$Name)
+        $request.Timeout = 20000
+        $request.ReadWriteTimeout = 60000
+        $response = $request.GetResponse()
+        $inputStream = $response.GetResponseStream()
+        $step = 'create'
+        $output = New-ZgSecureFile $Destination
+        $step = 'copy'
+        $received = -1
+        try { $inputStream.CopyTo($output); $output.Flush($true); $received = $output.Length } finally { $output.Dispose() }
+        if ($response.ContentLength -ge 0 -and $received -ne $response.ContentLength) { throw 'Release download ended before its announced length.' }
+        $step = 'done'
+      } catch {
+        $cause = $_.Exception
+        while ($cause) {
+          if ($cause -is [Net.WebException] -and $cause.Response) { $cause.Response.Close() }
+          $cause = $cause.InnerException
+        }
+        if ($request) { $request.Abort() }
+        if ($step -eq 'copy') { [IO.File]::Delete($Destination) }
+        if ($step -eq 'create' -or $attempt -ge 4) { throw }
+      } finally {
+        if ($inputStream) { $inputStream.Dispose() }
+        if ($response) { $response.Close() }
+      }
+      if ($step -eq 'done') { Assert-ZgPath $Destination; return }
+      Microsoft.PowerShell.Utility\Write-Host "Release download try $attempt of 4 failed; trying again in ${pause}s."
+      Microsoft.PowerShell.Utility\Start-Sleep -Seconds $pause
+      $pause *= 2
+    }
   } elseif ([IO.Directory]::Exists($Source)) {
     $inputStream = [IO.File]::OpenRead([IO.Path]::Combine($Source,$Name))
     try { Copy-ZgSecureFile $inputStream $Destination } finally { $inputStream.Dispose() }

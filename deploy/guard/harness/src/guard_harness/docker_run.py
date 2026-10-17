@@ -10,6 +10,7 @@ from pathlib import Path
 
 from guard_harness.docker_paper import lifecycle
 from guard_harness.docker_testnet import lifecycle as testnet_lifecycle
+from guard_harness.lifecycle_coverage import release_version
 from guard_harness.runner import run
 from guard_harness.staged_subjects import _private
 from guard_harness.testnet_run import ROOT, verified_asset
@@ -41,14 +42,6 @@ def subjects(assets: Path, *, tag: str, commit: str) -> tuple[str, bytes, str]:
     return reference, compose, manifest_digest
 
 
-def _version(tag: str) -> tuple[int, int, int, int, int]:
-    match = re.fullmatch(r"v(\d+)\.(\d+)\.(\d+)(?:-rc\.([1-9]\d*))?", tag)
-    if match is None:
-        raise ValueError("release version required")
-    # A final version follows every RC with the same numeric version.
-    return int(match[1]), int(match[2]), int(match[3]), 0 if match[4] else 1, int(match[4] or 0)
-
-
 def execute(
     *,
     tag: str,
@@ -78,7 +71,7 @@ def execute(
         raise ValueError("previous release tag and commit must be supplied together")
     if previous_tag is not None and (
         not re.fullmatch(r"[0-9a-f]{40}", previous_commit or "")
-        or _version(previous_tag) >= _version(tag)
+        or release_version(previous_tag) >= release_version(tag)
         or previous_commit == commit
     ):
         raise ValueError("previous release must precede the candidate on distinct source bytes")

@@ -1,4 +1,23 @@
-"""Withdraw first canonical OCI latest through an empty index, preserving release digests."""
+"""Withdraw first canonical OCI latest through an empty index, preserving release digests.
+
+Why an empty index. A first stable release has no earlier `latest` to restore, and GHCR
+offers no tag deletion (its registry API refuses manifest DELETE; deleting the package
+version would delete the release digest itself). Rollback therefore repoints `latest`
+at an index that names no platform, so `docker pull :latest` refuses while every
+released digest stays pullable. The OCI image-spec allows it: `manifests` MUST be
+present, and "the size of the array MAY be zero". It references nothing, so no
+registry check for missing children applies (go-containerregistry's reference
+registry accepts it and a platform pull refuses: "no child with platform").
+
+What is not documented is GHCR's own acceptance. So the promotion proves it before any
+channel is mutated: `prepare_sentinel` pushes these exact bytes by digest only (a tag
+is never moved), reads the digest back, and requires the same platform refusal a
+withdrawal needs, from a fresh `docker pull` of that digest. If GHCR refuses, the
+first promotion stops there with nothing mutated. Neither alternative is safer:
+skipping the sentinel would leave a failed first release on `latest`, and an index
+pointing at a real manifest under a made-up platform is just as unverified on GHCR
+and would tie the sentinel's bytes to one release's children.
+"""
 
 import base64
 import hashlib
@@ -96,12 +115,43 @@ def put_sentinel(body: bytes, *, reference: str) -> None:
         raise AttestationError("OCI empty-index withdrawal readback differs")
 
 
-def prepare_sentinel(body: bytes, *, original: str) -> None:
-    from guard_harness.promotion_channels import image_digest
+def pull_refused(reference: str, log: Path) -> None:
+    """A fresh linux/amd64 pull of `reference` must fail for want of a matching platform."""
+    env = {key: os.environ[key] for key in ("PATH", "HOME", "DOCKER_CONFIG") if key in os.environ}
+    try:
+        result = subprocess.run(
+            ["docker", "pull", "--platform", "linux/amd64", reference],
+            capture_output=True,
+            timeout=180,
+            env=env,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        # No docker, or no answer: the refusal was not observed, which is a refusal here.
+        raise AttestationError("docker pull refusal check did not complete") from None
+    output = (result.stdout + result.stderr).decode(errors="replace")[-65536:]
+    log.parent.mkdir(parents=True, exist_ok=True)
+    log.write_text(output.replace(os.environ.get("GH_TOKEN", "") or "\x00", "[REDACTED]"))
+    if result.returncode == 0 or not any(
+        literal in output.lower() for literal in ("no matching manifest", "no match for platform")
+    ):
+        raise AttestationError("withdrawn OCI latest did not produce the expected platform refusal")
+
+
+def prepare_sentinel(body: bytes, *, original: str, log: Path) -> None:
+    """Prove GHCR takes the withdrawal index, by digest only, before any channel mutation."""
+    from guard_harness.promotion_channels import IMAGE, image_digest
 
     if image_digest(original) != original:
         raise AttestationError("immutable released image is absent")
-    put_sentinel(body, reference=body_digest(body))
+    digest = body_digest(body)
+    try:
+        put_sentinel(body, reference=digest)
+        pull_refused(IMAGE + "@" + digest, log)
+    except AttestationError as error:
+        raise AttestationError(
+            "GHCR did not accept the first-release withdrawal index; no channel was mutated: "
+            + str(error)
+        ) from None
     if image_digest(original) != original:
         raise AttestationError("immutable release changed during withdrawal preflight")
 
@@ -115,17 +165,4 @@ def withdraw_latest(*, original: str, body: bytes, log: Path) -> None:
     put_sentinel(body, reference="latest")
     if image_digest(original) != original:
         raise AttestationError("immutable released image changed during withdrawal")
-    env = {key: os.environ[key] for key in ("PATH", "HOME", "DOCKER_CONFIG") if key in os.environ}
-    result = subprocess.run(
-        ["docker", "pull", "--platform", "linux/amd64", "ghcr.io/zunderlabs/zunder-guard:latest"],
-        capture_output=True,
-        timeout=180,
-        env=env,
-    )
-    output = (result.stdout + result.stderr).decode(errors="replace")[-65536:]
-    log.parent.mkdir(parents=True, exist_ok=True)
-    log.write_text(output.replace(os.environ.get("GH_TOKEN", "") or "\x00", "[REDACTED]"))
-    if result.returncode == 0 or not any(
-        literal in output.lower() for literal in ("no matching manifest", "no match for platform")
-    ):
-        raise AttestationError("withdrawn OCI latest did not produce the expected platform refusal")
+    pull_refused("ghcr.io/zunderlabs/zunder-guard:latest", log)

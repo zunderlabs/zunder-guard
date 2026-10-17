@@ -13,6 +13,7 @@ is what we built, and what it talks to.
 | `templates/` | AWS (`cloudformation.yaml`); other provider templates are deferred |
 | `github/workflows/` | `ci`, `release`, `verify`, `promote`, `nightly`, `monitor`, plus reusable install/journey consumers for the public repository (kept outside `.github/` here) |
 | `github/build-release.sh`, `packaging/` | Reproducible builds and archives; the Homebrew formula's template |
+| `github/registry-retry.sh` | Bounded retries of base-image pulls that a registry throttles or fails |
 | `rules/` | Rules schema v1: Rust crate `zunder-guard-rules`, `zr1.ts`, `schema-v1.json`, `vectors.json` |
 | `test/` | Every test, run on the Linux build host |
 
@@ -529,6 +530,12 @@ prior subjects when publication or smoke fails. Recovery uses `promote.yml` roll
 with the original promotion run and attempt and authenticates its signed immutable snapshot;
 see [the rollback runbook](release/canonical-rollback.md). Each channel is attempted independently.
 A release candidate cannot promote channels.
+
+The image builds in `release.yml` and `ci.yml` first fetch the Dockerfile's base images, pinned
+by digest, into the buildx builder, then build through `github/registry-retry.sh`: a pull that
+a registry throttles (HTTP 429), fails (5xx) or lets time out is retried at most three times,
+after 60, 120 and 240 seconds. The image is never swapped for another one, so the reproduction
+check still compares two builds from the same pinned bytes.
 
 `nightly.yml` first authenticates the latest promoted complete gate and exact canonical bytes,
 then reruns I1/I3/I4/I5 and staging P1 using those subjects, plus property tests on the promoted

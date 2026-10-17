@@ -397,14 +397,16 @@ impl PersistentRisk {
         if event == JournalEvent::Updated && !must {
             return Ok(());
         }
+        let resumed = matches!(event, JournalEvent::ResumedAfterReview { .. });
         let fields = match &self.flows {
             Some(book) => FlowFields {
                 horizon: Some(book.horizon.clone()),
                 view: view.cloned(),
+                // A review starts the re-base budget afresh.
+                budget: if resumed { None } else { book.budget.clone() },
             },
             None => FlowFields::default(),
         };
-        let resumed = matches!(event, JournalEvent::ResumedAfterReview { .. });
         self.journal
             .append(at, event, state, fields, None)
             .inspect_err(|error| {

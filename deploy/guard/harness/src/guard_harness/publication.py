@@ -11,7 +11,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any
 
-from guard_harness.attestation import AttestationError
+from guard_harness.attestation import AttestationError, cosign_trust_arguments
 from guard_harness.journey_evidence import JourneyBundle, authenticate_gate
 from guard_harness.release_state import canonical_bytes
 from guard_harness.runner import run
@@ -74,6 +74,7 @@ def prepare(
                 f"https://github.com/zunderlabs/zunder-guard/.github/workflows/release.yml@refs/tags/{tag}",
                 "--certificate-oidc-issuer",
                 "https://token.actions.githubusercontent.com",
+                *cosign_trust_arguments(),
                 str(root / "SHA256SUMS"),
             ],
             log=logs / "checksums.log",

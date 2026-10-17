@@ -72,6 +72,13 @@ fn credential_path(binding: &ServiceBinding) -> Result<PathBuf> {
 }
 
 /// Safe native token query, not PATH/whoami or an environment-provided identity.
+///
+/// This is the control that binds a running process to its binding: the process
+/// token's user must be exactly `NT SERVICE\<binding's service name>`, the
+/// virtual account SCM creates for that one registered service, and its SID must
+/// equal the SID admitted in the binding. Nothing else ties the process to its
+/// service (the binding path and the name derived from it come from the command
+/// line). Do not weaken, skip or reorder this check after any key access.
 pub fn verify_service_identity(binding: &ServiceBinding) -> Result<()> {
     let (name, expected) = platform(binding)?;
     let (sid, _, _) = LookupAccountName(None::<&std::ffi::OsStr>, format!(r"NT SERVICE\{name}"))?;
@@ -300,21 +307,30 @@ use windows_service::{
     service_control_handler::{self, ServiceControlHandlerResult},
     service_dispatcher,
 };
-static START: OnceLock<(ServiceBinding, PathBuf)> = OnceLock::new();
+static START: OnceLock<PathBuf> = OnceLock::new();
 
 /// Ignore SCM's raw argument pointers. All arguments were parsed by the safe
 /// CLI before dispatch; unlike define_windows_service!, no unsafe macro is needed.
 extern "system" fn scm_entry(_count: u32, _arguments: *mut *mut u16) {
-    if let Some((binding, path)) = START.get() {
+    if let Some(path) = START.get() {
         // SCM status is the authoritative result; no credential details logged.
-        let _ = scm_session(binding, path);
+        let _ = scm_session(path);
     }
 }
 
-pub fn run(binding: &ServiceBinding, path: &Path) -> Result<()> {
-    let (name, _) = platform(binding)?;
+/// Connect to the SCM dispatcher before anything else. SCM waits 30 seconds
+/// for a started service to connect; a process that refuses or exits before
+/// connecting is reported only as "did not respond" (error 1053, events
+/// 7009/7000). So nothing here touches the disk: the binding, its paths and
+/// their ACLs are admitted in [`scm_session`], after START_PENDING is
+/// reported, and a refusal there stops the service with a visible failure.
+pub fn run(binding_path: &Path) -> Result<()> {
+    // For an own-process service SCM ignores the dispatch table's name, so this
+    // name, derived from the command-line path, is no identity claim; an
+    // unexpected path still connects and is refused under SCM.
+    let name = super::scm_service_name(binding_path).unwrap_or_else(|| "ZunderGuard".into());
     START
-        .set((binding.clone(), path.to_owned()))
+        .set(binding_path.to_owned())
         .map_err(|_| refused("service dispatcher already initialized"))?;
     service_dispatcher::start(name, scm_entry).map_err(|_| {
         refused("SCM dispatcher failed; run this command through its registered Windows service")
@@ -322,12 +338,46 @@ pub fn run(binding: &ServiceBinding, path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn scm_session(binding: &ServiceBinding, path: &Path) -> Result<()> {
-    let (name, _) = platform(binding)?;
+/// The binding named on the command line, admitted in full before any key
+/// access: canonical path, protected layout and ACLs, crash-dump policy, the
+/// virtual account, the sending journal and the credential's presence.
+///
+/// `name` is derived from the same command-line path, so comparing it with the
+/// binding's service name is only a consistency check (a binding moved to
+/// another instance's folder), not proof of which service SCM started. What
+/// ties this process to the binding is [`verify_service_identity`]: the process
+/// runs as `NT SERVICE\<binding's service name>` with the admitted SID.
+fn admit_started(name: &str, raw_path: &Path) -> Result<(ServiceBinding, PathBuf)> {
+    admit_started_with(name, raw_path, super::load_binding)
+}
+
+/// [`admit_started`] with the binding loader as a seam for native tests.
+fn admit_started_with(
+    name: &str,
+    raw_path: &Path,
+    load: impl FnOnce(&Path) -> Result<ServiceBinding>,
+) -> Result<(ServiceBinding, PathBuf)> {
+    let path = fs::canonicalize(raw_path)?;
+    let binding = load(&path)?; // load_binding: validate_paths, layout and ACLs
+    let (bound, _) = platform(&binding)?;
+    if bound != name {
+        return Err(refused("binding is not this instance's service binding"));
+    }
+    enforce_no_core_dumps()?;
+    // The binding control: process SID == NT SERVICE\<binding's name> == admitted SID.
+    verify_service_identity(&binding)?;
+    binding.validate_journal()?;
+    check(&binding)?;
+    Ok((binding, path))
+}
+
+fn scm_session(raw_path: &Path) -> Result<()> {
+    let name = super::scm_service_name(raw_path);
     let (send, stop) = mpsc::channel();
     let stop_intent = Arc::new(super::lifecycle::StopIntent::default());
     let handler_intent = stop_intent.clone();
-    let status = service_control_handler::register(name, move |control| match control {
+    let handler_name = name.clone().unwrap_or_else(|| "ZunderGuard".into());
+    let status = service_control_handler::register(handler_name, move |control| match control {
         ServiceControl::Stop | ServiceControl::Shutdown => {
             if handler_intent.accept_stop() {
                 let _ = send.send(());
@@ -378,22 +428,22 @@ fn scm_session(binding: &ServiceBinding, path: &Path) -> Result<()> {
     };
     let result = (|| {
         report(ServiceState::StartPending, false)?;
-        let admitted = (|| {
-            validate_paths(binding, path)?;
-            enforce_no_core_dumps()?;
-            verify_service_identity(binding)?;
-            binding.validate_journal()?;
-            check(binding)?;
-            Ok(())
-        })();
-        if admitted.is_err() {
-            // Admission failures are permanent until reviewed; report a stopped
-            // service without recovery-triggering failure. No credential was read.
-            // A nonzero stopped status is visible in SCM. The installed service
-            // has non-crash failure actions disabled, so this never loops.
-            report(ServiceState::Stopped, true)?;
-            return admitted;
-        }
+        let admitted = name
+            .as_deref()
+            .ok_or_else(|| refused("service binding path is not a protected machine binding"))
+            .and_then(|name| admit_started(name, raw_path));
+        let (binding, path) = match admitted {
+            Ok(admitted) => admitted,
+            Err(error) => {
+                // Admission failures are permanent until reviewed; report a stopped
+                // service without recovery-triggering failure. No credential was read.
+                // A nonzero stopped status is visible in SCM. The installed service
+                // has non-crash failure actions disabled, so this never loops.
+                report(ServiceState::Stopped, true)?;
+                return Err(error);
+            }
+        };
+        let (binding, path) = (&binding, path.as_path());
         if stop_intent.is_stopping() {
             report(ServiceState::Stopped, false)?;
             return Ok(());
@@ -491,7 +541,9 @@ fn scm_session(binding: &ServiceBinding, path: &Path) -> Result<()> {
 
 /// Sending-mode init requires a pre-created protected machine service layout.
 /// Mainnet creates no journal; Testnet's fresh journal remains in this protected home.
-pub fn validate_setup(home: &Path, config: &Path, identity: &str) -> Result<()> {
+/// Returns the service's virtual account SID: init writes the config for it
+/// ([`create_service_config`]).
+pub fn validate_setup(home: &Path, config: &Path, identity: &str) -> Result<String> {
     if identity.is_empty()
         || identity.len() > 80
         || !identity
@@ -535,7 +587,7 @@ pub fn validate_setup(home: &Path, config: &Path, identity: &str) -> Result<()> 
         .open(&probe)?;
     drop(file);
     fs::remove_file(probe)?;
-    Ok(())
+    Ok(sid)
 }
 
 /// Service-aware administrative reads retain the exact SID ACL boundary;
@@ -617,6 +669,54 @@ pub fn validate_management_stopped(binding: &ServiceBinding) -> Result<()> {
     require_stopped(binding)
 }
 
+/// Create `path` new (never replacing a file, never following a final link)
+/// and give the same handle the exact service descriptor
+/// ([`super::acl::service_file_sddl`]) before any byte is written. The
+/// descriptor is owned by Administrators, so this runs elevated (an
+/// administrator or SYSTEM). `share` is the handle's share mode.
+fn create_protected(path: &Path, sid: &str, mutable: bool, share: u32) -> Result<File> {
+    use windows_permissions::{LocalBox, SecurityDescriptor, wrappers::SetSecurityInfo};
+    let descriptor: LocalBox<SecurityDescriptor> =
+        super::acl::service_file_sddl(sid, mutable)?.parse()?;
+    let mut file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .access_mode(0xc00e0000)
+        .share_mode(share)
+        .custom_flags(0x00200000)
+        .open(path)?;
+    if let Err(error) = SetSecurityInfo(
+        &mut file,
+        SE_FILE_OBJECT,
+        SecurityInformation::Owner | SecurityInformation::Dacl | SecurityInformation::ProtectedDacl,
+        descriptor.owner(),
+        None,
+        descriptor.dacl(),
+        None,
+    ) {
+        drop(file);
+        let _ = fs::remove_file(path);
+        return Err(error.into());
+    }
+    Ok(file)
+}
+
+/// `init --service-setup`: the new runtime config (`guard.toml.new`, renamed
+/// over `guard.toml` by init) with exactly the ACL the service's admission
+/// requires (Administrators and SYSTEM full control, the virtual account
+/// modify), never the installing user's owner-only file, which admission
+/// refuses. Read and delete sharing let init rename it while it is open.
+pub fn create_service_config(path: &Path, sid: &str) -> std::io::Result<File> {
+    if path.extension() != Some(std::ffi::OsStr::new("new"))
+        || path.file_stem() != Some(std::ffi::OsStr::new("guard.toml"))
+    {
+        return Err(std::io::Error::other(refused(
+            "service setup writes only the runtime guard.toml",
+        )));
+    }
+    create_protected(path, sid, true, 0x1 | 0x4).map_err(std::io::Error::other)
+}
+
 fn write_trusted(
     path: &Path,
     sid: &str,
@@ -624,34 +724,13 @@ fn write_trusted(
     mutable: bool,
     before_write: impl FnOnce() -> Result<()>,
 ) -> Result<()> {
-    use windows_permissions::{LocalBox, SecurityDescriptor, wrappers::SetSecurityInfo};
     let mut name = path.as_os_str().to_owned();
     name.push(".new");
     let temporary = PathBuf::from(name);
-    let mut file = OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .access_mode(0xc00e0000)
-        .share_mode(0)
-        .custom_flags(0x00200000)
-        .open(&temporary)?;
+    // The exact same file handle receives the DACL and payload. No key is
+    // ever stored here: credentials use only this helper's ciphertext.
+    let mut file = create_protected(&temporary, sid, mutable, 0)?;
     let result = (|| {
-        // The exact same file handle receives the DACL and payload. No key is
-        // ever stored here: credentials use only this helper's ciphertext.
-        let rights = if mutable { "0x1301bf" } else { "FR" };
-        let descriptor: LocalBox<SecurityDescriptor> =
-            format!("O:BAG:SYD:P(A;;FA;;;BA)(A;;FA;;;SY)(A;;{rights};;;{sid})").parse()?;
-        SetSecurityInfo(
-            &mut file,
-            SE_FILE_OBJECT,
-            SecurityInformation::Owner
-                | SecurityInformation::Dacl
-                | SecurityInformation::ProtectedDacl,
-            descriptor.owner(),
-            None,
-            descriptor.dacl(),
-            None,
-        )?;
         before_write()?;
         file.write_all(bytes)?;
         file.sync_all()?;
@@ -878,6 +957,116 @@ mod tests {
         wait_exit(&mut child);
         assert!(child.wait().expect("wait").success());
         drop(job);
+    }
+
+    fn fixture_binding(service_name: &str) -> ServiceBinding {
+        ServiceBinding {
+            version: 1,
+            credential_id: "ci-admit".into(),
+            mode: "mainnet".into(),
+            account: "0x1111111111111111111111111111111111111111".into(),
+            api_wallet: "0x2222222222222222222222222222222222222222".into(),
+            home: PathBuf::from(r"C:\nowhere\runtime"),
+            config: PathBuf::from(r"C:\nowhere\runtime\guard.toml"),
+            executable: PathBuf::from(r"C:\nowhere\zunder-guard.exe"),
+            executable_sha256: "0".repeat(64),
+            admission_config_sha256: "0".repeat(64),
+            identity: ServiceIdentity::Windows {
+                service_name: service_name.into(),
+                service_sid: "S-1-5-80-1-2-3-4-5".into(),
+            },
+        }
+    }
+
+    #[test]
+    fn admit_started_refuses_a_bad_path_or_another_instance_binding() {
+        // A path that does not exist: refused before any binding is read.
+        let temp = crate::testdir::TestDir::new("service-admit-started");
+        let missing = temp.path().join("ci-admit").join("binding.json");
+        assert!(
+            admit_started_with("ZunderGuard-ci-admit", &missing, |_| {
+                panic!("a missing binding path must be refused before loading")
+            })
+            .is_err()
+        );
+        // A binding whose service name is not this instance's: refused right
+        // after loading, before the crash-dump policy, identity or credential.
+        let path = temp.path().join("binding.json");
+        fs::write(&path, b"public synthetic metadata").expect("fixture binding file");
+        let error = admit_started_with("ZunderGuard-ci-admit", &path, |loaded| {
+            assert_eq!(
+                loaded,
+                fs::canonicalize(&path).expect("canonical").as_path()
+            );
+            Ok(fixture_binding("ZunderGuard-other"))
+        })
+        .expect_err("another instance's binding")
+        .to_string();
+        assert!(error.contains("not this instance"), "{error}");
+        // A binding for another platform's service: refused as well.
+        let mut macos = fixture_binding("ZunderGuard-ci-admit");
+        macos.identity = ServiceIdentity::Macos { uid: 501, gid: 20 };
+        let error = admit_started_with("ZunderGuard-ci-admit", &path, |_| Ok(macos))
+            .expect_err("not a Windows binding")
+            .to_string();
+        assert!(error.contains("not a Windows SCM service"), "{error}");
+        // The loader's refusal is propagated unchanged.
+        let error = admit_started_with("ZunderGuard-ci-admit", &path, |_| {
+            Err(refused("synthetic layout refusal"))
+        })
+        .expect_err("loader refusal")
+        .to_string();
+        assert!(error.contains("synthetic layout refusal"), "{error}");
+    }
+
+    #[test]
+    #[ignore = "requires elevated native Windows CI (the descriptor is owned by Administrators)"]
+    fn native_protected_file_acl_service_config_is_exact_shared_and_renames_open() {
+        let temp = crate::testdir::TestDir::new("service-config-create");
+        let sid = "S-1-5-80-1-2-3-4-5";
+        // Only the runtime config's staging name is accepted.
+        let other = temp.path().join("other.toml.new");
+        assert!(create_service_config(&other, sid).is_err());
+        assert!(!other.exists());
+        let staging = temp.path().join("guard.toml.new");
+        let mut file = create_service_config(&staging, sid).expect("service config");
+        // The exact descriptor, read back from the same handle.
+        let flags = SecurityInformation::Owner | SecurityInformation::Dacl;
+        let sd = GetSecurityInfo(&file, SE_FILE_OBJECT, flags).expect("descriptor");
+        let sddl = ConvertSecurityDescriptorToStringSecurityDescriptor(&sd, flags)
+            .expect("sddl")
+            .into_string()
+            .expect("unicode");
+        let dacl = sddl.strip_prefix("O:BAD:").expect("owner Administrators");
+        let entries = dacl.trim_start_matches(|c: char| c.is_ascii_uppercase());
+        assert!(dacl.starts_with('P'), "protected DACL: {sddl}");
+        assert_eq!(
+            entries,
+            format!("(A;;FA;;;BA)(A;;FA;;;SY)(A;;0x1301bf;;;{sid})"),
+            "{sddl}"
+        );
+        assert!(super::super::acl::check(&sddl, sid, true, false).is_ok());
+        // Share mode read and delete: a reader may open it, a second writer may not.
+        file.write_all(b"synthetic config").expect("write");
+        drop(
+            OpenOptions::new()
+                .read(true)
+                .open(&staging)
+                .expect("shared read"),
+        );
+        assert!(OpenOptions::new().write(true).open(&staging).is_err());
+        // init renames it over guard.toml while this handle is still open.
+        let config = temp.path().join("guard.toml");
+        fs::rename(&staging, &config).expect("rename while open");
+        file.sync_all().expect("still writable after rename");
+        drop(file);
+        assert!(!staging.exists());
+        assert_eq!(fs::read(&config).expect("renamed"), b"synthetic config");
+        assert!(open_checked(&config, sid, true, false).is_ok());
+        // Never replaces an existing file.
+        fs::write(&staging, b"another operation").expect("existing staging");
+        assert!(create_service_config(&staging, sid).is_err());
+        assert_eq!(fs::read(&staging).expect("kept"), b"another operation");
     }
 
     #[test]

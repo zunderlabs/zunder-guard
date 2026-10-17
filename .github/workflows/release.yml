@@ -223,12 +223,19 @@ jobs:
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
         with:
           driver-opts: image=mirror.gcr.io/moby/buildkit@sha256:cec9f139f45e93c5c69c60f8b07cfad9f43f4ef6b6a6cd917527fea5ff2e3dea
+      # A registry that throttles (HTTP 429) or fails (5xx, timeouts) gets bounded retries; the
+      # image is always the Dockerfile's, pinned by digest (deploy/guard/github/registry-retry.sh).
+      - name: Fetch the pinned builder image into the builder
+        if: matrix.platform != ''
+        env:
+          PLATFORM: ${{ matrix.platform }}
+        run: deploy/guard/github/registry-retry.sh warm deploy/guard/Dockerfile "$PLATFORM" build
       - name: Build (Linux, static musl, in the pinned builder image)
         if: matrix.platform != ''
         env:
           PLATFORM: ${{ matrix.platform }}
         run: |
-          docker buildx build -f deploy/guard/Dockerfile --target bin-build --platform "$PLATFORM" \
+          deploy/guard/github/registry-retry.sh run -- docker buildx build -f deploy/guard/Dockerfile --target bin-build --platform "$PLATFORM" \
             --no-cache -o type=local,dest=out .
       - name: Build (macOS, Windows)
         if: matrix.triple != ''
@@ -319,10 +326,14 @@ jobs:
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
         with:
           driver-opts: image=mirror.gcr.io/moby/buildkit@sha256:cec9f139f45e93c5c69c60f8b07cfad9f43f4ef6b6a6cd917527fea5ff2e3dea
+      - name: Fetch the pinned builder image into the builder
+        env:
+          PLATFORM: ${{ matrix.platform }}
+        run: deploy/guard/github/registry-retry.sh warm deploy/guard/Dockerfile "$PLATFORM" build
       - env:
           PLATFORM: ${{ matrix.platform }}
         run: |
-          docker buildx build -f deploy/guard/Dockerfile --target bin-build --platform "$PLATFORM" \
+          deploy/guard/github/registry-retry.sh run -- docker buildx build -f deploy/guard/Dockerfile --target bin-build --platform "$PLATFORM" \
             --no-cache -o type=local,dest=again .
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
@@ -527,6 +538,9 @@ jobs:
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
         with:
           driver-opts: image=mirror.gcr.io/moby/buildkit@sha256:cec9f139f45e93c5c69c60f8b07cfad9f43f4ef6b6a6cd917527fea5ff2e3dea
+      # build-push-action then reads the runtime image from the builder (deploy/guard/github/registry-retry.sh).
+      - name: Fetch the pinned runtime image into the builder
+        run: deploy/guard/github/registry-retry.sh warm deploy/guard/Dockerfile linux/amd64,linux/arm64 runtime
       - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           registry: ghcr.io

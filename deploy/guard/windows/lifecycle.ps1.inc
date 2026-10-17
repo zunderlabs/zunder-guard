@@ -169,6 +169,20 @@ function Install-ZgImage([string]$Directory) {
     if ([IO.File]::Exists($destination)) { [IO.File]::Replace($next,$destination,[NullString]::Value) } else { [IO.File]::Move($next,$destination) }
   }
 }
+# The service's virtual account re-admits its layout at every start, the two
+# shared anchors included: it must be able to open them and read their owner
+# and ACL. Authenticated Users may read and list this folder only, as stock
+# ProgramData and Program Files grant; nothing is inherited, nobody else writes.
+function Set-ZgBaseAcl {
+  foreach ($base in @($ZgData,$ZgBin)) {
+    $item = Microsoft.PowerShell.Management\Get-Item -LiteralPath $base -Force
+    if (-not $item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw 'Reparse or non-directory base refused.' }
+    $acl = New-ZgAcl $true ''
+    $acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new([Security.Principal.SecurityIdentifier]::new('S-1-5-11'),'ReadAndExecute',[Security.AccessControl.InheritanceFlags]::None,'None','Allow'))
+    Microsoft.PowerShell.Security\Set-Acl -LiteralPath $base -AclObject $acl
+    Assert-ZgPath $base
+  }
+}
 function Ensure-ZgService {
   $service = Get-ZgService
   if (-not $service) {
@@ -177,6 +191,7 @@ function Ensure-ZgService {
     $null = Get-ZgService
   }
   Disable-ZgService
+  Set-ZgBaseAcl
   foreach ($path in @($ZgRoot,$ZgBinaryDir,$ZgExe)) { Set-ZgAcl $path $ZgSid }
   Set-ZgAcl $ZgHome $ZgSid $true
   # Same per-executable WER exclusion as native service admission; never global policy.

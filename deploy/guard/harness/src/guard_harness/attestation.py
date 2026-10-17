@@ -1,6 +1,7 @@
 """Use gh's Sigstore verifier; never implement certificate verification in the harness."""
 
 import json
+import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -12,10 +13,78 @@ REPOSITORY = "zunderlabs/zunder-guard"
 WORKFLOWS = frozenset(
     {"release.yml", "verify.yml", "promote.yml", "install-matrix.yml", "journey.yml"}
 )
+# Written once per job by deploy/guard/github/fetch-trusted-root.sh (bounded retry):
+# gh's JSONL holds every Sigstore instance gh trusts; cosign takes exactly one
+# TrustedRoot, the public-good instance, derived from the same fetch.
+GH_TRUSTED_ROOT = "trusted_root.jsonl"
+COSIGN_TRUSTED_ROOT = "trusted_root.json"
+TRUSTED_ROOT_MEDIA = "application/vnd.dev.sigstore.trustedroot+json"
+TRUSTED_ROOT_LIMIT = 1024 * 1024
 
 
 class AttestationError(ValueError):
     """Cryptographically verified evidence did not carry the expected statement."""
+
+
+@dataclass(frozen=True)
+class TrustedRoots:
+    gh: Path
+    cosign: Path
+
+
+def _root_object(text: str) -> dict[str, Any]:
+    try:
+        value: Any = json.loads(text)
+    except json.JSONDecodeError as error:
+        raise AttestationError("fetched Sigstore trusted root is not JSON") from error
+    if not isinstance(value, dict):
+        raise AttestationError("fetched Sigstore trusted root must be an object")
+    media = value.get("mediaType")
+    if not isinstance(media, str) or not media.startswith(TRUSTED_ROOT_MEDIA):
+        raise AttestationError("fetched Sigstore trusted root has an unexpected type")
+    return value
+
+
+def trusted_roots() -> TrustedRoots | None:
+    """The job's pre-fetched Sigstore trust roots, or None to let gh/cosign fetch them.
+
+    Absent files keep the verifiers' own network fetch (local runs, unit tests). A
+    partial or malformed pair is refused, never silently replaced by a network fetch.
+    The roots only replace the transport: every verification still checks signer,
+    issuer, subject and transparency evidence against them, exactly once.
+    """
+    temp = os.environ.get("RUNNER_TEMP")
+    if not temp:
+        return None
+    gh = Path(temp) / GH_TRUSTED_ROOT
+    cosign = Path(temp) / COSIGN_TRUSTED_ROOT
+    present = [path.exists() or path.is_symlink() for path in (gh, cosign)]
+    if not any(present):
+        return None
+    if not all(present):
+        raise AttestationError("Sigstore trusted root was fetched incompletely")
+    texts = []
+    for path in (gh, cosign):
+        if path.is_symlink() or not path.is_file():
+            raise AttestationError("Sigstore trusted root must be a regular file")
+        if path.stat().st_size > TRUSTED_ROOT_LIMIT:
+            raise AttestationError("Sigstore trusted root exceeds its size limit")
+        texts.append(path.read_text(encoding="utf-8"))
+    lines = [_root_object(line) for line in texts[0].splitlines() if line.strip()]
+    public = _root_object(texts[1])
+    if not lines or lines.count(public) != 1:
+        raise AttestationError("cosign trusted root is not exactly one fetched gh root")
+    return TrustedRoots(gh, cosign)
+
+
+def gh_trust_arguments() -> list[str]:
+    roots = trusted_roots()
+    return [] if roots is None else ["--custom-trusted-root", str(roots.gh)]
+
+
+def cosign_trust_arguments() -> list[str]:
+    roots = trusted_roots()
+    return [] if roots is None else ["--trusted-root", str(roots.cosign)]
 
 
 @dataclass(frozen=True)
@@ -113,6 +182,7 @@ def verify_predicate(
             predicate_type,
             "--format",
             "json",
+            *gh_trust_arguments(),
         ],
         log=log,
         timeout=60,

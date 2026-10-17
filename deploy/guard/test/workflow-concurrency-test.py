@@ -55,6 +55,23 @@ class QueueCustody(unittest.TestCase):
                     path.write_text(yaml.safe_dump(doc))
                     module.validate([path])
 
+    def test_indirect_secrets_access_cannot_hide_custody(self):
+        for value in ("${{ toJSON(secrets) }}", "${{ secrets['E2E_TESTNET_API_WALLET_KEY'] }}"):
+            with self.subTest(value=value), tempfile.TemporaryDirectory() as tmp:
+                job = {"runs-on": "ubuntu-24.04", "steps": [{"run": "true", "env": {"ALL": value}}],
+                       "concurrency": {"group": "guard-e2e-testnet", "queue": "max", "cancel-in-progress": False}}
+                path = Path(tmp) / "workflow.yml"
+                path.write_text(yaml.safe_dump({"jobs": {"leaf": job}}))
+                with self.assertRaisesRegex(ValueError, "secrets must be named"):
+                    module.validate([path])
+        with tempfile.TemporaryDirectory() as tmp:
+            # Python's secrets module in a run script is not an expression.
+            job = {"runs-on": "ubuntu-24.04",
+                   "steps": [{"run": "python -c 'import secrets; print(secrets.token_hex(8))'"}]}
+            path = Path(tmp) / "workflow.yml"
+            path.write_text(yaml.safe_dump({"jobs": {"leaf": job}}))
+            module.validate([path])
+
     def test_forwarding_caller_is_not_leaf_custody(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "workflow.yml"
@@ -101,6 +118,25 @@ class RecoveryQueueGraph(unittest.TestCase):
             install.write_text(yaml.safe_dump(doc))
             with self.assertRaises(ValueError): module.validate(paths)
             install.write_text(original)
+            # W23: the account lock sits on exactly the jobs that read the API wallet key.
+            doc = module.contract.document(original)
+            self.assertNotIn("concurrency", doc)
+            locked = {name for name, job in doc["jobs"].items()
+                      if "guard-e2e-testnet" in str(job.get("concurrency", {}).get("group"))}
+            self.assertEqual(locked, set(module.contract.CUSTODY))
+            for mutation in ("workflow", "extra", "missing"):
+                doc = module.contract.document(original)
+                if mutation == "workflow":
+                    doc["concurrency"] = {"group": "guard-e2e-testnet", "queue": "max", "cancel-in-progress": False}
+                elif mutation == "extra":
+                    doc["jobs"]["mainnet-setup"]["concurrency"] = module.contract.install_lock("native")
+                else:
+                    del doc["jobs"]["docker"]["concurrency"]
+                install.write_text(yaml.safe_dump(doc))
+                with self.subTest(mutation=mutation), self.assertRaises(ValueError):
+                    module.validate(paths)
+            install.write_text(original)
+            module.validate(paths)
             # A foreground target never supplies the lock its formal callers lack.
             verify = paths[0]
             doc = module.contract.document(verify.read_text())

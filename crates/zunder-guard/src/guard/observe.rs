@@ -17,7 +17,7 @@ use zunder_guard_core::{
     flow_value,
     ledger::{LedgerFlow, LedgerProblem, Treated, classify, ledger_flow},
 };
-use zunder_venue::{Flow, FlowOutcome};
+use zunder_venue::{Flow, FlowOutcome, Unaccounted, UnaccountedEntry, UnaccountedRule};
 
 use crate::{locks::lock, upstream::Upstream};
 
@@ -75,6 +75,48 @@ const LEDGER_PAGES: usize = 4;
 pub(super) const UNACCOUNTED_KEPT: usize = 256;
 /// A UTC day in milliseconds.
 const DAY_MS: u64 = 86_400_000;
+/// What a view's venue times may lag a sync round's start by (the read's
+/// own time), for [`watched_gap_ms`].
+const WATCHED_READ_SLACK_MS: u64 = 2_000;
+
+/// How far, in venue time on every dex, the first view that shows a ledger
+/// entry Guard cannot account for may be from the last view the risk engine
+/// took, for Guard to have watched the account around it
+/// ([`zunder_venue::UnaccountedEntry::watched_gap_ms`]), with the sync reading every
+/// `sync_interval_ms`: three intervals (the round before the entry, a round
+/// within the 2 s around it, whose view is left out, and a round skipped
+/// after one that read twice), the 2 s on either side of the entry
+/// ([`zunder_venue::FLOW_TIME_MARGIN_MS`]), the 10 s a loss may be held back
+/// for the ledger ([`LEDGER_HOLD_MS`]), and 2 s for a read's own time. 31 s
+/// at the default 5 s; 50.84 s with one HIP-3 dex (11,613 ms), 78.31 s with
+/// two (20,770 ms); at most [`zunder_venue::UNKNOWN_TYPE_GAP_MAX_MS`], 2
+/// minutes (a sync slower than 34 s is held to it, so that with
+/// `sync_seconds` above 120 no change is ever watched). A longer gap is not
+/// watched.
+/// How the risk journal judges the change around a ledger entry Guard
+/// cannot account for, by what Guard read of it, and the credit it read:
+/// only the classified liquidator transfers may be taken as money (a credit
+/// read first); a type read as carrying a USD credit halts the day as it did
+/// in 1.0.1; every other entry is never taken as money (a fall counts, a
+/// rise halts).
+fn unaccounted_rule(treated: &Treated) -> (UnaccountedRule, Decimal) {
+    match treated {
+        Treated::LiquidatorTransfer(credit) => (UnaccountedRule::Rebasable, *credit),
+        Treated::Inflow(_) => (UnaccountedRule::Halts, Decimal::ZERO),
+        Treated::LeftAsLoss(_) | Treated::Unread => (UnaccountedRule::Strict, Decimal::ZERO),
+    }
+}
+
+pub(super) fn watched_gap_ms(sync_interval_ms: u64) -> i64 {
+    let gap = sync_interval_ms
+        .saturating_mul(3)
+        .saturating_add(LEDGER_LAG_MS.saturating_mul(2))
+        .saturating_add(LEDGER_HOLD_MS)
+        .saturating_add(WATCHED_READ_SLACK_MS);
+    i64::try_from(gap)
+        .unwrap_or(i64::MAX)
+        .min(zunder_venue::UNKNOWN_TYPE_GAP_MAX_MS)
+}
 
 fn fresh_flow_view(times: &BTreeMap<String, i64>, previous: &BTreeMap<String, i64>) -> bool {
     !times.is_empty()
@@ -473,6 +515,8 @@ impl<U: Upstream, C: Clock> Guard<U, C> {
         // Every entry is checked as a reconstruction checks it; one Guard
         // cannot account for is reported, never skipped as no flow.
         let mut flows = Vec::new();
+        // How the journal judges each entry Guard cannot account for, by id.
+        let mut rules = std::collections::BTreeMap::new();
         for update in entries {
             // Dex abstraction switched on: the account has left standard
             // mode, where Guard's equity is unknown and nothing is opened.
@@ -487,21 +531,35 @@ impl<U: Upstream, C: Clock> Guard<U, C> {
                 Ok(None) => {}
                 Err(problem) => {
                     if let Some(flow) = Self::unaccounted(inner, now, &problem) {
+                        rules.insert(flow.id.clone(), unaccounted_rule(&problem.treated));
                         flows.push(flow);
                     }
                 }
             }
         }
         flows.sort_by_key(|flow| flow.time_ms);
+        // How long a gap Guard watches the account through, with the sync
+        // it runs now: recorded with each entry it cannot account for.
+        let watched = watched_gap_ms(self.budgets.sync_interval_ms(inner.config.sync_seconds));
         let deadline = self.flow_read_deadline(inner, 3_000);
         let mut weight = 0;
         for flow in flows {
             if inner.risk.knows_flow(&flow.id) {
                 continue;
             }
-            let value = self
-                .reconstruct_flow(inner, now, &flow, &dexes, deadline, &mut weight)
-                .await;
+            // An entry Guard cannot account for has no value to
+            // reconstruct: the risk journal judges the change around it.
+            let unaccounted = rules.get(&flow.id).map(|(rule, credit)| UnaccountedEntry {
+                watched_gap_ms: watched,
+                rule: *rule,
+                credit: *credit,
+            });
+            let value = if unaccounted.is_some() {
+                None
+            } else {
+                self.reconstruct_flow(inner, now, &flow, &dexes, deadline, &mut weight)
+                    .await
+            };
             self.expire_hold(inner, self.clock.now_ms());
             let applied = inner.risk.apply_flow(
                 stamp(now),
@@ -512,6 +570,7 @@ impl<U: Upstream, C: Clock> Guard<U, C> {
                     dex: flow.dex.clone(),
                     between: flow.between,
                     value,
+                    unaccounted,
                 },
             );
             if let Err(error) = applied {
@@ -526,10 +585,19 @@ impl<U: Upstream, C: Clock> Guard<U, C> {
 
     /// A ledger entry Guard cannot account for (`ledger::classify`): it may
     /// have moved money into or out of the account, by an amount Guard does
-    /// not know. Fail closed, as for a flow whose value is unknown
-    /// (`docs/guard.md`, "Deposits and withdrawals", "When it is unknown"):
-    /// journaled and an alert, once per entry, and new positions refused
-    /// until the end of the UTC day it was seen; exits and protection go on.
+    /// not know. Journaled and an alert, once per entry, and new positions
+    /// refused until the end of the UTC day it was seen; exits and
+    /// protection go on (`docs/guard.md`, "Deposits and withdrawals"). One
+    /// with a time is returned as a flow of 0 whose value is unknown, marked
+    /// as such ([`zunder_venue::UNKNOWN_TYPE_ID_PREFIX`]), whatever it reads
+    /// as. The risk journal judges the change from the last view it took to
+    /// the first that shows it ([`unaccounted_rule`]): for a classified
+    /// liquidator transfer, while Guard watched the account around it and the
+    /// change (after a credit it reads) fits the stops' room and the day's
+    /// budget, it is the entry's money, the day not halted for it and the
+    /// peak never lowered; otherwise, and for every other entry, a fall
+    /// counts as the loss it shows and a rise halts the day; an entry read
+    /// as a USD credit halts the day whatever the change.
     /// An entry older than everything the risk journal replays from
     /// ([`PersistentRisk::flows_from_ms`]) is in the equity it started from
     /// already: journaled only.
@@ -537,9 +605,17 @@ impl<U: Upstream, C: Clock> Guard<U, C> {
         let old = problem
             .time_ms
             .is_some_and(|time| time < inner.risk.flows_from_ms());
-        // Applied as money in (the flow applies once: by its id).
-        let inflow = match &problem.treated {
-            Treated::Inflow(flow) if !old => Some(flow.as_ref().clone()),
+        // Re-based, never booked (the flow applies once: by its id).
+        let inflow = match problem.time_ms {
+            Some(time_ms) if !old => Some(LedgerFlow {
+                time_ms,
+                amount: Decimal::ZERO,
+                id: format!("{}{}", zunder_venue::UNKNOWN_TYPE_ID_PREFIX, problem.id),
+                dex: String::new(),
+                // Which dex it touched is not known: placed against every
+                // dex's time of a view (`flows::side`).
+                between: true,
+            }),
             _ => None,
         };
         if inner.ledger.unaccounted_seen.contains(&problem.id) {
@@ -553,13 +629,6 @@ impl<U: Upstream, C: Clock> Guard<U, C> {
             format!(
                 "the account's ledger has an entry Guard cannot account for ({problem}), from before the risk journal's horizon: it is in the equity Guard started from"
             )
-        } else if let Treated::Inflow(flow) = &problem.treated {
-            let text = format!(
-                "the account's ledger has an entry Guard cannot account for ({problem}): applied as money in ({} USDC), never as a trading gain; its effect on the account cannot be reconstructed, so under the flow rules the day halts",
-                flow.amount
-            );
-            Self::add_alert(inner, now, &text, None);
-            text
         } else {
             let until = now
                 .saturating_div(DAY_MS)
@@ -574,12 +643,33 @@ impl<U: Upstream, C: Clock> Guard<U, C> {
                 // A type Guard does not know: that the account paid it rests
                 // on field names Guard cannot vouch for.
                 Treated::LeftAsLoss(amount) => format!(
-                    "it reads as paid by the account ({amount} USDC) and stays in the equity as a loss, but its type is unknown"
+                    "it reads as paid by the account ({amount} USDC), but its type is unknown"
                 ),
-                _ => "how much it moved cannot be read".to_owned(),
+                Treated::Inflow(flow) => format!(
+                    "it reads as money in ({} USDC), but its type is unknown",
+                    flow.amount
+                ),
+                Treated::Unread => "how much it moved cannot be read".to_owned(),
+                Treated::LiquidatorTransfer(credit) => format!(
+                    "a HIP-3 liquidator transfer, which Guard does not book (credit read: {credit} USDC)"
+                ),
+            };
+            let shown = match (problem.time_ms, &problem.treated) {
+                (None, _) => {
+                    "it has no time, so it is not applied: the stops count the equity as it shows, and a debit it carries counts as a loss"
+                }
+                (Some(_), Treated::LiquidatorTransfer(_)) => {
+                    "the credit read counts as money in; the rest of the change from the last view to the first that shows it counts as its money, neither a gain nor a loss, if Guard watched the account around it and it fits the room the stops still allow and the day's budget for such entries (the drawdown stop still counts a fall); otherwise a fall counts as the loss it shows and a rise halts the day (an alert says which)"
+                }
+                (Some(_), Treated::Inflow(_)) => {
+                    "the day halts, and a fall around it counts as the loss it shows"
+                }
+                (Some(_), _) => {
+                    "a fall around it counts as the loss it shows, and a rise halts the day"
+                }
             };
             let text = format!(
-                "the account's ledger has an entry Guard cannot account for ({problem}): {what}, so new positions are refused until the end of the UTC day; exits and protection go on, and the stops count the equity as it shows. Compare the account's history with the equity"
+                "the account's ledger has an entry Guard cannot account for ({problem}): {what}, so new positions are refused until the end of the UTC day; {shown}. Compare the account's history with the equity"
             );
             inner.ledger.unaccounted = Some((text.clone(), until));
             Self::add_alert(inner, now, &text, None);
@@ -590,6 +680,46 @@ impl<U: Upstream, C: Clock> Guard<U, C> {
             .append(stamp(now), EventBody::Error { text })
             .ok();
         inflow
+    }
+
+    /// After a start: the entries Guard could not account for that the risk
+    /// journal holds, refusing new positions until the end of the UTC day
+    /// each was journaled (as when it was seen), so that a restart never
+    /// reopens that day. Each is remembered as seen, so that the ledger read
+    /// bringing it again raises no second alert.
+    pub(super) fn restore_unaccounted(inner: &mut Inner, now: u64) {
+        for (flow, at) in inner.risk.unaccounted_entries() {
+            let seen = u64::try_from(at.as_millis()).unwrap_or(0);
+            let until = seen
+                .saturating_div(DAY_MS)
+                .saturating_add(1)
+                .saturating_mul(DAY_MS);
+            let id = flow
+                .id
+                .strip_prefix(zunder_venue::UNKNOWN_TYPE_ID_PREFIX)
+                .unwrap_or(&flow.id)
+                .to_owned();
+            if !inner.ledger.unaccounted_seen.contains(&id) {
+                inner.ledger.unaccounted_seen.push_back(id);
+            }
+            if now >= until {
+                continue;
+            }
+            let until = inner
+                .ledger
+                .unaccounted
+                .as_ref()
+                .map_or(until, |(_, before)| until.max(*before));
+            let text = format!(
+                "the risk journal holds a ledger entry Guard could not account for ({}), seen this UTC day before Guard started: new positions are refused until the end of the day. Compare the account's history with the equity",
+                flow.id
+            );
+            inner.ledger.unaccounted = Some((text.clone(), until));
+            Self::add_alert(inner, now, &text, None);
+        }
+        while inner.ledger.unaccounted_seen.len() > UNACCOUNTED_KEPT {
+            inner.ledger.unaccounted_seen.pop_front();
+        }
     }
 
     /// Why new positions are refused for a ledger entry Guard cannot
@@ -724,19 +854,33 @@ impl<U: Upstream, C: Clock> Guard<U, C> {
                         .append(
                             stamp(now),
                             EventBody::Error {
-                                text: format!(
-                                    "a flow of {} USDC (deposit, withdrawal or transfer) kept out of the account stops",
-                                    flow.amount
-                                ),
+                                text: if flow.unknown_type() {
+                                    format!(
+                                        "a ledger entry Guard cannot account for ({}) placed at the first view that shows it: taken as its money only for a classified liquidator transfer Guard watched that fit the stops' room and the day's budget; otherwise an alert says how it counted",
+                                        flow.id
+                                    )
+                                } else {
+                                    format!(
+                                        "a flow of {} USDC (deposit, withdrawal or transfer) kept out of the account stops",
+                                        flow.amount
+                                    )
+                                },
                             },
                         )
                         .ok();
                 }
                 FlowOutcome::Skipped(why) => {
-                    inner.ledger.flow_note = Some(format!(
-                        "a flow of {} USDC counts as a gain or loss: {why}",
-                        flow.amount
-                    ));
+                    inner.ledger.flow_note = Some(if flow.unknown_type() {
+                        format!(
+                            "a ledger entry Guard cannot account for ({}) is in the equity as it shows: {why}",
+                            flow.id
+                        )
+                    } else {
+                        format!(
+                            "a flow of {} USDC counts as a gain or loss: {why}",
+                            flow.amount
+                        )
+                    });
                 }
                 FlowOutcome::Duplicate | FlowOutcome::Pending => {}
             }
@@ -744,7 +888,15 @@ impl<U: Upstream, C: Clock> Guard<U, C> {
         // A drawdown stop waived next to a withdrawal (the loss may have
         // come before it): the day halted instead. A person should know.
         for waived in inner.risk.take_waived_stops() {
-            let text = if let Some(reason) = waived.reason {
+            let text = if let Some(unaccounted) = waived.unaccounted {
+                match unaccounted {
+                    Unaccounted::NotWatched => "a ledger entry Guard cannot account for came while Guard was not watching the account closely (the first view showing it too long after the last one taken), and the account rose or held: the change across that gap may hide trading Guard could not see, so Guard halted the day (docs/guard.md#deposits-and-withdrawals)".to_owned(),
+                    Unaccounted::RiseBeyondRoom => "the account rose around a ledger entry Guard cannot account for by more than the stops' room or the day's budget for such entries allowed (or while trading was not active): it may hide a trading loss, so Guard halted the day (docs/guard.md#deposits-and-withdrawals)".to_owned(),
+                    Unaccounted::CountedAsLoss => "the account fell around a ledger entry Guard cannot account for, and the fall was not taken as its money (its type not one Guard may re-base, not watched, or more than the stops' room or the day's budget allowed): the fall counts as the loss it shows, and the risk engine's stops decide; a drawdown stop needs a person's review (docs/guard.md#deposits-and-withdrawals)".to_owned(),
+                    Unaccounted::RiseNotRebased => "the account rose around a ledger entry Guard cannot account for, of a type whose change Guard never takes as money: it may hide a trading loss, so Guard halted the day (docs/guard.md#deposits-and-withdrawals)".to_owned(),
+                    Unaccounted::Halted => "a ledger entry Guard cannot account for reads as a credit in dollars: Guard halted the day, as it always has for one (a fall around it counts as the loss it shows) (docs/guard.md#deposits-and-withdrawals)".to_owned(),
+                }
+            } else if let Some(reason) = waived.reason {
                 format!(
                     "account-flow arithmetic cannot be represented: {reason}; money stays pending and entries blocked; review may be needed"
                 )
@@ -755,7 +907,7 @@ impl<U: Upstream, C: Clock> Guard<U, C> {
                     percent(waived.kept)
                 )
             } else {
-                "account value at a flow is uncertain: complete exact reconstruction unavailable (positions open at transfer or incomplete records); Guard halted the day (docs/guard.md#deposits-and-withdrawals)".to_owned()
+                "account value at a flow is uncertain: complete exact reconstruction unavailable (positions open at transfer, incomplete records, or a ledger entry Guard cannot account for beside it); Guard halted the day (docs/guard.md#deposits-and-withdrawals)".to_owned()
             };
             inner
                 .journal
@@ -783,6 +935,35 @@ mod tests {
     #![allow(clippy::unwrap_used)]
 
     use super::*;
+
+    /// The watched gap: 3 sync intervals + 2 x 2 s + 10 s + 2 s. The
+    /// intervals are the budget's at `ip_share` 1 and `sync_seconds` 5
+    /// (`limits::tests`): 5,000 ms with the main dex alone, 11,613 with one
+    /// HIP-3 dex, 20,770 with two.
+    #[test]
+    fn the_watched_gap_is_three_sync_intervals_and_sixteen_seconds() {
+        assert_eq!(watched_gap_ms(5_000), 31_000);
+        assert_eq!(watched_gap_ms(11_613), 50_839);
+        assert_eq!(watched_gap_ms(20_770), 78_310);
+        let interval = |sync_seconds, dexes| {
+            crate::budget::plan(Decimal::ONE, dexes)
+                .unwrap()
+                .sync_interval_ms(sync_seconds)
+        };
+        assert_eq!(watched_gap_ms(interval(5, 0)), 31_000);
+        assert_eq!(watched_gap_ms(interval(5, 1)), 50_839);
+        assert_eq!(watched_gap_ms(interval(5, 2)), 78_310);
+        // `sync_seconds` 30: 106 s. 34 s: 118 s; 35 s: 121 s, held to the
+        // journal's 2 minutes. At the most a config allows (300 s): 916 s,
+        // held to 2 minutes, which the 300 s between views never meet: no
+        // change is watched (stricter).
+        assert_eq!(watched_gap_ms(interval(30, 0)), 106_000);
+        assert_eq!(watched_gap_ms(interval(34, 0)), 118_000);
+        assert_eq!(watched_gap_ms(interval(35, 0)), 120_000);
+        assert_eq!(watched_gap_ms(interval(300, 0)), 120_000);
+        assert!(interval(300, 0) > 120_000);
+        assert_eq!(watched_gap_ms(u64::MAX), 120_000);
+    }
 
     #[test]
     fn the_next_ledger_read_overlaps_the_last_complete_one_by_a_minute() {

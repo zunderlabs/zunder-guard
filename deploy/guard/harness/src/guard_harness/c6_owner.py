@@ -17,12 +17,6 @@ import yaml
 
 GROUP = "guard-e2e-testnet"
 LOCK = {"group": GROUP, "cancel-in-progress": False, "queue": "max"}
-INSTALL_LOCK = {
-    "group": "${{ contains(github.workflow_ref, '/.github/workflows/install-matrix.yml@') "
-    "&& 'guard-e2e-testnet' || format('guard-c6-install-inner-{0}', github.run_id) }}",
-    "cancel-in-progress": False,
-    "queue": "max",
-}
 CALLS = {
     "verify.yml": {
         "install-matrix": "./.github/workflows/install-matrix.yml",
@@ -43,6 +37,7 @@ JOBS = {
         "gate",
         "promote",
         "completion",
+        "wallet-restore",
     },
     "nightly.yml": {"promoted", "properties", "installs", "purchase", "nightly"},
     "install-matrix.yml": {
@@ -80,6 +75,8 @@ REF = re.compile(
     r"refs/(?:heads/(?:main|preview/[a-z0-9-]+)|tags/v\d+\.\d+\.\d+(?:-rc\.[1-9]\d*)?)\Z"
 )
 READERS = ("linux-amd64", "linux-arm64", "linux-container", "native", "docker")
+# Every install-matrix job that reads the E2E account's API wallet key, and no other.
+CUSTODY = (*READERS, "operator-recovery", "testnet-foreground", "testnet-systemd")
 RECOVERY_IF = (
     "${{ inputs.target == 'operator-recovery' && inputs.diagnostic == true "
     "&& inputs.profile == 'all' && inputs.scenario == 'fresh' "
@@ -88,10 +85,56 @@ RECOVERY_IF = (
 )
 FOREGROUND_IF = RECOVERY_IF.replace("'operator-recovery'", "'testnet-foreground'")
 SYSTEMD_IF = RECOVERY_IF.replace("'operator-recovery'", "'testnet-systemd'")
+# W18: verify's one transfer job (staging merchant -> payers). It holds no account custody,
+# starts only after every trading and install row of the run finished, and holds only its
+# network's purchase lock beneath verify's whole-run account lock.
+CLEANUP_IF = (
+    "${{ !cancelled() && needs.staging.result == 'success' "
+    "&& (needs.journeys.result == 'success' || needs.journeys.result == 'failure') "
+    "&& (needs.install-matrix.result == 'success' || needs.install-matrix.result == 'failure' "
+    "|| needs.install-matrix.result == 'skipped') }}"
+)
+CLEANUP = {
+    "name": "Restore staging USDC (${{ matrix.network }})",
+    "needs": ["staging", "journeys", "install-matrix"],
+    "if": CLEANUP_IF,
+    "runs-on": "ubuntu-24.04",
+    "timeout-minutes": 30,
+    "environment": "e2e",
+    "permissions": {"contents": "read", "actions": "read"},
+    "concurrency": {
+        "group": "guard-e2e-purchase-${{ matrix.network }}",
+        "cancel-in-progress": False,
+        "queue": "max",
+    },
+    "strategy": {"fail-fast": False, "matrix": {"network": ["hyperliquid", "arbitrum", "base"]}},
+}
+CLEANUP_SECRETS = {"E2E_ACCESS_CLIENT_ID", "E2E_ACCESS_CLIENT_SECRET", "E2E_MERCHANT_TESTNET_KEY"}
 
 
 class OwnerError(ValueError):
     """No caller ownership is inferred on unknown or ambiguous workflow state."""
+
+
+def install_lock(job: str) -> dict[str, Any]:
+    """The exact job-level account lock of one install-matrix custody job.
+
+    install-matrix holds no workflow-level lock. Each job that takes the E2E account's
+    custody holds the account group at job level, and only when install-matrix is the run's
+    own workflow (a standalone diagnostic). Called from verify or nightly, which own the
+    account for their whole run, the same key names a group unique to the run, job and
+    matrix leg: the called jobs never queue behind their own caller (no nested global lock)
+    and never serialise each other. Paper-only, refusal and admission jobs take no lock.
+    """
+    if job not in CUSTODY:
+        raise OwnerError("C6 lock requested for a job without account custody")
+    return {
+        "group": "${{ contains(github.workflow_ref, '/.github/workflows/install-matrix.yml@') "
+        f"&& 'guard-e2e-testnet' || format('guard-c6-install-inner-{{0}}-{job}-{{1}}', "
+        "github.run_id, strategy.job-index) }}",
+        "cancel-in-progress": False,
+        "queue": "max",
+    }
 
 
 class UniqueLoader(yaml.SafeLoader):
@@ -186,6 +229,7 @@ def validate(caller: str, source: str, install: str, journey: str) -> None:
             inputs = _mapping(_job(jobs, name).get("with"))
             if inputs.get("profile", "all") != "all":
                 raise OwnerError("C6 verify profile differs")
+        _cleanup(_job(jobs, "wallet-restore"))
     else:
         for name in ("installs", "purchase"):
             job = _job(jobs, name)
@@ -209,10 +253,70 @@ def validate(caller: str, source: str, install: str, journey: str) -> None:
         raise OwnerError("C6 T2 must follow successful T1")
 
 
+EXPRESSION = re.compile(r"\$\{\{(.*?)\}\}", re.S)
+SECRET_WORD = re.compile(r"\bsecrets\b")
+SECRET_NAME = re.compile(r"\bsecrets\.([A-Za-z_][A-Za-z0-9_]*)\b")
+
+
+def secret_names(text: str) -> set[str]:
+    """Every secret a workflow text's expressions name; any other use of `secrets` refuses.
+
+    Inside `${{ }}`, `toJSON(secrets)`, `secrets[...]` or `secrets.*` would hand over secrets
+    that a name allow-list cannot see, so only the plain `secrets.<NAME>` form is admitted.
+    (Outside expressions the word is shell or Python text, such as Python's `secrets`.)
+    """
+    names: set[str] = set()
+    for expression in EXPRESSION.findall(text):
+        found = SECRET_NAME.findall(expression)
+        if len(SECRET_WORD.findall(expression)) != len(found):
+            raise OwnerError("C6 secrets must be named one by one as secrets.<NAME>")
+        names.update(found)
+    return names
+
+
+def _cleanup(job: dict[str, Any]) -> None:
+    """Admit verify's wallet restore: no account custody, no overlap with any C6 row.
+
+    `needs` holds it until journeys (P8, T1, T2 and the purchases) and install-matrix have
+    finished; the condition refuses a cancelled or still-unfinished dependency. Its only lock
+    is the network's purchase group, never the account group verify already holds, so it
+    cannot nest or deadlock, and no other run can use the account while it transfers.
+    """
+    if set(job) != {*CLEANUP, "steps"}:
+        raise OwnerError("C6 cleanup job structure differs")
+    for key, expected in CLEANUP.items():
+        if job[key] != expected:
+            raise OwnerError("C6 cleanup must follow every trading and install row")
+    _lock(job["concurrency"], cast(dict[str, Any], CLEANUP["concurrency"]))
+    steps = job["steps"]
+    if not isinstance(steps, list) or any(not isinstance(step, dict) for step in steps):
+        raise OwnerError("C6 cleanup job structure differs")
+    text = yaml.safe_dump(steps)
+    secrets = secret_names(text)
+    if (
+        not secrets <= CLEANUP_SECRETS
+        or "E2E_TESTNET" in text
+        or GROUP in text
+        or "c6_owner" in text
+        or any("continue-on-error" in step for step in steps)
+    ):
+        raise OwnerError("C6 cleanup must never hold the E2E account or its lock")
+
+
 def _readers(source: str) -> None:
     matrix = document(source)
-    _lock(matrix.get("concurrency"), INSTALL_LOCK)
+    if "concurrency" in matrix:
+        raise OwnerError("C6 install-matrix holds a workflow-level lock")
     leaves = _leaves(matrix, "install-matrix.yml")
+    for name, job in leaves.items():
+        if name in CUSTODY:
+            # Exactly its own standalone-only lock: never the literal global group (a nested
+            # lock under verify/nightly), never a shared or missing one.
+            if _mapping(job).get("concurrency") != install_lock(name):
+                raise OwnerError("C6 custody job lock differs or holds an inner account lock")
+            _lock(job["concurrency"], install_lock(name))
+        elif "concurrency" in _mapping(job):
+            raise OwnerError("C6 job without account custody holds a lock")
     recovery = _job(leaves, "operator-recovery")
     _singular(recovery)
     if (
@@ -221,7 +325,6 @@ def _readers(source: str) -> None:
         or recovery.get("runs-on") != "ubuntu-24.04"
         or recovery.get("environment") != "e2e"
         or recovery.get("timeout-minutes") != 120
-        or "concurrency" in recovery
     ):
         raise OwnerError("C6 operator recovery must be a bounded standalone diagnostic")
     foreground = _job(leaves, "testnet-foreground")
@@ -234,7 +337,6 @@ def _readers(source: str) -> None:
         or foreground.get("timeout-minutes") != 120
         or foreground.get("permissions")
         != {"contents": "read", "actions": "read", "packages": "read"}
-        or "concurrency" in foreground
         or any("actions/attest" in str(step.get("uses", "")) for step in foreground["steps"])
     ):
         raise OwnerError(
@@ -249,13 +351,10 @@ def _readers(source: str) -> None:
         or systemd.get("environment") != "e2e"
         or systemd.get("timeout-minutes") != 120
         or systemd.get("permissions") != {"contents": "read", "actions": "read", "packages": "read"}
-        or "concurrency" in systemd
         or any("actions/attest" in str(step.get("uses", "")) for step in systemd["steps"])
     ):
         raise OwnerError("C6 systemd must be a bounded standalone diagnostic without attestation")
     for name in READERS:
-        if "concurrency" in _job(leaves, name):
-            raise OwnerError("C6 reader holds an inner account lock")
         strategy = _mapping(_job(leaves, name).get("strategy"))
         if strategy.get("fail-fast") is not False:
             raise OwnerError("C6 reader cancellation differs")

@@ -48,7 +48,7 @@ FROM bin-${GUARD_SOURCE} AS bin
 
 # ---------------------------------------------------------------- runtime
 # distroless/static: CA certificates, /etc/passwd with uid 65532 "nonroot", nothing else.
-FROM gcr.io/distroless/static-debian12:nonroot@sha256:afa5c872c891853ca7fcf1f12c3edb23f7eeef36189728842dd51042ff57f7ab
+FROM gcr.io/distroless/static-debian12:nonroot@sha256:afa5c872c891853ca7fcf1f12c3edb23f7eeef36189728842dd51042ff57f7ab AS runtime
 LABEL org.opencontainers.image.title="zunder-guard" \
       org.opencontainers.image.description="Zunder Guard: a self-hosted risk firewall between trading bots and Hyperliquid" \
       org.opencontainers.image.source="https://github.com/zunderlabs/zunder-guard" \

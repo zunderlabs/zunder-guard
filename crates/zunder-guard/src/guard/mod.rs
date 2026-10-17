@@ -666,6 +666,9 @@ impl<U: Upstream, C: Clock> Guard<U, C> {
         }
         // A kill file left in place latches before anything is served.
         Self::check_kill(&mut inner, started_ms);
+        // Entries refused for a ledger entry Guard could not account for,
+        // seen this UTC day before the restart: still refused.
+        Self::restore_unaccounted(&mut inner, started_ms);
         Ok(Arc::new(Self {
             upstream: Arc::new(upstream),
             clock,

@@ -20,7 +20,7 @@ use super::{
     persistent::must_write,
     record::{CHECK_PREFIX, FlowFields, RECORD_VERSION, hex},
 };
-use crate::flows::{self, Flow, SeenView};
+use crate::flows::{self, Flow, RebaseBudget, SeenView, UnaccountedEntry, UnaccountedRule};
 
 const HOUR: i64 = Timestamp::MS_PER_HOUR;
 const DAY: i64 = Timestamp::MS_PER_DAY;
@@ -154,6 +154,7 @@ fn pending_origin_survives_retention_restart_and_blocks_entries() {
         dex: String::new(),
         between: false,
         value: None,
+        unaccounted: None,
     };
     risk.apply_flow(at(HOUR), &withdrawal).unwrap();
     let empty = VenueView::default();
@@ -183,6 +184,7 @@ fn pending_origin_survives_retention_restart_and_blocks_entries() {
         dex: String::new(),
         between: false,
         value: Some(flows::ValueRange::cash_exact(dec!(0))),
+        unaccounted: None,
     };
     risk.apply_flow(at(2 * DAY + 2 * HOUR), &refill).unwrap();
     let ms = 2 * DAY + 3 * HOUR;
@@ -218,6 +220,7 @@ fn a_review_refuses_pending_money_without_mutation() {
                 dex: String::new(),
                 between: false,
                 value: Some(flows::ValueRange::cash_exact(dec!(7000))),
+                unaccounted: None,
             });
         }
         flows.push(Flow {
@@ -227,6 +230,7 @@ fn a_review_refuses_pending_money_without_mutation() {
             dex: String::new(),
             between: false,
             value: None,
+            unaccounted: None,
         });
         for flow in flows {
             risk.apply_flow(at(2 * HOUR), &flow).unwrap();
@@ -354,6 +358,7 @@ fn exact_arithmetic_underflow_stays_pending_after_restart() {
         dex: String::new(),
         between: false,
         value: Some(flows::ValueRange::cash_exact(dec!(100000000000000000000))),
+        unaccounted: None,
     };
     risk.apply_flow(at(2 * HOUR), &flow).unwrap();
     let out = risk.observe_view_at(
@@ -396,6 +401,7 @@ fn pending_history_bound_refuses_entries_without_a_loss_stop() {
         dex: String::new(),
         between: false,
         value: None,
+        unaccounted: None,
     };
     risk.apply_flow(at(HOUR), &withdrawal).unwrap();
     let seen = SeenView {
@@ -460,6 +466,7 @@ fn too_many_views_forget_the_oldest_bases_first_and_never_break_the_journal() {
         dex: String::new(),
         between: false,
         value: None,
+        unaccounted: None,
     };
     assert_eq!(
         risk.apply_flow(at(HOUR + 400_000), &late).unwrap(),
@@ -916,6 +923,7 @@ fn rebuilding_flows_keeps_the_writer_and_appends_after_the_existing_records() {
         dex: String::new(),
         between: false,
         value: Some(flows::ValueRange::cash_exact(dec!(2000))),
+        unaccounted: None,
     };
     risk.apply_flow(at(HOUR), &flow).unwrap();
     // Hand calculation: 2,000 cash + 100 deposit = 2,100; no trade PnL.
@@ -1602,6 +1610,7 @@ fn seen(venue_ms: i64) -> FlowFields {
     FlowFields {
         horizon: Some([(String::new(), venue_ms)].into()),
         view: None,
+        budget: None,
     }
 }
 
@@ -1648,7 +1657,7 @@ fn a_horizon_belongs_in_a_version_3_record_and_only_there() {
     write_lines(&dir, &forged);
     assert_eq!(
         refused_by_reader(&dir),
-        "a horizon in a record of version 3, and only there"
+        "a horizon in a record of version 3 or later, and only there"
     );
     // A record with a horizon claiming version 2.
     forge_with(
@@ -1663,7 +1672,7 @@ fn a_horizon_belongs_in_a_version_3_record_and_only_there() {
     write_lines(&dir, &forged);
     assert_eq!(
         refused_by_reader(&dir),
-        "a horizon in a record of version 3, and only there"
+        "a horizon in a record of version 3 or later, and only there"
     );
     // A view without a horizon (a version 2 record).
     forge_with(
@@ -1677,6 +1686,7 @@ fn a_horizon_belongs_in_a_version_3_record_and_only_there() {
                 FlowFields {
                     horizon: None,
                     view: Some(view(HOUR, HOUR)),
+                    budget: None,
                 },
             ),
         ],
@@ -1740,6 +1750,7 @@ fn the_horizon_never_goes_back() {
                 FlowFields {
                     horizon: Some([(String::new(), HOUR), ("xyz".to_owned(), HOUR)].into()),
                     view: None,
+                    budget: None,
                 },
             ),
             (2 * HOUR, JournalEvent::Updated, fresh(), seen(2 * HOUR)),
@@ -1920,6 +1931,7 @@ fn a_flow_listed_again_must_be_the_flow_first_listed() {
         dex: String::new(),
         between: false,
         value: None,
+        unaccounted: None,
     };
     risk.apply_flow(at(HOUR), &withdrawal).unwrap();
     let out = risk.observe_view_at(
@@ -1955,6 +1967,7 @@ fn a_flow_listed_again_must_be_the_flow_first_listed() {
         FlowFields {
             horizon: last.horizon.clone(),
             view: None,
+            budget: None,
         },
     )
     .unwrap();
@@ -1967,4 +1980,263 @@ fn a_flow_listed_again_must_be_the_flow_first_listed() {
             if message == "the flow withdraw changed since it was listed"),
         "{refused:?}"
     );
+}
+
+/// `line` changed by `change` (on its JSON, the checksum left out) and
+/// checksummed again: the last line of a journal, tampered with.
+fn rechecked(line: &str, change: impl FnOnce(&mut serde_json::Value)) -> String {
+    let mut record: serde_json::Value = serde_json::from_str(line).unwrap();
+    record.as_object_mut().unwrap().remove("check");
+    change(&mut record);
+    let body = record.to_string();
+    let check = hex(&Sha3_256::digest(body.as_bytes()));
+    format!("{CHECK_PREFIX}{check}\",{}", &body[1..])
+}
+
+/// A base is never taken while a flow is pending: a replay starts watching
+/// from a base's horizon, which then is the last view the engine took (a
+/// view is left out only beside a flow not applied yet).
+#[test]
+fn no_base_is_taken_while_a_flow_is_pending() {
+    let dir = TestDir::new("no-base-pending");
+    let mut risk = PersistentRisk::initialise(&dir.journal(), limits(), at(0), dec!(10000), "test")
+        .unwrap()
+        .with_flows();
+    risk.observe_view_at(
+        at(HOUR),
+        [(String::new(), HOUR)].into(),
+        dec!(10000),
+        &VenueView::default(),
+        true,
+    );
+    let entry = Flow {
+        time_ms: HOUR + 20_000,
+        amount: Decimal::ZERO,
+        id: format!("{}0xabc:liquidator", flows::UNKNOWN_TYPE_ID_PREFIX),
+        dex: String::new(),
+        between: true,
+        value: None,
+        unaccounted: Some(UnaccountedEntry {
+            watched_gap_ms: 31_000,
+            rule: UnaccountedRule::Rebasable,
+            credit: Decimal::ZERO,
+        }),
+    };
+    assert_eq!(
+        risk.apply_flow(at(HOUR + 19_000), &entry).unwrap(),
+        FlowOutcome::Pending
+    );
+    let bases = |risk: &PersistentRisk| {
+        risk.flows
+            .as_ref()
+            .unwrap()
+            .bases
+            .iter()
+            .map(|base| base.seq)
+            .collect::<Vec<_>>()
+    };
+    let before = bases(&risk);
+    // A view at 1 h + 19 s may or may not show it: left out, written, and
+    // no base.
+    let out = risk.observe_view_at(
+        at(HOUR + 19_000),
+        [(String::new(), HOUR + 19_000)].into(),
+        dec!(10100),
+        &VenueView::default(),
+        true,
+    );
+    assert!(!out.taken);
+    assert_eq!(bases(&risk), before);
+    // The view that shows it, 30 s after the last view taken (1 h; the
+    // left-out view does not count): watched, the 100 is the entry's (1%,
+    // within the room): P = D = 10,100, active.
+    let out = risk.observe_view_at(
+        at(HOUR + 30_000),
+        [(String::new(), HOUR + 30_000)].into(),
+        dec!(10100),
+        &VenueView::default(),
+        true,
+    );
+    assert!(out.taken);
+    let snapshot = risk.engine.snapshot();
+    assert_eq!(
+        (snapshot.state, snapshot.peak, snapshot.day_start),
+        (RiskState::Active, dec!(10100), dec!(10100))
+    );
+}
+
+/// Every line of a journal re-encoded from version `from` to `to`, the
+/// checksums and the chain redone: a journal as an older build wrote it.
+fn as_version(lines: &[String], from: u32, to: u32) -> Vec<String> {
+    let mut out = Vec::new();
+    let (mut old_prev, mut new_prev) = (String::new(), String::new());
+    for line in lines {
+        let old_check = line
+            .strip_prefix(CHECK_PREFIX)
+            .and_then(|rest| rest.split_once('"'))
+            .map(|(check, _)| check.to_owned())
+            .unwrap();
+        let mut body = format!("{{{}", line.split_once("\",").unwrap().1).replace(
+            &format!(r#""version":{from}"#),
+            &format!(r#""version":{to}"#),
+        );
+        if !old_prev.is_empty() {
+            body = body.replace(
+                &format!(r#""prev":"{old_prev}""#),
+                &format!(r#""prev":"{new_prev}""#),
+            );
+        }
+        let check = hex(&Sha3_256::digest(body.as_bytes()));
+        out.push(format!("{CHECK_PREFIX}{check}\",{}", &body[1..]));
+        old_prev = old_check;
+        new_prev = check;
+    }
+    out
+}
+
+/// An engine that takes flows, 10,000 at 1 h; an entry the caller cannot
+/// account for at 1 h + 5 s, watched through 31 s, shown by the view at
+/// 1 h + 10 s at 10,500: the 500 (a loss of it would be 5%, under the 6%
+/// daily stop) is its money (P = D = 10,500, active). The journal holds it
+/// as version 4 and reopens intact, with the same figures; the same records
+/// claiming version 3 are refused (an older build would replay the entry as
+/// another flow); a malformed entry is never journaled; one written as
+/// version 3 (an older build's, before any such entry) opens in this build.
+#[test]
+fn a_journal_with_an_unknown_entry_reopens_and_version_3_still_opens() {
+    let dir = TestDir::new("unknown-entry");
+    let mut risk = PersistentRisk::initialise(&dir.journal(), limits(), at(0), dec!(10000), "test")
+        .unwrap()
+        .with_flows();
+    risk.observe_view_at(
+        at(HOUR),
+        [(String::new(), HOUR)].into(),
+        dec!(10000),
+        &VenueView::default(),
+        true,
+    );
+    // A version 3 copy of the journal so far (no unknown entry in it).
+    let older = as_version(&lines(&dir), JOURNAL_VERSION, 3);
+    let entry = Flow {
+        time_ms: HOUR + 5_000,
+        amount: Decimal::ZERO,
+        id: format!(
+            "{}0xabc:{}:welcomeBonus",
+            flows::UNKNOWN_TYPE_ID_PREFIX,
+            HOUR + 5_000
+        ),
+        dex: String::new(),
+        between: true,
+        value: None,
+        unaccounted: Some(UnaccountedEntry {
+            watched_gap_ms: 31_000,
+            rule: UnaccountedRule::Rebasable,
+            credit: Decimal::ZERO,
+        }),
+    };
+    assert_eq!(
+        risk.apply_flow(at(HOUR + 5_000), &entry).unwrap(),
+        FlowOutcome::Pending
+    );
+    let out = risk.observe_view_at(
+        at(HOUR + 10_000),
+        [(String::new(), HOUR + 10_000)].into(),
+        dec!(10500),
+        &VenueView::default(),
+        true,
+    );
+    assert!(out.journal_error.is_none());
+    let state = risk.engine.snapshot();
+    assert_eq!(
+        (state.state, state.peak, state.day_start),
+        (RiskState::Active, dec!(10500), dec!(10500))
+    );
+    assert!(risk.check_ready().is_ok());
+    assert!(
+        lines(&dir)
+            .iter()
+            .any(|line| line.contains(&format!(r#""version":{JOURNAL_VERSION}"#)))
+    );
+    // The day's re-base budget: the room at the entry, 600 (6% of 10,000),
+    // 500 used, as shares of the day's start; on the journal's last record.
+    let budget = Some(RebaseBudget {
+        day: 0,
+        room: dec!(0.06),
+        used: dec!(0.05),
+    });
+    assert_eq!(risk.journal.last.budget, budget);
+    assert_eq!(
+        risk.unaccounted_entries()
+            .iter()
+            .map(|(flow, at)| (flow.id.clone(), *at))
+            .collect::<Vec<_>>(),
+        vec![(entry.id.clone(), at(HOUR + 5_000))]
+    );
+    drop(risk);
+    let mut reopened = PersistentRisk::open(&dir.journal(), &limits())
+        .unwrap()
+        .with_flows();
+    // Intact (not broken); ready once a view is observed, nothing pending.
+    assert_eq!(reopened.check_ready(), Err(JournalError::NotObserved));
+    reopened.observe_view_at(
+        at(HOUR + 20_000),
+        [(String::new(), HOUR + 20_000)].into(),
+        dec!(10500),
+        &VenueView::default(),
+        true,
+    );
+    assert!(reopened.check_ready().is_ok());
+    let again = reopened.engine.snapshot();
+    assert_eq!(
+        (again.state, again.peak, again.day_start),
+        (RiskState::Active, dec!(10500), dec!(10500))
+    );
+    // The budget and the entry, read back (a restarted Guard refuses
+    // entries for the day from them).
+    assert_eq!(reopened.journal.last.budget, budget);
+    assert_eq!(reopened.flows.as_ref().unwrap().budget, budget);
+    assert_eq!(reopened.unaccounted_entries().len(), 1);
+    // An entry without its watched gap: skipped, nothing written.
+    let before = lines(&dir).len();
+    let malformed = Flow {
+        id: format!(
+            "{}0xdef:{}:welcomeBonus",
+            flows::UNKNOWN_TYPE_ID_PREFIX,
+            HOUR + 25_000
+        ),
+        time_ms: HOUR + 25_000,
+        unaccounted: None,
+        ..entry
+    };
+    let outcome = reopened.apply_flow(at(HOUR + 25_000), &malformed).unwrap();
+    assert!(
+        matches!(&outcome, FlowOutcome::Skipped(why) if why.contains("no watched gap")),
+        "{outcome:?}"
+    );
+    assert_eq!(lines(&dir).len(), before);
+    assert!(!reopened.knows_flow(&malformed.id));
+    drop(reopened);
+    // A budget changed on the last record: refused.
+    let current = lines(&dir);
+    let mut tampered = current.clone();
+    let last = tampered.pop().unwrap();
+    tampered.push(rechecked(&last, |record| {
+        record["budget"]["used"] = serde_json::json!("1");
+    }));
+    write_lines(&dir, &tampered);
+    let refused = refused_by_reader(&dir);
+    assert!(refused.contains("budget"), "{refused}");
+    // The same records claiming version 3: refused.
+    write_lines(&dir, &as_version(&current, JOURNAL_VERSION, 3));
+    let refused = refused_by_reader(&dir);
+    assert!(
+        refused.contains("lists a flow for a ledger entry the caller cannot account for"),
+        "{refused}"
+    );
+    write_lines(&dir, &older);
+    let opened = PersistentRisk::open(&dir.journal(), &limits())
+        .unwrap()
+        .with_flows();
+    assert_eq!(opened.check_ready(), Err(JournalError::NotObserved));
+    assert_eq!(opened.engine.snapshot().last, dec!(10000));
 }

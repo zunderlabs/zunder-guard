@@ -156,8 +156,15 @@ pub(super) fn parse(
                 .listings
                 .check(*base, &reach(base_record), listed)
                 .map_err(|message| inconsistent(number, message))?;
-            let replayed = check_flowed(&limits, &base_record.state, horizon, previous, &record)
-                .map_err(|message| inconsistent(number, message))?;
+            let replayed = check_flowed(
+                &limits,
+                &base_record.state,
+                horizon,
+                base_record.budget.as_ref(),
+                previous,
+                &record,
+            )
+            .map_err(|message| inconsistent(number, message))?;
             checks.listings.record(record.seq, listed, &replayed.placed);
         }
         checks.trail.record(&record);

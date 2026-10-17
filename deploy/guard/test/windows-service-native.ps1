@@ -138,7 +138,9 @@ function Set-FixtureAcl([string]$Path, [bool]$Writable = $false, [bool]$Public =
   $Reader = if ($Public) { 'S-1-5-11' } else { $script:Sid }
   if ($Reader) {
     $Rights = if ($Writable) { 'Modify' } else { 'ReadAndExecute' }
-    $Acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new([Security.Principal.SecurityIdentifier]::new($Reader),$Rights,$Inheritance,'None','Allow'))
+    # Shared bases: this folder only, as the production installer's Set-ZgBaseAcl.
+    $ReaderInheritance = if ($Public) { [Security.AccessControl.InheritanceFlags]::None } else { $Inheritance }
+    $Acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new([Security.Principal.SecurityIdentifier]::new($Reader),$Rights,$ReaderInheritance,'None','Allow'))
   }
   Set-Acl -LiteralPath $Path -AclObject $Acl
 }

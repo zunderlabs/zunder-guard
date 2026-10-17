@@ -1921,6 +1921,423 @@ async fn an_early_round_on_a_view_that_does_not_show_the_fill_keeps_protection_d
     assert_eq!(order.orders[0].size.raw(), "0.1");
 }
 
+/// A type Guard does not know read as a credit in dollars (`welcomeBonus`
+/// with `usdc` 500, the money there: main 9,500): the day halts, as it did
+/// in 1.0.1, whatever the account did around it; entries are refused
+/// naming it. Account 9,000 on the main dex and 1,000 on xyz: 10,000 at
+/// the day's start; views 2.1 s apart.
+#[tokio::test]
+async fn an_unknown_dollar_credit_halts_the_day_as_before() {
+    let running = start("stream-unknown-credit", true).await;
+    let venue = running.guard.upstream();
+    running.guard.sync().await;
+    let mut nonce = running.clock.now_ms();
+    let mut signed_now = |body: &Value| {
+        nonce = nonce.max(running.clock.now_ms()) + 1;
+        resigned(body, nonce)
+    };
+    running.clock.advance(20);
+    venue.set_equity("9500");
+    let now = running.clock.now_ms();
+    venue.ledger_entry_at(
+        json!({"type": "welcomeBonus", "usdc": "500"}),
+        now as i64,
+        false,
+    );
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    running.clock.advance(2_100);
+    running.guard.sync().await;
+    let status = running.guard.status().await;
+    assert_eq!(status["risk"]["state"], "halted_for_day", "{status}");
+    assert_eq!(status["risk"]["flows_applied"], 1, "{status}");
+    assert!(
+        status["alerts"].as_array().unwrap().iter().any(|alert| {
+            alert
+                .as_str()
+                .unwrap_or("")
+                .contains("reads as a credit in dollars")
+        }),
+        "{status}"
+    );
+    let reply = post(
+        &running.url,
+        &signed_now(&order(1, true, "3000", "0.1", false)),
+    )
+    .await;
+    assert_ne!(reply["status"], "ok", "{reply}");
+}
+
+/// A type Guard does not know that reads as paid by the account to
+/// another (its addresses say so), 300 out of main's 9,000: never taken as
+/// money; the fall counts as the loss it shows (3%, under the 6% daily
+/// stop: active, the peak still 10,000), and entries are refused naming it.
+#[tokio::test]
+async fn an_unknown_debit_counts_as_the_loss_it_shows_and_refuses_entries() {
+    let running = start("stream-unknown-debit", true).await;
+    let venue = running.guard.upstream();
+    running.guard.sync().await;
+    let mut nonce = running.clock.now_ms();
+    let mut signed_now = |body: &Value| {
+        nonce = nonce.max(running.clock.now_ms()) + 1;
+        resigned(body, nonce)
+    };
+    running.clock.advance(20);
+    venue.set_equity("8700");
+    let now = running.clock.now_ms();
+    venue.ledger_entry_at(
+        json!({"type": "newPayment", "usdc": "300", "user": ACCOUNT,
+            "destination": "0x0000000000000000000000000000000000000001"}),
+        now as i64,
+        false,
+    );
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    running.clock.advance(2_100);
+    running.guard.sync().await;
+    running.clock.advance(2_100);
+    running.guard.sync().await;
+    let status = running.guard.status().await;
+    assert_eq!(status["risk"]["state"], "active", "{status}");
+    assert_eq!(status["risk"]["flows_applied"], 1, "{status}");
+    assert_eq!(status["risk"]["peak"], "10000", "{status}");
+    let reply = post(
+        &running.url,
+        &signed_now(&order(1, true, "3000", "0.1", false)),
+    )
+    .await;
+    assert_eq!(reply["code"], "account_unreadable", "{reply}");
+    assert!(
+        reply["response"]
+            .as_str()
+            .unwrap_or("")
+            .contains("newPayment"),
+        "{reply}"
+    );
+}
+
+/// A classified liquidator transfer with a position open: 300 out of main
+/// (10,000 to 9,700, 3%, under the room and the day's budget of 600) is the
+/// entry's money: the day's start 9,700, the peak kept at 10,000; no halt,
+/// the position stays, entries are refused. A trading loss to 9,200 then
+/// (5.15% of 9,700) leaves it active, which it would not had the 300
+/// counted (8% of 10,000).
+///
+/// The review's case after it: a liquidation-related entry
+/// (`borrowLendBackstopLiquidation`, never seen, naming the account and a
+/// USD amount, so it reads as a credit in dollars) while 1,300 left main.
+/// Never taken as money: the day halts and the fall counts.
+#[tokio::test]
+async fn a_liquidator_transfer_is_re_based_and_a_liquidation_type_halts() {
+    let running = start("stream-unknown-1300", true).await;
+    let venue = running.guard.upstream();
+    venue.add_position("ETH", "0.1");
+    running.guard.sync().await;
+    running.clock.advance(20);
+    venue.set_equity("8700");
+    let now = running.clock.now_ms();
+    venue.ledger_entry_at(
+        json!({"type": "hip3LiquidatorDeposit", "dex": "xyz", "amount": "300",
+            "token": "USDC"}),
+        now as i64,
+        false,
+    );
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    running.clock.advance(2_100);
+    running.guard.sync().await;
+    running.clock.advance(2_100);
+    running.guard.sync().await;
+    let status = running.guard.status().await;
+    assert_eq!(status["risk"]["state"], "active", "{status}");
+    assert_eq!(status["risk"]["peak"], "10000", "{status}");
+    assert_eq!(status["halted"], false, "{status}");
+    assert_eq!(status["positions"], 1, "{status}");
+    assert!(
+        status["risk"]["ledger_unaccounted"]
+            .as_str()
+            .unwrap_or("")
+            .contains("hip3LiquidatorDeposit"),
+        "{status}"
+    );
+    // Trading to 9,200 (8,200 on main): 500 of 9,700, active.
+    venue.set_equity("8200");
+    running.clock.advance(2_100);
+    running.guard.sync().await;
+    let status = running.guard.status().await;
+    assert_eq!(status["risk"]["state"], "active", "{status}");
+    running.clock.advance(20);
+    venue.set_equity("6900");
+    let now = running.clock.now_ms();
+    venue.ledger_entry_at(
+        json!({"type": "borrowLendBackstopLiquidation", "usdc": "1300", "user": ACCOUNT}),
+        now as i64,
+        false,
+    );
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    running.clock.advance(2_100);
+    running.guard.sync().await;
+    running.clock.advance(2_100);
+    running.guard.sync().await;
+    let status = running.guard.status().await;
+    assert_ne!(status["risk"]["state"], "active", "{status}");
+    assert!(
+        status["alerts"].as_array().unwrap().iter().any(|alert| {
+            alert
+                .as_str()
+                .unwrap_or("")
+                .contains("reads as a credit in dollars")
+        }),
+        "{status}"
+    );
+}
+
+/// The review's case for a credit Guard cannot read: a liquidator
+/// withdrawal of 3,000 whose amount is not in USDC (so not read) lands while
+/// 2,700 is lost trading, the account 300 up (main 9,000 to 9,300; 10,300 in
+/// all). Read as a credit of 0 and re-based, the +300 would raise the peak to
+/// 10,300 and hide the 27% loss. Unread, it is never taken as money: the
+/// rise halts the day.
+#[tokio::test]
+async fn a_liquidator_credit_guard_cannot_read_halts_on_a_rise() {
+    let running = start("stream-unread-credit", true).await;
+    let venue = running.guard.upstream();
+    running.guard.sync().await;
+    running.clock.advance(20);
+    venue.set_equity("9300");
+    let now = running.clock.now_ms();
+    venue.ledger_entry_at(
+        json!({"type": "hip3LiquidatorWithdraw", "dex": "xyz", "amount": "3000",
+            "token": "HYPE"}),
+        now as i64,
+        false,
+    );
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    running.clock.advance(2_100);
+    running.guard.sync().await;
+    running.clock.advance(2_100);
+    running.guard.sync().await;
+    let status = running.guard.status().await;
+    assert_eq!(status["risk"]["state"], "halted_for_day", "{status}");
+    assert!(
+        status["alerts"].as_array().unwrap().iter().any(|alert| {
+            alert
+                .as_str()
+                .unwrap_or("")
+                .contains("never takes as money")
+        }),
+        "{status}"
+    );
+}
+
+/// The review's probe E: Guard manages the main dex only (9,000), and a
+/// liquidator withdrawal of 10,000 in USDC names `xyz`, which Guard does not
+/// manage: its money lands outside the equity Guard sums. Counted as a
+/// credit it would raise the peak to 19,000 and stop Guard at a false 52.6%
+/// drawdown, a review with no trading at all. It is not read: the equity
+/// did not move, nothing happens (the state and the peak as they were; the
+/// journal here started at 10,000, so the first view of 9,000 already
+/// halted the day), entries are refused for the day.
+#[tokio::test]
+async fn a_liquidator_credit_on_a_dex_guard_does_not_manage_is_not_counted() {
+    let running = start_markets(
+        "stream-probe-e",
+        true,
+        Limits {
+            request_weight_per_second: 1_000_000,
+            request_weight_burst: 1_000_000,
+        },
+        &["*"],
+    )
+    .await;
+    let venue = running.guard.upstream();
+    running.guard.sync().await;
+    let before = running.guard.status().await;
+    let (state, peak) = (
+        before["risk"]["state"].clone(),
+        before["risk"]["peak"].clone(),
+    );
+    running.clock.advance(20);
+    let now = running.clock.now_ms();
+    venue.ledger_entry_at(
+        json!({"type": "hip3LiquidatorWithdraw", "dex": "xyz", "amount": "10000",
+            "token": "USDC"}),
+        now as i64,
+        false,
+    );
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    running.clock.advance(2_100);
+    running.guard.sync().await;
+    running.clock.advance(2_100);
+    running.guard.sync().await;
+    let status = running.guard.status().await;
+    assert_eq!(status["risk"]["state"], state, "{status}");
+    assert_ne!(status["risk"]["state"], "stopped", "{status}");
+    assert_eq!(status["risk"]["peak"], peak, "{status}");
+    assert!(
+        status["risk"]["ledger_unaccounted"]
+            .as_str()
+            .unwrap_or("")
+            .contains("not one Guard manages"),
+        "{status}"
+    );
+}
+
+/// The watched gap follows Guard's sync: with one HIP-3 dex the sync reads
+/// every 11,613 ms at the default settings, so the gap is 3 x 11,613 +
+/// 16,000 = 50,839 ms. A liquidator transfer whose first view comes 45 s
+/// after the last one taken (the old fixed 30 s would not have watched it),
+/// the account 200 up: the entry's money, a deposit's rules (peak 10,200),
+/// active. Another, 200 up, seen 52 s after the last view: Guard was not
+/// watching, the day halts.
+#[tokio::test]
+async fn the_watched_gap_follows_the_sync_interval() {
+    let running = start("stream-unknown-hip3-gap", true).await;
+    let venue = running.guard.upstream();
+    running.guard.sync().await;
+    running.clock.advance(20);
+    venue.set_equity("9200");
+    let now = running.clock.now_ms();
+    venue.ledger_entry_at(
+        json!({"type": "hip3LiquidatorDeposit", "dex": "xyz", "amount": "1", "token": "USDC"}),
+        now as i64,
+        false,
+    );
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    running.clock.advance(45_000);
+    running.guard.sync().await;
+    let status = running.guard.status().await;
+    assert_eq!(status["risk"]["state"], "active", "{status}");
+    assert_eq!(status["risk"]["peak"], "10200", "{status}");
+    running.clock.advance(20);
+    venue.set_equity("9400");
+    let now = running.clock.now_ms();
+    venue.ledger_entry_at(
+        json!({"type": "hip3LiquidatorDeposit", "dex": "xyz", "amount": "2", "token": "USDC"}),
+        now as i64,
+        false,
+    );
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    running.clock.advance(52_000);
+    running.guard.sync().await;
+    let status = running.guard.status().await;
+    assert_eq!(status["risk"]["state"], "halted_for_day", "{status}");
+    assert!(
+        status["alerts"].as_array().unwrap().iter().any(|alert| {
+            alert
+                .as_str()
+                .unwrap_or("")
+                .contains("was not watching the account closely")
+        }),
+        "{status}"
+    );
+}
+
+/// A restart never reopens the day an entry Guard could not account for
+/// refused: the journal holds the entry, and a Guard started on it refuses
+/// new positions until the end of the UTC day it was seen, with an alert.
+/// (A liquidator transfer, 300 out, re-based: the engine itself is active.)
+#[tokio::test]
+async fn a_restart_keeps_the_days_refusal_for_an_unaccounted_entry() {
+    let running = start("stream-unknown-restart", true).await;
+    let venue = running.guard.upstream();
+    running.guard.sync().await;
+    running.clock.advance(20);
+    venue.set_equity("8700");
+    let now = running.clock.now_ms();
+    venue.ledger_entry_at(
+        json!({"type": "hip3LiquidatorDeposit", "dex": "xyz", "amount": "300",
+            "token": "USDC"}),
+        now as i64,
+        false,
+    );
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    running.clock.advance(2_100);
+    running.guard.sync().await;
+    running.clock.advance(2_100);
+    running.guard.sync().await;
+    let status = running.guard.status().await;
+    assert_eq!(status["risk"]["state"], "active", "{status}");
+    let until = status["risk"]["entries_refused_until_ms"].as_u64().unwrap();
+    // A Guard started on a copy of the journal (the running one holds its
+    // lock), on the same clock.
+    let (restarted, _dir) = restarted_on(&running, "stream-unknown-restarted");
+    let status = restarted.status().await;
+    let now = running.clock.now_ms();
+    if now < until {
+        assert_eq!(
+            status["risk"]["entries_refused_until_ms"], until,
+            "{status}"
+        );
+        assert!(
+            status["risk"]["ledger_unaccounted"]
+                .as_str()
+                .unwrap_or("")
+                .contains("hip3LiquidatorDeposit"),
+            "{status}"
+        );
+        assert!(
+            status["alerts"].as_array().unwrap().iter().any(|alert| {
+                alert
+                    .as_str()
+                    .unwrap_or("")
+                    .contains("seen this UTC day before Guard started")
+            }),
+            "{status}"
+        );
+    }
+    assert_eq!(status["risk"]["state"], "active", "{status}");
+}
+
+/// A Guard started (paper, the same account and markets as [`start`]) on a
+/// copy of `running`'s risk journal, on `running`'s clock: a restart.
+fn restarted_on(running: &Running, name: &str) -> (Arc<Guard<MemoryVenue, VenueClock>>, TestDir) {
+    let dir = TestDir::new(name);
+    let config = GuardConfig {
+        network: Some(GuardNetwork::Testnet),
+        mode: GuardMode::Paper,
+        account: Some(ACCOUNT.to_owned()),
+        api_wallet: Some(api_key().address().to_hex()),
+        state_dir: dir.path().to_owned(),
+        auth: AuthConfig {
+            clients: vec![GuardKey::from_hex(CLIENT_KEY).unwrap().address().to_hex()],
+            ..AuthConfig::default()
+        },
+        policy: Policy {
+            markets: Markets::from_list(["*".to_owned(), "xyz:*".to_owned()]),
+            ..Policy::default()
+        },
+        ..GuardConfig::default()
+    };
+    std::fs::copy(
+        running._dir.path().join("risk-paper.jsonl"),
+        config.risk_journal(true),
+    )
+    .unwrap();
+    let risk = PersistentRisk::open_for(
+        &config.risk_journal(true),
+        &config.policy.risk_limits(),
+        &config.journal_scope(true).unwrap(),
+    )
+    .unwrap();
+    let journal = DecisionJournal::open(&config.decision_journal(true)).unwrap();
+    let guard = Guard::new(
+        Setup {
+            config,
+            mode: Mode::Paper,
+            risk,
+            journal,
+            fee: FeeMode::Off("test".into()),
+            fee_warning: None,
+            limits: Limits {
+                request_weight_per_second: 1_000_000,
+                request_weight_burst: 1_000_000,
+            },
+        },
+        memory_venue(true),
+        running.clock.clone(),
+    )
+    .unwrap();
+    (guard, dir)
+}
+
 /// An activation the socket delivers while the request's view is being
 /// built (a HIP-3 entry's book read, slowed), with the venue's account time
 /// held so that the request does not take the stream's entries: counted
@@ -1968,13 +2385,14 @@ async fn dex_abstraction_delivered_while_the_view_is_read_refuses_the_entry() {
 /// A ledger entry Guard cannot account for whose amount cannot be read (a
 /// type it does not know without a USD amount, a transfer without its fee):
 /// reported by name, and new positions refused until the end of the UTC day
-/// it was seen, from the socket and from the read over HTTP alike. One of a
-/// type Guard does not know with a USD amount is applied as money in, never
-/// a trading gain: its effect cannot be reconstructed, so the day halts. One
-/// older than the risk journal's horizon is in the equity Guard started
-/// from: neither.
+/// it was seen, from the socket and from the read over HTTP alike, and the
+/// day is not halted for it while Guard watched the account around it
+/// (views 10 s apart). One of a type Guard does not know with a USD amount
+/// that turns up when Guard took no view for 5 minutes around it (as after
+/// a restart) halts the day: Guard could not watch it. One older than the
+/// risk journal's horizon is in the equity Guard started from: neither.
 #[tokio::test]
-async fn a_ledger_entry_guard_cannot_account_for_is_money_in_or_refuses_entries() {
+async fn a_ledger_entry_guard_cannot_account_for_refuses_entries_and_halts_only_unwatched() {
     const DAY_MS: u64 = 86_400_000;
     let running = start("stream-unaccounted", true).await;
     let venue = running.guard.upstream();
@@ -2036,19 +2454,22 @@ async fn a_ledger_entry_guard_cannot_account_for_is_money_in_or_refuses_entries(
         now as i64,
         true,
     );
-    running.clock.advance(300_100);
-    running.guard.sync().await;
+    // A view every 10 s until the periodic read (5 minutes on) brings it.
+    for _ in 0..31 {
+        running.clock.advance(10_000);
+        running.guard.sync().await;
+    }
     let status = running.guard.status().await;
     let text = status["risk"]["ledger_unaccounted"].as_str().unwrap_or("");
     assert!(
         text.contains("internalTransfer") && text.contains("fee"),
         "{status}"
     );
-    // A type Guard does not know with a USD amount, read over HTTP (the
-    // periodic read; the socket reconnects after the clock's jumps): money
-    // in, so the 5 cannot pass as a gain; the account's value at it cannot
-    // be reconstructed, so the day halts once a view shows it.
     assert_eq!(status["risk"]["state"], "active", "{status}");
+    // A type Guard does not know with a USD amount, read over HTTP (the
+    // periodic read; the socket reconnects after the clock's jumps), with
+    // no view for 5 minutes around it: Guard did not watch the account
+    // then, so the day halts, as for any flow whose value is unknown.
     let now = running.clock.now_ms();
     venue.ledger_entry_at(
         json!({"type": "welcomeBonus", "usdc": "5"}),
@@ -2070,7 +2491,7 @@ async fn a_ledger_entry_guard_cannot_account_for_is_money_in_or_refuses_entries(
     assert!(
         status["alerts"].as_array().unwrap().iter().any(|alert| {
             let text = alert.as_str().unwrap_or("");
-            text.contains("welcomeBonus") && text.contains("money in")
+            text.contains("welcomeBonus") && text.contains("reads as money in")
         }),
         "{status}"
     );

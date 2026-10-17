@@ -1,7 +1,8 @@
-"""Released Keychain and Windows per-user testnet lifecycle. Read-only HTTP; never /exchange.
+"""Released Keychain, Windows per-user and Windows SCM testnet lifecycle. Read-only HTTP only.
 
-Guard 1.0 ships Windows per-user only (decision of 15 Oct 2026). The SCM service
-route and its hosted crash-policy step stay here for 1.0.1, off unless `windows_service`.
+Never /exchange. On Windows the per-user install is measured first, then the SCM service
+with its hosted crash-policy step, from 1.0.2 (`WINDOWS_SERVICE`). An upgrade from a release
+before the first working service measures the per-user scope only.
 """
 
 import argparse
@@ -16,7 +17,12 @@ import time
 from collections.abc import Callable
 from pathlib import Path
 
-from guard_harness.lifecycle_coverage import WINDOWS_TESTNET_SCOPE
+from guard_harness.lifecycle_coverage import (
+    WINDOWS_SERVICE_SCOPE,
+    WINDOWS_SERVICE_SKIP,
+    WINDOWS_TESTNET_SCOPE,
+    windows_service_measured,
+)
 from guard_harness.native_paper import LifecycleError, Paper
 from guard_harness.native_release import Release, staged_loader
 from guard_harness.paper_bot import LocalGuard, PaperError
@@ -26,8 +32,8 @@ from guard_harness.testnet_run import ROOT
 from guard_harness.testnet_scan import TestnetReads, flat_scan
 from guard_harness.windows_diagnostics import observe as windows_observe
 
-# The Windows service (SCM) mode arrives in 1.0.1; 1.0 measures only per-user custody.
-WINDOWS_SERVICE = False
+# The Windows service (SCM) route is measured from 1.0.2, after per-user custody.
+WINDOWS_SERVICE = True
 
 
 class NativeTestnet:
@@ -50,7 +56,9 @@ class NativeTestnet:
             raise LifecycleError("native lifecycle scenario refused")
         self.scenario = scenario
         self.mac = platform.system() == "Darwin"
-        self.windows_service = WINDOWS_SERVICE if windows_service is None else windows_service
+        self.windows_service = (
+            WINDOWS_SERVICE and not self.mac if windows_service is None else windows_service
+        )
         if self.mac and self.windows_service:
             raise LifecycleError("Windows service route refused on macOS")
         if source is not None and (
@@ -458,9 +466,16 @@ class NativeTestnet:
                 with windows_observe(self.work, "per-user-lifecycle"):
                     measured = per_user(self, self.work / "per-user", key)
                 if not self.windows_service:
-                    # 1.0: the per-user receipt is the whole Windows testnet scope. No
-                    # crash-policy removal, no SCM install (1.0.1).
+                    # Route switched off (diagnostics only): row admission refuses this receipt.
                     return {**measured, "scope": WINDOWS_TESTNET_SCOPE}
+                if not windows_service_measured(self.scenario, self.previous.tag):
+                    # An upgrade from a release without a working service: nothing to upgrade
+                    # under SCM. The skip is named in the receipt, never silent.
+                    return {
+                        **measured,
+                        "scope": WINDOWS_TESTNET_SCOPE,
+                        "service_skipped": WINDOWS_SERVICE_SKIP,
+                    }
                 self.key = key  # Per-user cleanup clears its copy; SCM has a separate admission.
                 from guard_harness.windows_policy import prepare as prepare_windows_policy
 
@@ -507,7 +522,11 @@ class NativeTestnet:
             self.audit()
             active = False
             if self.mac:
-                from guard_harness.native_uninstall import execute, prepare_foreground
+                from guard_harness.native_uninstall import (
+                    assert_foreground_removed,
+                    execute,
+                    prepare_foreground,
+                )
 
                 foreground = prepare_foreground(self.current, self.work, self.env)
                 (self.work / "foreground-cleanup.log").write_text(
@@ -517,6 +536,8 @@ class NativeTestnet:
                 execute(self.current, self.work, self.env, self.work / f"step-{self.sequence}.log")
                 if self.plist.exists():
                     raise LifecycleError("launchd registration survived removal")
+                if foreground == "product-uninstall":
+                    assert_foreground_removed()
             else:
                 self.action("Uninstall")
                 self.command(
@@ -547,6 +568,7 @@ class NativeTestnet:
                 "decision_journal_sha256": self.journal_digest,
                 "no_exchange": True,
                 **({"foreground_cleanup": foreground} if self.mac else {}),
+                **({} if self.mac else {"scope": WINDOWS_SERVICE_SCOPE}),
                 "coverage": [
                     *(
                         ["windows-crash-policy-refusal", "windows-crash-policy-removed"]

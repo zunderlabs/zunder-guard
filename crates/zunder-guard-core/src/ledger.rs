@@ -31,9 +31,10 @@
 //! - unknown ([`LedgerProblem`]): any other type, and an entry without its
 //!   time, hash or type, with an amount that is not a non-negative decimal
 //!   string, or without a field its flow needs (the fee the account pays
-//!   among them). Guard cannot tell whether it moved money, so it refuses
-//!   new positions for the day rather than guess (`docs/guard.md`,
-//!   "Deposits and withdrawals").
+//!   among them). Guard refuses new positions for the day rather than
+//!   guess; while Guard watched the account around it, a change no bigger
+//!   than a loss the stops still allow is neither a gain nor a loss and
+//!   does not halt the day (`docs/guard.md`, "Deposits and withdrawals").
 
 use std::{collections::BTreeSet, str::FromStr};
 
@@ -70,15 +71,33 @@ pub enum Treated {
     /// day it was seen.
     Unread,
     /// A type Guard does not know whose USD amount (`usdc`, else
-    /// `usdcValue`) reads, and which the account did not pay as far as its
-    /// addresses tell: applied as money in, never counted as a trading
-    /// gain, so a loss it could hide still counts. Treating a payment as
-    /// money in only makes the stops stricter.
+    /// `usdcValue`) reads, nonzero, with the main dex among those Guard
+    /// manages (else it is [`Treated::Unread`]), and which the account did
+    /// not pay as far as its addresses tell: it reads as money in. Guard
+    /// does not trust that reading: the day halts whatever the account did
+    /// around it (a fall counts as the loss it shows as well), as it did in
+    /// 1.0.1, and new positions are refused for the day.
     Inflow(Box<LedgerFlow>),
-    /// A type Guard does not know that the account paid (it names the
-    /// account as the sender and another as the receiver), of this USD
-    /// amount: left in the equity as the loss it shows.
+    /// A type Guard does not know that reads as paid by the account (it
+    /// names the account as the sender and another as the receiver), or
+    /// whose USD amount is 0, of this USD amount. Guard does not trust that
+    /// reading either: a fall around it counts as the loss it shows, a rise
+    /// halts the day; new positions refused for the day.
     LeftAsLoss(Decimal),
+    /// A HIP-3 liquidator transfer (`hip3LiquidatorDeposit`,
+    /// `hip3LiquidatorWithdraw`), classified from real entries as
+    /// collateral moved to or from a dex's backstop liquidator, not
+    /// trading, but not booked: which perp account it moves depends on the
+    /// account's mode. Only one on a dex Guard manages, with the main dex
+    /// managed too, and for a withdrawal with its USDC amount readable;
+    /// otherwise [`Treated::Unread`]. The credit Guard reads from it (a
+    /// withdrawal's `amount` in USDC; 0 for a deposit, whose debit is never
+    /// read): taken
+    /// as money in, and the rest of the change around it is the entry's
+    /// money while Guard watched the account and it fits the stops' room
+    /// and the day's budget; else a fall counts as the loss it shows and a
+    /// rise halts the day. New positions refused for the day.
+    LiquidatorTransfer(Decimal),
 }
 
 /// A ledger entry Guard cannot account for: its type is not one Guard
@@ -91,7 +110,8 @@ pub struct LedgerProblem {
     /// When the venue booked it (epoch ms), when it says.
     pub time_ms: Option<i64>,
     /// An id for it: as a flow's (hash, time and type) when it has them,
-    /// else the entry itself (cut to 200 characters).
+    /// else the entry itself (cut to 120 characters) and a digest of all of
+    /// it ([`fallback_id`]).
     pub id: String,
     pub why: String,
     /// What Guard does with it.
@@ -124,15 +144,21 @@ const AMOUNT_FIELDS: [&str; 6] = [
 
 /// The checks every ledger entry passes before it is read, on both paths
 /// (a flow applied to the account stops, and a ledger read to reconstruct
-/// one: [`crate::flow_value::valid_ledger`]): a time, a hash, a type, and
+/// one: [`crate::flow_value::valid_ledger`]): a time, a hash (`0x` and hex
+/// digits), a type, and
 /// every amount it carries a non-negative decimal string. The entry's
 /// type when it passes, why not otherwise.
 pub fn check_entry(update: &Value) -> Result<&str, String> {
     if update["time"].as_i64().is_none() {
         return Err("no time".into());
     }
-    if update["hash"].as_str().is_none_or(str::is_empty) {
-        return Err("no hash".into());
+    // A transaction hash: `0x` and hex digits (so no id can be taken for
+    // another kind, `zunder_venue::UNKNOWN_TYPE_ID_PREFIX`).
+    if !update["hash"].as_str().is_some_and(|hash| {
+        hash.strip_prefix("0x")
+            .is_some_and(|hex| !hex.is_empty() && hex.bytes().all(|b| b.is_ascii_hexdigit()))
+    }) {
+        return Err("no hash (0x and hex digits)".into());
     }
     let delta = &update["delta"];
     let kind = delta["type"].as_str().ok_or("no type")?;
@@ -144,6 +170,22 @@ pub fn check_entry(update: &Value) -> Result<&str, String> {
         }
     }
     Ok(kind)
+}
+
+/// An id for an entry without a hash, a time or a type to name it by: its
+/// first 120 characters, to read, and `#` with the first 8 bytes of the
+/// Keccak-256 of all of it, in hex, so that two entries alike in their
+/// first characters stay two (one is never skipped as the other).
+fn fallback_id(update: &Value) -> String {
+    let whole = update.to_string();
+    let digest = crate::sign::keccak256(whole.as_bytes());
+    let mut id: String = whole.chars().take(120).collect();
+    id.push('#');
+    for byte in &digest[..8] {
+        id.push(char::from(b"0123456789abcdef"[usize::from(byte >> 4)]));
+        id.push(char::from(b"0123456789abcdef"[usize::from(byte & 15)]));
+    }
+    id
 }
 
 /// The flow a ledger entry is for the equity of `user`'s USDC perp
@@ -166,7 +208,7 @@ pub fn classify(
         (Some(hash), Some(time), Some(kind)) if !hash.is_empty() => {
             format!("{hash}:{time}:{kind}")
         }
-        _ => update.to_string().chars().take(200).collect(),
+        _ => fallback_id(update),
     };
     let problem = |why: String| LedgerProblem {
         kind: kind_named.clone(),
@@ -355,6 +397,46 @@ pub fn classify(
                 }
                 (false, true) => value,
             }
+        }
+        // Classified from real entries (`{dex, amount, token}`), never
+        // booked: which perp account it moves depends on the account's mode
+        // (the HIP-3 dex's in standard mode, the main dex's under dex
+        // abstraction, as far as seen). It is a liquidator transfer only when
+        // its money is surely among the accounts Guard sums, whichever the
+        // mode: Guard manages both the dex it names and the main dex. Then a
+        // deposit's debit is never read, and a withdrawal's credit is its
+        // `amount` in USDC. Anything else (a dex Guard does not manage, or
+        // not the main dex too; a withdrawal whose USDC amount cannot be
+        // read) is unread: a fall counts as the loss it shows and a rise
+        // halts the day, never a credit counted that did not reach the
+        // accounts (a false drawdown stop) nor a rise taken as money that a
+        // credit not read may explain (a hidden loss).
+        "hip3LiquidatorDeposit" | "hip3LiquidatorWithdraw" => {
+            let managed = main
+                && delta["dex"]
+                    .as_str()
+                    .is_some_and(|dex| !dex.is_empty() && dexes.contains(dex));
+            let credit = if kind == "hip3LiquidatorWithdraw" {
+                (delta["token"] == "USDC")
+                    .then(|| decimal(&delta["amount"]))
+                    .flatten()
+            } else {
+                Some(Decimal::ZERO)
+            };
+            return Err(match (managed, credit) {
+                (true, Some(credit)) => LedgerProblem {
+                    treated: Treated::LiquidatorTransfer(credit),
+                    ..problem(format!(
+                        "Guard does not book {kind}: which perp account it moves depends on the account's mode"
+                    ))
+                },
+                (false, _) => problem(format!(
+                    "Guard does not book {kind}, and its dex is not one Guard manages beside the main dex"
+                )),
+                (true, None) => problem(format!(
+                    "Guard does not book {kind}, and its USDC amount cannot be read"
+                )),
+            });
         }
         other => {
             let why = format!("Guard does not know the type {other}");
@@ -592,7 +674,7 @@ mod tests {
         );
         // `usdcValue` when there is no `usdc`.
         assert!(matches!(
-            problem(json!({"type": "hip3LiquidatorDeposit", "usdcValue": "7"})).treated,
+            problem(json!({"type": "newCredit", "usdcValue": "7"})).treated,
             Treated::Inflow(flow) if flow.amount == dec!(7)
         ));
         // The account paid it to another: left as the loss it shows.
@@ -607,6 +689,34 @@ mod tests {
                 .treated,
             Treated::Inflow(_)
         ));
+        // None of them is an exact flow (`ledger_flow`): the credit, the
+        // payment and the unread entry alike.
+        assert_eq!(
+            ledger_flow(
+                &entry(json!({"type": "welcomeBonus", "usdc": "5"})),
+                me(),
+                &main
+            ),
+            None
+        );
+        assert_eq!(
+            ledger_flow(
+                &entry(
+                    json!({"type": "newPayment", "usdc": "3", "user": ME, "destination": OTHER})
+                ),
+                me(),
+                &main
+            ),
+            None
+        );
+        assert_eq!(
+            ledger_flow(
+                &entry(json!({"type": "activateDexAbstraction"})),
+                me(),
+                &main
+            ),
+            None
+        );
         // No USD amount (a token amount is no USD amount): unread.
         assert_eq!(
             problem(json!({"type": "activateDexAbstraction"})).treated,
@@ -853,6 +963,97 @@ mod tests {
                 assert_eq!(problem.treated, Treated::Unread, "{delta} {names:?}");
             }
         }
+    }
+
+    /// The liquidator types, in the shapes seen on real entries (`info`'s
+    /// `userNonFundingLedgerUpdates`): mainnet, the `xyz` dex's fee
+    /// recipient, 15 Oct 2026, `hip3LiquidatorDeposit` of 1,000 and
+    /// 2,068,000 USDC; testnet, the `rawr` dex's deployer, 27 Apr 2026, one
+    /// deposit of 10,000 and withdrawals of 3,000 and 2,000. Which perp
+    /// account they move depends on the account's mode (the HIP-3 dex's in
+    /// standard mode, the main dex's under dex abstraction, as far as
+    /// seen), so Guard does not book them: entries it cannot account for,
+    /// liquidator transfers when Guard manages their dex and the main dex
+    /// (the withdrawal's 3,000 read as a credit, the deposit's 1,000 never
+    /// as a debit), unread otherwise.
+    #[test]
+    fn the_liquidator_types_seen_are_entries_guard_cannot_account_for() {
+        for (time, hash, delta, credit) in [
+            (
+                1_792_039_040_584_i64,
+                "0x967063596265e68497ea0446972a9402050a003efd6905563a390eac2169c06f",
+                json!({"type": "hip3LiquidatorDeposit", "dex": "xyz", "amount": "1000.0",
+                    "token": "USDC"}),
+                Decimal::ZERO,
+            ),
+            (
+                1_777_283_747_070,
+                "0xa66cc8187f67e333a7e604210354ff010300dffe1a6b02054a35736b3e6bbd1e",
+                json!({"type": "hip3LiquidatorWithdraw", "dex": "rawr", "amount": "3000.0",
+                    "token": "USDC"}),
+                dec!(3000),
+            ),
+        ] {
+            let row = json!({"time": time, "hash": hash, "delta": delta});
+            let named = delta["dex"].as_str().unwrap();
+            for names in [&[""][..], &["", "xyz"], &["xyz"], &["", "rawr"], &["rawr"]] {
+                let problem = classify(&row, me(), &dexes(names)).unwrap_err();
+                // A liquidator transfer only with its dex and the main dex
+                // both managed; else unread.
+                let both = names.contains(&"") && names.contains(&named);
+                let treated = if both {
+                    Treated::LiquidatorTransfer(credit)
+                } else {
+                    Treated::Unread
+                };
+                assert_eq!(problem.treated, treated, "{row} {names:?}");
+                assert_eq!(problem.time_ms, Some(time));
+                assert_eq!(
+                    problem.id,
+                    format!("{hash}:{time}:{}", delta["type"].as_str().unwrap())
+                );
+            }
+            assert!(!crate::flow_value::valid_ledger(
+                std::slice::from_ref(&row),
+                me(),
+                &dexes(&["", "xyz"])
+            ));
+        }
+        // A withdrawal whose USDC credit cannot be read (another token, no
+        // amount, no token): unread, never a liquidator transfer reading 0.
+        let both = dexes(&["", "rawr"]);
+        for delta in [
+            json!({"type": "hip3LiquidatorWithdraw", "dex": "rawr", "amount": "5", "token": "HYPE"}),
+            json!({"type": "hip3LiquidatorWithdraw", "dex": "rawr", "token": "USDC"}),
+            json!({"type": "hip3LiquidatorWithdraw", "dex": "rawr", "amount": "5"}),
+        ] {
+            let row = json!({"time": 1, "hash": "0x1", "delta": delta});
+            assert_eq!(
+                classify(&row, me(), &both).unwrap_err().treated,
+                Treated::Unread,
+                "{row}"
+            );
+        }
+    }
+
+    /// Two entries without a hash whose first 120 characters agree (a long
+    /// field first): two ids, so neither is skipped as the other; the same
+    /// entry gives the same id.
+    #[test]
+    fn entries_without_a_hash_keep_apart_by_a_digest_of_all_of_them() {
+        let long = "x".repeat(300);
+        let one = json!({"delta": {"a": long, "type": "newCredit", "usdc": "1"}, "time": 1});
+        let two = json!({"delta": {"a": long, "type": "newCredit", "usdc": "2"}, "time": 1});
+        let main = dexes(&[""]);
+        let (first, second) = (
+            classify(&one, me(), &main).unwrap_err().id,
+            classify(&two, me(), &main).unwrap_err().id,
+        );
+        assert_ne!(first, second);
+        assert_eq!(first, classify(&one, me(), &main).unwrap_err().id);
+        // 120 characters, `#`, 16 hex digits.
+        assert_eq!(first.chars().count(), 120 + 1 + 16);
+        assert!(first.starts_with(r#"{"delta":{"a":"xxx"#), "{first}");
     }
 
     #[test]

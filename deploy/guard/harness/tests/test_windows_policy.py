@@ -280,6 +280,8 @@ def test_scm_install_waits_for_policy_step(
 
     monkeypatch.setattr("guard_harness.native_testnet.platform.system", lambda: "Windows")
     monkeypatch.setenv("ProgramData", str(tmp_path / "data"))
+    # The upgrade scenario installs the predecessor's service: treat v1.0.0 as having one.
+    monkeypatch.setattr("guard_harness.lifecycle_coverage.WINDOWS_SERVICE_SINCE", "v1.0.0")
     current = release(tmp_path / "assets")
     controller = NativeTestnet(
         current, current, tmp_path / "work", "inert-account", "pwsh.exe", windows_service=True

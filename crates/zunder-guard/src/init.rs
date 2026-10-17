@@ -460,6 +460,39 @@ pub struct InitOptions {
     /// set (`LicenceIssuers::for_test`, feature `test-hooks`), and the
     /// network's rule applies to it too (`LicenceIssuers::on`).
     pub licence_issuers: Option<zunder_guard_core::licence::LicenceIssuers>,
+    /// Who may read and write the config file init writes.
+    pub config_access: ConfigAccess,
+}
+
+/// Who may read and write the config file `init` writes.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum ConfigAccess {
+    /// The person running init alone ([`zunder_venue::owner_only`]).
+    #[default]
+    OwnerOnly,
+    /// `init --service-setup` (Windows): the protected machine service's
+    /// runtime config, with exactly the ACL its admission requires:
+    /// Administrators and SYSTEM, and the service's virtual account (this SID)
+    /// with modify rights. An owner-only file for the installing person is
+    /// refused by that admission and unreadable for the service.
+    WindowsService { service_sid: String },
+}
+
+/// Create the new config file (`<config>.new`, renamed over the config once
+/// written) for `access`. Nothing is written into it here.
+fn create_config(path: &Path, access: &ConfigAccess) -> io::Result<fs::File> {
+    match access {
+        ConfigAccess::OwnerOnly => zunder_venue::owner_only::create(path),
+        #[cfg(windows)]
+        ConfigAccess::WindowsService { service_sid } => {
+            crate::service::windows::create_service_config(path, service_sid)
+        }
+        #[cfg(not(windows))]
+        ConfigAccess::WindowsService { .. } => Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "a Windows service config is written on Windows only",
+        )),
+    }
 }
 
 /// The `ip_share` of the config at `path`, if one exists and names one
@@ -971,7 +1004,7 @@ pub async fn init(
     let mut temporary = options.config.as_os_str().to_owned();
     temporary.push(".new");
     let temporary = PathBuf::from(temporary);
-    let mut file = zunder_venue::owner_only::create(&temporary)
+    let mut file = create_config(&temporary, &options.config_access)
         .map_err(|error| InitError::Io(error.to_string()))?;
     let written = (|| {
         use std::io::Write;
@@ -1682,6 +1715,67 @@ mod tests {
         assert!(kept.0.borrow().is_none());
         assert!(!prompt.output.contains(&KEY[2..]));
         input.iter_mut().for_each(|byte| *byte = 0);
+    }
+
+    #[tokio::test]
+    async fn the_service_config_access_reaches_the_config_file_and_nothing_else() {
+        // `init --service-setup` asks for the service's config ACL. Off
+        // Windows that file cannot be made: init stops there, writes no
+        // config (not even the owner-only fallback) and no `.new` remains.
+        let dir = TestDir::new("init-service-config-access");
+        let options = InitOptions {
+            non_interactive: true,
+            account: Some(ACCOUNT.into()),
+            mode: Some(GuardMode::Testnet),
+            no_key: true,
+            check_key_only: true,
+            config_access: ConfigAccess::WindowsService {
+                service_sid: "S-1-5-80-1-2-3-4-5".into(),
+            },
+            ..options(&dir)
+        };
+        let mut input = format!("{}\n", KEY.trim_start_matches("0x"))
+            .as_bytes()
+            .to_vec();
+        let mut reader = input.as_slice();
+        let kept = Kept::default();
+        let result = init(
+            &options,
+            &mut script(&[]),
+            Some(&mut reader),
+            &agent(),
+            &kept,
+            &mut counter(),
+        )
+        .await;
+        input.iter_mut().for_each(|byte| *byte = 0);
+        assert!(!dir.path().join("guard.toml.new").exists());
+        assert!(kept.0.borrow().is_none());
+        if cfg!(windows) {
+            // Elevated (hosted CI): the config carries the service's descriptor, so
+            // the owner-only check names the service account as a writer; never
+            // the installing person's owner-only file. Not elevated: setting the
+            // Administrators owner fails and nothing is left behind.
+            match result {
+                Ok(_) => match zunder_venue::owner_only::check(&options.config) {
+                    Ok(Some(zunder_venue::owner_only::Openness::Writable(why))) => {
+                        assert!(why.contains("S-1-5-80-1-2-3-4-5"), "{why}");
+                    }
+                    other => panic!("service config is not the service descriptor: {other:?}"),
+                },
+                Err(_) => assert!(!options.config.exists()),
+            }
+            return;
+        }
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("Windows service config"), "{error}");
+        assert!(!options.config.exists());
+        assert!(!dir.path().join("risk.jsonl").exists());
+        // The default stays the owner-only file.
+        assert_eq!(
+            InitOptions::default().config_access,
+            ConfigAccess::OwnerOnly
+        );
     }
 
     #[tokio::test]

@@ -139,7 +139,7 @@ class PublicationWiringTest(unittest.TestCase):
         publish = next(i for i, step in enumerate(steps) if '--phase publish' in step.get('run', ''))
         self.assertLess(admission, publish)
         self.assertEqual(steps[publish]['env']['INSTALLER_PUBLISH_TOKEN'], '${{ secrets.INSTALLER_PUBLISH_TOKEN }}')
-        self.assertEqual(document['jobs']['rollback']['needs'], ['promote', 'canonical-smoke'])
+        self.assertEqual(document['jobs']['rollback']['needs'], ['promote', 'canonical-smoke', 'recovery-inputs'])
         self.assertIn('always()', document['jobs']['rollback']['if'])
         self.assertFalse((workflows / 'publish.yml').exists())
 

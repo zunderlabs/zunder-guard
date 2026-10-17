@@ -504,6 +504,7 @@ fn journal_resume_refuses_durable_pending_flows_before_equity_http() {
             dex: String::new(),
             between: false,
             value: Some(ValueRange::cash_exact(dec!(7000))),
+            unaccounted: None,
         },
         Flow {
             time_ms: 7_200_000,
@@ -512,6 +513,7 @@ fn journal_resume_refuses_durable_pending_flows_before_equity_http() {
             dex: String::new(),
             between: false,
             value: None,
+            unaccounted: None,
         },
     ] {
         risk.apply_flow(Timestamp::from_millis(7_200_000), &flow)

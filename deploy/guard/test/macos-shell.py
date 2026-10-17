@@ -544,6 +544,78 @@ case "$*" in *'--key-stdin'*) IFS= read -r frame; [ "$frame" = SYNTHETIC-FIRST-F
     def test_clean_logs_pass(self):
         self.assertEqual(self.logs().returncode, 0)
 
+    def foreground_removal(self, race):
+        # The signed uninstall helper's descriptor walk under the interpreter it runs with
+        # (/usr/bin/python3, 3.9 on macOS), with a user-writable bin and share as on an
+        # Intel Mac with Homebrew. Root ownership is modeled; no sudo, service or key.
+        python = '/usr/bin/python3'
+        probe = subprocess.run([python, '-I', '-c', 'pass'], capture_output=True, timeout=30) \
+            if os.access(python, os.X_OK) else None
+        if probe is None or probe.returncode:
+            self.skipTest('the system Python the helper requires is unavailable')
+        driver = r'''
+import hashlib, importlib.util, os, stat, sys
+from pathlib import Path
+spec = importlib.util.spec_from_file_location('helper', sys.argv[1])
+helper = importlib.util.module_from_spec(spec); spec.loader.exec_module(helper)
+root, race = Path(sys.argv[2]).resolve(), sys.argv[3]
+body = b'signed executable fixture'; digest = hashlib.sha256(body).hexdigest()
+generic, notices = root / 'bin/zunder-guard', root / 'share/licenses/zunder-guard'
+release, victim = root / 'base/releases' / digest, root / 'victim'
+for directory in (generic.parent, notices, release, victim / 'zunder-guard'):
+    directory.mkdir(parents=True)
+generic.write_bytes(body); (release / 'zunder-guard').write_bytes(body)
+for name in helper.NOTICES:
+    for folder in (notices, release, victim / 'zunder-guard'):
+        (folder / name).write_bytes(name.encode())
+helper.MUTABLE_FOREGROUND = frozenset({generic.parent, root / 'share'})
+mutable = {(os.lstat(p).st_dev, os.lstat(p).st_ino) for p in helper.MUTABLE_FOREGROUND}
+def ownership(fd):
+    fields = list(os.fstat(fd))
+    fields[4], fields[0] = 0, fields[0] & ~0o022
+    if (fields[2], fields[1]) in mutable:
+        fields[4], fields[0] = 501, stat.S_IFMT(fields[0]) | 0o775
+    return os.stat_result(fields)
+helper.ownership = ownership
+held = helper.verify_foreground(generic, notices, frozenset({digest}), root / 'base')
+if race == 'licenses':
+    notices.parent.rename(root / 'share/licenses-moved')
+    notices.parent.symlink_to(victim, target_is_directory=True)
+elif race == 'binary':
+    generic.rename(generic.parent / 'moved'); generic.symlink_to(victim / 'zunder-guard/NOTICE')
+try:
+    held.remove(generic, notices)
+except helper.UninstallRefused as refusal:
+    print('refused:', refusal)
+finally:
+    held.close()
+print('generic:', os.path.lexists(generic))
+print('victim:', sorted(os.listdir(victim / 'zunder-guard')))
+print('moved:', os.listdir(root / 'share/licenses-moved') if race == 'licenses' else None)
+'''
+        with tempfile.TemporaryDirectory() as directory:
+            return subprocess.run([python, '-I', '-B', '-c', driver, str(MAC / 'uninstall.py'),
+                                   directory, race], capture_output=True, text=True, timeout=30)
+
+    def test_uninstall_removes_verified_copy_from_user_writable_bin_and_share(self):
+        result = self.foreground_removal('none')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.splitlines()[:2],
+                         ['generic: False', "victim: ['LICENSE', 'NOTICE', 'THIRD_PARTY_LICENSES.md']"])
+
+    def test_uninstall_never_follows_a_licences_directory_swapped_after_verification(self):
+        result = self.foreground_removal('licenses')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.splitlines(), [
+            'generic: False', "victim: ['LICENSE', 'NOTICE', 'THIRD_PARTY_LICENSES.md']", 'moved: []'])
+
+    def test_uninstall_refuses_a_binary_replaced_after_verification(self):
+        result = self.foreground_removal('binary')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.splitlines()[:3], [
+            'refused: foreground copy changed during removal', 'generic: True',
+            "victim: ['LICENSE', 'NOTICE', 'THIRD_PARTY_LICENSES.md']"])
+
     def test_mac_scripts_are_in_both_existing_lint_entrypoints(self):
         lint = (ROOT / 'deploy/guard/test/lint.sh').read_text()
         source = ROOT / 'deploy/guard/github/workflows/ci.yml'

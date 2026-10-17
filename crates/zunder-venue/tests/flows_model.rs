@@ -49,7 +49,7 @@ use zunder_core::Timestamp;
 use zunder_risk::{RiskEngine, RiskLimits, RiskSnapshot, RiskState, VenueView};
 use zunder_venue::{
     FLOW_TIME_MARGIN_MS as MARGIN, Flow, FlowOutcome, JournalError, JournalEvent, JournalRecord,
-    PersistentRisk, SeenView, ValueRange, rebase,
+    PersistentRisk, SeenView, UnaccountedEntry, UnaccountedRule, ValueRange, rebase,
 };
 
 const DAY: i64 = Timestamp::MS_PER_DAY;
@@ -826,6 +826,7 @@ fn build(setup: &Setup, ops: &[Op], two_dexes: bool) -> Timeline {
                             dex,
                             between: false,
                             value: None,
+                            unaccounted: None,
                         },
                         *latency,
                         total,
@@ -853,6 +854,7 @@ fn build(setup: &Setup, ops: &[Op], two_dexes: bool) -> Timeline {
                             dex,
                             between: false,
                             value: None,
+                            unaccounted: None,
                         },
                         *latency,
                         total,
@@ -894,6 +896,7 @@ fn build(setup: &Setup, ops: &[Op], two_dexes: bool) -> Timeline {
                             dex: from,
                             between: true,
                             value: None,
+                            unaccounted: None,
                         },
                         *latency,
                         total,
@@ -1656,6 +1659,7 @@ fn delayed_cash_replay_uses_retained_views_after_a_durable_rollover() {
             dex: String::new(),
             between: false,
             value: Some(ValueRange::cash_exact(dec!(13500))),
+            unaccounted: None,
         });
         timeline.before.insert("late cash".into(), dec!(13500));
         timeline.events.push((t0 + 23_000, Event::Report(0)));
@@ -2238,6 +2242,7 @@ fn a_withdrawal_after_a_small_loss(
         dex: String::new(),
         between: false,
         value: None,
+        unaccounted: None,
     }];
     if let Some(back) = back {
         flows.push(Flow {
@@ -2247,6 +2252,7 @@ fn a_withdrawal_after_a_small_loss(
             dex: String::new(),
             between: false,
             value: None,
+            unaccounted: None,
         });
     }
     for flow in &flows {
@@ -2322,6 +2328,7 @@ fn a_loss_after_a_withdrawal_seen(
         dex: String::new(),
         between: false,
         value: Some(ValueRange::cash_exact(equity)),
+        unaccounted: None,
     };
     prop_assert_eq!(
         risk.apply_flow(ts(t0 + 8_000), &flow).unwrap(),
@@ -2403,6 +2410,7 @@ fn a_loss_next_to_a_withdrawal(
         dex: String::new(),
         between: false,
         value: None,
+        unaccounted: None,
     };
     prop_assert_eq!(
         risk.apply_flow(ts(t0 + 8_000), &flow).unwrap(),
@@ -2753,9 +2761,9 @@ proptest! {
         let zero_at = origin + 30000;
         let refill_at = origin + days * DAY + 40000;
         let flows = vec![
-            Flow { time_ms: origin+5000, amount: deposit, id: "prefix".into(), dex: String::new(), between: false, value: Some(ValueRange::cash_exact(before)) },
-            Flow { time_ms: origin+10000, amount: -(before+deposit), id: "empty".into(), dex: String::new(), between: false, value: None },
-            Flow { time_ms: refill_at-5000, amount: base, id: "refill".into(), dex: String::new(), between: false, value: None },
+            Flow { time_ms: origin+5000, amount: deposit, id: "prefix".into(), dex: String::new(), between: false, value: Some(ValueRange::cash_exact(before)), unaccounted: None },
+            Flow { time_ms: origin+10000, amount: -(before+deposit), id: "empty".into(), dex: String::new(), between: false, value: None, unaccounted: None },
+            Flow { time_ms: refill_at-5000, amount: base, id: "refill".into(), dex: String::new(), between: false, value: None, unaccounted: None },
         ];
         let dir = Dir::new();
         let mut risk = PersistentRisk::initialise(&dir.journal(), limits.clone(), ts(origin), base, "deferred origin").unwrap().with_flows();
@@ -2813,8 +2821,8 @@ proptest! {
         let before = base - denominator * dec!(0.30);
         let origin = 20000 * DAY + if midnight { DAY - 15000 } else { 3600000 };
         let flows = [
-            Flow { time_ms: origin + 5000, amount: Decimal::ONE, id: "known".into(), dex: String::new(), between: false, value: Some(ValueRange::cash_exact(before)) },
-            Flow { time_ms: origin + 10000, amount: Decimal::from(incoming), id: "unknown".into(), dex: String::new(), between: false, value: None },
+            Flow { time_ms: origin + 5000, amount: Decimal::ONE, id: "known".into(), dex: String::new(), between: false, value: Some(ValueRange::cash_exact(before)), unaccounted: None },
+            Flow { time_ms: origin + 10000, amount: Decimal::from(incoming), id: "unknown".into(), dex: String::new(), between: false, value: None, unaccounted: None },
         ];
         let shown = before + Decimal::ONE + Decimal::from(incoming);
         let at = origin + 20000;
@@ -2848,8 +2856,8 @@ proptest! {
         let origin = 20000 * DAY + if midnight { DAY - 10000 } else { 3600000 };
         let unknown = if legacy { Some(ValueRange { lo: base * dec!(0.50), hi: base * dec!(0.50), cash_exact: false }) } else { None };
         let flows = [
-            Flow { time_ms: origin + 5000, amount: deposit, id: "unknown".into(), dex: String::new(), between: false, value: unknown },
-            Flow { time_ms: origin + 15000, amount: Decimal::ONE, id: "known".into(), dex: String::new(), between: false, value: Some(ValueRange::cash_exact(base)) },
+            Flow { time_ms: origin + 5000, amount: deposit, id: "unknown".into(), dex: String::new(), between: false, value: unknown, unaccounted: None },
+            Flow { time_ms: origin + 15000, amount: Decimal::ONE, id: "known".into(), dex: String::new(), between: false, value: Some(ValueRange::cash_exact(base)), unaccounted: None },
         ];
         let after = base + Decimal::ONE;
         let denominator = limits.max_trading_equity_usd.map_or(after, |cap| after.min(cap));
@@ -3160,4 +3168,594 @@ fn case_exact_zero_views_keep_the_day_halt_after_a_late_report() {
         )
     };
     assert_eq!(figures(&late), figures(&now));
+}
+
+// ---------------------------------------------------------------------
+// Ledger entries the caller cannot account for
+// ---------------------------------------------------------------------
+//
+// The rule for ledger entries the caller cannot account for
+// (`docs/guard.md#deposits-and-withdrawals`), written apart from the fold:
+// a timeline of trading, exact deposits and withdrawals, and entries (every
+// one reported before the view that shows it, one dex, no view ambiguous to
+// an entry), each view fed to the implementation and to this model, whose
+// stops are `RiskEngine`'s and whose money moves are `reference_rebase`.
+// Compared after every view: the figures and the state exactly, and the
+// re-base budget on the journal's last record. Each entry also carries the
+// money it truly moved, which a third engine (the truth) applies exactly:
+// while no entry's money went unread and no change was normalised, the
+// implementation's drawdown is never below the truth's (a credit Guard
+// cannot read, taken as money, would break that).
+
+/// What the model remembers of a day's re-bases: (day, room, used), as
+/// shares of the day's start (or the cap where smaller).
+type ModelBudget = (i64, Decimal, Decimal);
+
+/// What a loss is measured against: the base, or the cap where smaller.
+fn against_cap(cap: Option<Decimal>, base: Decimal) -> Decimal {
+    cap.map_or(base, |cap| cap.min(base))
+}
+
+/// The drawdown `snapshot` measures, as the engine does.
+fn drawdown_of(limits: &RiskLimits, snapshot: &RiskSnapshot) -> Decimal {
+    (snapshot.peak - snapshot.last) / against_cap(limits.max_trading_equity_usd, snapshot.peak)
+}
+
+#[derive(Debug, Clone)]
+struct UnknownModel {
+    limits: RiskLimits,
+    engine: RiskEngine,
+    /// The venue time of the last view taken.
+    last_view: i64,
+    budget: Option<ModelBudget>,
+    /// What the last entry came to: 0 taken as its money, 1 counted (or
+    /// nothing), 2 halted; for coverage.
+    outcome: usize,
+    /// A change was normalised (an unknown span): the truth comparison no
+    /// longer holds.
+    normalised: bool,
+}
+
+/// The move for an entry's change when it is taken as its money: a rise by
+/// a deposit's rules; a fall moves the day's start only (by a
+/// withdrawal's), the peak never lowered.
+fn moved_keeping_peak(
+    limits: &RiskLimits,
+    engine: &RiskEngine,
+    time: i64,
+    before: Decimal,
+    amount: Decimal,
+) -> Option<RiskEngine> {
+    if amount > Decimal::ZERO {
+        return moved(limits, engine, time, before, amount);
+    }
+    let cap = limits.max_trading_equity_usd;
+    let now = engine.snapshot();
+    let after = before + amount;
+    let day_start = reference_rebase(now.day_start, before, after, cap)?;
+    let peak = now.peak.max(after).normalize();
+    let mut engine = RiskEngine::restore(
+        limits.clone(),
+        RiskSnapshot {
+            peak,
+            day_start: day_start.normalize(),
+            last: peak,
+            ..now
+        },
+    )
+    .ok()?;
+    engine.observe(ts(time), after);
+    Some(engine)
+}
+
+impl UnknownModel {
+    /// Whether `change` from `base` may be taken as the entry's money, and
+    /// the budget after it.
+    fn fits(&self, base: Decimal, change: Decimal) -> Option<ModelBudget> {
+        let after = base - change.abs();
+        if rank(self.engine.state()) != 0 || after <= Decimal::ZERO {
+            return None;
+        }
+        let snapshot = self.engine.snapshot();
+        let cap = self.limits.max_trading_equity_usd;
+        let day_base = against_cap(cap, snapshot.day_start);
+        let peak_base = against_cap(cap, snapshot.peak);
+        if (snapshot.day_start - after) / day_base >= self.limits.daily_loss_stop
+            || (snapshot.peak - after) / peak_base >= self.limits.drawdown_stop
+        {
+            return None;
+        }
+        let (_, room, used) = match self.budget {
+            Some(budget) if budget.0 == snapshot.day => budget,
+            _ => {
+                let day_room = self.limits.daily_loss_stop * day_base - (snapshot.day_start - base);
+                let peak_room = self.limits.drawdown_stop * peak_base - (snapshot.peak - base);
+                (
+                    snapshot.day,
+                    day_room.min(peak_room).max(Decimal::ZERO) / day_base,
+                    Decimal::ZERO,
+                )
+            }
+        };
+        let used = used + change.abs() / day_base;
+        (used < room).then_some((snapshot.day, room, used))
+    }
+
+    /// The bases normalised on `shown` and the day halted (a stop kept):
+    /// an unknown span.
+    fn halt_on(&mut self, shown: Decimal, at: i64) {
+        let mut snapshot = self.engine.snapshot();
+        let cap = self.limits.max_trading_equity_usd;
+        let stopped = rank(snapshot.state) == 2;
+        let before = snapshot.last;
+        snapshot.peak = reference_rebase(snapshot.peak, before, shown, cap)
+            .unwrap_or(snapshot.peak.max(shown))
+            .max(shown);
+        snapshot.day_start = reference_rebase(snapshot.day_start, before, shown, cap)
+            .unwrap_or(shown.max(Decimal::ONE));
+        snapshot.last = shown;
+        // A rescaling never turns a sublimit loss into a stop by rounding.
+        if !stopped
+            && (snapshot.peak - shown) / against_cap(cap, snapshot.peak)
+                >= self.limits.drawdown_stop
+        {
+            snapshot.peak = (snapshot.peak
+                - snapshot.peak.abs().max(Decimal::ONE) * dec!(0.000000000000000000000001))
+            .max(shown);
+        }
+        if !stopped {
+            snapshot.state = RiskState::HaltedForDay { day: snapshot.day };
+        }
+        self.engine = RiskEngine::restore(self.limits.clone(), snapshot).unwrap();
+        self.engine.observe(ts(at), shown);
+        self.outcome = 2;
+        self.normalised = true;
+    }
+
+    /// An exact deposit or withdrawal of `amount` at `time` (the equity
+    /// just before it known), then a view at `at` showing `shown`.
+    fn money(&mut self, time: i64, amount: Decimal, at: i64, shown: Decimal) {
+        let before = self.engine.snapshot().last;
+        self.engine.observe(ts(time), before);
+        self.engine = moved(&self.limits, &self.engine, time, before, amount).unwrap();
+        self.engine.observe(ts(at), shown);
+        self.last_view = at;
+    }
+
+    /// A view at venue (and engine) time `at` showing `shown`, after an
+    /// entry at `entry` (if any).
+    fn view(&mut self, at: i64, shown: Decimal, entry: Option<(&UnaccountedEntry, i64)>) {
+        let Some((entry, time)) = entry else {
+            self.engine.observe(ts(at), shown);
+            self.last_view = at;
+            return;
+        };
+        let watched = at - self.last_view <= entry.watched_gap_ms;
+        self.outcome = 1;
+        self.last_view = at;
+        let before = self.engine.snapshot().last;
+        self.engine.observe(ts(time), before);
+        match entry.rule {
+            UnaccountedRule::Halts => {
+                if shown < before {
+                    self.engine.observe(ts(at), shown);
+                    let mut snapshot = self.engine.snapshot();
+                    if rank(snapshot.state) < 2 {
+                        snapshot.state = RiskState::HaltedForDay { day: snapshot.day };
+                    }
+                    self.engine = RiskEngine::restore(self.limits.clone(), snapshot).unwrap();
+                    self.outcome = 2;
+                } else {
+                    self.halt_on(shown, at);
+                }
+            }
+            UnaccountedRule::Strict => {
+                if shown <= before {
+                    self.engine.observe(ts(at), shown);
+                } else {
+                    self.halt_on(shown, at);
+                }
+            }
+            UnaccountedRule::Rebasable => {
+                let mut base = before;
+                if entry.credit > Decimal::ZERO && before > Decimal::ZERO {
+                    self.engine =
+                        moved(&self.limits, &self.engine, time, before, entry.credit).unwrap();
+                    base = before + entry.credit;
+                }
+                let change = shown - base;
+                if change.is_zero() {
+                    self.engine.observe(ts(at), shown);
+                    return;
+                }
+                if watched && let Some(budget) = self.fits(base, change) {
+                    self.engine =
+                        moved_keeping_peak(&self.limits, &self.engine, time, base, change).unwrap();
+                    self.budget = Some(budget);
+                    self.engine.observe(ts(at), shown);
+                    self.outcome = 0;
+                } else if change < Decimal::ZERO {
+                    self.engine.observe(ts(at), shown);
+                } else {
+                    self.halt_on(shown, at);
+                }
+            }
+        }
+    }
+}
+
+/// An entry's type, as the generator draws it.
+#[derive(Debug, Clone, Copy)]
+enum UnknownKind {
+    /// A HIP-3 liquidator deposit: money out (never read).
+    Deposit,
+    /// A HIP-3 liquidator withdrawal: money in, its USDC amount readable
+    /// or not.
+    Withdraw { readable: bool },
+    /// Any other type, under this rule, moving money in (+) or out (-).
+    Other(UnaccountedRule),
+}
+
+/// The rule and credit Guard gives an entry (`zunder_guard_core::ledger`
+/// and `zunder-guard`'s `unaccounted_rule`, restated): a liquidator
+/// transfer only on a dex Guard manages (with the main dex), a withdrawal
+/// only with its USDC credit readable; anything else strict.
+fn rule_of(kind: UnknownKind, managed: bool, credit: Decimal) -> (UnaccountedRule, Decimal) {
+    match kind {
+        UnknownKind::Deposit if managed => (UnaccountedRule::Rebasable, Decimal::ZERO),
+        UnknownKind::Withdraw { readable: true } if managed => (UnaccountedRule::Rebasable, credit),
+        UnknownKind::Deposit | UnknownKind::Withdraw { .. } => {
+            (UnaccountedRule::Strict, Decimal::ZERO)
+        }
+        UnknownKind::Other(rule) => (rule, Decimal::ZERO),
+    }
+}
+
+#[derive(Debug, Clone)]
+enum UnknownOp {
+    /// Trading: the equity moves by this many units, seen 10 s on.
+    Trade(i64),
+    /// An exact deposit (+) or withdrawal (-) of this many units 5 s on,
+    /// its value known, seen 10 s on.
+    Money(i64),
+    /// An entry 5 s on of `kind`, truly moving `money` units (in for a
+    /// withdrawal, out for a deposit, signed for another type) into the
+    /// accounts Guard sums only when `managed`, and `trading` units of
+    /// trading beside it; seen 10 s on (watched) or the gap and 10 s on
+    /// (`late`: not watched); its gap 31 s or 78.31 s.
+    Entry {
+        kind: UnknownKind,
+        money: i64,
+        trading: i64,
+        managed: bool,
+        late: bool,
+        long_gap: bool,
+    },
+    /// The next UTC day: a view an hour into it.
+    Midnight,
+}
+
+fn unknown_op() -> impl Strategy<Value = UnknownOp> {
+    let kind = prop_oneof![
+        3 => Just(UnknownKind::Deposit),
+        3 => any::<bool>().prop_map(|readable| UnknownKind::Withdraw { readable }),
+        1 => Just(UnknownKind::Other(UnaccountedRule::Strict)),
+        1 => Just(UnknownKind::Other(UnaccountedRule::Halts)),
+    ];
+    prop_oneof![
+        3 => (-4_i64..=4).prop_map(UnknownOp::Trade),
+        1 => (-40_i64..=20).prop_map(UnknownOp::Money),
+        6 => (
+            kind,
+            0_i64..=30,
+            -10_i64..=10,
+            prop::bool::weighted(0.85),
+            prop::bool::weighted(0.2),
+            any::<bool>()
+        )
+            .prop_map(|(kind, money, trading, managed, late, long_gap)| {
+                UnknownOp::Entry {
+                    kind,
+                    // Another type's money in or out, from the parity.
+                    money: match kind {
+                        UnknownKind::Other(_) if money % 2 == 1 => -money,
+                        _ => money,
+                    },
+                    trading,
+                    managed: managed || matches!(kind, UnknownKind::Other(_)),
+                    late,
+                    long_gap,
+                }
+            }),
+        1 => Just(UnknownOp::Midnight),
+    ]
+}
+
+/// Run `ops` from 10,000 through the implementation, the model and the
+/// truth, comparing after every view. The counts of entries taken as
+/// money, counted and halted, for coverage.
+fn run_unknown(limits: &RiskLimits, ops: &[UnknownOp]) -> Result<[usize; 3], TestCaseError> {
+    run_unknown_with(limits, ops, rule_of)
+}
+
+fn run_unknown_with(
+    limits: &RiskLimits,
+    ops: &[UnknownOp],
+    rule: fn(UnknownKind, bool, Decimal) -> (UnaccountedRule, Decimal),
+) -> Result<[usize; 3], TestCaseError> {
+    let unit = dec!(100);
+    let dir = Dir::new();
+    let start = dec!(10000);
+    let mut risk =
+        PersistentRisk::initialise(&dir.journal(), limits.clone(), ts(0), start, "model")
+            .unwrap()
+            .with_flows();
+    let mut model = UnknownModel {
+        limits: limits.clone(),
+        engine: RiskEngine::new(limits.clone(), ts(0), start).unwrap(),
+        last_view: 0,
+        budget: None,
+        outcome: 1,
+        normalised: false,
+    };
+    let mut truth = RiskEngine::new(limits.clone(), ts(0), start).unwrap();
+    // No entry's money went unread so far: the truth comparison holds.
+    let mut clean = true;
+    let mut now = Timestamp::MS_PER_HOUR;
+    let mut equity = start;
+    let mut seen = [0; 3];
+    let feed = |risk: &mut PersistentRisk, at: i64, shown: Decimal| {
+        risk.observe_view_at(
+            ts(at),
+            [(String::new(), at)].into(),
+            shown,
+            &VenueView::default(),
+            true,
+        )
+    };
+    feed(&mut risk, now, equity);
+    model.view(now, equity, None);
+    truth.observe(ts(now), equity);
+    for (n, op) in ops.iter().enumerate() {
+        let mut entry = None;
+        let at;
+        let shown;
+        match op {
+            UnknownOp::Trade(units) => {
+                shown = equity + unit * Decimal::from(*units);
+                if shown < unit {
+                    continue;
+                }
+                at = now + 10_000;
+                model.view(at, shown, None);
+                truth.observe(ts(at), shown);
+            }
+            UnknownOp::Midnight => {
+                at = (now / DAY + 1) * DAY + Timestamp::MS_PER_HOUR;
+                shown = equity;
+                model.view(at, shown, None);
+                truth.observe(ts(at), shown);
+            }
+            UnknownOp::Money(units) => {
+                let amount = unit * Decimal::from(*units);
+                shown = equity + amount;
+                if shown < unit || amount.is_zero() {
+                    continue;
+                }
+                let time = now + 5_000;
+                at = now + 10_000;
+                let flow = Flow {
+                    time_ms: time,
+                    amount,
+                    id: format!("0x{n:x}:money"),
+                    dex: String::new(),
+                    between: false,
+                    value: Some(ValueRange::cash_exact(equity)),
+                    unaccounted: None,
+                };
+                risk.apply_flow(ts(time + 1_000), &flow).unwrap();
+                model.money(time, amount, at, shown);
+                truth.observe(ts(time), equity);
+                truth = moved(limits, &truth, time, equity, amount).unwrap();
+                truth.observe(ts(at), shown);
+            }
+            UnknownOp::Entry {
+                kind,
+                money,
+                trading,
+                managed,
+                late,
+                long_gap,
+            } => {
+                let signed = match kind {
+                    UnknownKind::Deposit => -money,
+                    _ => *money,
+                };
+                let moved_in = if *managed {
+                    unit * Decimal::from(signed)
+                } else {
+                    Decimal::ZERO
+                };
+                shown = equity + moved_in + unit * Decimal::from(*trading);
+                if shown < unit || equity + moved_in < unit {
+                    continue;
+                }
+                let (rule, credit) = rule(*kind, *managed, unit * Decimal::from(*money));
+                if rule != UnaccountedRule::Rebasable && !moved_in.is_zero() {
+                    clean = false;
+                }
+                let gap = if *long_gap { 78_310 } else { 31_000 };
+                let time = now + 5_000;
+                let flow = Flow {
+                    time_ms: time,
+                    amount: Decimal::ZERO,
+                    id: format!("{}0x{n:x}:entry", zunder_venue::UNKNOWN_TYPE_ID_PREFIX),
+                    dex: String::new(),
+                    between: true,
+                    value: None,
+                    unaccounted: Some(UnaccountedEntry {
+                        watched_gap_ms: gap,
+                        rule,
+                        credit,
+                    }),
+                };
+                let outcome = risk.apply_flow(ts(time + 1_000), &flow).unwrap();
+                prop_assert_eq!(outcome, FlowOutcome::Pending);
+                at = if *late {
+                    now + gap + 10_000
+                } else {
+                    now + 10_000
+                };
+                model.view(
+                    at,
+                    shown,
+                    flow.unaccounted.as_ref().map(|entry| (entry, time)),
+                );
+                truth.observe(ts(time), equity);
+                if !moved_in.is_zero() {
+                    truth = moved(limits, &truth, time, equity, moved_in).unwrap();
+                }
+                truth.observe(ts(at), shown);
+                entry = Some(flow);
+            }
+        }
+        let sync = feed(&mut risk, at, shown);
+        prop_assert!(sync.journal_error.is_none(), "{:?}", sync.journal_error);
+        let after = model.engine.snapshot();
+        if entry.is_some() {
+            seen[model.outcome] += 1;
+        }
+        now = at;
+        equity = shown;
+        let got = risk.engine().snapshot();
+        let figures = |s: &RiskSnapshot| {
+            (
+                s.day,
+                s.peak.normalize(),
+                s.day_start.normalize(),
+                s.last.normalize(),
+            )
+        };
+        prop_assert_eq!(figures(&got), figures(&after), "figures, op {} {:?}", n, op);
+        prop_assert_eq!(
+            rank(got.state),
+            rank(after.state),
+            "state, op {} {:?}",
+            n,
+            op
+        );
+        let records = PersistentRisk::read(&dir.journal()).unwrap();
+        let budget = records
+            .last()
+            .and_then(|record| record.budget.as_ref())
+            .map(|budget| (budget.day, budget.room, budget.used));
+        prop_assert_eq!(budget, model.budget, "budget, op {} {:?}", n, op);
+        // Never a loss hidden below the truth's drawdown while every
+        // entry's money was read and nothing was normalised.
+        if clean && !model.normalised {
+            let (mine, true_drawdown) = (
+                drawdown_of(limits, &got),
+                drawdown_of(limits, &truth.snapshot()),
+            );
+            prop_assert!(
+                mine >= true_drawdown - dec!(0.000000000001),
+                "drawdown {} below the truth's {}, op {} {:?}",
+                mine,
+                true_drawdown,
+                n,
+                op
+            );
+        }
+    }
+    // Every record is one the reader accepts, and a restart opens it.
+    drop(risk);
+    let reopened = PersistentRisk::open(&dir.journal(), limits)
+        .unwrap()
+        .with_flows();
+    prop_assert!(!matches!(
+        reopened.check_ready(),
+        Err(JournalError::Broken(_))
+    ));
+    Ok(seen)
+}
+
+fn unknown_config() -> ProptestConfig {
+    ProptestConfig {
+        cases: flows_cases(1_000),
+        max_shrink_iters: 2_000,
+        rng_seed: RngSeed::Fixed(run_seed()),
+        ..ProptestConfig::default()
+    }
+}
+
+proptest! {
+    #![proptest_config(unknown_config())]
+
+    /// Entries the caller cannot account for, against the model and the
+    /// truth: the room, the day's budget (scaled by exact deposits and
+    /// withdrawals), the peak never lowered by one, a readable credit
+    /// first, unread credits and dexes Guard does not manage, the rules by
+    /// type, watched or not, across midnight, with the equity cap or
+    /// without.
+    #[test]
+    fn unknown_entries_follow_the_reference(
+        capped in any::<bool>(),
+        ops in prop::collection::vec(unknown_op(), 1..30),
+    ) {
+        let limits = RiskLimits {
+            max_trading_equity_usd: capped.then_some(dec!(2000)),
+            ..RiskLimits::default()
+        };
+        run_unknown(&limits, &ops)?;
+    }
+}
+
+/// The generator reaches every outcome: an entry taken as its money,
+/// counted as the loss it shows, and halting the day.
+#[test]
+fn the_unknown_entry_generator_reaches_every_outcome() {
+    let mut runner = proptest::test_runner::TestRunner::new(ProptestConfig {
+        rng_seed: RngSeed::Fixed(run_seed()),
+        ..ProptestConfig::default()
+    });
+    let strategy = prop::collection::vec(unknown_op(), 1..30);
+    let mut seen = [0; 3];
+    for _ in 0..200 {
+        let ops = proptest::strategy::ValueTree::current(&strategy.new_tree(&mut runner).unwrap());
+        let counts = run_unknown(&RiskLimits::default(), &ops).unwrap();
+        for (total, count) in seen.iter_mut().zip(counts) {
+            *total += count;
+        }
+    }
+    assert!(seen.iter().all(|count| *count > 20), "{seen:?}");
+}
+
+/// The truth comparison catches a liquidator withdrawal whose credit cannot
+/// be read taken as re-basable with a credit of 0 (the review's case): a
+/// 3,000 credit beside 2,700 lost, taken as a +300 deposit, hides the loss.
+#[test]
+fn reading_an_unread_credit_as_zero_is_caught_by_the_truth() {
+    fn zero_for_unread(
+        kind: UnknownKind,
+        managed: bool,
+        credit: Decimal,
+    ) -> (UnaccountedRule, Decimal) {
+        match kind {
+            UnknownKind::Withdraw { readable: false } if managed => {
+                (UnaccountedRule::Rebasable, Decimal::ZERO)
+            }
+            _ => rule_of(kind, managed, credit),
+        }
+    }
+    let ops = [UnknownOp::Entry {
+        kind: UnknownKind::Withdraw { readable: false },
+        money: 30,
+        trading: -27,
+        managed: true,
+        late: false,
+        long_gap: false,
+    }];
+    let limits = RiskLimits::default();
+    assert!(run_unknown_with(&limits, &ops, rule_of).is_ok());
+    assert!(run_unknown_with(&limits, &ops, zero_for_unread).is_err());
 }

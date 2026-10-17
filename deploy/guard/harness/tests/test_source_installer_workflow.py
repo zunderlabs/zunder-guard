@@ -11,7 +11,7 @@ from typing import Any, cast
 
 import pytest
 
-from guard_harness.c6_owner import document
+from guard_harness.c6_owner import CUSTODY, document, install_lock
 
 _GUARD = Path(__file__).resolve().parents[2]
 # Private source keeps the workflows in deploy/guard/github/workflows;
@@ -141,8 +141,13 @@ def test_component_flag_is_dispatch_only_and_off_by_default() -> None:
         "default": False,
     }
     assert "source_installer_diagnostic" not in events["workflow_call"]["inputs"]
-    assert workflow["concurrency"]["cancel-in-progress"] is False
-    assert workflow["concurrency"]["queue"] == "max"
+    # W23: no workflow-level lock; the source-mode rows still queue on the account at job level.
+    assert "concurrency" not in workflow
+    for name in ("linux-amd64", "linux-container", "native"):
+        assert name in CUSTODY
+        assert workflow["jobs"][name]["concurrency"] == install_lock(name)
+        assert workflow["jobs"][name]["concurrency"]["cancel-in-progress"] is False
+        assert workflow["jobs"][name]["concurrency"]["queue"] == "max"
 
 
 @pytest.mark.parametrize(

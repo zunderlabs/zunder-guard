@@ -208,7 +208,7 @@ def test_duplicate_keys_unsafe_tags_and_merges_refuse_at_every_depth(source_text
         c6_owner.document(source_text)
 
 
-@pytest.mark.parametrize("leaf", c6_owner.READERS)
+@pytest.mark.parametrize("leaf", c6_owner.CUSTODY)
 def test_inner_reader_account_lock_refuses(leaf: str) -> None:
     files = sources()
     doc = c6_owner.document(files["install-matrix.yml"])
@@ -216,6 +216,257 @@ def test_inner_reader_account_lock_refuses(leaf: str) -> None:
     files["install-matrix.yml"] = yaml.safe_dump(doc)
     with pytest.raises(c6_owner.OwnerError, match="inner account lock"):
         check("verify.yml", files)
+
+
+def _api_wallet_jobs(doc: dict[str, Any]) -> set[str]:
+    return {
+        name
+        for name, job in doc["jobs"].items()
+        if "secrets.E2E_TESTNET_API_WALLET_KEY" in yaml.safe_dump(job)
+        or "secrets.E2E_TESTNET_OWNER_KEY" in yaml.safe_dump(job)
+    }
+
+
+def test_w23_account_lock_sits_on_exactly_the_api_wallet_jobs() -> None:
+    doc = c6_owner.document(source("install-matrix.yml"))
+    assert "concurrency" not in doc
+    assert _api_wallet_jobs(doc) == set(c6_owner.CUSTODY)
+    for name, job in doc["jobs"].items():
+        if name in c6_owner.CUSTODY:
+            assert job["concurrency"] == c6_owner.install_lock(name)
+        else:
+            # Paper-only, mainnet refusal, mainnet-setup, AWS and admission jobs never queue.
+            assert "concurrency" not in job, name
+
+
+def _group(job: str, *, workflow_ref: str, run_id: int, index: int) -> str:
+    """Evaluate the one admitted group expression for one context, independently of GitHub."""
+    expression = c6_owner.install_lock(job)["group"]
+    prefix = "${{ contains(github.workflow_ref, '/.github/workflows/install-matrix.yml@') "
+    tail = (
+        f"&& 'guard-e2e-testnet' || format('guard-c6-install-inner-{{0}}-{job}-{{1}}', "
+        "github.run_id, strategy.job-index) }}"
+    )
+    assert expression == prefix + tail
+    if "/.github/workflows/install-matrix.yml@" in workflow_ref:
+        return "guard-e2e-testnet"
+    return f"guard-c6-install-inner-{run_id}-{job}-{index}"
+
+
+def test_w23_standalone_jobs_share_the_account_group_and_called_jobs_never_nest() -> None:
+    standalone = "zunderlabs/zunder-guard/.github/workflows/install-matrix.yml@refs/heads/main"
+    groups = {
+        _group(job, workflow_ref=standalone, run_id=7, index=index)
+        for job in c6_owner.CUSTODY
+        for index in range(10)
+    }
+    # A standalone diagnostic's custody jobs queue on the one account group, behind any
+    # verify or nightly run that owns it for its whole run.
+    assert groups == {c6_owner.GROUP}
+    for caller in ("verify.yml", "nightly.yml"):
+        ref = f"zunderlabs/zunder-guard/.github/workflows/{caller}@refs/heads/main"
+        called = [
+            _group(job, workflow_ref=ref, run_id=7, index=index)
+            for job in c6_owner.CUSTODY
+            for index in range(10)
+        ]
+        # Never the caller's own global group (no deadlock), and unique per job and leg so
+        # the whole-run owner's install rows stay concurrent as before.
+        assert c6_owner.GROUP not in called
+        assert len(set(called)) == len(called)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "workflow-global",
+        "workflow-legacy-inner",
+        "missing",
+        "shared-run-group",
+        "other-job-name",
+        "cancel",
+        "cancel-zero",
+        "single",
+    ],
+)
+@pytest.mark.parametrize("leaf", c6_owner.CUSTODY)
+def test_w23_custody_lock_layout_is_exact(leaf: str, mutation: str) -> None:
+    files = sources()
+    doc = c6_owner.document(files["install-matrix.yml"])
+    job = doc["jobs"][leaf]
+    other = "docker" if leaf != "docker" else "native"
+    if mutation == "workflow-global":
+        doc["concurrency"] = dict(c6_owner.LOCK)
+    elif mutation == "workflow-legacy-inner":
+        doc["concurrency"] = {
+            "group": "${{ contains(github.workflow_ref, '/.github/workflows/install-matrix.yml@') "
+            "&& 'guard-e2e-testnet' || format('guard-c6-install-inner-{0}', github.run_id) }}",
+            "cancel-in-progress": False,
+            "queue": "max",
+        }
+    elif mutation == "missing":
+        del job["concurrency"]
+    elif mutation == "shared-run-group":
+        job["concurrency"]["group"] = (
+            "${{ contains(github.workflow_ref, '/.github/workflows/install-matrix.yml@') "
+            "&& 'guard-e2e-testnet' || format('guard-c6-install-inner-{0}', github.run_id) }}"
+        )
+    elif mutation == "other-job-name":
+        job["concurrency"] = c6_owner.install_lock(other)
+    elif mutation == "cancel":
+        job["concurrency"]["cancel-in-progress"] = True
+    elif mutation == "cancel-zero":
+        job["concurrency"]["cancel-in-progress"] = 0
+    else:
+        job["concurrency"]["queue"] = "single"
+    files["install-matrix.yml"] = yaml.safe_dump(doc)
+    for caller in ("verify.yml", "nightly.yml"):
+        with pytest.raises(c6_owner.OwnerError):
+            check(caller, files)
+
+
+@pytest.mark.parametrize(
+    "job", ["subjects", "aws-stack", "mainnet-setup", "linux-mainnet", "mainnet-admission"]
+)
+@pytest.mark.parametrize("lock", ["global", "standalone-expression"])
+def test_w23_jobs_without_custody_take_no_account_lock(job: str, lock: str) -> None:
+    files = sources()
+    doc = c6_owner.document(files["install-matrix.yml"])
+    value = dict(c6_owner.LOCK) if lock == "global" else c6_owner.install_lock("native")
+    doc["jobs"][job]["concurrency"] = value
+    files["install-matrix.yml"] = yaml.safe_dump(doc)
+    with pytest.raises(c6_owner.OwnerError, match="without account custody"):
+        check("verify.yml", files)
+
+
+def test_w18_actual_cleanup_is_admitted_exactly() -> None:
+    job = c6_owner.document(source("verify.yml"))["jobs"]["wallet-restore"]
+    assert {key: job[key] for key in c6_owner.CLEANUP} == c6_owner.CLEANUP
+    # It waits for the trading reusable call and the install reusable call: both hold
+    # every C6 custody leaf of the run (P8/T1/T2 in journeys, readers in install-matrix).
+    assert set(job["needs"]) == {"staging", "journeys", "install-matrix"}
+    assert c6_owner.GROUP not in json.dumps(job)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "missing-job",
+        "needs-without-installs",
+        "needs-staging-only",
+        "if-always",
+        "if-running-installs",
+        "global-lock",
+        "standalone-lock",
+        "no-lock",
+        "cancel-zero",
+        "testnet-key",
+        "owner-key",
+        "account-variable",
+        "payer-key",
+        "job-continue",
+        "step-continue",
+        "reusable",
+        "secrets-forward",
+        "permissions",
+        "mainnet-network",
+        "timeout",
+        "environment",
+        "runner",
+        "c6-claim",
+    ],
+)
+def test_w18_cleanup_admission_refuses_every_widening(mutation: str) -> None:
+    files = sources()
+    doc = c6_owner.document(files["verify.yml"])
+    job = doc["jobs"]["wallet-restore"]
+    step_env = job["steps"][-2].setdefault("env", {})
+    if mutation == "missing-job":
+        del doc["jobs"]["wallet-restore"]
+    elif mutation == "needs-without-installs":
+        job["needs"] = ["staging", "journeys"]
+    elif mutation == "needs-staging-only":
+        job["needs"] = "staging"
+    elif mutation == "if-always":
+        job["if"] = "${{ always() }}"
+    elif mutation == "if-running-installs":
+        job["if"] = c6_owner.CLEANUP_IF.replace(
+            "needs.install-matrix.result == 'skipped'", "needs.install-matrix.result != ''"
+        )
+    elif mutation == "global-lock":
+        job["concurrency"] = dict(c6_owner.LOCK)
+    elif mutation == "standalone-lock":
+        job["concurrency"] = c6_owner.install_lock("native")
+    elif mutation == "no-lock":
+        del job["concurrency"]
+    elif mutation == "cancel-zero":
+        job["concurrency"]["cancel-in-progress"] = 0
+    elif mutation == "testnet-key":
+        step_env["KEY"] = "${{ secrets.E2E_TESTNET_API_WALLET_KEY }}"
+    elif mutation == "owner-key":
+        step_env["KEY"] = "${{ secrets.E2E_TESTNET_OWNER_KEY }}"
+    elif mutation == "account-variable":
+        step_env["ACCOUNT"] = "${{ vars.E2E_TESTNET_ACCOUNT }}"
+    elif mutation == "payer-key":
+        step_env["KEY"] = "${{ secrets.E2E_PAYER_HYPERLIQUID_TESTNET_KEY }}"
+    elif mutation == "job-continue":
+        job["continue-on-error"] = True
+    elif mutation == "step-continue":
+        job["steps"][-2]["continue-on-error"] = True
+    elif mutation == "reusable":
+        job["uses"] = "./.github/workflows/journey.yml"
+    elif mutation == "secrets-forward":
+        job["secrets"] = "inherit"
+    elif mutation == "permissions":
+        job["permissions"]["id-token"] = "write"
+    elif mutation == "mainnet-network":
+        job["strategy"]["matrix"]["network"].append("mainnet")
+    elif mutation == "timeout":
+        job["timeout-minutes"] = 600
+    elif mutation == "environment":
+        job["environment"] = "promote"
+    elif mutation == "runner":
+        job["runs-on"] = "self-hosted"
+    else:
+        job["steps"].insert(0, {"run": "python -m guard_harness.c6_owner --callee journey.yml"})
+    files["verify.yml"] = yaml.safe_dump(doc)
+    with pytest.raises(c6_owner.OwnerError):
+        check("verify.yml", files)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "${{ toJSON(secrets) }}",
+        "${{ secrets['E2E_MERCHANT_TESTNET_KEY'] }}",
+        "${{ secrets[format('{0}', 'E2E_TESTNET_API_WALLET_KEY')] }}",
+        "${{ secrets.* }}",
+        "${{ secrets }}",
+        "${{ secrets .E2E_MERCHANT_TESTNET_KEY }}",
+    ],
+)
+def test_w18_cleanup_refuses_indirect_secrets_access(value: str) -> None:
+    files = sources()
+    doc = c6_owner.document(files["verify.yml"])
+    doc["jobs"]["wallet-restore"]["steps"][-2]["env"]["EXTRA"] = value
+    files["verify.yml"] = yaml.safe_dump(doc)
+    with pytest.raises(c6_owner.OwnerError, match="secrets"):
+        check("verify.yml", files)
+
+
+def test_secret_names_reads_only_expressions_and_named_secrets() -> None:
+    text = (
+        "run: python -c 'import secrets; print(secrets.token_hex(16))'\n"
+        "env: {A: '${{ secrets.ONE }}', B: '${{ inputs.x && secrets.TWO || 1 }}'}\n"
+    )
+    assert c6_owner.secret_names(text) == {"ONE", "TWO"}
+    with pytest.raises(c6_owner.OwnerError):
+        c6_owner.secret_names("x: ${{ fromJSON(toJSON(secrets)).ONE }}")
+
+
+def test_w23_install_lock_refuses_unknown_job() -> None:
+    with pytest.raises(c6_owner.OwnerError):
+        c6_owner.install_lock("aws-stack")
 
 
 def test_t2_requires_successful_t1_and_no_trading_self_lock() -> None:
@@ -906,7 +1157,7 @@ def test_macos_selector_launches_only_signed_i3_rows(scenario: str) -> None:
     for name, job in doc["jobs"].items():
         if name not in {"subjects", "native"}:
             assert "'macos'" not in job.get("if", "")
-    assert doc["concurrency"] == c6_owner.INSTALL_LOCK
+    assert "concurrency" not in doc
     assert doc["jobs"]["native"]["needs"] == "subjects"
     assert doc["jobs"]["native"]["strategy"]["fail-fast"] is False
     assert "!inputs.diagnostic" in doc["jobs"]["native-admission"]["if"]
@@ -996,7 +1247,7 @@ def test_linux_guest_diagnostic_selects_both_failed_rows_without_arm_replay() ->
         if "linux-guests" in re.findall(r"inputs.target == '([^']*)'", job.get("if", ""))
     }
     assert selected == {"linux-amd64", "linux-container"}
-    assert doc["concurrency"] == c6_owner.INSTALL_LOCK
+    assert "concurrency" not in doc
     assert all(doc["jobs"][name]["needs"] == "subjects" for name in selected)
 
 
@@ -1021,7 +1272,7 @@ def test_unix_diagnostic_fans_out_only_failed_linux_and_mac_rows(scenario: str) 
         {scenario} if scenario != "all" else {"fresh", "upgrade"}
     )
     assert len(native_jobs) == (1 if scenario != "all" else 2)
-    assert doc["concurrency"] == c6_owner.INSTALL_LOCK
+    assert "concurrency" not in doc
     for name in selected:
         assert doc["jobs"][name]["needs"] == "subjects"
         assert doc["jobs"][name]["strategy"]["fail-fast"] is False
