@@ -7,7 +7,7 @@ set -euo pipefail
 cd "$(dirname "$0")"
 python3 release-policy.py
 python3 macos-shell.py
-python3 -B distribution.py DockerBuildContext HomebrewServicePolicy
+python3 -B distribution.py DockerBuildContext HomebrewServicePolicy WindowsAclPolicy ReleaseRendering.test_windows_embedded_trust_and_lifecycle_sources_match
 ./rules.sh
 ./lint.sh
 ./image.sh

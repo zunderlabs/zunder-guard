@@ -27,9 +27,13 @@ class WindowsAclPolicy(unittest.TestCase):
         # owner and ACL at every start; without a read entry it cannot open
         # them and its admission refuses before Guard starts.
         lifecycle = (GUARD / 'windows/lifecycle.ps1.inc').read_text()
-        body = re.search(r'function Set-ZgBaseAcl \{\n(.*?)\n\}\n', lifecycle, re.S)
+        body = re.search(r'function Set-ZgBaseAcl\(\[string\[\]\]\$Bases\) \{\n(.*?)\n\}\n', lifecycle, re.S)
         self.assertIsNotNone(body)
-        self.assertIn("foreach ($base in @($ZgData,$ZgBin))", body[1])
+        self.assertIn("foreach ($base in $Bases)", body[1])
+        # Always written, never skipped by a comparison that could miss an entry.
+        self.assertNotIn("Test-ZgBaseAcl", lifecycle)
+        self.assertIn("Microsoft.PowerShell.Security\\Set-Acl -LiteralPath $base -AclObject $acl",
+                      body[1])
         grants = re.findall(r'FileSystemAccessRule\]::new\((.*?)\)\)$', body[1], re.M)
         self.assertEqual(len(grants), 1)
         self.assertEqual(
@@ -38,11 +42,45 @@ class WindowsAclPolicy(unittest.TestCase):
             "[Security.AccessControl.InheritanceFlags]::None,'None','Allow'",
         )
         self.assertIn("$acl = New-ZgAcl $true ''", body[1])
-        ensure = re.search(r'function Ensure-ZgService \{\n(.*?)\n\}\n', lifecycle, re.S)
-        self.assertIsNotNone(ensure)
-        steps = ensure[1].splitlines()
-        self.assertLess(steps.index('  Set-ZgBaseAcl'), steps.index(
-            '  foreach ($path in @($ZgRoot,$ZgBinaryDir,$ZgExe)) { Set-ZgAcl $path $ZgSid }'))
+        # Both anchors, in the owned install (and its resume) before the service's own
+        # paths, and in an upgrade; never in the read-only actions.
+        calls = [line for line in lifecycle.splitlines() if 'Set-ZgBaseAcl @(' in line]
+        self.assertEqual(calls, ['  Set-ZgBaseAcl @($ZgData,$ZgBin)'] * 2)
+        prepare = re.search(r'function Complete-ZgPrepare \{\n(.*?)\n\}\n', lifecycle, re.S)
+        self.assertIsNotNone(prepare)
+        steps = prepare[1].splitlines()
+        settle = steps.index('  Set-ZgBaseAcl @($ZgData,$ZgBin)')
+        self.assertLess(steps.index("  Save-ZgPhase 'paths-created'"), settle)
+        self.assertLess(settle, next(i for i, line in enumerate(steps)
+                                     if line.startswith('  Ensure-ZgService;')))
+        upgrade = re.search(r'function Complete-ZgUpgrade \{\n(.*?)\n\}\n', lifecycle, re.S)
+        self.assertIsNotNone(upgrade)
+        self.assertIn('  Set-ZgBaseAcl @($ZgData,$ZgBin)', upgrade[1].splitlines())
+
+    def test_machine_folders_fail_closed_on_an_incomplete_environment(self):
+        # rc.1 I4: under an environment without ALLUSERSPROFILE/SystemDrive, Windows
+        # PowerShell 5.1 resolved ProgramData to '' and the installer died on an
+        # ArgumentException before its first step. Both anchors now come only from a
+        # checked resolution, and an empty path is a fixed refusal.
+        source = (GUARD / 'windows/bootstrap.ps1.inc').read_text()
+        self.assertIn("$script:ZgData = [IO.Path]::Combine((Get-ZgMachineFolder "
+                      "'CommonApplicationData'),'ZunderGuard')", source)
+        self.assertIn("$script:ZgBin = [IO.Path]::Combine((Get-ZgMachineFolder "
+                      "'ProgramFiles'),'ZunderGuard')", source)
+        check = re.search(r'function Get-ZgMachineFolder\(\[string\]\$Name\) \{\n(.*?)\n\}\n',
+                          source, re.S)
+        self.assertIsNotNone(check)
+        for condition in ("-not $folder", "$folder.Contains('%')", "$folder.StartsWith('\\\\')",
+                          "-not [IO.Path]::IsPathRooted($folder)",
+                          # Exactly its own full path: no trailing separator or other form.
+                          "[IO.Path]::GetFullPath($folder) -cne $folder)"):
+            self.assertIn(condition, check[1])
+        self.assertIn("throw 'Windows did not resolve ProgramData or Program Files for this "
+                      "process; run the installer with the complete Windows environment.'",
+                      check[1])
+        assert_path = source.index('function Assert-ZgPath(')
+        self.assertTrue(source[assert_path:].splitlines()[1].strip()
+                        == "if (-not $Path) { throw 'Noncanonical machine path refused.' }")
 
     def test_programdata_exception_cannot_grant_destructive_or_anchor_rights(self):
         source = (GUARD / 'windows/bootstrap.ps1.inc').read_text()

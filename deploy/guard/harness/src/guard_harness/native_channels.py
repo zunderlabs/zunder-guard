@@ -20,6 +20,7 @@ from guard_harness.native_verifier import LoaderDownloads, verifier_probe
 from guard_harness.paper_bot import LocalGuard
 from guard_harness.paper_roundtrip import round_trip
 from guard_harness.runner import run
+from guard_harness.windows_environment import WINDOWS_LOCATIONS
 
 # Ordered from specific refusals to wrapper/cmdlet failures. Never return a
 # regex capture: paths, exception details and even successful setup output can
@@ -104,16 +105,7 @@ def channel_environment() -> dict[str, str]:
         # PowerShell and module discovery need the normal Windows profile and
         # program roots. Python normalizes Windows environment names to upper
         # case; use a case-insensitive allow-list for the two PowerShell editions.
-        allowed |= {
-            "APPDATA",
-            "PROGRAMFILES",
-            "PROGRAMFILES(X86)",
-            "PROGRAMW6432",
-            "WINDIR",
-            "COMSPEC",
-            "PATHEXT",
-            "PSMODULEPATH",
-        }
+        allowed |= WINDOWS_LOCATIONS  # the same list as the installer rows (windows_environment)
     clean = {name: value for name, value in os.environ.items() if name.upper() in allowed}
     clean["TERM"] = "dumb"
     return clean

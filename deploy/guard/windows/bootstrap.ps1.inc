@@ -26,13 +26,22 @@ function Initialize-ZgMachineContext([switch]$RuntimeModules) {
     Microsoft.PowerShell.Core\Import-Module $manifest -Force -ErrorAction Stop
   }
   foreach ($cpu in @(CimCmdlets\Get-CimInstance Win32_Processor)) { if ($cpu.Architecture -ne 9) { throw 'Windows mainnet requires native x64, not ARM emulation.' } }
-  $script:ZgData = [IO.Path]::Combine([Environment]::GetFolderPath('CommonApplicationData'),'ZunderGuard')
-  $script:ZgBin = [IO.Path]::Combine([Environment]::GetFolderPath('ProgramFiles'),'ZunderGuard')
+  $script:ZgData = [IO.Path]::Combine((Get-ZgMachineFolder 'CommonApplicationData'),'ZunderGuard')
+  $script:ZgBin = [IO.Path]::Combine((Get-ZgMachineFolder 'ProgramFiles'),'ZunderGuard')
   Assert-ZgPath ([Diagnostics.Process]::GetCurrentProcess().MainModule.FileName) -Machine
   Assert-ZgPath $ZgPowerShell -Machine
   Assert-ZgPath $ZgSc -Machine
 }
+# Windows resolves the machine folders through the process environment (ALLUSERSPROFILE,
+# SystemDrive); Windows PowerShell 5.1 returns an empty path when they are missing, which
+# would otherwise surface as an ArgumentException. Refuse that plainly, before any path use.
+function Get-ZgMachineFolder([string]$Name) {
+  $folder = [Environment]::GetFolderPath($Name)
+  if (-not $folder -or $folder.Contains('%') -or $folder.StartsWith('\\') -or -not [IO.Path]::IsPathRooted($folder) -or [IO.Path]::GetFullPath($folder) -cne $folder) { throw 'Windows did not resolve ProgramData or Program Files for this process; run the installer with the complete Windows environment.' }
+  return $folder
+}
 function Assert-ZgPath([string]$Path,[switch]$Machine,[string]$ReadSid) {
+  if (-not $Path) { throw 'Noncanonical machine path refused.' }
   $full = [IO.Path]::GetFullPath($Path)
   if ($full -cne $Path -or $full.StartsWith('\\') -or $full.Substring(2).Contains(':')) { throw 'Noncanonical machine path refused.' }
   $known = @([Environment]::GetFolderPath('CommonApplicationData'),[Environment]::GetFolderPath('ProgramFiles'),[IO.Path]::GetPathRoot($full))

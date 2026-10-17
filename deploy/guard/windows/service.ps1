@@ -41,13 +41,22 @@ function Initialize-ZgMachineContext([switch]$RuntimeModules) {
     Microsoft.PowerShell.Core\Import-Module $manifest -Force -ErrorAction Stop
   }
   foreach ($cpu in @(CimCmdlets\Get-CimInstance Win32_Processor)) { if ($cpu.Architecture -ne 9) { throw 'Windows mainnet requires native x64, not ARM emulation.' } }
-  $script:ZgData = [IO.Path]::Combine([Environment]::GetFolderPath('CommonApplicationData'),'ZunderGuard')
-  $script:ZgBin = [IO.Path]::Combine([Environment]::GetFolderPath('ProgramFiles'),'ZunderGuard')
+  $script:ZgData = [IO.Path]::Combine((Get-ZgMachineFolder 'CommonApplicationData'),'ZunderGuard')
+  $script:ZgBin = [IO.Path]::Combine((Get-ZgMachineFolder 'ProgramFiles'),'ZunderGuard')
   Assert-ZgPath ([Diagnostics.Process]::GetCurrentProcess().MainModule.FileName) -Machine
   Assert-ZgPath $ZgPowerShell -Machine
   Assert-ZgPath $ZgSc -Machine
 }
+# Windows resolves the machine folders through the process environment (ALLUSERSPROFILE,
+# SystemDrive); Windows PowerShell 5.1 returns an empty path when they are missing, which
+# would otherwise surface as an ArgumentException. Refuse that plainly, before any path use.
+function Get-ZgMachineFolder([string]$Name) {
+  $folder = [Environment]::GetFolderPath($Name)
+  if (-not $folder -or $folder.Contains('%') -or $folder.StartsWith('\\') -or -not [IO.Path]::IsPathRooted($folder) -or [IO.Path]::GetFullPath($folder) -cne $folder) { throw 'Windows did not resolve ProgramData or Program Files for this process; run the installer with the complete Windows environment.' }
+  return $folder
+}
 function Assert-ZgPath([string]$Path,[switch]$Machine,[string]$ReadSid) {
+  if (-not $Path) { throw 'Noncanonical machine path refused.' }
   $full = [IO.Path]::GetFullPath($Path)
   if ($full -cne $Path -or $full.StartsWith('\\') -or $full.Substring(2).Contains(':')) { throw 'Noncanonical machine path refused.' }
   $known = @([Environment]::GetFolderPath('CommonApplicationData'),[Environment]::GetFolderPath('ProgramFiles'),[IO.Path]::GetPathRoot($full))
@@ -426,8 +435,11 @@ function Install-ZgImage([string]$Directory) {
 # shared anchors included: it must be able to open them and read their owner
 # and ACL. Authenticated Users may read and list this folder only, as stock
 # ProgramData and Program Files grant; nothing is inherited, nobody else writes.
-function Set-ZgBaseAcl {
-  foreach ($base in @($ZgData,$ZgBin)) {
+# Always written, never skipped by a comparison: like Set-ZgAcl for every other
+# protected path, each owned install, resume and upgrade states the one form,
+# so no entry a read-back can miss (a conditional ACE, for one) survives it.
+function Set-ZgBaseAcl([string[]]$Bases) {
+  foreach ($base in $Bases) {
     $item = Microsoft.PowerShell.Management\Get-Item -LiteralPath $base -Force
     if (-not $item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw 'Reparse or non-directory base refused.' }
     $acl = New-ZgAcl $true ''
@@ -444,7 +456,6 @@ function Ensure-ZgService {
     $null = Get-ZgService
   }
   Disable-ZgService
-  Set-ZgBaseAcl
   foreach ($path in @($ZgRoot,$ZgBinaryDir,$ZgExe)) { Set-ZgAcl $path $ZgSid }
   Set-ZgAcl $ZgHome $ZgSid $true
   # Same per-executable WER exclusion as native service admission; never global policy.
@@ -461,6 +472,8 @@ function Complete-ZgPrepare {
     if (-not [IO.Directory]::Exists($path)) { New-ZgDirectory $path }
   }
   Save-ZgPhase 'paths-created'
+  # Both shared anchors exist from here; an owned install or its resume settles them.
+  Set-ZgBaseAcl @($ZgData,$ZgBin)
   Assert-ZgPath $ZgRoot; Assert-ZgPath $ZgBinaryDir
   if ([IO.File]::Exists($ZgExe) -and (Get-ZgHash $ZgExe) -cne $ZgTransaction.new_hash) { throw 'Partial installation image differs from transaction.' }
   # Reconcile binary AND notices after interruption; never touch runtime state.
@@ -528,6 +541,8 @@ function Get-ZgJournalHash {
 function Complete-ZgUpgrade {
   Confirm-ZgConsent; Assert-ZgCache
   Disable-ZgService; Save-ZgPhase 'startup-disabled'
+  # An upgrade repairs both shared anchors as an install does.
+  Set-ZgBaseAcl @($ZgData,$ZgBin)
   $backup = [IO.Path]::Combine($ZgManagement,($Id+'-'+$ZgTransaction.transaction+'-previous.exe'))
   $oldBinding = [IO.Path]::Combine($ZgManagement,($Id+'-'+$ZgTransaction.transaction+'-previous.json'))
   if (-not $ZgTransaction.snapshot_captured) {

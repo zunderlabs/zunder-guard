@@ -6,9 +6,14 @@
 # on any venue). Guard only makes read-only info requests for them. Because every input
 # is synthetic, the installer's own output is printed in full (the key itself never is).
 #
-# Stage A runs the released loader exactly as the I4 harness does (testnet, managed
-# service, private stdin, captured stdio). Its init refuses the unapproved synthetic
-# wallet by design, so every step before init is exercised for real.
+# Stage 0 prints how Windows PowerShell 5.1 and PowerShell 7 resolve ProgramData and
+# Program Files under the I4 harness's minimal environment, with single variables added
+# back, and under the full one. Stage A0 runs the released loader exactly as the I4 harness
+# did, its environment included. Stage A1 runs it with the fixed harness's environment,
+# generated from guard_harness.windows_environment, and must reach config-preparing; only if
+# it does not, stage A runs it again with the full environment (testnet,
+# managed service, private stdin, captured stdio). Its init refuses the unapproved
+# synthetic wallet by design, so every step before init is exercised for real.
 # Stage B then writes a synthetic testnet config and journal and resumes with the
 # retained, verified helper: service prepare, binding, credential provision, check,
 # and an explicit Start, showing whether SCM starts the broker.
@@ -47,10 +52,15 @@ $Report = Join-Path $Out 'report.txt'
 function Say([string]$Text) { Write-Host $Text; Add-Content -LiteralPath $Report -Value $Text -Encoding utf8 }
 function Hide([string]$Text) { if ($null -eq $Text) { return '' }; return $Text.Replace($Key,'[SYNTHETIC KEY]') }
 
-function Invoke-Captured([string]$Label,[string]$File,[string[]]$Arguments,[string]$Stdin) {
+function Invoke-Captured([string]$Label,[string]$File,[string[]]$Arguments,[string]$Stdin,[hashtable]$Environment) {
   # Captured stdio, as the harness runs the installer: the same redirection and wrapping.
+  # With -Environment, exactly that environment (as the I4 harness passes its allow-list).
   $info = [Diagnostics.ProcessStartInfo]::new($File)
   foreach ($argument in $Arguments) { $info.ArgumentList.Add($argument) }
+  if ($null -ne $Environment) {
+    $info.Environment.Clear()
+    foreach ($name in $Environment.Keys) { $info.Environment[$name] = $Environment[$name] }
+  }
   $info.UseShellExecute = $false
   $info.RedirectStandardInput = $true
   $info.RedirectStandardOutput = $true
@@ -114,8 +124,61 @@ foreach ($hive in @('HKLM:','HKCU:')) {
 }
 
 $Frame = "$Key`n"
+
+# The environment the I4 harness gave the installer up to rc.1 (native_run.py's allow-list,
+# matched case-insensitively as Python sees Windows names): no ALLUSERSPROFILE or SystemDrive.
+$HarnessNames = @('PATH','HOME','USERPROFILE','LOCALAPPDATA','PROGRAMDATA','PROGRAMFILES','SYSTEMROOT','TEMP','TMP','LANG','GITHUB_ACTIONS','RUNNER_ENVIRONMENT','INSTALL_MATRIX_PROFILE','DIAGNOSTIC','GITHUB_SHA','APPDATA','PROGRAMFILES(X86)','PROGRAMW6432','WINDIR','COMSPEC','PATHEXT','PSMODULEPATH')
+function Get-Environment([string[]]$Names) {
+  $selected = @{}
+  foreach ($entry in [Environment]::GetEnvironmentVariables().GetEnumerator()) {
+    if ($Names -contains ([string]$entry.Key).ToUpperInvariant()) { $selected[[string]$entry.Key] = [string]$entry.Value }
+  }
+  return $selected
+}
+# Stage 0: how each PowerShell edition resolves the machine folders under each environment.
+$Probe = "[Environment]::GetFolderPath('CommonApplicationData') + ' | ' + [Environment]::GetFolderPath('ProgramFiles')"
+$WindowsPowerShell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+foreach ($edition in @($WindowsPowerShell,(Get-Command pwsh.exe).Source)) {
+  foreach ($case in @(
+      @{Label='harness'; Names=$HarnessNames},
+      @{Label='harness + ALLUSERSPROFILE'; Names=$HarnessNames + 'ALLUSERSPROFILE'},
+      @{Label='harness + SYSTEMDRIVE'; Names=$HarnessNames + 'SYSTEMDRIVE'},
+      @{Label='harness + ALLUSERSPROFILE + SYSTEMDRIVE + PUBLIC + COMMONPROGRAMFILES'; Names=$HarnessNames + @('ALLUSERSPROFILE','SYSTEMDRIVE','PUBLIC','COMMONPROGRAMFILES','COMMONPROGRAMFILES(X86)','COMMONPROGRAMW6432')})) {
+    $null = Invoke-Captured "stage 0: $([IO.Path]::GetFileName($edition)) folders, $($case.Label) env" $edition @('-NoProfile','-NonInteractive','-Command',$Probe) '' (Get-Environment $case.Names)
+  }
+  $null = Invoke-Captured "stage 0: $([IO.Path]::GetFileName($edition)) folders, full env" $edition @('-NoProfile','-NonInteractive','-Command',$Probe) ''
+}
+
+# Stage A0: the released loader exactly as the I4 harness ran it, its environment included.
+$null = Invoke-Captured 'stage A0: loader -ManagedService testnet in the harness environment' $ShellExe @('-NoProfile','-ExecutionPolicy','Bypass','-File',$Loader,'-Network','testnet','-ManagedService','-NonInteractive','-KeyStdin','-Id',$Id,'-Rules',$Rules,'-Account',$Account,'-ConfirmAccount',$Account,'-EquityCap','100') ($Frame + $Frame) (Get-Environment $HarnessNames)
+Show-State 'stage A0'
+if (Test-Path -LiteralPath $Transaction) {
+  Say 'stage A0 wrote a transaction: the harness environment is not the cause; later stages skipped.'
+  exit 0
+}
+
+# Stage A1: the same, with exactly the environment the fixed harness passes, generated from
+# the harness source (guard_harness.windows_environment), not a copy. It must reach
+# config-preparing before a candidate is spent on the gate.
+$Python = (Get-Command python.exe).Source
+$GateInfo = [Diagnostics.ProcessStartInfo]::new($Python)
+foreach ($argument in @('-I','-c',"import sys; sys.path.insert(0, sys.argv[1]); from guard_harness.windows_environment import windows_installer_names; print('\n'.join(windows_installer_names()))",(Join-Path $PSScriptRoot '..\harness\src'))) { $GateInfo.ArgumentList.Add($argument) }
+$GateInfo.UseShellExecute = $false
+$GateInfo.RedirectStandardOutput = $true
+$GateProcess = [Diagnostics.Process]::Start($GateInfo)
+$GateNames = @($GateProcess.StandardOutput.ReadToEnd() -split "`r?`n" | Where-Object { $_ })
+$GateProcess.WaitForExit()
+if ($GateProcess.ExitCode -ne 0 -or $GateNames.Count -lt 10 -or $GateNames -notcontains 'ALLUSERSPROFILE') { throw 'Could not read the harness installer environment.' }
+Say "gate environment names: $($GateNames -join ' ')"
+$null = Invoke-Captured 'stage A1: loader -ManagedService testnet in the fixed gate environment' $ShellExe @('-NoProfile','-ExecutionPolicy','Bypass','-File',$Loader,'-Network','testnet','-ManagedService','-NonInteractive','-KeyStdin','-Id',$Id,'-Rules',$Rules,'-Account',$Account,'-ConfirmAccount',$Account,'-EquityCap','100') ($Frame + $Frame) (Get-Environment $GateNames)
+Show-State 'stage A1'
+$phase = if (Test-Path -LiteralPath $Transaction) { (Get-Content -Raw -LiteralPath $Transaction | ConvertFrom-Json).phase } else { '' }
+Say ("stage A1 verdict: " + $(if ($phase -eq 'config-preparing') { 'PASS, reached config-preparing in the gate environment' } else { "FAIL, stopped at phase '$phase'" }))
+
+if (-not $phase) {
 $code = Invoke-Captured 'stage A: loader -ManagedService testnet (synthetic wallet)' $ShellExe @('-NoProfile','-ExecutionPolicy','Bypass','-File',$Loader,'-Network','testnet','-ManagedService','-NonInteractive','-KeyStdin','-Id',$Id,'-Rules',$Rules,'-Account',$Account,'-ConfirmAccount',$Account,'-EquityCap','100') ($Frame + $Frame)
 Show-State 'stage A'
+}
 
 $phase = if (Test-Path -LiteralPath $Transaction) { (Get-Content -Raw -LiteralPath $Transaction | ConvertFrom-Json).phase } else { '' }
 if ($phase -ne 'config-preparing' -or (Test-Path -LiteralPath $Config)) {

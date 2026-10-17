@@ -15,18 +15,7 @@ from guard_harness.native_testnet import sanitize_logs
 from guard_harness.source_installer import prepare, verify_file
 from guard_harness.testnet_process import ProcessError
 from guard_harness.testnet_scan import TestnetReads, flat_scan
-
-WINDOWS_LOCATIONS = frozenset(
-    {
-        "APPDATA",
-        "PROGRAMFILES(X86)",
-        "PROGRAMW6432",
-        "WINDIR",
-        "COMSPEC",
-        "PATHEXT",
-        "PSMODULEPATH",
-    }
-)
+from guard_harness.windows_environment import INSTALLER_NAMES, WINDOWS_LOCATIONS
 
 
 def execute(*, subjects: Path, output: Path, scenario: str, account: str, shell: str) -> None:
@@ -72,32 +61,9 @@ def execute(*, subjects: Path, output: Path, scenario: str, account: str, shell:
     clean = {
         name: value
         for name, value in os.environ.items()
-        if name
-        in {
-            "PATH",
-            "HOME",
-            "USERPROFILE",
-            "LOCALAPPDATA",
-            "ProgramData",
-            "ProgramFiles",
-            "PROGRAMDATA",
-            "PROGRAMFILES",
-            "SystemRoot",
-            "SYSTEMROOT",
-            "TEMP",
-            "TMP",
-            "LANG",
-            "GITHUB_ACTIONS",
-            "RUNNER_ENVIRONMENT",
-            "INSTALL_MATRIX_PROFILE",
-            "DIAGNOSTIC",
-            # The harness source identity every receipt records (rc.17: without it the
-            # upgrade's Homebrew M2 receipt had an empty harness_commit and M2 refused).
-            "GITHUB_SHA",
-        }
-        # PowerShell needs these to run a downloaded .exe and to load its own modules
-        # (rc.16: "Cannot run a document in the middle of a pipeline" without PATHEXT).
-        # Windows reports environment names in upper case.
+        if name in INSTALLER_NAMES
+        # The shared Windows locations (windows_environment); Windows reports names in
+        # upper case.
         or (sys.platform == "win32" and name.upper() in WINDOWS_LOCATIONS)
         or (
             source is not None

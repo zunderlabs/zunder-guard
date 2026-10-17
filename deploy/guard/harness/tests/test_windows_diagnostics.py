@@ -1,9 +1,11 @@
+import re
 import subprocess
 import textwrap
 from pathlib import Path
 
 import pytest
 
+from guard_harness.guard_refusals import GUARD_SERVICE_REFUSALS
 from guard_harness.native_paper import LifecycleError
 from guard_harness.runner import RunError
 from guard_harness.windows_diagnostics import (
@@ -274,3 +276,54 @@ def test_scm_state_reads_only_closed_phase_and_scm_names(
     ]
     controller.transaction.write_text('{"phase": "C:\\\\private"}')
     assert controller.scm_state()[0] == "transaction phase: other"
+    for unhashable in ('{"phase": ["config-preparing"]}', '{"phase": {"x": 1}}', "[1]"):
+        controller.transaction.write_text(unhashable)
+        assert controller.scm_state()[0] in (
+            "transaction phase: other",
+            "transaction phase: unreadable",
+        )
+
+
+def test_guard_refusal_literals_are_exactly_the_rust_source() -> None:
+    root = Path(__file__).resolve().parents[4]
+    sources = [
+        root / "crates/zunder-guard/src/service.rs",
+        *sorted((root / "crates/zunder-guard/src/service").glob("*.rs")),
+    ]
+    assert len(sources) >= 4
+    literals: set[str] = set()
+    for source in sources:
+        literals |= set(re.findall(r'refused\(\s*"((?:[^"\\]|\\.)*)"', source.read_text()))
+    assert literals == GUARD_SERVICE_REFUSALS
+
+
+def test_only_a_fixed_guard_literal_is_named() -> None:
+    literal = "service ACL grants another identity access"
+    assert literal in GUARD_SERVICE_REFUSALS
+    assert installer_details("zunder-guard: service refused: " + literal) == [
+        "guard service refusal: " + literal
+    ]
+    # Words-only text that is not one of Guard's literals is only "present".
+    for other in (
+        "service ACL grants another identity access today",
+        "please read the private notes",
+        "",
+    ):
+        assert installer_details("zunder-guard: service refused: " + other) == [
+            "guard error: present"
+        ]
+
+
+def test_every_fixed_installer_literal_is_thrown_by_the_signed_loader_or_helper() -> None:
+    guard = Path(__file__).resolve().parents[2]
+    source = (guard / "windows/service.ps1").read_text() + (guard / "loader/i.ps1").read_text()
+    interpolated = ("Untrusted machine path owner (", "Organization ")
+    for message in INSTALLER_REFUSALS:
+        if not message.startswith(interpolated):
+            assert f"'{message}'" in source, message
+    # rc.1 I4: an incomplete environment now refuses with this literal, not an
+    # ArgumentException from an empty machine path.
+    assert (
+        "Windows did not resolve ProgramData or Program Files for this process; run the "
+        "installer with the complete Windows environment."
+    ) in INSTALLER_REFUSALS

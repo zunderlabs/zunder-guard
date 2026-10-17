@@ -162,7 +162,8 @@ class NativeTestnet:
         try:
             if self.transaction.is_file() and self.transaction.stat().st_size <= 65536:
                 phase = json.loads(self.transaction.read_bytes()).get("phase")
-                lines.append(f"transaction phase: {phase if phase in PHASES else 'other'}")
+                known = isinstance(phase, str) and phase in PHASES
+                lines.append(f"transaction phase: {phase if known else 'other'}")
             else:
                 lines.append("transaction phase: absent")
         except (OSError, ValueError, AttributeError):

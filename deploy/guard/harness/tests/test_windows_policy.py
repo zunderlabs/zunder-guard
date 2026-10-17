@@ -13,6 +13,7 @@ from test_install_evidence import release
 from guard_harness import windows_policy as policy
 from guard_harness.native_paper import LifecycleError
 from guard_harness.native_release import Release
+from guard_harness.windows_environment import WINDOWS_LOCATIONS
 
 
 class Registry:
@@ -313,6 +314,40 @@ def test_scm_install_waits_for_policy_step(
     assert controller.key == b""
 
 
+def test_windows_locations_pin_the_machine_folder_names_and_carry_no_secret(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # rc.1 I4: without these Windows PowerShell 5.1 resolved ProgramData to '' and the
+    # protected service installer failed with ArgumentException before its first step.
+    assert {
+        "ALLUSERSPROFILE",
+        "SYSTEMDRIVE",
+        "PUBLIC",
+        "COMMONPROGRAMFILES",
+        "COMMONPROGRAMFILES(X86)",
+        "COMMONPROGRAMW6432",
+    } <= WINDOWS_LOCATIONS
+    assert all(name == name.upper() for name in WINDOWS_LOCATIONS)
+    from guard_harness.windows_environment import windows_installer_names
+
+    # Every name an installer child keeps, as the hosted SCM diagnostic generates it.
+    assert set(WINDOWS_LOCATIONS) <= set(windows_installer_names())
+    for name in windows_installer_names():
+        assert not any(
+            marker in name for marker in ("KEY", "TOKEN", "SECRET", "WALLET", "ZUNDER_")
+        ), name
+    # The per-user channels keep the same list as the installer rows.
+    from guard_harness import native_channels
+
+    monkeypatch.setattr("guard_harness.native_channels.platform.system", lambda: "Windows")
+    monkeypatch.setattr(
+        "guard_harness.native_channels.os.environ",
+        {name: "inert" for name in WINDOWS_LOCATIONS} | {"ZUNDER_GUARD_HOME": "private"},
+    )
+    kept = native_channels.channel_environment()
+    assert WINDOWS_LOCATIONS <= set(kept) and "ZUNDER_GUARD_HOME" not in kept
+
+
 def test_windows_child_environment_keeps_machine_service_roots(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -344,7 +379,9 @@ def test_windows_child_environment_keeps_machine_service_roots(
     monkeypatch.setenv("PROGRAMDATA", "inert-program-data")
     monkeypatch.setenv("PROGRAMFILES", "inert-program-files")
     # rc.16: without PATHEXT PowerShell refused to run the downloaded cosign.exe.
-    windows_locations = {name: f"inert-{name.lower()}" for name in native_run.WINDOWS_LOCATIONS}
+    windows_locations = {
+        name: f"inert-{name.lower()}" for name in WINDOWS_LOCATIONS - {"PROGRAMFILES"}
+    }
     for name, value in windows_locations.items():
         monkeypatch.setenv(name, value)
     monkeypatch.setattr("guard_harness.native_run.sys.platform", "win32")

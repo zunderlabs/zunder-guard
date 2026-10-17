@@ -6,6 +6,7 @@ from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
 
+from guard_harness.guard_refusals import GUARD_SERVICE_REFUSALS
 from guard_harness.runner import RunError
 
 STEPS = frozenset(
@@ -177,6 +178,10 @@ INSTALLER_REFUSALS = frozenset(
         "Validated licence is not active/fee-free in this runtime.",
         "Verified binary does not report the release version.",
         "Windows mainnet requires native x64, not ARM emulation.",
+        (
+            "Windows did not resolve ProgramData or Program Files for this process; run the "
+            "installer with the complete Windows environment."
+        ),
     }
 )
 PATH_KINDS = ("drive-root", "program-data-root", "program-files-root", "protected-path")
@@ -304,9 +309,9 @@ ERROR_CATEGORIES = frozenset(
 # A .NET or PowerShell error identifier: letters and dots only (no digits, so no key,
 # account, SID or address; no separators, so no path or free text).
 ERROR_ID = re.compile(r"[A-Za-z][A-Za-z.]{2,100}")
-# Guard's own service refusals are fixed literals (`service refused: ...` in its Rust
-# source): words only. Guard's inherited stderr is never wrapped by PowerShell.
-GUARD_REFUSAL = re.compile(r"zunder-guard: service refused: ([A-Za-z][A-Za-z ;,'/()-]{6,160})")
+# Guard's own service refusals: exactly one of its fixed Rust literals (guard_refusals).
+# Guard's inherited stderr is never wrapped by PowerShell.
+GUARD_REFUSAL_PREFIX = "zunder-guard: service refused: "
 GUARD_OS_ERROR = re.compile(r"zunder-guard: service I/O: .*\(os error (\d{1,6})\)")
 
 
@@ -314,7 +319,7 @@ def installer_details(stderr: str) -> list[str]:
     """Finite, sanitized classes of the installer's errors; never captured free text.
 
     Each line is `name: value`, where the value is a closed-set name, a letters-only
-    error identifier, a Guard service refusal literal (words only) or a decimal OS error.
+    error identifier, one of Guard's fixed service refusal literals or a decimal OS error.
     """
     found: dict[str, list[str]] = {}
 
@@ -325,9 +330,12 @@ def installer_details(stderr: str) -> list[str]:
 
     for raw in ANSI.sub("", stderr[:65536]).splitlines():
         line = raw.strip()
-        if match := GUARD_REFUSAL.fullmatch(line):
-            if len(match[1].split()) >= 3 and all(len(word) <= 24 for word in match[1].split()):
-                add("guard service refusal", match[1])
+        if line.startswith(GUARD_REFUSAL_PREFIX):
+            literal = line.removeprefix(GUARD_REFUSAL_PREFIX)
+            if literal in GUARD_SERVICE_REFUSALS:
+                add("guard service refusal", literal)
+            else:
+                add("guard error", "present")
             continue
         if match := GUARD_OS_ERROR.fullmatch(line):
             add("guard os error", match[1])

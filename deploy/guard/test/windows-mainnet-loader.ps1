@@ -183,6 +183,7 @@ function Assert-ZgCache { if ($script:badCache) { throw 'synthetic signature rej
 function Confirm-ZgConsent { if ($ConfirmAccount -cne $ZgTransaction.account) { throw 'synthetic consent mismatch' } }
 function New-ZgDirectory($Path) { [IO.Directory]::CreateDirectory($Path) | Out-Null }
 function Set-ZgAcl($Path,$Sid,$Writable) { if (-not (Test-Path -LiteralPath $Path)) { throw 'missing fixture ACL target' } }
+function Set-ZgBaseAcl([string[]]$Bases) { foreach ($base in $Bases) { if (-not (Test-Path -LiteralPath $base)) { throw 'missing fixture base' } } }
 function Disable-ZgService { $script:trace.Add('disabled'); $script:startupMode='Disabled'; $script:running=$false; Assert-ZgStopped }
 function Assert-ZgStopped { if ($startupMode -ne 'Disabled' -or $running) { throw 'mutation before durable disabled/stopped state' } }
 function Ensure-ZgService { Disable-ZgService; $script:ZgSid='fixture-service-sid' }
