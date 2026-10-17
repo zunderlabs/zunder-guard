@@ -19,7 +19,7 @@
 ARG GUARD_SOURCE=build
 
 # ---------------------------------------------------------------- compile (native per platform)
-FROM public.ecr.aws/docker/library/rust:1.97.0-alpine3.22@sha256:3ab54ebc56cb9b6544edfbbb9f171d1576ecf86f5a0a37a231b0e32ff3b48e0c AS build
+FROM mirror.gcr.io/library/rust:1.97.0-alpine3.22@sha256:3ab54ebc56cb9b6544edfbbb9f171d1576ecf86f5a0a37a231b0e32ff3b48e0c AS build
 ARG GUARD_PACKAGE=zunder-guard
 # The image's toolchain must be the one rust-toolchain.toml pins; no download during the build.
 ENV RUSTUP_TOOLCHAIN=1.97.0 CARGO_INCREMENTAL=0 CARGO_TERM_COLOR=never
