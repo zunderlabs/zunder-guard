@@ -32,6 +32,50 @@ from guard_harness.testnet_run import ROOT
 from guard_harness.testnet_scan import TestnetReads, flat_scan
 from guard_harness.windows_diagnostics import observe as windows_observe
 
+# The helper's transaction phases (install-windows-service.ps1, Read-ZgTransaction).
+PHASES = frozenset(
+    {
+        "install-planned",
+        "paths-created",
+        "image-admitted",
+        "service-created-disabled",
+        "config-preparing",
+        "config-prepared",
+        "binding-prepared",
+        "credential-provisioning",
+        "credential-present",
+        "admitted-disabled",
+        "journal-requested",
+        "journal-present",
+        "upgrade-planned",
+        "startup-disabled",
+        "quiesced",
+        "promoting-image",
+        "promoting-binding",
+        "activation-requested",
+        "activation-committed",
+        "stopped",
+        "uninstalled",
+        "rolled-back",
+    }
+)
+# sc.exe query STATE and qc START_TYPE names.
+SCM_VALUES = frozenset(
+    {
+        "STOPPED",
+        "START_PENDING",
+        "STOP_PENDING",
+        "RUNNING",
+        "CONTINUE_PENDING",
+        "PAUSE_PENDING",
+        "PAUSED",
+        "BOOT_START",
+        "SYSTEM_START",
+        "AUTO_START",
+        "DEMAND_START",
+        "DISABLED",
+    }
+)
 # The Windows service (SCM) route is measured from 1.0.2, after per-user custody.
 WINDOWS_SERVICE = True
 
@@ -110,6 +154,42 @@ class NativeTestnet:
             secrets=[self.key.decode().strip()],
             failure_classifier=failure_classifier,
         ).output.strip()
+
+    def scm_state(self) -> list[str]:
+        """After a failed Windows install: the owned transaction's phase and the SCM state,
+        each from a closed set. No path, SID, account, argument or free text."""
+        lines = []
+        try:
+            if self.transaction.is_file() and self.transaction.stat().st_size <= 65536:
+                phase = json.loads(self.transaction.read_bytes()).get("phase")
+                lines.append(f"transaction phase: {phase if phase in PHASES else 'other'}")
+            else:
+                lines.append("transaction phase: absent")
+        except (OSError, ValueError, AttributeError):
+            lines.append("transaction phase: unreadable")
+        sc = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32" / "sc.exe"
+        for verb, field, name in (
+            ("query", "STATE", "scm state"),
+            ("qc", "START_TYPE", "scm start"),
+        ):
+            try:
+                result = subprocess.run(
+                    [str(sc), verb, f"ZunderGuard-{self.id}"],
+                    capture_output=True,
+                    timeout=20,
+                    check=False,
+                )
+            except (OSError, subprocess.SubprocessError):
+                lines.append(f"{name}: unavailable")
+                continue
+            if result.returncode == 1060:  # ERROR_SERVICE_DOES_NOT_EXIST
+                lines.append(f"{name}: absent")
+                continue
+            text = result.stdout.decode("utf-8", errors="replace")
+            match = re.search(rf"^\s*{field}\s*:\s*\d+\s+([A-Z_]+)", text, re.M)
+            value = match[1] if match and match[1] in SCM_VALUES else f"exit {result.returncode}"
+            lines.append(f"{name}: {value}")
+        return lines
 
     def ps(self, words: list[str]) -> list[str]:
         return [self.shell, "-NoProfile", "-ExecutionPolicy", "Bypass", *words]
@@ -260,7 +340,9 @@ class NativeTestnet:
                 ]
             self.command(words, key=fresh, sensitive=True)
         else:
-            with windows_observe(self.work, "scm-install", installer=True) as classifier:
+            with windows_observe(
+                self.work, "scm-install", installer=True, after_failure=self.scm_state
+            ) as classifier:
                 self.command(
                     self.ps(
                         [

@@ -198,37 +198,151 @@ ERROR_PREFIX = re.compile(
 )
 
 
+def _compact(text: str) -> str:
+    return re.sub(r"\s+", "", text)
+
+
+# Fixed literals compared without whitespace: PowerShell 5.1 hard-wraps redirected error
+# output at the buffer width, mid-word, so a wrapped payload rejoined either way matches.
+COMPACT_REFUSALS = {_compact(message): message for message in INSTALLER_REFUSALS}
+COMPACT_WRAPPER = _compact(INSTALLER_WRAPPER)
+
+
+def _lines(stderr: str) -> tuple[list[str], list[str]]:
+    raw, lines = [], []
+    for line in ANSI.sub("", stderr[:65536]).splitlines():
+        line = line.strip()
+        line = re.sub(r"^\|\s*", "", line)
+        raw.append(line)
+        lines.append(ERROR_PREFIX.sub("", line).strip())
+    return raw, lines
+
+
+# The same prefixes as ERROR_PREFIX, on a compacted window: a wrap can split them too.
+COMPACT_PREFIX = re.compile(r"^(?:.*\.ps1:|Exception:|Write-Error:|\+FullyQualifiedErrorId:)")
+
+
 def installer_refusal(stderr: str) -> str:
     """Recognize PS5.1/PS7 error payloads; return only a frozen, public literal.
 
     PS7 decorates/wraps payload lines with a pipe; PS5.1 prefixes the script
-    filename and wraps long messages. Source excerpts, unknown messages and
-    appended private data cannot match a complete allow-listed payload.
+    filename and hard-wraps redirected output at the buffer width, at a space or
+    mid-word, the prefix included. Source excerpts, unknown messages and appended
+    private data cannot match a complete allow-listed payload: the joined window,
+    without its prefix, must equal the literal, ignoring only whitespace.
     """
-    lines = []
-    for line in ANSI.sub("", stderr[:65536]).splitlines():
-        line = line.strip()
-        line = re.sub(r"^\|\s*", "", line)
-        lines.append(ERROR_PREFIX.sub("", line).strip())
+    raw, lines = _lines(stderr)
     wrapper = False
     for index in range(len(lines)):
         # Bounded unfolding, returning the allow-list value rather than captured text.
-        for count in range(1, 9):
-            payload = " ".join(lines[index : index + count])
-            if payload in INSTALLER_REFUSALS:
-                return next(message for message in INSTALLER_REFUSALS if message == payload)
-            for kind in PATH_KINDS:
-                if re.fullmatch(
-                    re.escape(f"Unprivileged machine path mutation rights refused ({kind}, rights=")
-                    + r"[0-9a-f]{8}\)\.",
-                    payload,
-                ):
-                    return (
-                        f"Unprivileged machine path mutation rights refused ({kind}, "
-                        "rights withheld)."
-                    )
-            wrapper |= payload == INSTALLER_WRAPPER
+        for count in range(1, 17):
+            if index + count > len(lines):
+                break
+            candidates = (
+                _compact(" ".join(lines[index : index + count])),
+                COMPACT_PREFIX.sub("", _compact(" ".join(raw[index : index + count]))),
+            )
+            for compact in candidates:
+                if compact in COMPACT_REFUSALS:
+                    return COMPACT_REFUSALS[compact]
+                for kind in PATH_KINDS:
+                    if re.fullmatch(
+                        re.escape(
+                            _compact(
+                                "Unprivileged machine path mutation rights refused "
+                                f"({kind}, rights="
+                            )
+                        )
+                        + r"[0-9a-f]{8}\)\.",
+                        compact,
+                    ):
+                        return (
+                            f"Unprivileged machine path mutation rights refused ({kind}, "
+                            "rights withheld)."
+                        )
+                wrapper |= compact == COMPACT_WRAPPER
     return INSTALLER_WRAPPER if wrapper else "unknown"
+
+
+# ErrorCategory names (System.Management.Automation.ErrorCategory): a closed enumeration.
+ERROR_CATEGORIES = frozenset(
+    {
+        "NotSpecified",
+        "OpenError",
+        "CloseError",
+        "DeviceError",
+        "DeadlockDetected",
+        "InvalidArgument",
+        "InvalidData",
+        "InvalidOperation",
+        "InvalidResult",
+        "InvalidType",
+        "MetadataError",
+        "NotImplemented",
+        "NotInstalled",
+        "ObjectNotFound",
+        "OperationStopped",
+        "OperationTimeout",
+        "SyntaxError",
+        "ParserError",
+        "PermissionDenied",
+        "ResourceBusy",
+        "ResourceExists",
+        "ResourceUnavailable",
+        "ReadError",
+        "WriteError",
+        "FromStdErr",
+        "SecurityError",
+        "ProtocolError",
+        "ConnectionError",
+        "AuthenticationError",
+        "LimitsExceeded",
+        "QuotaExceeded",
+        "NotEnabled",
+    }
+)
+# A .NET or PowerShell error identifier: letters and dots only (no digits, so no key,
+# account, SID or address; no separators, so no path or free text).
+ERROR_ID = re.compile(r"[A-Za-z][A-Za-z.]{2,100}")
+# Guard's own service refusals are fixed literals (`service refused: ...` in its Rust
+# source): words only. Guard's inherited stderr is never wrapped by PowerShell.
+GUARD_REFUSAL = re.compile(r"zunder-guard: service refused: ([A-Za-z][A-Za-z ;,'/()-]{6,160})")
+GUARD_OS_ERROR = re.compile(r"zunder-guard: service I/O: .*\(os error (\d{1,6})\)")
+
+
+def installer_details(stderr: str) -> list[str]:
+    """Finite, sanitized classes of the installer's errors; never captured free text.
+
+    Each line is `name: value`, where the value is a closed-set name, a letters-only
+    error identifier, a Guard service refusal literal (words only) or a decimal OS error.
+    """
+    found: dict[str, list[str]] = {}
+
+    def add(name: str, value: str) -> None:
+        values = found.setdefault(name, [])
+        if value not in values and len(values) < 4:
+            values.append(value)
+
+    for raw in ANSI.sub("", stderr[:65536]).splitlines():
+        line = raw.strip()
+        if match := GUARD_REFUSAL.fullmatch(line):
+            if len(match[1].split()) >= 3 and all(len(word) <= 24 for word in match[1].split()):
+                add("guard service refusal", match[1])
+            continue
+        if match := GUARD_OS_ERROR.fullmatch(line):
+            add("guard os error", match[1])
+            continue
+        if line.startswith("zunder-guard: "):
+            add("guard error", "present")
+            continue
+        line = re.sub(r"^\|\s*", "", line)
+        if match := re.fullmatch(r"\+\s*FullyQualifiedErrorId\s*:\s*([^,\s]+)(?:,.*)?", line):
+            if ERROR_ID.fullmatch(match[1]):
+                add("powershell error id", match[1])
+        elif match := re.fullmatch(r"\+\s*CategoryInfo\s*:\s*([A-Za-z]+)\s*:.*", line):
+            if match[1] in ERROR_CATEGORIES:
+                add("powershell error category", match[1])
+    return [f"{name}: {value}" for name, values in found.items() for value in values]
 
 
 def reason(error: Exception) -> str:
@@ -244,27 +358,46 @@ def reason(error: Exception) -> str:
 
 @contextmanager
 def observe(
-    work: Path, step: str, *, installer: bool = False
+    work: Path,
+    step: str,
+    *,
+    installer: bool = False,
+    after_failure: Callable[[], list[str]] | None = None,
 ) -> Iterator[Callable[[str], str] | None]:
+    """Record a failing step's fixed classes. `after_failure` returns `name: value`
+    lines from closed sets (such as the owned transaction's phase), read after a
+    failed installer command; anything else it returns is dropped."""
     step = step if step in STEPS else "unknown"
     capture = installer and step == "scm-install"
     refusal = "unknown"
+    details: list[str] = []
 
     def classify(stderr: str) -> str:
-        nonlocal refusal
+        nonlocal refusal, details
         refusal = installer_refusal(stderr)
+        details = installer_details(stderr)
         return "unknown"  # runner's finite category; the literal lives only in this observation.
 
     try:
         yield classify if capture else None
     except Exception as error:
         work.mkdir(parents=True, exist_ok=True)
+        failed = isinstance(error, RunError)
+        observed: list[str] = []
+        if capture and failed:
+            observed = list(details)
+            if after_failure is not None:
+                try:
+                    observed += [
+                        line
+                        for line in after_failure()
+                        if re.fullmatch(r"[a-z ]{3,40}: [A-Za-z0-9 .;,'/()-]{1,160}", line)
+                    ]
+                except Exception:
+                    observed.append("after-failure observation: unavailable")
         (work / f"windows-{step}-failure.log").write_text(
             f"Windows lifecycle failure step: {step}\nfailure reason: {reason(error)}\n"
-            + (
-                f"installer refusal: {refusal if isinstance(error, RunError) else 'unknown'}\n"
-                if capture
-                else ""
-            )
+            + (f"installer refusal: {refusal if failed else 'unknown'}\n" if capture else "")
+            + "".join(line + "\n" for line in observed)
         )
         raise

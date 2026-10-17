@@ -230,6 +230,8 @@ def test_windows_scm_install_retains_only_the_installer_literal(
         return subprocess.CompletedProcess(words, 0 if failure == "success" else 1, stdout, stderr)
 
     monkeypatch.setattr("guard_harness.runner.subprocess.run", execute)
+    # The closed post-failure state (phase, SCM) is tested in test_windows_diagnostics.
+    monkeypatch.setattr(controller, "scm_state", lambda: ["transaction phase: absent"])
     initial = current if scenario == "fresh" else previous
     if failure == "success":
         controller.install(initial, fresh=True)
@@ -240,6 +242,7 @@ def test_windows_scm_install_retains_only_the_installer_literal(
         assert body == (
             "Windows lifecycle failure step: scm-install\nfailure reason: command-failed\n"
             f"installer refusal: {message if failure == 'helper' else 'unknown'}\n"
+            "transaction phase: absent\n"
         )
     assert calls == (2 if failure == "success" else 1)
     assert identities == ([initial] if failure == "success" else [])
