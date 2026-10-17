@@ -269,6 +269,10 @@ $definition=$ast.Find({{
 $Tmp={quote(stage)}
 New-Item -ItemType Directory -Path $Tmp | Out-Null
 $global:Failed=0
+# Load the real cmdlet before the fake shadows its name: Get-Asset asks the cmdlet (by
+# command type) whether it has -OperationTimeoutSeconds, and a shadowing function stops
+# module auto-loading.
+Import-Module Microsoft.PowerShell.Utility
 function Invoke-WebRequest {{
   param([switch]$UseBasicParsing,[string]$Uri,[string]$OutFile,[int]$TimeoutSec,[int]$OperationTimeoutSeconds)
   $state = if ([IO.File]::Exists($OutFile)) {{ 'stale' }} else {{ 'fresh' }}

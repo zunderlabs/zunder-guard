@@ -460,11 +460,19 @@ impl Target for HttpTarget {
     }
 
     fn healthy(&mut self) -> bool {
-        self.client
-            .get(format!("{}/guard/status", self.base))
-            .send()
-            .map(|response| response.status().is_success())
-            .unwrap_or(false)
+        // After a refused oversized body Guard closes the connection with data unread,
+        // which Windows answers with a reset, so one pooled request can fail once. A
+        // Guard that crashed or hangs fails every try.
+        (0..3).any(|attempt| {
+            if attempt > 0 {
+                std::thread::sleep(std::time::Duration::from_millis(250));
+            }
+            self.client
+                .get(format!("{}/guard/status", self.base))
+                .send()
+                .map(|response| response.status().is_success())
+                .unwrap_or(false)
+        })
     }
 
     fn label(&self) -> String {
