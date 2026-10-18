@@ -124,7 +124,9 @@ function Write-ZgJson([string]$Path,$Value) {
   if ([IO.File]::Exists($Path)) { Assert-ZgPath $Path }
   $next = $Path + '.next-' + [Guid]::NewGuid().ToString('N')
   $bytes = [Text.UTF8Encoding]::new($false).GetBytes(($Value | Microsoft.PowerShell.Utility\ConvertTo-Json -Depth 24))
-  $file = [IO.FileStream]::new($next,[IO.FileMode]::CreateNew,[IO.FileAccess]::Write,[IO.FileShare]::None)
+  # Owner Administrators and the protected ACL from creation (New-ZgSecureFile): a plain
+  # new file's owner follows the creating token, which can be the user (Git Bash/MSYS).
+  $file = New-ZgSecureFile $next
   try { $file.Write($bytes,0,$bytes.Length); $file.Flush($true) } finally { $file.Dispose() }
   Set-ZgAcl $next ''
   # A bare $null becomes an empty .NET string in Windows PowerShell 5.1.
@@ -425,11 +427,27 @@ function Install-ZgImage([string]$Directory) {
     $destination = [IO.Path]::Combine($ZgBinaryDir,$name)
     if ([IO.File]::Exists($destination)) { Assert-ZgPath $destination }
     $next = $destination+'.next-'+[Guid]::NewGuid().ToString('N')
-    [IO.File]::Copy($source,$next,$false); Set-ZgAcl $next $ZgSid
+    Copy-ZgSecureFileFromPath $source $next; Set-ZgAcl $next $ZgSid
     $stream = [IO.FileStream]::new($next,[IO.FileMode]::Open,[IO.FileAccess]::ReadWrite,[IO.FileShare]::None)
     try { $stream.Flush($true) } finally { $stream.Dispose() }
     if ([IO.File]::Exists($destination)) { [IO.File]::Replace($next,$destination,[NullString]::Value) } else { [IO.File]::Move($next,$destination) }
   }
+}
+# A protected copy of a file: created with its owner (Administrators) and protected ACL in
+# one call (the shared stream Copy-ZgSecureFile), under a temporary name, then moved to the
+# final name, which never exists partially. A failed copy or move removes its own temporary.
+function Copy-ZgSecureFileFromPath([string]$Source,[string]$Destination) {
+  $next = $Destination + '.copy-' + [Guid]::NewGuid().ToString('N')
+  try {
+    $reader = [IO.File]::OpenRead($Source)
+    try { Copy-ZgSecureFile $reader $next } finally { $reader.Dispose() }
+    [IO.File]::Move($next,$Destination)
+  } catch {
+    # A failed cleanup never replaces the copy's own error.
+    try { if ([IO.File]::Exists($next)) { [IO.File]::Delete($next) } } catch { }
+    throw
+  }
+  Assert-ZgPath $Destination
 }
 # The service's virtual account re-admits its layout at every start, the two
 # shared anchors included: it must be able to open them and read their owner
@@ -508,7 +526,7 @@ function Complete-ZgPrepare {
   Save-ZgPhase 'binding-prepared'
   $credential = [IO.Path]::Combine($ZgRoot,'credential.dpapi')
   if (-not [IO.File]::Exists($credential)) {
-    $file = [IO.FileStream]::new($credential,[IO.FileMode]::CreateNew,[IO.FileAccess]::Write,[IO.FileShare]::None)
+    $file = New-ZgSecureFile $credential
     $file.Dispose(); Set-ZgAcl $credential $ZgSid
   }
   Assert-ZgPath $credential
@@ -551,12 +569,12 @@ function Complete-ZgUpgrade {
   Save-ZgPhase 'quiesced'
   if (-not [IO.File]::Exists($backup)) {
     if ((Get-ZgHash $ZgExe) -cne $ZgTransaction.old_hash) { throw 'Missing old image backup and unexpected active digest.' }
-    [IO.File]::Copy($ZgExe,$backup,$false); Set-ZgAcl $backup ''
+    Copy-ZgSecureFileFromPath $ZgExe $backup; Set-ZgAcl $backup ''
   }
   if ((Get-ZgHash $backup) -cne $ZgTransaction.old_hash) { throw 'Old image backup changed.' }
   if (-not [IO.File]::Exists($oldBinding)) {
     if ((Get-ZgHash $ZgBinding) -cne $ZgTransaction.old_binding_hash) { throw 'Missing old binding backup and unexpected active binding.' }
-    [IO.File]::Copy($ZgBinding,$oldBinding,$false); Set-ZgAcl $oldBinding ''
+    Copy-ZgSecureFileFromPath $ZgBinding $oldBinding; Set-ZgAcl $oldBinding ''
   }
   if ((Get-ZgHash $oldBinding) -cne $ZgTransaction.old_binding_hash) { throw 'Old binding backup changed.' }
   $image = Get-ZgImage
@@ -704,8 +722,28 @@ function Invoke-ZgLifecycle {
   New-ZgDirectory $ZgData; New-ZgDirectory $ZgManagement
   # Exclusive OS file handle is the lock, not a PID file: crashes release it automatically.
   $lockPath = [IO.Path]::Combine($ZgManagement,($Id+'.lock'))
-  if ([IO.File]::Exists($lockPath)) { Assert-ZgPath $lockPath }
-  $lock = [IO.FileStream]::new($lockPath,[IO.FileMode]::OpenOrCreate,[IO.FileAccess]::ReadWrite,[IO.FileShare]::None)
+  # Owner Administrators and the protected ACL in the creating call. A plain new file's
+  # owner follows the creating token: under Git Bash/MSYS (the I4 harness) that is the
+  # user, and the next helper run then refused its own lock as an untrusted owner. An
+  # existing lock is asserted before it is opened, never adopted or re-owned. A held lock
+  # (sharing or lock violation) or a lost creation race (the file exists) is one fixed
+  # refusal; every other I/O error is rethrown unchanged.
+  $lockAcl = New-ZgAcl $false ''
+  $lockRights = [Security.AccessControl.FileSystemRights]'Read, Write'
+  $lockExists = [IO.File]::Exists($lockPath)
+  if ($lockExists) { Assert-ZgPath $lockPath }
+  try {
+    $lock = if ($lockExists) { [IO.FileStream]::new($lockPath,[IO.FileMode]::Open,[IO.FileAccess]::ReadWrite,[IO.FileShare]::None) }
+      elseif ($PSVersionTable.PSVersion.Major -ge 6) { [IO.FileSystemAclExtensions]::Create([IO.FileInfo]::new($lockPath),[IO.FileMode]::CreateNew,$lockRights,[IO.FileShare]::None,4096,[IO.FileOptions]::None,$lockAcl) }
+      else { [IO.FileStream]::new($lockPath,[IO.FileMode]::CreateNew,$lockRights,[IO.FileShare]::None,4096,[IO.FileOptions]::None,$lockAcl) }
+  } catch {
+    # HResults 0x80070020 sharing violation, 0x80070021 lock violation, 0x80070050 and
+    # 0x800700B7 file exists, written as the signed Int32 values .NET reports.
+    $reason = $_.Exception.GetBaseException()
+    if ($reason -is [IO.IOException] -and $reason.HResult -in @(-2147024864,-2147024863,-2147024816,-2147024713)) { throw 'Another helper holds this instance''s lock.' }
+    throw
+  }
+  if (-not $lockExists) { Assert-ZgPath $lockPath }
   # Validation and Status are read-only. Cleanup is armed at the first admitted
   # owned service mutation, never merely because a name/path matches SCM.
   $cleanupOwnedMutation = $false
@@ -746,6 +784,9 @@ function Invoke-ZgLifecycle {
           if (-not [IO.File]::Exists((Get-ZgJournalPath))) { throw 'Journal not committed; explicitly invoke JournalInit with a review note.' }
           $old = $env:ZUNDER_MAINNET_CONFIRM
           try { $env:ZUNDER_MAINNET_CONFIRM=$ConfirmAccount; Invoke-ZgGuard @('journal-show','--mode','mainnet') } finally { $env:ZUNDER_MAINNET_CONFIRM=$old }
+          # JournalInit stopped after Guard created the journal (owner: the creating token)
+          # and before it was given the protected form: give it now, as JournalInit does.
+          Set-ZgAcl ((Get-ZgJournalPath)) $ZgSid $true
           Save-ZgPhase 'journal-present'
         } elseif ($phase -in @('admitted-disabled','journal-present')) { Microsoft.PowerShell.Utility\Write-Host 'Preparation already complete; choose JournalInit/Start separately.' }
         elseif ($ZgTransaction.operation -eq 'install') { Complete-ZgPrepare }
@@ -808,7 +849,7 @@ function Invoke-ZgLifecycle {
         $cleanupOwnedMutation = $true
         Disable-ZgService
         if ((Get-ZgJournalHash) -cne $ZgTransaction.journal_hash) { throw 'Journal changed while quiescing; rollback refused.' }
-        $next=$ZgExe+'.recover-'+[Guid]::NewGuid().ToString('N'); [IO.File]::Copy($backup,$next,$false); Set-ZgAcl $next $ZgSid; [IO.File]::Replace($next,$ZgExe,[NullString]::Value)
+        $next=$ZgExe+'.recover-'+[Guid]::NewGuid().ToString('N'); Copy-ZgSecureFileFromPath $backup $next; Set-ZgAcl $next $ZgSid; [IO.File]::Replace($next,$ZgExe,[NullString]::Value)
         Write-ZgJson $ZgBinding ([IO.File]::ReadAllText($oldBinding) | Microsoft.PowerShell.Utility\ConvertFrom-Json); Set-ZgAcl $ZgBinding $ZgSid
         Invoke-ZgGuard @('service','check','--binding',$ZgBinding)
         $ZgTransaction.tag=$ZgTransaction.old_tag; $ZgTransaction.release=$ZgTransaction.old_release; $ZgTransaction.helper_hash=$ZgTransaction.old_helper_hash; $ZgTransaction.new_hash=$ZgTransaction.old_hash

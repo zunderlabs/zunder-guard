@@ -19,6 +19,152 @@ IMAGE = 'ghcr.io/zunderlabs/zunder-guard@sha256:' + 'b' * 64
 NOTICES = ('LICENSE', 'NOTICE', 'THIRD_PARTY_LICENSES.md')
 
 
+# The code that writes the protected machine tree, as PowerShell code with strings and
+# comments blanked: the shared trust code, the loader's managed path, the helper's
+# lifecycle, and i.ps1 without its per-user %LOCALAPPDATA% install (named below).
+PER_USER_FUNCTIONS = frozenset({'Install-ZunderGuard'})
+BANNED_CREATION = (
+    r'\bOut-File\b', r'\bSet-Content\b', r'\bAdd-Content\b', r'\bTee-Object\b',
+    r'\bStart-Transcript\b', r'\bCopy-Item\b', r'\bMove-Item\b', r'\bExpand-Archive\b',
+    r'ExtractToDirectory', r'\bNew-Item\b[^\n]*-ItemType\s+(File|Directory)',
+    r'\[(System\.)?IO\.File\]::(Open|OpenWrite|AppendAllText|AppendAllLines|AppendText|'
+    r'WriteAllLines|WriteAllText|WriteAllBytes|CreateText|Create|Copy)\(',
+    r'\[(System\.)?IO\.StreamWriter\]::new\(',
+    r'New-Object\s+(-TypeName\s+)?(System\.)?IO\.(StreamWriter|FileStream)',
+    r'\[(System\.)?IO\.FileInfo\]::new\([^)]*\)\.(Create|Open|OpenWrite|CreateText)\(',
+    r'\[(System\.)?IO\.Directory\]::CreateDirectory\(\s*[^,()]+\)',
+    r'OpenOrCreate', r'\[System\.IO\.FileStream\]::new\(',
+    # A FileInfo (or other) variable creating or opening for write: .Create(), .CreateText(),
+    # .OpenWrite(), .AppendText(), and .Open(mode...) with arguments (a zip entry's
+    # argument-less .Open() reads).
+    r'\$\w+\.(Create|CreateText|OpenWrite|AppendText)\(\s*\)', r'\$\w+\.Open\(\s*[^)\s]',
+    # Aliases of the creating cmdlets, in command position.
+    r'(?m)(?:^|[;|{(=])\s*(?:ni|mkdir|md|sc|ac|cp|cpi|copy|mv|mi|move|tee)(?=\s|$)',
+    # File redirection: > and >> (2>&1 merges streams; > $null discards).
+    r'(?<![\w\-=<>!&])\d?>>?(?!\s*(&|\$null))',
+)
+# Calls that create a file or folder. Each must pass an ACL that New-ZgAcl made in the
+# same function (owner Administrators, protected DACL): a FileStream's last argument unless
+# its mode is literally Open or Truncate (a mode in a variable counts as creating),
+# FileSystemAclExtensions.Create's last, FileSystemAclExtensions.CreateDirectory's first and
+# Directory.CreateDirectory's second (its one-argument form is banned above).
+CREATING_PREFIXES = (
+    '[IO.FileStream]::new(',
+    '[IO.FileSystemAclExtensions]::Create(',
+    '[IO.FileSystemAclExtensions]::CreateDirectory(',
+    '[IO.Directory]::CreateDirectory(',
+)
+NON_CREATING_MODES = ('[IO.FileMode]::Open', '[IO.FileMode]::Truncate')
+
+
+def ps_call_arguments(code, prefix):
+    """The top-level arguments of every call starting with `prefix`, across lines."""
+    start = code.find(prefix)
+    while start >= 0:
+        depth, i, args, current = 1, start + len(prefix), [], []
+        while depth and i < len(code):
+            c = code[i]
+            if c in '([{':
+                depth += 1
+            elif c in ')]}':
+                depth -= 1
+            if depth == 1 and c == ',':
+                args.append(''.join(current).strip())
+                current = []
+            elif depth:
+                current.append(c)
+            i += 1
+        args.append(''.join(current).strip())
+        yield start, [arg for arg in args if arg]
+        start = code.find(prefix, i)
+
+
+def creating_acl(prefix, args):
+    """The ACL argument a creating call must carry, or None for an Open/Truncate stream."""
+    if prefix == '[IO.FileStream]::new(':
+        if len(args) >= 2 and args[1] in NON_CREATING_MODES:
+            return None
+        return args[-1] if args else ''
+    if prefix == '[IO.FileSystemAclExtensions]::CreateDirectory(':
+        return args[0] if args else ''
+    return args[-1] if len(args) >= 2 else ''
+
+
+def ps_code(text):
+    """PowerShell text with string contents and comments blanked, lengths kept."""
+    out, i, n = list(text), 0, len(text)
+    while i < n:
+        c = text[i]
+        if c == '#' or text.startswith('<#', i):
+            end = text.find('#>', i) + 2 if text.startswith('<#', i) else text.find('\n', i)
+            end = n if end < (2 if text.startswith('<#', i) else 0) else end
+            for j in range(i, end):
+                if out[j] != '\n':
+                    out[j] = ' '
+            i = end
+        elif c == "'":
+            j = i + 1
+            while j < n and not (text[j] == "'" and text[j + 1:j + 2] != "'"):
+                j += 2 if text[j] == "'" else 1
+            for k in range(i + 1, min(j, n)):
+                if out[k] != '\n':
+                    out[k] = ' '
+            i = j + 1
+        elif c == '"':
+            j = i + 1
+            while j < n and text[j] != '"':
+                j += 2 if text[j] == '`' else 1
+            for k in range(i + 1, min(j, n)):
+                if out[k] != '\n':
+                    out[k] = ' '
+            i = j + 1
+        else:
+            i += 1
+    return ''.join(out)
+
+
+def ps_function_spans(code):
+    spans = {}
+    for match in re.finditer(r'(?mi)^[ \t]*function\s+([\w-]+)[^{\n]*\{', code):
+        depth, i = 1, match.end()
+        while depth and i < len(code):
+            depth += {'{': 1, '}': -1}.get(code[i], 0)
+            i += 1
+        spans.setdefault(match[1], (match.start(), i))
+    return spans
+
+
+def ps_function_bodies(code):
+    return {name: code[start:end] for name, (start, end) in ps_function_spans(code).items()}
+
+
+def ps_function(code, text, name):
+    """A function's original text (strings intact), located on the blanked code."""
+    start, end = ps_function_spans(code)[name]
+    return text[start:end]
+
+
+def protected_sources():
+    for relative in ('windows/bootstrap.ps1.inc', 'windows/lifecycle.ps1.inc',
+                     'windows/loader-mainnet.ps1.inc', 'loader/i.ps1'):
+        code = ps_code((GUARD / relative).read_text())
+        if relative == 'loader/i.ps1':
+            spans = ps_function_spans(code)
+            assert PER_USER_FUNCTIONS <= set(spans), relative
+            text = (GUARD / relative).read_text()
+            for name in PER_USER_FUNCTIONS:
+                start, end = spans[name]
+                per_user = text[start:end]
+                for machine in ('$ZgData', '$ZgBin', '$ZgRoot', '$ZgManagement', '$ZgHome',
+                                '$ZgExe', 'CommonApplicationData', 'ProgramData',
+                                'Get-ZgMachineFolder', 'New-ZgSecureFile', 'New-ZgDirectory'):
+                    assert machine not in per_user, (name, machine)
+            for name in PER_USER_FUNCTIONS:
+                start, end = spans[name]
+                code = code[:start] + ''.join('\n' if c == '\n' else ' ' for c in code[start:end]) + code[end:]
+        yield relative, code
+
+
 class WindowsAclPolicy(unittest.TestCase):
     """Offline bit-contract check; real PowerShell selector execution is in its fixture."""
 
@@ -81,6 +227,117 @@ class WindowsAclPolicy(unittest.TestCase):
         assert_path = source.index('function Assert-ZgPath(')
         self.assertTrue(source[assert_path:].splitlines()[1].strip()
                         == "if (-not $Path) { throw 'Noncanonical machine path refused.' }")
+
+    def test_every_protected_file_is_created_with_its_owner(self):
+        # rc.1 I4: the helper's lock file was created plainly, so its owner followed the
+        # creating token. Under Git Bash/MSYS (the I4 harness) that is the user, and the next
+        # helper action refused the lock as "Untrusted machine path owner (protected-path,
+        # owner=current-user)". In the code that writes the protected machine tree (the shared
+        # trust code, the loader's managed path, the helper; i.ps1 except its per-user
+        # %LOCALAPPDATA% install), no API may create a file or folder unless it supplies an
+        # ACL from New-ZgAcl, which sets owner Administrators and protects the DACL.
+        shared = (GUARD / 'windows/bootstrap.ps1.inc').read_text()
+        new_acl = ps_function(ps_code(shared), shared, 'New-ZgAcl')
+        self.assertIn('$acl.SetAccessRuleProtection($true,$false)', new_acl)
+        self.assertIn("$acl.SetOwner([Security.Principal.SecurityIdentifier]::new('S-1-5-32-544'))",
+                      new_acl)
+        checked = []
+        for name, code in protected_sources():
+            for pattern in BANNED_CREATION:
+                found = re.search(pattern, code)
+                self.assertIsNone(found, f'{name}: {found and found[0]}')
+            for function, body in ps_function_bodies(code).items():
+                for prefix in CREATING_PREFIXES:
+                    for _, args in ps_call_arguments(body, prefix):
+                        acl = creating_acl(prefix, args)
+                        if acl is None:
+                            continue
+                        where = f'{name} {function}: {prefix}{", ".join(args)})'
+                        variable = re.fullmatch(r'\$(\w+)', acl)
+                        self.assertIsNotNone(variable, where)
+                        self.assertRegex(body, r'\$' + variable[1] + r'\s*=\s*New-ZgAcl\b',
+                                         f'{where} has no owner-setting ACL')
+                        checked.append(where)
+        # The creating calls the sources have today: New-ZgDirectory (two), New-ZgSecureFile
+        # (two) in each of bootstrap and i.ps1, and the lock (two).
+        self.assertGreaterEqual(len(checked), 10, checked)
+        writer = ps_function(ps_code(shared), shared, 'Write-ZgJson')
+        self.assertIn('$file = New-ZgSecureFile $next', writer)
+        lifecycle = (GUARD / 'windows/lifecycle.ps1.inc').read_text()
+        main = ps_function(ps_code(lifecycle), lifecycle, 'Invoke-ZgLifecycle')
+        self.assertIn('[IO.FileMode]::CreateNew,$lockRights,[IO.FileShare]::None,4096,'
+                      '[IO.FileOptions]::None,$lockAcl)', main)
+        self.assertIn('$lockAcl = New-ZgAcl $false', main)
+        # An existing lock is asserted before it is opened, never adopted or re-owned; a held
+        # lock or a lost creation race is one fixed refusal.
+        self.assertLess(main.index('if ($lockExists) { Assert-ZgPath $lockPath }'),
+                        main.index('[IO.FileMode]::Open,[IO.FileAccess]::ReadWrite'))
+        catch = main[main.index('$reason = $_.Exception.GetBaseException()'):]
+        catch = catch[:catch.index('\n  }')]
+        self.assertIn("if ($reason -is [IO.IOException] -and $reason.HResult -in "
+                      "@(-2147024864,-2147024863,-2147024816,-2147024713)) { throw "
+                      "'Another helper holds this instance''s lock.' }", catch)
+        # Every other I/O error is rethrown unchanged.
+        self.assertEqual(catch.rstrip().splitlines()[-1].strip(), 'throw')
+        # 0x80070020 sharing, 0x80070021 lock violation, 0x80070050 and 0x800700B7 exists.
+        self.assertEqual([h - 2**32 for h in (0x80070020, 0x80070021, 0x80070050, 0x800700B7)],
+                         [-2147024864, -2147024863, -2147024816, -2147024713])
+
+    def test_no_powershell_function_is_defined_twice(self):
+        # A later definition silently replaces an earlier one in the same script: the
+        # helper's path copy once shadowed the shared stream Copy-ZgSecureFile.
+        shared = (GUARD / 'windows/bootstrap.ps1.inc').read_text()
+        sources = {
+            relative: (GUARD / relative).read_text()
+            for relative in ('windows/service.ps1', 'loader/i.ps1')
+        }
+        # The sources they are assembled from, so an edit is caught before re-embedding.
+        for part in ('windows/lifecycle.ps1.inc', 'windows/loader-mainnet.ps1.inc'):
+            sources['bootstrap.ps1.inc + ' + part] = shared + '\n' + (GUARD / part).read_text()
+        for relative, source in sources.items():
+            names = re.findall(r'(?mi)^\s*function\s+([\w-]+)', ps_code(source))
+            duplicates = sorted({n for n in names if names.count(n) > 1})
+            self.assertEqual(duplicates, [], relative)
+            self.assertGreater(len(names), 20, relative)
+
+    def test_a_path_copy_is_complete_or_absent_at_its_final_name(self):
+        lifecycle = (GUARD / 'windows/lifecycle.ps1.inc').read_text()
+        copy = ps_function(ps_code(lifecycle), lifecycle, 'Copy-ZgSecureFileFromPath')
+        steps = [line.strip() for line in copy.splitlines()]
+        self.assertIn("$next = $Destination + '.copy-' + [Guid]::NewGuid().ToString('N')", steps)
+        self.assertIn('try { Copy-ZgSecureFile $reader $next } finally { $reader.Dispose() }',
+                      steps)
+        self.assertIn('[IO.File]::Move($next,$Destination)', steps)
+        # The copy's own error survives a failed cleanup, which is swallowed, then rethrown.
+        cleanup = 'try { if ([IO.File]::Exists($next)) { [IO.File]::Delete($next) } } catch { }'
+        self.assertIn(cleanup, steps)
+        self.assertEqual(steps[steps.index(cleanup) + 1], 'throw')
+        self.assertLess(steps.index('[IO.File]::Move($next,$Destination)'),
+                        steps.index('} catch {'))
+        self.assertEqual(steps[-2:], ['Assert-ZgPath $Destination', '}'])
+        for call in ('Copy-ZgSecureFileFromPath $source $next;',
+                     "Copy-ZgSecureFileFromPath $ZgExe $backup; Set-ZgAcl $backup ''",
+                     "Copy-ZgSecureFileFromPath $ZgBinding $oldBinding; Set-ZgAcl $oldBinding ''",
+                     'Copy-ZgSecureFileFromPath $backup $next;'):
+            self.assertIn(call, lifecycle)
+        # The shared Copy-ZgSecureFile takes a stream; every call passes one.
+        for match in re.finditer(r'Copy-ZgSecureFile (\$\w+)', ps_code(lifecycle)):
+            self.assertIn(match[1], ('$reader',))
+
+    def test_mainnet_journal_is_protected_on_init_and_on_resume(self):
+        lifecycle = (GUARD / 'windows/lifecycle.ps1.inc').read_text()
+        protect = 'Set-ZgAcl ((Get-ZgJournalPath)) $ZgSid $true'
+        main = ps_function(ps_code(lifecycle), lifecycle, 'Invoke-ZgLifecycle')
+        journal_init = main[main.index("'JournalInit' {"):main.index("'Start' {")]
+        self.assertEqual(journal_init.count('Set-ZgAcl'), 1)
+        self.assertLess(journal_init.index("'journal-init','--mode','mainnet'"),
+                        journal_init.index(protect))
+        self.assertLess(journal_init.index(protect), journal_init.index("Save-ZgPhase 'journal-present'"))
+        # Resume after a JournalInit that stopped in journal-requested: the journal Guard
+        # created gets the same protected form before journal-present is recorded.
+        resume = main[main.index("if ($phase -eq 'journal-requested') {"):main.index("} elseif ($phase -in")]
+        self.assertLess(resume.index("'journal-show','--mode','mainnet'"), resume.index(protect))
+        self.assertLess(resume.index(protect), resume.index("Save-ZgPhase 'journal-present'"))
 
     def test_programdata_exception_cannot_grant_destructive_or_anchor_rights(self):
         source = (GUARD / 'windows/bootstrap.ps1.inc').read_text()

@@ -320,7 +320,8 @@ def test_every_fixed_installer_literal_is_thrown_by_the_signed_loader_or_helper(
     interpolated = ("Untrusted machine path owner (", "Organization ")
     for message in INSTALLER_REFUSALS:
         if not message.startswith(interpolated):
-            assert f"'{message}'" in source, message
+            quoted = "'" + message.replace("'", "''") + "'"  # PowerShell single-quote escaping
+            assert quoted in source, message
     # rc.1 I4: an incomplete environment now refuses with this literal, not an
     # ArgumentException from an empty machine path.
     assert (

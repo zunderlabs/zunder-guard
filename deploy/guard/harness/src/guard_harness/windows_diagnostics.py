@@ -42,6 +42,7 @@ INSTALLER_WRAPPER = (
 INSTALLER_REFUSALS = frozenset(
     {
         "A transaction is pending; use its exact retained helper Resume.",
+        "Another helper holds this instance's lock.",
         "Archive member exceeds installer size bound.",
         "Binding differs from owned transaction.",
         "Broker identity mismatch.",

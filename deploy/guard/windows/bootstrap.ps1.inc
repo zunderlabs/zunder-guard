@@ -109,7 +109,9 @@ function Write-ZgJson([string]$Path,$Value) {
   if ([IO.File]::Exists($Path)) { Assert-ZgPath $Path }
   $next = $Path + '.next-' + [Guid]::NewGuid().ToString('N')
   $bytes = [Text.UTF8Encoding]::new($false).GetBytes(($Value | Microsoft.PowerShell.Utility\ConvertTo-Json -Depth 24))
-  $file = [IO.FileStream]::new($next,[IO.FileMode]::CreateNew,[IO.FileAccess]::Write,[IO.FileShare]::None)
+  # Owner Administrators and the protected ACL from creation (New-ZgSecureFile): a plain
+  # new file's owner follows the creating token, which can be the user (Git Bash/MSYS).
+  $file = New-ZgSecureFile $next
   try { $file.Write($bytes,0,$bytes.Length); $file.Flush($true) } finally { $file.Dispose() }
   Set-ZgAcl $next ''
   # A bare $null becomes an empty .NET string in Windows PowerShell 5.1.

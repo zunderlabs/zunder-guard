@@ -6,6 +6,8 @@
 # on any venue). Guard only makes read-only info requests for them. Because every input
 # is synthetic, the installer's own output is printed in full (the key itself never is).
 #
+# Stage 0b prints the owner of a plainly created file when PowerShell is started directly
+# and when it is started from Git Bash, as the I4 harness starts the installer.
 # Stage 0 prints how Windows PowerShell 5.1 and PowerShell 7 resolve ProgramData and
 # Program Files under the I4 harness's minimal environment, with single variables added
 # back, and under the full one. Stage A0 runs the released loader exactly as the I4 harness
@@ -147,6 +149,22 @@ foreach ($edition in @($WindowsPowerShell,(Get-Command pwsh.exe).Source)) {
     $null = Invoke-Captured "stage 0: $([IO.Path]::GetFileName($edition)) folders, $($case.Label) env" $edition @('-NoProfile','-NonInteractive','-Command',$Probe) '' (Get-Environment $case.Names)
   }
   $null = Invoke-Captured "stage 0: $([IO.Path]::GetFileName($edition)) folders, full env" $edition @('-NoProfile','-NonInteractive','-Command',$Probe) ''
+}
+
+# Stage 0b: who owns a file a plain PowerShell call creates, started directly and started
+# from Git Bash as the I4 harness starts the installer (Python under bash). MSYS sets the
+# process token's default owner to the user, so plain new files are the user's there.
+$OwnerProbe = (Join-Path $Work 'owner-probe').Replace('\','/')
+New-Item -ItemType Directory -Force -Path $OwnerProbe | Out-Null
+$GitBash = Join-Path ([Environment]::GetFolderPath('ProgramFiles')) 'Git\bin\bash.exe'
+$WindowsPowerShellUnix = $WindowsPowerShell.Replace('\','/')
+$null = Invoke-Captured 'stage 0b: plain file created by powershell.exe started directly' $WindowsPowerShell @('-NoProfile','-NonInteractive','-Command',"[IO.File]::WriteAllText('$OwnerProbe/direct.txt','x')") ''
+if (Test-Path -LiteralPath $GitBash) {
+  $null = Invoke-Captured 'stage 0b: plain file created by powershell.exe started from Git Bash' $GitBash @('-c',"'$WindowsPowerShellUnix' -NoProfile -NonInteractive -Command `"[IO.File]::WriteAllText('$OwnerProbe/bash.txt','x')`"") ''
+}
+foreach ($probe in @('direct.txt','bash.txt')) {
+  $path = Join-Path $OwnerProbe $probe
+  if (Test-Path -LiteralPath $path) { Say ("stage 0b owner of $probe = " + (Get-Acl -LiteralPath $path).Owner) } else { Say "stage 0b owner of $probe = absent" }
 }
 
 # Stage A0: the released loader exactly as the I4 harness ran it, its environment included.

@@ -51,6 +51,20 @@ A committed config is reused without init or pairing again. A present credential
 
 Re-running the loader does not silently upgrade a completed instance. Run the same loader command after the new exact release is published. It verifies and retains the new cache, prints its exact helper and Upgrade command, and leaves the existing service running or stopped as it was. Use that verified cached helper with `-Action Upgrade -ReleaseDir <verified cache> -Tag <exact tag> -Id guard -ConfirmAccount <account>`. Upgrade disables startup and confirms no owned runtime before replacing the image/binding. It preserves credentials, configuration, licence, client pairings and journals and never restarts because the old service was running. Use explicit Start afterwards.
 
+### A refused instance lock
+
+Each helper action takes an exclusive lock file, `%ProgramData%\ZunderGuard\management\<id>.lock` (`<id>` is the instance, `guard` by default). Helpers from 1.0.2 create it owned by Administrators. A helper before 1.0.2 created it with the owner of the process that ran it, which can be your own account (an ordinary desktop console, or Git Bash); every later action then refuses it with `Untrusted machine path owner (protected-path, owner=current-user).` To recover, close every PowerShell window running the helper, then in a plain elevated PowerShell either delete the lock or give it to Administrators:
+
+```powershell
+Remove-Item -LiteralPath "$env:ProgramData\ZunderGuard\management\guard.lock"
+# or
+icacls "$env:ProgramData\ZunderGuard\management\guard.lock" /setowner "*S-1-5-32-544"
+```
+
+Deleting it is safe: the lock holds no state, it is only the handle that keeps two helpers apart, and a 1.0.2 helper creates it again with the right owner. A retained helper from before 1.0.2 recreates it with the owner of the process that runs it, so until the instance is upgraded to 1.0.2 run that helper only from a plain elevated PowerShell, never from Git Bash, MSYS or Cygwin. If `icacls` still shows your own account as the lock's owner after such a run (a desktop edition of Windows can default new files to their creator), give it to Administrators again as above before the next action.
+
+`Another helper holds this instance's lock.` means the lock file is held right now: usually another helper still running for this instance (wait for it or close it), or briefly an antivirus scanner reading the new file, in which case simply run the action again.
+
 An interrupted upgrade resumes while disabled using its exact retained transaction/helper. `-Action Recover -Recovery RollbackImage` is limited to a not-yet-started new runtime and an unchanged journal; it restores only the old verified image/binding. It never rolls back accounting/risk journals, configuration or credentials. Old release caches and backups remain until separately reviewed cleanup.
 
 ## Stop and uninstall
